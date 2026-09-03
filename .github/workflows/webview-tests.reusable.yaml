@@ -118,8 +118,18 @@ jobs:
         working-directory: typescript2
 
       - name: "Run unit tests"
+        id: unit-tests
         run: pnpm --filter app-vscode-webview test:unit:run
         working-directory: typescript2
+
+      - name: "Report test results to Trunk"
+        if: ${{ !cancelled() && steps.unit-tests.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: typescript2/app-vscode-webview/junit.xml
+          variant: webview-unit
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.unit-tests.outcome }}
 
   browser-tests:
     name: "Browser Tests (Playwright)"
@@ -170,5 +180,15 @@ jobs:
         working-directory: typescript2/app-vscode-webview
 
       - name: "Run browser tests"
+        id: browser-tests
         run: pnpm --filter app-vscode-webview test:browser:run
         working-directory: typescript2
+
+      - name: "Report test results to Trunk"
+        if: ${{ !cancelled() && steps.browser-tests.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: typescript2/app-vscode-webview/junit.xml
+          variant: webview-browser
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.browser-tests.outcome }}

@@ -188,7 +188,9 @@ cargo check --target wasm32-unknown-unknown -p bridge_wasm
 ```
 
 Start with `baml_language/ARCHITECTURE.md` for the compiler pipeline and
-`baml_language/TEST_INSTRUCTIONS.md` for the snapshot-test workflow. Design
+`baml_language/TEST_INSTRUCTIONS.md` for the snapshot-test workflow. CI reports
+its test results to Trunk Flaky Tests — see `docs/flaky-tests.md` if you are
+adding a test lane or chasing a test that fails only sometimes. Design
 documents for larger subsystems (e.g. the LSP server's locking and rebuild
 pipeline) live in `docs/design/`.
 

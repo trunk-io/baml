@@ -1,0 +1,56 @@
+name: Upload test results to Trunk
+description: >
+  Uploads JUnit XML from a test step to Trunk Flaky Tests. Never fails the job:
+  a secretless run (fork PR) skips the upload, and an upload error is
+  swallowed — test reporting must not become a second gate on CI.
+
+inputs:
+  junit-paths:
+    description: Comma-separated glob paths to the JUnit XML files, relative to the workspace root.
+    required: true
+  variant:
+    description: >
+      Label distinguishing this run of the suite from the same tests run
+      elsewhere (platform, SDK, runner). Trunk tracks flakiness per variant, so
+      a test that only flakes on windows stays separable from its linux twin.
+    required: true
+  token:
+    description: >
+      Trunk organization API token. Empty on fork PRs (repository secrets are
+      withheld), which skips the upload.
+    required: false
+    default: ""
+  org-slug:
+    description: Trunk organization slug.
+    required: false
+    default: trunk
+  previous-step-outcome:
+    description: >
+      `steps.<id>.outcome` of the test step this uploads for. Lets the uploader
+      distinguish "no failures reported" from "the suite never ran".
+    required: false
+    default: ""
+  quarantine:
+    description: >
+      Whether Trunk may absolve a failing test that it has already quarantined.
+      Off while the repo is in reporting-only mode; turning it on makes this
+      step the gate on the test outcome.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Repo monitors: https://app.trunk.io/trunk/flaky-tests/repo/trunk-io/baml
+    - name: "Upload JUnit XML to Trunk"
+      if: inputs.token != ''
+      continue-on-error: true
+      uses: trunk-io/analytics-uploader@v2.1.2
+      with:
+        junit-paths: ${{ inputs.junit-paths }}
+        org-slug: ${{ inputs.org-slug }}
+        token: ${{ inputs.token }}
+        variant: ${{ inputs.variant }}
+        previous-step-outcome: ${{ inputs.previous-step-outcome }}
+        quarantine: ${{ inputs.quarantine }}
+        show-failure-messages: true

@@ -68,5 +68,12 @@ export default defineConfig({
         },
       },
     ],
+    // CI hands junit.xml to Trunk Flaky Tests (docs/flaky-tests.md); locally
+    // the extra reporter would only litter the package root. Reporters are
+    // root-level in vitest, so the two projects above share this one — they
+    // run in separate CI jobs, each uploaded under its own Trunk variant.
+    reporters: process.env.CI
+      ? ['default', ['junit', { outputFile: 'junit.xml' }]]
+      : ['default'],
   },
 });
