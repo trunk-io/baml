@@ -23,7 +23,7 @@ inputs:
   org-slug:
     description: Trunk organization slug.
     required: false
-    default: trunk
+    default: boundaryml
   previous-step-outcome:
     description: >
       `steps.<id>.outcome` of the test step this uploads for. Lets the uploader
@@ -41,7 +41,7 @@ inputs:
 runs:
   using: composite
   steps:
-    # Repo monitors: https://app.trunk.io/trunk/flaky-tests/repo/trunk-io/baml
+    # Repo monitors: https://app.trunk.io/boundaryml/flaky-tests/repo/trunk-io/baml
     - name: "Upload JUnit XML to Trunk"
       if: inputs.token != ''
       continue-on-error: true

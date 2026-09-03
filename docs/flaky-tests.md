@@ -8,8 +8,8 @@ extra step at the end of a lane, and reporting never gates CI.
 ## Setup
 
 One repository Actions secret, `TRUNK_ORG_TOKEN` — a Trunk organization API
-token for the `trunk` org (Settings → Manage → Organization API token in the
-[Trunk app]). Everything else is checked in.
+token for the `boundaryml` org (Settings → Manage → Organization API token in
+the [Trunk app]). Everything else is checked in.
 
 Without it (including on every fork PR, where GitHub withholds repository
 secrets) the upload step skips and CI behaves exactly as before.
@@ -97,4 +97,4 @@ green. Turning it on for a lane is a one-input change in the calling workflow,
 and makes that upload step part of the lane's verdict.
 
 [Trunk Flaky Tests]: https://docs.trunk.io/flaky-tests
-[Trunk app]: https://app.trunk.io/trunk/flaky-tests
+[Trunk app]: https://app.trunk.io/boundaryml/flaky-tests
