@@ -2,6 +2,19 @@ nextest-version = "0.9.98"
 
 experimental = ["setup-scripts"]
 
+# Every nextest run writes a JUnit report to
+# target/nextest/default/junit.xml, which CI hands to Trunk Flaky Tests. It
+# lives on the `default` profile rather than a `ci` profile so no invocation
+# has to opt in: the suites run through several entry points (plain nextest,
+# `cargo insta test --test-runner nextest`, the sdk-test lanes) and a profile
+# only some of them pass would silently report a subset. A job that runs
+# nextest more than once overwrites the report, so those jobs move it aside
+# between runs.
+[profile.default.junit]
+path = "junit.xml"
+store-failure-output = true
+store-success-output = false
+
 # The rust sdk-test fixture tests each spawn a `cargo` subprocess into one
 # shared CARGO_TARGET_DIR, whose build lock serializes them anyway — running
 # them concurrently only multiplies waiting cargo processes and their rustc

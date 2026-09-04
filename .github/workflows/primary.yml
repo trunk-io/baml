@@ -399,9 +399,19 @@ jobs:
         working-directory: engine
 
       - name: Run Python integration tests
+        id: python-integration
         if: matrix.test-suite == 'python-integration'
         run: |
-          cd integ-tests/python && ./run_tests.sh
+          cd integ-tests/python && ./run_tests.sh --junitxml=junit.xml
+
+      - name: Report test results to Trunk
+        if: ${{ !cancelled() && steps.python-integration.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: integ-tests/python/junit.xml
+          variant: python-integration
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.python-integration.outcome }}
 
   # Build CLI for releases only
   build-cli:

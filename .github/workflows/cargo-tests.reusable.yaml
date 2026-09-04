@@ -37,6 +37,9 @@ on:
         required: false
       BAML_SCCACHE_R2_SECRET_ACCESS_KEY:
         required: false
+      # Optional for the same reason: a fork PR uploads nothing.
+      TRUNK_ORG_TOKEN:
+        required: false
 
 # Jobs run PR-controlled code with read-only repository access.
 permissions:
@@ -123,8 +126,18 @@ jobs:
         working-directory: baml_language
 
       - name: "Run tests with nextest"
+        id: nextest
         run: cargo nextest run --all-features --workspace --exclude baml_tests --exclude baml_cli --exclude "sdk_test_*" --exclude baml_bridge
         working-directory: baml_language
+
+      - name: "Report test results to Trunk"
+        if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: baml_language/target/nextest/default/junit.xml
+          variant: linux-gnu
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.nextest.outcome }}
 
       # Release leg: the profiler's value copy carries `debug_assert`-adjacent
       # logic whose behavior must not change when debug assertions are
@@ -229,8 +242,18 @@ jobs:
         working-directory: baml_language
 
       - name: "Run tests with nextest"
+        id: nextest
         run: cargo nextest run --workspace --exclude baml_tests --exclude "sdk_test_*" --exclude baml_bridge -E 'not binary(=pack_e2e)'
         working-directory: baml_language
+
+      - name: "Report test results to Trunk"
+        if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: baml_language/target/nextest/default/junit.xml
+          variant: linux-musl
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.nextest.outcome }}
 
       - name: "Run pack end-to-end tests"
         run: cargo test -p baml_cli --test pack_e2e
@@ -450,10 +473,22 @@ jobs:
       # need `baml-pack-host` separately so their process-global OnceLocks
       # build and share it instead of relinking it for every nextest case.
       - name: "Run tests"
+        id: nextest
         run: cargo nextest run --all-features --workspace --exclude baml_tests --exclude "sdk_test_*" --exclude baml_bridge -E 'not binary(=pack_e2e) and not binary(=exit_code_e2e)'
         working-directory: baml_language
         env:
           BAML_PROFILE: "0"
+
+      # Ahead of the `cargo clean` below, which takes the JUnit report in
+      # target/ with it.
+      - name: "Report test results to Trunk"
+        if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: baml_language/target/nextest/default/junit.xml
+          variant: windows
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.nextest.outcome }}
 
       - name: "Free disk for CLI binary e2e tests"
         run: |
@@ -1140,13 +1175,28 @@ jobs:
         working-directory: baml_language
 
       - name: "Run sdk tests"
+        id: sdk-tests
         if: matrix.sdk-label != 'csharp'
         run: cargo nextest run -p ${{ matrix.package-name }} --all-features -E 'package(=${{ matrix.package-name }})'
         working-directory: baml_language
 
       - name: "Run C# sdk tests"
+        id: sdk-tests-csharp
         if: matrix.sdk-label == 'csharp'
         run: cargo nextest run -p ${{ matrix.package-name }} --all-features --no-fail-fast -E 'package(=${{ matrix.package-name }})'
+        working-directory: baml_language
+
+      # The rust leg runs nextest again below, over the same report path. Move
+      # this suite's report aside so both are uploaded; the glob picks up
+      # whichever exist.
+      - name: "Set aside sdk test results"
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          report=target/nextest/default/junit.xml
+          if [ -f "$report" ]; then
+            mv "$report" target/nextest/default/junit-sdk.xml
+          fi
         working-directory: baml_language
 
       # Record the content hashes the next run's backdate steps compare
@@ -1185,6 +1235,17 @@ jobs:
         if: matrix.sdk-label == 'rust'
         run: cargo nextest run -p baml_bridge --all-features
         working-directory: baml_language
+
+      - name: "Report test results to Trunk"
+        # One of the two runs above is always skipped by its own `if`; both
+        # are skipped only when an earlier step failed and no suite ran.
+        if: ${{ !cancelled() && (steps.sdk-tests.outcome != 'skipped' || steps.sdk-tests-csharp.outcome != 'skipped') }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: baml_language/target/nextest/default/junit*.xml
+          variant: sdk-${{ matrix.sdk-label }}-${{ matrix.os-label }}
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ matrix.sdk-label == 'csharp' && steps.sdk-tests-csharp.outcome || steps.sdk-tests.outcome }}
 
       - name: "Upload test results on failure"
         if: failure()
@@ -1546,8 +1607,18 @@ jobs:
       # `--exclude` list in sync with the package list here. The musl job separately runs `baml_cli`, including
       # `pack_e2e`, so both Linux libc variants exercise the ELF pack path.
       - name: "Run snapshot tests"
+        id: snapshot-tests
         run: cargo insta test --test-runner nextest -p baml_tests -p baml_cli --all-features --unreferenced=reject
         working-directory: baml_language
+
+      - name: "Report test results to Trunk"
+        if: ${{ !cancelled() && steps.snapshot-tests.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: baml_language/target/nextest/default/junit.xml
+          variant: snapshot
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.snapshot-tests.outcome }}
 
       - name: "Check for snapshot changes"
         run: |

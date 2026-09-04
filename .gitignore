@@ -196,3 +196,7 @@ rpi/
 !baml_language/sdks/typescript/bridge_typescript/dist/
 !baml_language/sdks/typescript/bridge_typescript/dist/**
 baml_language/sdks/typescript/bridge_typescript/dist/*.node
+
+# JUnit reports written by CI test runs and uploaded to Trunk Flaky Tests.
+# The nextest ones land under target/, already ignored above.
+junit.xml

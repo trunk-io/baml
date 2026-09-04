@@ -593,6 +593,7 @@ jobs:
     secrets:
       BAML_SCCACHE_R2_ACCESS_KEY_ID: ${{ secrets.BAML_SCCACHE_R2_ACCESS_KEY_ID }}
       BAML_SCCACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BAML_SCCACHE_R2_SECRET_ACCESS_KEY }}
+      TRUNK_ORG_TOKEN: ${{ secrets.TRUNK_ORG_TOKEN }}
 
   size-gate:
     name: "Size Gate"
@@ -656,14 +657,34 @@ jobs:
         run: git diff --exit-code -- typescript2/pkg-grammar typescript2/app-vscode-ext
 
       - name: "Run grammar tests"
+        id: grammar-tests
         run: pnpm --filter @b/pkg-grammar test
         working-directory: typescript2
 
+      - name: "Report grammar test results to Trunk"
+        if: ${{ !cancelled() && steps.grammar-tests.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: typescript2/pkg-grammar/junit.xml
+          variant: grammar
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.grammar-tests.outcome }}
+
       - name: "Run highlight.js grammar tests"
+        id: hljs-tests
         # The hljs port validates against pkg-grammar's fixtures, so a grammar
         # change that the port doesn't handle fails here (conformance gate).
         run: pnpm --filter @b/pkg-grammar-hljs test
         working-directory: typescript2
+
+      - name: "Report highlight.js grammar test results to Trunk"
+        if: ${{ !cancelled() && steps.hljs-tests.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-test-results
+        with:
+          junit-paths: typescript2/pkg-grammar-hljs/junit.xml
+          variant: grammar-hljs
+          token: ${{ secrets.TRUNK_ORG_TOKEN }}
+          previous-step-outcome: ${{ steps.hljs-tests.outcome }}
 
       - name: "Run tree-sitter grammar tests"
         # Generates the parser and runs the corpus + fixture parse gate.
