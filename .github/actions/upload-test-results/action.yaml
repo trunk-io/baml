@@ -41,6 +41,15 @@ inputs:
 runs:
   using: composite
   steps:
+    # An absent token skips the upload silently, which on a repo that is
+    # supposed to have the secret looks exactly like a working upload. Say so
+    # once, as a warning rather than a failure: on a fork PR this is expected.
+    - name: "Note missing Trunk token"
+      if: inputs.token == ''
+      shell: bash
+      run: |
+        echo "::warning title=Trunk upload skipped::No Trunk token, so the ${{ inputs.variant }} test results were not uploaded. Expected on fork PRs, where GitHub withholds repository secrets; anywhere else, check that TRUNK_ORG_TOKEN is set on this repository and passed to this workflow."
+
     # Repo monitors: https://app.trunk.io/boundaryml/flaky-tests/repo/trunk-io/baml
     - name: "Upload JUnit XML to Trunk"
       if: inputs.token != ''

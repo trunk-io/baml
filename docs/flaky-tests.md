@@ -12,7 +12,9 @@ token for the `boundaryml` org (Settings → Manage → Organization API token i
 the [Trunk app]). Everything else is checked in.
 
 Without it (including on every fork PR, where GitHub withholds repository
-secrets) the upload step skips and CI behaves exactly as before.
+secrets) the upload step skips and CI behaves exactly as before, logging a
+warning that names the variant it did not upload — a skipped upload and a
+successful one otherwise look identical in a green job.
 
 ## How a lane reports
 
