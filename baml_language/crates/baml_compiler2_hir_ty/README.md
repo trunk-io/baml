@@ -163,11 +163,11 @@ corpus (see Testing below). The reference architecture is rust-analyzer's
 ## Principles
 
 1. Layering mirrors rust-analyzer (`hir-def -> hir-ty -> hir`). This crate
-   depends on ast/hir/ppir/baml_type and never on
+   depends on ast/hir/baml_type and never on
    tir/mir/emit.
 2. Leaf crate until cutover (S16). Until then its only consumer is the test
    harness in `baml_tests`, and every existing compiler snapshot stays
-   byte-identical. A slice that changes a `03_ppir`/`04_tir`/`04_5_mir`/
+   byte-identical. A slice that changes a `03_hir`/`04_tir`/`04_5_mir`/
    codegen snapshot has leaked.
 3. Slice-local correctness. Each slice's tests assert only what that slice
    implements. Constructs the engine does not handle yet infer to an error
@@ -402,17 +402,19 @@ diagnostic (S17).
   function annotation gives params `!error`. Fix: structurally_resolve
   the expectation.
 - A3 `dispatch_operator`/`operand_members` never expand aliases; also
-  await (false mismatch on aliased Future), spawn body/baml.spawn.Params
-  (silent wrong future value), obligation subjects (alias -> permanent
-  stall), `sub()` decomposition arms (alias skips invariant arms),
-  upcast targets, `expectation_shape` (bounded vars don't adopt).
+  await (false mismatch on aliased Future), `sub()` decomposition arms
+  (alias skips invariant arms), upcast targets, `expectation_shape`
+  (bounded vars don't adopt). Obligation subjects are judged for what an
+  alias denotes: its head is expanded in `attempt` and in the ground
+  resolver, and a nested one unfolds where an impl header needs structure
+  (the ground road's `match_pattern` as it descends, and
+  `impls::unfold_aliases_against` ahead of selection's unifier).
 - A4 scrutinee forcing: `infer_match` forces occurring vars; `if let`,
   `while let`, `is`, let-destructure, and `Is`-facts do not (latent -
   probed, no observable divergence yet; fix for consistency).
 - A5 (downgraded to B after probing): plain-union operands dispatch
   fine; the poison-to-top in `dispatch_operator`/`field_access` union
-  arms stays theoretical. Alias-typed obligation subjects stall
-  UNOBSERVABLY today (bounds silently unchecked - surfaces at S17).
+  arms stays theoretical.
 
 ### B - inconsistencies (one pass over the union/freshness layer)
 - `union_of` syntactic fallback does not collapse singletons

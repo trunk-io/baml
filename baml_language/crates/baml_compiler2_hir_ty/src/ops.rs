@@ -7,7 +7,7 @@
 //! instructions is MIR's job at lowering, invisible to inference.
 
 use baml_type::{
-    Name, TypeName,
+    DeclName, Name,
     interned::{InferInterface, InferTy, Ty},
 };
 
@@ -99,12 +99,12 @@ pub const INDEX_DISPATCH: OperatorDispatch = OperatorDispatch {
 /// for `lhs`, or `None` when the operands do not support the operator.
 /// Operands must be resolved and literal-widened by the caller.
 pub fn operator_output(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     interface: &str,
     lhs: &Ty,
     rhs: Option<&Ty>,
 ) -> Option<Ty> {
-    let resolved = resolve_impl(db, lhs, &operator_goal(interface, rhs))?;
+    let resolved = resolve_impl(db, lhs, &operator_goal(db, interface, rhs)?)?;
     // Binding-else-default through the shared `leaf_def` read, so an
     // operator interface with a defaulted `Output` resolves like any
     // other associated member.
@@ -112,20 +112,22 @@ pub fn operator_output(
 }
 
 /// The impl goal an operator application poses: `baml.ops.<interface>` with
-/// the rhs operand filling the single generic slot when present.
-fn operator_goal(interface: &str, rhs: Option<&Ty>) -> InferInterface {
-    InferInterface::new(
-        TypeName::new(
-            Name::new("baml"),
-            vec![Name::new("ops")],
-            Name::new(interface),
-        ),
+/// the rhs operand filling the single generic slot when present. `None`
+/// when the `baml` package is not installed, so no operator interface exists.
+fn operator_goal(
+    db: &dyn baml_compiler2_hir::Db,
+    interface: &str,
+    rhs: Option<&Ty>,
+) -> Option<InferInterface> {
+    let baml = baml_compiler2_hir::package::lang_roots(db).get(baml_base::LangPackage::Baml)?;
+    Some(InferInterface::new(
+        DeclName::in_root(baml, vec![Name::new("ops")], Name::new(interface)),
         rhs.cloned()
             .into_iter()
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         Box::new([]),
-    )
+    ))
 }
 
 /// The method declaration an operator application dispatches to, for the
@@ -136,23 +138,22 @@ fn operator_goal(interface: &str, rhs: Option<&Ty>) -> InferInterface {
 /// widen here (`1 + 2` navigates like `int + int`); `None` only when the
 /// interface itself is not in the database.
 pub fn operator_method<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     dispatch: OperatorDispatch,
     lhs: &Ty,
     rhs: Option<&Ty>,
 ) -> Option<baml_compiler2_hir::loc::FunctionLoc<'db>> {
     let widen = |ty: &Ty| match ty.kind() {
-        InferTy::Literal(literal, _, attr) => {
-            Ty::intern(crate::infer::literal_base(literal, attr.clone()))
-        }
+        InferTy::Literal(literal, _) => Ty::intern(crate::infer::literal_base(literal)),
         _ => ty.clone(),
     };
     let lhs = widen(lhs);
     let rhs = rhs.map(widen);
     let method_name = Name::new(dispatch.method);
 
-    if let Some(resolved) = resolve_impl(db, &lhs, &operator_goal(dispatch.interface, rhs.as_ref()))
-        && let Some(crate::impls::ProvidedMethod::Source { func, .. }) =
+    if let Some(goal) = operator_goal(db, dispatch.interface, rhs.as_ref())
+        && let Some(resolved) = resolve_impl(db, &lhs, &goal)
+        && let Some(baml_compiler2_hir::loc::DeclRef::Source(func)) =
             resolved.provided_method(db, &method_name)
     {
         return Some(func);
@@ -160,18 +161,18 @@ pub fn operator_method<'db>(
 
     // The interface's own declaration: default body or required signature —
     // both are real function items on the interface.
-    let package = baml_compiler2_hir::package::PackageId::new(db, Name::new("baml"));
+    let package = baml_compiler2_hir::package::lang_roots(db).get(baml_base::LangPackage::Baml)?;
     let Some(baml_compiler2_hir::contributions::Definition::Interface(iface)) =
-        baml_compiler2_ppir::package_items(db, package)
+        baml_compiler2_hir::package::package_items(db, package)
             .lookup_type(&[Name::new("ops")], &Name::new(dispatch.interface))
     else {
         return None;
     };
-    baml_compiler2_ppir::item_data::interface_data(db, iface)
+    baml_compiler2_hir::item_data::interface_data(db, iface)
         .methods
         .iter()
         .copied()
         .find(|&method| {
-            baml_compiler2_ppir::item_data::function_data(db, method).name == method_name
+            baml_compiler2_hir::item_data::function_data(db, method).name == method_name
         })
 }

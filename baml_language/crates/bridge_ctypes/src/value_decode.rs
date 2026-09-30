@@ -67,6 +67,7 @@ pub fn inbound_to_external(
                 Ok(BexExternalValue::Bigint(bi))
             }
             InboundValueVariant::FloatValue(f) => Ok(BexExternalValue::Float(f)),
+            InboundValueVariant::JsNumberValue(f) => Ok(BexExternalValue::JsNumber(f)),
             InboundValueVariant::BoolValue(b) => Ok(BexExternalValue::Bool(b)),
             InboundValueVariant::ListValue(list) => convert_list(list, handle_table),
             InboundValueVariant::MapValue(map) => convert_map(map, handle_table),
@@ -205,18 +206,14 @@ fn proto_prompt_ast_simple_to_bex_prompt_ast_simple(
 
 /// Build the default "any scalar" union type for untyped inbound values.
 fn default_scalar_union_ty() -> RuntimeTy {
-    let d = baml_type::TyAttr::default();
-    RuntimeTy::Union(
-        Box::new([
-            RuntimeTy::Int { attr: d.clone() },
-            RuntimeTy::Float { attr: d.clone() },
-            RuntimeTy::String { attr: d.clone() },
-            RuntimeTy::Bool { attr: d.clone() },
-            RuntimeTy::Uint8Array { attr: d.clone() },
-            RuntimeTy::Null { attr: d.clone() },
-        ]),
-        d,
-    )
+    RuntimeTy::Union(Box::new([
+        RuntimeTy::Int,
+        RuntimeTy::Float,
+        RuntimeTy::String,
+        RuntimeTy::Bool,
+        RuntimeTy::Uint8Array,
+        RuntimeTy::Null,
+    ]))
 }
 
 fn convert_list(
@@ -370,6 +367,22 @@ mod tests {
     }
 
     #[test]
+    fn javascript_number_has_a_distinct_inbound_wire_variant() {
+        let decoded = inbound_to_external(
+            InboundValue {
+                value_type: None,
+                value: Some(InboundValueVariant::JsNumberValue(-0.0)),
+            },
+            &CffiHandleTable::new(),
+        )
+        .unwrap();
+        let BexExternalValue::JsNumber(value) = decoded else {
+            panic!("expected a JavaScript number")
+        };
+        assert_eq!(value.to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
     fn portable_prompt_with_media_decodes_as_owned_adts() {
         use crate::baml_bridge::cffi::{
             BamlValuePromptAstMessage, BamlValuePromptAstMultiple, BamlValuePromptAstSimpleMultiple,
@@ -439,7 +452,6 @@ mod tests {
         let literal = RuntimeTy::Literal(
             baml_type::Literal::String("draft".to_string()),
             baml_type::Freshness::Regular,
-            baml_type::TyAttr::default(),
         );
         let decoded = inbound_to_external(
             typed_input(
@@ -739,7 +751,6 @@ mod tests {
         let class_type = RuntimeTy::Class(
             baml_type::TypeName::local(baml_type::Name::new("GenericBox")),
             Box::new([RuntimeTy::int()]),
-            baml_type::TyAttr::default(),
         );
         let decoded = inbound_to_external(
             typed_input(

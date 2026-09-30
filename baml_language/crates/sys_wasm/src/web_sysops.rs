@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use bex_project::{BexExternalValue, Handle, HostValueArc};
+use bex_project::{BexExternalValue, Handle, HostValueArc, js_number_to_i64};
 use indexmap::{IndexMap, indexmap};
 use num_traits::ToPrimitive as _;
 use sys_ops::io::{
@@ -255,6 +255,7 @@ impl io::IoClassHttpServer for WebHttp {
         _call_id: CallId,
         _server: io::owned::http::Server,
         _handler: Handle,
+        _websocket: Handle,
         _tls_config: Option<io::owned::http::TlsConfig>,
         _allow_http1: bool,
         _allow_http2: bool,
@@ -678,6 +679,9 @@ fn take_int(
         .ok_or_else(|| bridge_failure(format!("{context} is missing {key}")))?
     {
         BexExternalValue::Int(value) => Ok(value),
+        BexExternalValue::JsNumber(value) => js_number_to_i64(value).ok_or_else(|| {
+            bridge_failure(format!("{context}.{key} must be an integer, got js_number"))
+        }),
         other => Err(bridge_failure(format!(
             "{context}.{key} must be an integer, got {}",
             other.type_name()

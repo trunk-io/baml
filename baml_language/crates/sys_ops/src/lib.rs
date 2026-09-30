@@ -25,13 +25,13 @@ pub mod io {
     use std::sync::Arc;
 
     pub use bex_heap::{AccessError, BexClass, BexValue, BuiltinClass, PermitProof};
-    pub use bex_vm_types::SysOp;
+    pub use bex_vm_types::{ObjectType, SysOp, types::Type};
     // Owned structs are generated once in sys_types and re-exported here
     // so that `io::owned::ai::*` paths continue to work.
     pub use sys_types::generated::owned;
     pub use sys_types::{
         AsBexExternalValue, BexExternalValue, BexHeap, CallId, OpError, SysOpContext, SysOpFn,
-        SysOpOutput, SysOpResult, VmBamlError, VmPanic, VmRustFnError,
+        SysOpOutput, SysOpResult, VmBamlError, VmInternalError, VmPanic, VmRustFnError,
     };
 
     include!(concat!(env!("OUT_DIR"), "/io_generated.rs"));
@@ -219,10 +219,9 @@ mod schema {
     /// a lane type; `baml.json.json` is compiled, so it has a real qualified
     /// name and this conversion is total.
     fn json_alias_ty() -> baml_type::RuntimeTy {
-        baml_type::RuntimeTy::TypeAlias(
-            baml_type::TypeName::from_dotted_path(baml_base::qualified_name::BAML_JSON_JSON),
-            baml_type::TyAttr::default(),
-        )
+        baml_type::RuntimeTy::TypeAlias(baml_type::TypeName::from_dotted_path(
+            baml_base::qualified_name::BAML_JSON_JSON,
+        ))
     }
 
     pub(super) fn json_to_bex(value: Value) -> BexExternalValue {
@@ -258,7 +257,7 @@ mod schema {
         };
 
         let (mut root, root_class_key) = match ty {
-            SapTy::Class(name, _, _) => {
+            SapTy::Class(name, _) => {
                 let key = definition_key(name);
                 builder.building.insert(key.clone());
                 let schema = builder.class_object(name)?;
@@ -293,14 +292,14 @@ mod schema {
     impl SchemaBuilder<'_> {
         fn ty_schema(&mut self, ty: &SapTy) -> Result<Value, String> {
             match ty {
-                SapTy::Int { .. } | SapTy::Bigint { .. } => Ok(json!({ "type": "integer" })),
-                SapTy::Float { .. } => Ok(json!({ "type": "number" })),
-                SapTy::String { .. } => Ok(json!({ "type": "string" })),
-                SapTy::Bool { .. } => Ok(json!({ "type": "boolean" })),
-                SapTy::Null { .. } => Ok(json!({ "type": "null" })),
-                SapTy::Uint8Array { .. } => Ok(json!({ "type": "string" })),
-                SapTy::Literal(lit, _, _) => Ok(Self::literal_schema(lit)),
-                SapTy::List(inner, _) => Ok(json!({
+                SapTy::Int | SapTy::Bigint => Ok(json!({ "type": "integer" })),
+                SapTy::Float => Ok(json!({ "type": "number" })),
+                SapTy::String => Ok(json!({ "type": "string" })),
+                SapTy::Bool => Ok(json!({ "type": "boolean" })),
+                SapTy::Null => Ok(json!({ "type": "null" })),
+                SapTy::Uint8Array => Ok(json!({ "type": "string" })),
+                SapTy::Literal(lit, _) => Ok(Self::literal_schema(lit)),
+                SapTy::List(inner) => Ok(json!({
                     "type": "array",
                     "items": self.ty_schema(inner)?,
                 })),
@@ -308,11 +307,11 @@ mod schema {
                     "type": "object",
                     "additionalProperties": self.ty_schema(value)?,
                 })),
-                SapTy::Union(members, _) => self.union_schema(members),
-                SapTy::Enum(name, _) => Self::enum_schema(name, self.ctx),
-                SapTy::Class(name, _, _) => self.class_ref(name),
-                SapTy::TypeAlias(name, _) => self.type_alias_ref(name),
-                SapTy::Unknown { .. } => Ok(json!({})),
+                SapTy::Union(members) => self.union_schema(members),
+                SapTy::Enum(name) => Self::enum_schema(name, self.ctx),
+                SapTy::Class(name, _) => self.class_ref(name),
+                SapTy::TypeAlias(name) => self.type_alias_ref(name),
+                SapTy::Unknown => Ok(json!({})),
                 other => Err(format!(
                     "json_schema: no JSON Schema representation for `{other}`"
                 )),
@@ -492,7 +491,7 @@ mod schema {
     mod tests {
         use std::sync::Arc;
 
-        use baml_type::{TyAttr, TypeName};
+        use baml_type::TypeName;
         use serde_json::json;
         use sys_types::{
             ClassDefinition, ClassFieldDefinition, DefKey, EnumDefinition, EnumVariantDefinition,
@@ -506,7 +505,7 @@ mod schema {
         }
 
         fn class_ty(name: &TypeName) -> RuntimeTy {
-            RuntimeTy::Class(key(name), Box::new([]), TyAttr::default())
+            RuntimeTy::Class(key(name), Box::new([]))
         }
 
         /// A lane key for a compiled test declaration.
@@ -518,7 +517,7 @@ mod schema {
         }
 
         fn alias_ty(name: &TypeName) -> RuntimeTy {
-            RuntimeTy::TypeAlias(key(name), TyAttr::default())
+            RuntimeTy::TypeAlias(key(name))
         }
 
         fn field(name: &str, field_type: RuntimeTy) -> ClassFieldDefinition {
@@ -530,6 +529,8 @@ mod schema {
                 docstring: None,
                 alias: None,
                 skip: false,
+                stream_done: false,
+                must_exist: false,
             }
         }
 
@@ -540,6 +541,7 @@ mod schema {
                 docstring: None,
                 alias: None,
                 fields,
+                stream_done: false,
             }
         }
 
@@ -652,8 +654,8 @@ mod schema {
             let mut ctx = SysOpContext::empty();
             ctx.enum_definitions = Arc::new(enums);
 
-            let schema = json_schema(&RuntimeTy::Enum(key(&status), TyAttr::default()), &ctx)
-                .expect("schema should lower");
+            let schema =
+                json_schema(&RuntimeTy::Enum(key(&status)), &ctx).expect("schema should lower");
             assert_eq!(
                 schema,
                 json!({ "type": "string", "enum": ["ready-now", "Done"] })
@@ -888,9 +890,9 @@ pub fn get_return_type_op(
 
 /// Blanket impl — schema-aligned parsing, backing both public `baml.sap.parse`
 /// and incremental `ai.stream.Stream` parsing. All three are free functions
-/// (see `ns_sap/sap.baml`), so each carries its own `TStream`/`TFinal`
-/// type-arg operands; the cache already holds the compiled model, so the
-/// two parse entry points ignore theirs.
+/// (see `ns_sap/sap.baml`), so each carries its own `T` type-arg operand; the
+/// cache already holds the compiled model, so the two parse entry points
+/// ignore theirs.
 impl<T> io::IoClassSapParseCache for T {
     fn _parse_final(
         &self,
@@ -899,7 +901,6 @@ impl<T> io::IoClassSapParseCache for T {
         cache: io::owned::sap::ParseCache,
         json: String,
         _type_arg_0: ::sys_types::SapTy,
-        _type_arg_1: ::sys_types::SapTy,
         ctx: &SysOpContext,
     ) -> SysOpOutput<BexExternalValue> {
         let Ok(sap) = cache._data.clone().downcast::<crate::sap::SapParseCache>() else {
@@ -920,7 +921,6 @@ impl<T> io::IoClassSapParseCache for T {
         cache: io::owned::sap::ParseCache,
         json: String,
         _type_arg_0: ::sys_types::SapTy,
-        _type_arg_1: ::sys_types::SapTy,
         ctx: &SysOpContext,
     ) -> SysOpOutput<BexExternalValue> {
         let Ok(sap) = cache._data.clone().downcast::<crate::sap::SapParseCache>() else {
@@ -946,23 +946,21 @@ impl<T> io::IoNamespaceSap for T {
         &self,
         _heap: &std::sync::Arc<BexHeap>,
         _call_id: CallId,
-        stream_target: ::sys_types::SapTy,
         target: ::sys_types::SapTy,
         ctx: &SysOpContext,
     ) -> SysOpOutput<io::owned::sap::ParseCache> {
-        let compiled =
-            match ::bex_sap::CompiledSapModel::from_sys_op_context(ctx, target, stream_target) {
-                Ok(compiled) => compiled,
-                Err(e) => {
-                    // `_new_parse_cache` declares `throws never`, and the type
-                    // arguments that reach it come from the caller's own
-                    // `parse<T>` — a `T` schema-aligned parsing cannot model is
-                    // a program bug, not a recoverable condition, so it panics.
-                    return SysOpOutput::err(VmPanic::UserPanic {
-                        message: format!("schema-aligned parsing cannot model this type: {e}"),
-                    });
-                }
-            };
+        let compiled = match ::bex_sap::CompiledSapModel::from_sys_op_context(ctx, target) {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                // `_new_parse_cache` declares `throws never`, and the type
+                // arguments that reach it come from the caller's own
+                // `parse<T>` — a `T` schema-aligned parsing cannot model is
+                // a program bug, not a recoverable condition, so it panics.
+                return SysOpOutput::err(VmPanic::UserPanic {
+                    message: format!("schema-aligned parsing cannot model this type: {e}"),
+                });
+            }
+        };
         let sap = crate::sap::SapParseCache::new(compiled);
         let data: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(sap);
         SysOpOutput::ok(io::owned::sap::ParseCache { _data: data })
@@ -1399,6 +1397,7 @@ impl io::IoClassHttpServer for DefaultIoOps {
         _c: CallId,
         _server: io::owned::http::Server,
         _handler: bex_external_types::Handle,
+        _websocket: bex_external_types::Handle,
         _tls_config: Option<io::owned::http::TlsConfig>,
         _allow_http1: bool,
         _allow_http2: bool,
@@ -1484,13 +1483,13 @@ impl io::IoNamespaceHttp for DefaultIoOps {
     }
 }
 
-impl io::IoClassWsWsStream for DefaultIoOps {
+impl io::IoClassWsWebSocket for DefaultIoOps {
     fn send(
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
-        _stream: io::owned::ws::WsStream,
-        _text: String,
+        _websocket: io::owned::ws::WebSocket,
+        _data: BexExternalValue,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
@@ -1503,9 +1502,9 @@ impl io::IoClassWsWsStream for DefaultIoOps {
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
-        _stream: io::owned::ws::WsStream,
+        _websocket: io::owned::ws::WebSocket,
         _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<String>> {
+    ) -> SysOpOutput<BexExternalValue> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "websocket".to_string(),
             message: "Operation not supported on this platform".to_string(),
@@ -1516,7 +1515,9 @@ impl io::IoClassWsWsStream for DefaultIoOps {
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
-        _stream: io::owned::ws::WsStream,
+        _websocket: io::owned::ws::WebSocket,
+        _code: i64,
+        _reason: String,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
@@ -1535,7 +1536,7 @@ impl io::IoNamespaceWs for DefaultIoOps {
         _headers: indexmap::IndexMap<String, String>,
         _timeout_nanos: Arc<num_bigint::BigInt>,
         _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::ws::WsStream> {
+    ) -> SysOpOutput<io::owned::ws::WebSocket> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "websocket".to_string(),
             message: "Operation not supported on this platform".to_string(),

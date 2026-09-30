@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use baml_type::{Name, QualifiedTypeName, TyAttr};
+use baml_type::{Name, QualifiedTypeName};
 use bex_external_types::WeakHeapRef;
 use bex_heap::{BexHeap, CollectionLevel, Generation, Tlab};
 use bex_vm_types::{
@@ -141,8 +141,8 @@ fn runtime_package_mint_cycle_survives_when_rooted_and_collects_when_dropped() {
             alias: None,
             docstring: None,
             other: IndexMap::new(),
+            stream_done: false,
             type_tag,
-            ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
             owner: package_ptr,
@@ -150,7 +150,6 @@ fn runtime_package_mint_cycle_survives_when_rooted_and_collects_when_dropped() {
         let ty = RealizedTy::Class(
             bex_vm_types::TypeHead::new(class_ptr, type_tag),
             Box::new([]),
-            TyAttr::default(),
         );
         let type_ptr = tlab.alloc_type(TypeValue::new(ty));
         let function_ptr = tlab.alloc(Object::GenericFunction(GenericFunction {
@@ -196,7 +195,7 @@ fn runtime_package_mint_cycle_survives_when_rooted_and_collects_when_dropped() {
     let Object::Type(type_value) = (unsafe { moved_type.get() }) else {
         panic!("package type value ceased to be a type")
     };
-    let RealizedTy::Class(head, _, _) = &type_value.ty else {
+    let RealizedTy::Class(head, _) = &type_value.ty else {
         panic!("package type value ceased to wrap a class type")
     };
     assert_eq!(
@@ -1121,13 +1120,9 @@ fn a_field_type_value_keeps_its_declaration_and_package_alive() {
         docstring: None,
         other: IndexMap::new(),
         type_tag: enum_tag,
-        ty_attr: TyAttr::default(),
         owner: package_ptr,
     })));
-    let field_ty = RealizedTy::Enum(
-        bex_vm_types::TypeHead::new(enum_ptr, enum_tag),
-        TyAttr::default(),
-    );
+    let field_ty = RealizedTy::Enum(bex_vm_types::TypeHead::new(enum_ptr, enum_tag));
     let class_ptr = tlab.alloc(Object::Class(Box::new(Class {
         name: bex_vm_types::DeclarationName::Declared(QualifiedTypeName::local(Name::new(
             "FieldOwner",
@@ -1141,14 +1136,16 @@ fn a_field_type_value_keeps_its_declaration_and_package_alive() {
             docstring: None,
             other: IndexMap::new(),
             skip: false,
+            stream_done: false,
+            must_exist: false,
             runtime_type: Some(TypeValue::new(field_ty)),
         }],
         description: None,
         alias: None,
         docstring: None,
         other: IndexMap::new(),
+        stream_done: false,
         type_tag: baml_type::typetag::TypeTag::of_head("FieldOwner"),
-        ty_attr: TyAttr::default(),
         has_cleanup: false,
         generic_param_count: 0,
         owner: bex_vm_types::HeapPtr::null(),
@@ -1175,7 +1172,7 @@ fn a_field_type_value_keeps_its_declaration_and_package_alive() {
         .runtime_type
         .as_ref()
         .expect("field runtime type was lost");
-    let RealizedTy::Enum(head, _) = &exact.ty else {
+    let RealizedTy::Enum(head) = &exact.ty else {
         panic!("field runtime type ceased to wrap an enum")
     };
     assert_eq!(head.tag(), enum_tag, "a move must not change identity");
@@ -1262,6 +1259,13 @@ fn impl_rule_edges_are_traced_and_forwarded() {
     assert!(matches!(unsafe { fqn.get() }, Object::String(_)));
 }
 
+// BUG: the `assert_ne!(ptr_after_gc, ptr_before)` checks in this file are
+// flaky. "The object moved" is not something a collection guarantees: a lone
+// survivor copied into a fresh region can land at the address it came from, so
+// these fail intermittently (roughly one run in three) with no code change.
+// The invariant worth asserting is that the edge still resolves to the right
+// object, which the surrounding assertions already cover; the address
+// comparison should go.
 /// A runtime-declared interface back-references its owning package and points
 /// at its default-method bodies; the collector must keep both alive through
 /// the interface alone and repoint them as they move.
@@ -1282,44 +1286,46 @@ fn interface_owner_and_default_bodies_are_traced_and_forwarded() {
             name: Name::new("greet"),
             args: Vec::new(),
             kwargs: Vec::new(),
-            returns: baml_type::RuntimeTy::Void {
-                attr: TyAttr::default(),
-            },
-            errors: baml_type::RuntimeTy::Void {
-                attr: TyAttr::default(),
-            },
+            returns: baml_type::RuntimeTy::Void,
+            errors: baml_type::RuntimeTy::Void,
             default: Some(bex_vm_types::ObjectIndex::from_raw(0)),
             default_fn: body_ptr,
         }],
         owner: package_ptr,
     })));
 
-    // Root only the interface across two moves and a compaction.
-    let (_, roots, _) =
-        unsafe { heap.collect_garbage_generational(&[iface_ptr], CollectionLevel::Minor) };
-    let (_, roots, _) =
-        unsafe { heap.collect_garbage_generational(&roots, CollectionLevel::Minor) };
-    let (stats, roots, _) =
-        unsafe { heap.collect_garbage_generational(&roots, CollectionLevel::Major) };
-
-    assert_eq!(
-        stats.live_count, 3,
-        "interface, owner package and default body must all survive"
-    );
+    // Check each forwarding step. A later allocation may reuse the original
+    // address after its source chunk was freed; comparing against that stale
+    // address after three collections is not a valid movement assertion.
+    let mut roots = vec![iface_ptr];
+    let mut expected_body = body_ptr;
+    let mut expected_owner = package_ptr;
+    for level in [
+        CollectionLevel::Minor,
+        CollectionLevel::Minor,
+        CollectionLevel::Major,
+    ] {
+        let (stats, next_roots, forwarding) =
+            unsafe { heap.collect_garbage_generational(&roots, level) };
+        assert_eq!(stats.live_count, 3);
+        let next_body = forwarding[&expected_body];
+        let next_owner = forwarding[&expected_owner];
+        assert_ne!(next_body, expected_body);
+        assert_ne!(next_owner, expected_owner);
+        expected_body = next_body;
+        expected_owner = next_owner;
+        roots = next_roots;
+    }
     let Object::Interface(iface) = (unsafe { roots[0].get() }) else {
         panic!("root was not the interface")
     };
-    assert_ne!(
-        iface.owner, package_ptr,
-        "package moved; owner must be repointed"
-    );
+    assert_eq!(iface.owner, expected_owner);
     assert!(matches!(unsafe { iface.owner.get() }, Object::Package(_)));
-    let bound = iface.methods[0].default_fn;
-    assert_ne!(
-        bound, body_ptr,
-        "default body moved; default_fn must be repointed"
-    );
-    assert!(matches!(unsafe { bound.get() }, Object::String(_)));
+    assert_eq!(iface.methods[0].default_fn, expected_body);
+    let Object::String(body) = (unsafe { expected_body.get() }) else {
+        panic!("body was not forwarded")
+    };
+    assert_eq!(body.as_str(), "default body");
 }
 
 /// A runtime-declared alias back-references its owning package; the collector
@@ -1377,8 +1383,8 @@ fn future_output_type_heads_are_traced_and_forwarded() {
         alias: None,
         docstring: None,
         other: IndexMap::new(),
+        stream_done: false,
         type_tag,
-        ty_attr: TyAttr::default(),
         has_cleanup: false,
         generic_param_count: 0,
         owner: bex_vm_types::HeapPtr::null(),
@@ -1386,7 +1392,6 @@ fn future_output_type_heads_are_traced_and_forwarded() {
     let returns = RealizedTy::Class(
         bex_vm_types::TypeHead::new(class_ptr, type_tag),
         Box::new([]),
-        TyAttr::default(),
     );
     let future = bex_vm_types::types::Future::pending(
         bex_vm_types::types::FutureId::from_usize(1),
@@ -1407,7 +1412,7 @@ fn future_output_type_heads_are_traced_and_forwarded() {
     let Object::Future(future) = (unsafe { moved_future.get() }) else {
         panic!("root ceased to be a future")
     };
-    let RealizedTy::Class(head, _, _) = future.returns() else {
+    let RealizedTy::Class(head, _) = future.returns() else {
         panic!("future returns ceased to be a class")
     };
     assert!(head.is_resolved());

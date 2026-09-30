@@ -12,10 +12,12 @@
 //! - `ops` — `BamlClassOps*` (`Equals`/`Compare` for primitives + containers)
 //! - `ops_math` — `BamlClassOps*` (`Add`/`Subtract`/`Multiply`/`Divide`/
 //!   `Remainder`/`Negate` for the numeric primitives)
+//! - `regex` — `BamlClassRegexRegex` + `BamlNamespaceRegex` (pattern
+//!   compilation, matching, splitting, template replacement)
 //! - `root` — `BamlPackageBaml` (`deep_copy`, the numeric-array
 //!   reductions `_sum_int` / `_sum_float` / `_mean_float` / `_median_float`,
-//!   the saturating `_trunc_to_int`, and the `Sortable.sort` shims
-//!   `_compare_shim` / `_is_primitive_array` / `_rust_sort` / `_float_total_cmp`)
+//!   the saturating `_trunc_to_int`, and the `Sortable.sort` fast path
+//!   `_is_primitive_array` / `_rust_sort`)
 //!
 //! # Adding a new builtin
 //!
@@ -29,7 +31,6 @@ mod csv;
 mod error_context;
 mod float;
 mod future;
-pub(crate) mod id;
 mod int;
 pub mod json;
 mod map;
@@ -39,10 +40,12 @@ mod ops_bitwise;
 mod ops_math;
 mod prompt;
 mod random;
+mod regex;
 pub(crate) mod resolve;
 pub(crate) use resolve::ImplResolver;
 pub(crate) mod root;
 mod spawn;
+pub use spawn::{SpawnLaunch, plan_body, spawn_launch};
 mod stack_trace;
 mod string;
 mod sys;
@@ -123,7 +126,7 @@ pub trait Continuation: Send {
 }
 
 /// Returns the dispatched callee's result unchanged. Shared by the single-call
-/// shims (`_compare_shim` and `string.to<T>`'s `from_string` dispatch) whose
+/// shims (`string.to<T>`'s `from_string` dispatch, `reflect.call_any`) whose
 /// only job is to dispatch one call and surface its value.
 pub(crate) struct PassThroughContinuation;
 
@@ -217,38 +220,6 @@ pub use generated::*;
 /// The VM's native function implementations.
 pub struct PackageBamlImpl;
 
-/// For a value `v` whose type implements `baml.Comparable`, look up the
-/// matching `compare` function and return a `BoundMethod { compare, receiver: v }`.
-///
-/// Resolution reads the impl-rule tables (`shim_rule_method`) — the block's
-/// spelling (in-body or out-of-body) is display-only and never consulted.
-/// The bound method has `receiver = v` baked in, so the VM inserts it as `self`
-/// and the comparison call only passes the `other` argument
-/// (`YieldToCall { args: [other] }`).
-///
-/// Used by the native `baml._compare_shim` (`root.rs`) that the BAML
-/// `Sortable.sort` passes to `sort_by` on its non-primitive path: `compare`'s
-/// two `Self` params make it undispatchable through an interface-typed value,
-/// so the per-pair comparison is resolved here on the receiver's runtime class
-/// (the homogeneous `T[]` guarantees the other element shares that class).
-pub(super) fn make_compare_callee(vm: &mut BexVm, v: Value) -> Result<HeapPtr, VmRustFnError> {
-    let resolved =
-        shim_rule_method(vm, v, "Comparable", "compare").map_err(VmRustFnError::InternalError)?;
-    let Some(resolved) = resolved else {
-        // `T extends Comparable` is checked at compile time, so no applicable
-        // rule means the bound and the impl-rule tables disagree - an invariant
-        // violation, not a condition the caller could have avoided. It also
-        // could not be reported on the declared `throws T.CompareError`
-        // channel.
-        return Err(VmRustFnError::InternalError(
-            VmInternalError::MissingNativeFunction {
-                name: "_compare_shim: element type does not implement Comparable".to_string(),
-            },
-        ));
-    };
-    Ok(rule_bound_method(vm, v, resolved))
-}
-
 /// A rule-resolved shim callee: one method entry of the receiver's impl rule,
 /// with its realized frame.
 pub(super) struct ShimRuleMethod {
@@ -299,9 +270,7 @@ pub(super) fn shim_rule_method(
     else {
         return Ok(None);
     };
-    let Some(resolved) = resolver.rule_method_impl(&rule, method) else {
-        return Ok(None);
-    };
+    let resolved = resolver.rule_method_impl(&rule, method)?;
     let type_args = resolver.realize_frame(&resolved.method.frame, &bound_args)?;
     Ok(Some(ShimRuleMethod {
         callee: resolved.method.fqn,
@@ -325,8 +294,9 @@ fn rule_bound_method(vm: &mut BexVm, v: Value, resolved: ShimRuleMethod) -> Heap
 /// `to_string`, resolve it through the impl rules and return a
 /// `BoundMethod { to_string, receiver: v }`. `Ok(None)` when `v`'s type has no
 /// rule or its rule adopts the structural default body — the caller then
-/// renders `v` with the structural default. Used by the native
-/// `baml._to_string_shim` (`root.rs`) backing `string.from`.
+/// renders `v` with the structural default. Used by the override-honoring
+/// walker behind `baml._to_string_default` (`root.rs`), which renders nested
+/// values for `string.from`.
 pub(super) fn make_to_string_callee(
     vm: &mut BexVm,
     v: Value,
@@ -375,21 +345,25 @@ const VM_NATIVE_PACKAGES: &[(&str, NativeResolver)] = &[
         <crate::package_ai::PackageAiImpl as crate::package_ai::BamlPackageAi>::get_native_fn,
     ),
     (
-        "boundary.",
-        <crate::package_boundary::PackageBoundaryImpl as crate::package_boundary::BamlPackageBoundary>::get_native_fn,
-    ),
-    (
         "reflect.",
         <crate::package_reflect::PackageReflectImpl as crate::package_reflect::BamlPackageReflect>::get_native_fn,
     ),
+    (
+        "trace.",
+        <crate::package_trace::PackageTraceImpl as crate::package_trace::BamlPackageTrace>::get_native_fn,
+    ),
 ];
 
-/// Resolves native function pointers for unresolved native functions in objects.
+/// Resolves native function pointers for `NativeUnresolved` functions at load.
 ///
-/// Only functions in VM-owned native namespaces are resolved here. Functions
-/// from other packages (e.g. `assert.*`, `testing.*`) are left as
-/// `NativeUnresolved` so they can be wired up by future package implementations.
-/// They will only fail at runtime if actually called.
+/// Dispatch keys on the function's `native_key` (minted by emit for every
+/// `$rust_function` body), never its display name. Two shapes fail HERE, at
+/// load, rather than at first call: an unkeyed native body (no key can ever
+/// resolve it) and a VM-owned key with no native behind it (the package's
+/// generated trait requires an implementation for every `$rust_function` it
+/// declares). Keyed functions from other stdlib packages (`assert.*`,
+/// `testing.*`, …) stay `NativeUnresolved` for a future implementation to
+/// wire up, and fail only if actually called.
 pub fn attach_builtins(object: Object) -> Result<Object, VmInternalError> {
     Ok(match object {
         Object::Function(function) => {
@@ -445,6 +419,9 @@ pub fn attach_builtins(object: Object) -> Result<Object, VmInternalError> {
                 real_local_count: function.real_local_count,
                 bytecode: function.bytecode,
                 kind,
+                telemetry_function_id: None,
+                telemetry_registration: bex_vm_types::FunctionRegistration::default(),
+                telemetry_policy_id: function.telemetry_policy_id,
                 local_names: function.local_names,
                 debug_locals: function.debug_locals,
                 span: function.span,
@@ -461,8 +438,7 @@ pub fn attach_builtins(object: Object) -> Result<Object, VmInternalError> {
                 is_interface_body: function.is_interface_body,
                 native_key: function.native_key,
                 body_meta: function.body_meta,
-                capture: function.capture,
-                function_id: 0, // synthetic; not in the profiling function table
+
                 runtime_package: function.runtime_package,
             }))
         }

@@ -6,15 +6,13 @@
 //! must agree pair-for-pair, and each case pins the expected set so the
 //! agreement is never vacuous.
 
-use baml_compiler2_hir::package::PackageId;
 use baml_db::ProjectDatabase;
 use text_size::TextRange;
 
 use crate::engine::TestDbExt;
 
-fn user_package<'db>(db: &'db ProjectDatabase, file: baml_base::SourceFile) -> PackageId<'db> {
-    let package = baml_compiler2_hir::file_package::file_package(db, file).package;
-    PackageId::new(db, package)
+fn user_package(db: &ProjectDatabase, file: baml_base::SourceFile) -> baml_base::SourceRoot {
+    baml_compiler2_hir::file_package::file_package(db, file).root
 }
 
 fn hir_ty_pairs(source: &str) -> Vec<(TextRange, TextRange, bool)> {
@@ -27,7 +25,7 @@ fn hir_ty_pairs(source: &str) -> Vec<(TextRange, TextRange, bool)> {
             .iter()
             .map(|violation| {
                 let span_of = |loc: baml_compiler2_hir::loc::ImplLoc<'_>| {
-                    baml_compiler2_ppir::item_data::impl_block_source_map(&db, loc).span
+                    baml_compiler2_hir::item_data::impl_block_source_map(&db, loc).span
                 };
                 (
                     span_of(violation.primary),

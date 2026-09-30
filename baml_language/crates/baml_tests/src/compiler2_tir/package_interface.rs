@@ -9,7 +9,6 @@
 //! consumption; these focused tests keep the derivation contract readable.
 
 use baml_base::Name;
-use baml_compiler2_hir::package::PackageId;
 use baml_compiler2_tir::{
     package_interface::{
         ExportedAssociatedType, ExportedFunction, ExportedImpl, ExportedImplMethod,
@@ -141,7 +140,7 @@ fn fixture_db() -> ProjectDatabase {
 }
 
 fn user_interface(db: &ProjectDatabase) -> &PackageInterface {
-    package_interface(db, PackageId::new(db, Name::new("user")))
+    package_interface(db, (db).workspace_root().unwrap())
 }
 
 #[track_caller]
@@ -262,7 +261,7 @@ fn interface_export_carries_full_symbolic_surface() {
     // Fields with schema attributes, resolved in the interface's own scope.
     let (field_name, field_ty, attrs) = &fields[0];
     assert_eq!(field_name.as_str(), "label");
-    assert!(matches!(field_ty, Ty::String { .. }));
+    assert!(matches!(field_ty, Ty::String));
     assert_eq!(attrs.alias.as_deref(), Some("lbl"));
     assert_eq!(attrs.description.as_deref(), Some("source label"));
 
@@ -277,7 +276,7 @@ fn interface_export_carries_full_symbolic_surface() {
         matches!(&next.return_type, Ty::AssociatedTypeProjection { member, .. }
             if member.as_str() == "Item")
     );
-    assert!(matches!(&next.callable_throws, Ty::Never { .. }));
+    assert!(matches!(&next.callable_throws, Ty::Never));
     assert_eq!(next.callable_fqn, "user.Source.next");
     assert!(next.interface_target.is_none());
 
@@ -289,7 +288,7 @@ fn interface_export_carries_full_symbolic_surface() {
     assert!(matches!(&twice.return_type, Ty::List(inner, _)
             if matches!(inner.as_ref(), Ty::AssociatedTypeProjection { member, .. }
                 if member.as_str() == "Item")));
-    assert!(matches!(&twice.callable_throws, Ty::Never { .. }));
+    assert!(matches!(&twice.callable_throws, Ty::Never));
     assert_eq!(twice.callable_fqn, "user.Source.twice");
 }
 
@@ -467,7 +466,12 @@ fn enriched_interface_borsh_round_trips() {
     assert_eq!(iface, &decoded);
 
     // The stdlib exercises the gnarly idioms — round-trip it too.
-    let stdlib = package_interface(&db, PackageId::new(&db, Name::new("baml")));
+    let stdlib = package_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("baml"))
+            .unwrap(),
+    );
     let bytes = borsh::to_vec(stdlib).expect("serialize stdlib interface");
     let decoded: PackageInterface = borsh::from_slice(&bytes).expect("deserialize stdlib");
     assert_eq!(stdlib, &decoded);
@@ -490,12 +494,16 @@ fn enriched_interface_derivation_is_deterministic() {
 
     let baml1 = borsh::to_vec(package_interface(
         &db1,
-        PackageId::new(&db1, Name::new("baml")),
+        baml_compiler2_hir::package::spelling(&db1)
+            .root(&Name::new("baml"))
+            .unwrap(),
     ))
     .expect("serialize");
     let baml2 = borsh::to_vec(package_interface(
         &db2,
-        PackageId::new(&db2, Name::new("baml")),
+        baml_compiler2_hir::package::spelling(&db2)
+            .root(&Name::new("baml"))
+            .unwrap(),
     ))
     .expect("serialize");
     assert_eq!(baml1, baml2, "stdlib derivation must be deterministic");
@@ -507,7 +515,12 @@ fn stdlib_interfaces_derive_enriched() {
 
     // Every stdlib package derives its enriched interface without panicking.
     for name in baml_builtins2::stdlib_package_names().iter().copied() {
-        let iface = package_interface(&db, PackageId::new(&db, Name::new(name)));
+        let iface = package_interface(
+            &db,
+            baml_compiler2_hir::package::spelling(&db)
+                .root(&Name::new(name))
+                .unwrap(),
+        );
         assert!(
             iface.namespaces.contains(&Vec::new()),
             "{name} has a root namespace"
@@ -516,7 +529,12 @@ fn stdlib_interfaces_derive_enriched() {
 
     // Spot-check the gnarliest idiom: `Iterator requires
     // Iterable<Item = Self.Item, Error = Self.Error>`.
-    let baml = package_interface(&db, PackageId::new(&db, Name::new("baml")));
+    let baml = package_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("baml"))
+            .unwrap(),
+    );
     let ExportedType::Interface {
         requires,
         associated_types,
@@ -550,7 +568,7 @@ fn stdlib_interfaces_derive_enriched() {
     assert!(item.default.is_none(), "Item declares no default");
     let error = assoc(associated_types, "Error");
     assert!(
-        matches!(error.default.as_ref(), Some(Ty::Never { .. })),
+        matches!(error.default.as_ref(), Some(Ty::Never)),
         "`type Error = never` exports its default"
     );
 
@@ -723,7 +741,7 @@ fn in_body_impl_exports_with_field_links() {
         "the receiver realizes to the for-type, got {:?}",
         id.sig.params[0].ty
     );
-    assert!(matches!(&id.sig.return_type, Ty::String { .. }));
+    assert!(matches!(&id.sig.return_type, Ty::String));
 }
 
 #[test]
@@ -763,7 +781,7 @@ fn out_of_body_impl_realizes_self_to_the_for_type() {
         "-> Self: {:?}",
         merge.sig.return_type
     );
-    assert!(matches!(&merge.sig.callable_throws, Ty::Never { .. }));
+    assert!(matches!(&merge.sig.callable_throws, Ty::Never));
     assert!(merge.sig.generic_params.is_empty());
     // A free-impl method's fqn renders owner-less — identity is the structural
     // (impl, name) pair, and MIR's scoped symbol is reconstructed downstream.
@@ -842,23 +860,24 @@ fn dep_interface_rows_resolve_only_for_mounted_packages() {
         "main.baml",
         "function f() -> int throws never {\n    1\n}\n",
     );
-    db.set_mounted_packages(
-        [(
-            "app".to_string(),
-            mounted::app_blob(&[(
-                "lib.baml",
-                "interface Marker {\n    function id(self) -> string throws never\n}\n",
-            )]),
-        )]
-        .into(),
-    )
-    .unwrap();
-    let res_ctx = package_resolution_context(&db, PackageId::new(&db, Name::new("user")));
+    db.mount(
+        "app",
+        mounted::app_blob(&[(
+            "lib.baml",
+            "interface Marker {\n    function id(self) -> string throws never\n}\n",
+        )]),
+    );
+    let res_ctx = package_resolution_context(&db, db.workspace_root().unwrap());
 
     let path = |parts: &[&str]| -> Vec<Name> { parts.iter().map(|p| Name::new(*p)).collect() };
 
     // The source-backed row IS exported…
-    let baml = package_interface(&db, PackageId::new(&db, Name::new("baml")));
+    let baml = package_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("baml"))
+            .unwrap(),
+    );
     assert!(
         matches!(
             baml.lookup_type(&[Name::new("iter")], &Name::new("Iterator")),
@@ -981,7 +1000,7 @@ fn blanket_impl_exports_the_bare_typevar_pattern() {
         "the blanket receiver stays the impl's param, got {:?}",
         tag.sig.params[0].ty
     );
-    assert!(matches!(&tag.sig.return_type, Ty::String { .. }));
+    assert!(matches!(&tag.sig.return_type, Ty::String));
 }
 
 #[test]
@@ -990,11 +1009,22 @@ fn stdlib_impls_export_and_int_equals_is_complete() {
 
     // Every stdlib package derives its impls table without panicking.
     for name in baml_builtins2::stdlib_package_names().iter().copied() {
-        let _ = &package_interface(&db, PackageId::new(&db, Name::new(name))).impls;
+        let _ = &package_interface(
+            &db,
+            baml_compiler2_hir::package::spelling(&db)
+                .root(&Name::new(name))
+                .unwrap(),
+        )
+        .impls;
     }
 
     // Spot-check `implement Equals for int` (baml.ops).
-    let baml = package_interface(&db, PackageId::new(&db, Name::new("baml")));
+    let baml = package_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("baml"))
+            .unwrap(),
+    );
     assert!(!baml.impls.is_empty(), "the stdlib exports impl rows");
     let row = baml
         .impls
@@ -1002,7 +1032,7 @@ fn stdlib_impls_export_and_int_equals_is_complete() {
         .find(|row| {
             row.interface.name.name().as_str() == "Equals"
                 && *row.interface.name.namespace() == [Name::new("ops")]
-                && matches!(row.for_ty_pattern, Ty::Int { .. })
+                && matches!(row.for_ty_pattern, Ty::Int)
         })
         .expect("baml.ops's `implement Equals for int` is exported");
     assert!(matches!(row.origin, ExportedImplOrigin::OutOfBody));
@@ -1011,16 +1041,16 @@ fn stdlib_impls_export_and_int_equals_is_complete() {
 
     let eq = impl_method(&row.methods, "eq");
     assert!(
-        matches!(&eq.sig.params[0].ty, Ty::Int { .. }),
+        matches!(&eq.sig.params[0].ty, Ty::Int),
         "self realizes to int"
     );
     assert!(
-        matches!(&eq.sig.params[1].ty, Ty::Int { .. }),
+        matches!(&eq.sig.params[1].ty, Ty::Int),
         "`other: Self` realizes to int, got {:?}",
         eq.sig.params[1].ty
     );
-    assert!(matches!(&eq.sig.return_type, Ty::Bool { .. }));
-    assert!(matches!(&eq.sig.callable_throws, Ty::Never { .. }));
+    assert!(matches!(&eq.sig.return_type, Ty::Bool));
+    assert!(matches!(&eq.sig.callable_throws, Ty::Never));
     assert_eq!(
         eq.sig.builtin_kind,
         Some(baml_compiler2_ast::BuiltinKind::Vm),
@@ -1039,7 +1069,6 @@ fn stdlib_impls_export_and_int_equals_is_complete() {
 /// suites exercise the same blobs beyond this check-level module.
 pub(super) mod mounted {
     use baml_base::Name;
-    use baml_compiler2_hir::package::PackageId;
     use baml_compiler2_tir::package_interface::package_interface;
     use baml_db::{ProjectDatabase, testing::assert_no_diagnostic_errors};
 
@@ -1060,7 +1089,12 @@ pub(super) mod mounted {
             db.file(format!("<builtin>/app/{path}"), src);
         }
         assert_no_diagnostic_errors(&db);
-        let iface = package_interface(&db, PackageId::new(&db, Name::new("app")));
+        let iface = package_interface(
+            &db,
+            baml_compiler2_hir::package::spelling(&db)
+                .root(&Name::new("app"))
+                .unwrap(),
+        );
         assert!(
             iface.types.values().any(|ns| !ns.is_empty()),
             "the library fixture must export at least one type"
@@ -1073,8 +1107,7 @@ pub(super) mod mounted {
     /// source anywhere.
     fn consumer_db(blob: Vec<u8>, files: &[(&str, &str)]) -> ProjectDatabase {
         let mut db = make_db();
-        db.set_mounted_packages([("app".to_string(), blob)].into())
-            .unwrap();
+        db.mount("app", blob);
         for (path, src) in files {
             db.file(path, src);
         }
@@ -1419,10 +1452,10 @@ implement app.Taggable for Mine {
     }
 
     #[test]
-    fn stream_companion_of_mounted_class_resolves_in_consumer_expansion() {
-        // Canonical PPIR `$stream` companions are exported as ordinary type
-        // rows. A consumer-side declarative LLM expansion can therefore name
-        // the mounted return type's companion with no dependency source.
+    fn llm_companions_of_mounted_return_type_resolve_in_consumer_expansion() {
+        // A consumer-side declarative LLM function's companions (`@spec`,
+        // `@stream`, ...) name the mounted return type, which must resolve
+        // with no dependency source.
         let db = consumer_db(
             lib_blob(),
             &[(

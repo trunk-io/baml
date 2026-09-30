@@ -38,13 +38,6 @@ pub struct RawAttributeArg {
 /// happens once during `lower_file` and is never repeated.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeExprKind {
-    /// A runtime type atom. Body-owned occurrences carry the carrier expression
-    /// in the enclosing body's arena. Declaration-owned occurrences have no
-    /// body arena and keep `None`; the declaration checker diagnoses them.
-    Unreflect {
-        operand: Option<ExprId>,
-        attrs: Vec<RawAttribute>,
-    },
     /// Named type path: `User`, `baml.http.Request`, `Stream<T>`
     Path {
         segments: Vec<Name>,
@@ -52,75 +45,49 @@ pub enum TypeExprKind {
         generic_args: Vec<TypeExpr>,
         /// Named associated type bindings in type positions, e.g. `Iterator<Item = int>`.
         associated_type_bindings: Vec<AssociatedTypeBinding>,
-        attrs: Vec<RawAttribute>,
     },
     /// Associated type projection: `Base.Item` or `(Base as Interface).Item`.
     AssociatedTypeProjection {
         base: Box<TypeExpr>,
         interface: Option<Box<TypeExpr>>,
         member: Name,
-        attrs: Vec<RawAttribute>,
     },
     /// Primitive types
-    Int {
-        attrs: Vec<RawAttribute>,
-    },
-    Bigint {
-        attrs: Vec<RawAttribute>,
-    },
-    Float {
-        attrs: Vec<RawAttribute>,
-    },
-    String {
-        attrs: Vec<RawAttribute>,
-    },
-    Bool {
-        attrs: Vec<RawAttribute>,
-    },
-    Null {
-        attrs: Vec<RawAttribute>,
-    },
-    Never {
-        attrs: Vec<RawAttribute>,
-    },
+    Int,
+    Bigint,
+    Float,
+    String,
+    Bool,
+    Null,
+    Never,
     /// The `void` type — valid only as a function return type.
-    Void {
-        attrs: Vec<RawAttribute>,
-    },
+    Void,
     /// `Uint8Array` (binary data) type
-    Uint8Array {
-        attrs: Vec<RawAttribute>,
-    },
+    Uint8Array,
     /// Media types
     Media {
         kind: baml_base::MediaKind,
-        attrs: Vec<RawAttribute>,
     },
     /// T?
     Optional {
         inner: Box<TypeExpr>,
-        attrs: Vec<RawAttribute>,
     },
     /// T[]
     List {
         inner: Box<TypeExpr>,
-        attrs: Vec<RawAttribute>,
     },
     /// map<K, V>
     Map {
         key: Box<TypeExpr>,
         value: Box<TypeExpr>,
-        attrs: Vec<RawAttribute>,
     },
     /// A | B | C
     Union {
         variants: Vec<TypeExpr>,
-        attrs: Vec<RawAttribute>,
     },
     /// Literal types in unions: `"user"`, `200`, `3.14`, `true`.
     Literal {
         value: baml_base::Literal,
-        attrs: Vec<RawAttribute>,
     },
     /// Function type: `(params) -> return throws E`. Function *values* are
     /// realized, so a function type carries no generic parameters of its own —
@@ -129,36 +96,23 @@ pub enum TypeExprKind {
         params: Vec<FunctionTypeParam>,
         ret: Box<TypeExpr>,
         throws: Option<Box<TypeExpr>>,
-        attrs: Vec<RawAttribute>,
     },
     /// The `unknown` keyword type
-    Unknown {
-        attrs: Vec<RawAttribute>,
-    },
+    Unknown,
     /// The `type` meta-type keyword
-    Type {
-        attrs: Vec<RawAttribute>,
-    },
+    Type,
     /// `$rust_type` — opaque Rust-managed state field type.
-    Rust {
-        attrs: Vec<RawAttribute>,
-    },
+    Rust,
     /// Error recovery sentinel
-    Error {
-        attrs: Vec<RawAttribute>,
-    },
+    Error,
     /// No type was written at this slot (an omitted annotation), as distinct
     /// from the written `unknown` keyword above.
-    Missing {
-        attrs: Vec<RawAttribute>,
-    },
+    Missing,
     /// The wildcard `_` — an inference hole. Valid only where the type at this
     /// slot can be inferred from context (a generic type argument whose binding
     /// is fixed by an initializer, or a `throws`-clause member). Lowered to
     /// an inference hole and filled during TIR checking.
-    Infer {
-        attrs: Vec<RawAttribute>,
-    },
+    Infer,
 }
 
 /// A type expression node paired with its source span. Every node in the tree
@@ -204,7 +158,7 @@ impl std::ops::DerefMut for TypeExpr {
 }
 
 impl TypeExprKind {
-    /// Pair this node with its source span. `TypeExprKind::Int { .. }.at(span)`.
+    /// Pair this node with its source span. `TypeExprKind::Int.at(span)`.
     pub fn at(self, span: TextRange) -> TypeExpr {
         TypeExpr { kind: self, span }
     }
@@ -219,44 +173,52 @@ impl TypeExpr {
         self
     }
 
-    /// Append every runtime carrier nested in this type, in source order.
-    pub fn unreflect_operands(&self, out: &mut Vec<ExprId>) {
+    /// Every span in this type, in source order: its own and its children's.
+    ///
+    /// [`TypeExpr`]'s `PartialEq` deliberately ignores spans, so two types that
+    /// differ only in position compare equal. A memoized value that carries
+    /// spans needs them compared too, or Salsa keeps the older value and every
+    /// span read out of it is stale — see `signature::SignatureTypeExpr`.
+    #[must_use]
+    pub fn spans(&self) -> Vec<TextRange> {
+        let mut out = Vec::new();
+        self.collect_spans(&mut out);
+        out
+    }
+
+    fn collect_spans(&self, out: &mut Vec<TextRange>) {
+        out.push(self.span);
         match &self.kind {
-            TypeExprKind::Unreflect {
-                operand: Some(operand),
-                ..
-            } => out.push(*operand),
-            TypeExprKind::Unreflect { operand: None, .. } => {}
             TypeExprKind::Path {
                 generic_args,
                 associated_type_bindings,
                 ..
             } => {
                 for arg in generic_args {
-                    arg.unreflect_operands(out);
+                    arg.collect_spans(out);
                 }
                 for binding in associated_type_bindings {
-                    binding.ty.unreflect_operands(out);
+                    binding.ty.collect_spans(out);
                 }
             }
             TypeExprKind::AssociatedTypeProjection {
                 base, interface, ..
             } => {
-                base.unreflect_operands(out);
+                base.collect_spans(out);
                 if let Some(interface) = interface {
-                    interface.unreflect_operands(out);
+                    interface.collect_spans(out);
                 }
             }
             TypeExprKind::Optional { inner, .. } | TypeExprKind::List { inner, .. } => {
-                inner.unreflect_operands(out);
+                inner.collect_spans(out);
             }
             TypeExprKind::Map { key, value, .. } => {
-                key.unreflect_operands(out);
-                value.unreflect_operands(out);
+                key.collect_spans(out);
+                value.collect_spans(out);
             }
             TypeExprKind::Union { variants, .. } => {
                 for variant in variants {
-                    variant.unreflect_operands(out);
+                    variant.collect_spans(out);
                 }
             }
             TypeExprKind::Function {
@@ -266,81 +228,35 @@ impl TypeExpr {
                 ..
             } => {
                 for param in params {
-                    param.ty.unreflect_operands(out);
+                    param.ty.collect_spans(out);
                 }
-                ret.unreflect_operands(out);
+                ret.collect_spans(out);
                 if let Some(throws) = throws {
-                    throws.unreflect_operands(out);
+                    throws.collect_spans(out);
                 }
             }
-            _ => {}
+            TypeExprKind::Int
+            | TypeExprKind::Bigint
+            | TypeExprKind::Float
+            | TypeExprKind::String
+            | TypeExprKind::Bool
+            | TypeExprKind::Null
+            | TypeExprKind::Uint8Array
+            | TypeExprKind::Never
+            | TypeExprKind::Void
+            | TypeExprKind::Rust
+            | TypeExprKind::Literal { .. }
+            | TypeExprKind::Media { .. }
+            | TypeExprKind::Unknown
+            | TypeExprKind::Type
+            | TypeExprKind::Error
+            | TypeExprKind::Missing
+            | TypeExprKind::Infer => {}
         }
     }
 }
 
-impl TypeExprKind {
-    /// Access the type-level attributes on this type expression.
-    pub fn attrs(&self) -> &[RawAttribute] {
-        match self {
-            Self::Unreflect { attrs, .. }
-            | Self::Path { attrs, .. }
-            | Self::AssociatedTypeProjection { attrs, .. }
-            | Self::Int { attrs }
-            | Self::Bigint { attrs }
-            | Self::Float { attrs }
-            | Self::String { attrs }
-            | Self::Bool { attrs }
-            | Self::Null { attrs }
-            | Self::Never { attrs }
-            | Self::Void { attrs }
-            | Self::Uint8Array { attrs }
-            | Self::Media { attrs, .. }
-            | Self::Optional { attrs, .. }
-            | Self::List { attrs, .. }
-            | Self::Map { attrs, .. }
-            | Self::Union { attrs, .. }
-            | Self::Literal { attrs, .. }
-            | Self::Function { attrs, .. }
-            | Self::Unknown { attrs }
-            | Self::Type { attrs }
-            | Self::Rust { attrs }
-            | Self::Error { attrs }
-            | Self::Missing { attrs }
-            | Self::Infer { attrs } => attrs,
-        }
-    }
-
-    /// Mutable access to the type-level attributes on this type expression.
-    pub fn attrs_mut(&mut self) -> &mut Vec<RawAttribute> {
-        match self {
-            Self::Unreflect { attrs, .. }
-            | Self::Path { attrs, .. }
-            | Self::AssociatedTypeProjection { attrs, .. }
-            | Self::Int { attrs }
-            | Self::Bigint { attrs }
-            | Self::Float { attrs }
-            | Self::String { attrs }
-            | Self::Bool { attrs }
-            | Self::Null { attrs }
-            | Self::Never { attrs }
-            | Self::Void { attrs }
-            | Self::Uint8Array { attrs }
-            | Self::Media { attrs, .. }
-            | Self::Optional { attrs, .. }
-            | Self::List { attrs, .. }
-            | Self::Map { attrs, .. }
-            | Self::Union { attrs, .. }
-            | Self::Literal { attrs, .. }
-            | Self::Function { attrs, .. }
-            | Self::Unknown { attrs }
-            | Self::Type { attrs }
-            | Self::Rust { attrs }
-            | Self::Error { attrs }
-            | Self::Missing { attrs }
-            | Self::Infer { attrs } => attrs,
-        }
-    }
-}
+impl TypeExprKind {}
 
 impl std::fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -366,7 +282,6 @@ impl std::fmt::Display for TypeExprKind {
         }
 
         match self {
-            TypeExprKind::Unreflect { .. } => write!(f, "unreflect(…)"),
             TypeExprKind::Path {
                 segments,
                 generic_args,
@@ -413,15 +328,15 @@ impl std::fmt::Display for TypeExprKind {
                     write!(f, ".{member}")
                 }
             }
-            TypeExprKind::Int { .. } => write!(f, "int"),
-            TypeExprKind::Bigint { .. } => write!(f, "bigint"),
-            TypeExprKind::Float { .. } => write!(f, "float"),
-            TypeExprKind::String { .. } => write!(f, "string"),
-            TypeExprKind::Bool { .. } => write!(f, "bool"),
-            TypeExprKind::Null { .. } => write!(f, "null"),
-            TypeExprKind::Never { .. } => write!(f, "never"),
-            TypeExprKind::Void { .. } => write!(f, "void"),
-            TypeExprKind::Uint8Array { .. } => write!(f, "uint8array"),
+            TypeExprKind::Int => write!(f, "int"),
+            TypeExprKind::Bigint => write!(f, "bigint"),
+            TypeExprKind::Float => write!(f, "float"),
+            TypeExprKind::String => write!(f, "string"),
+            TypeExprKind::Bool => write!(f, "bool"),
+            TypeExprKind::Null => write!(f, "null"),
+            TypeExprKind::Never => write!(f, "never"),
+            TypeExprKind::Void => write!(f, "void"),
+            TypeExprKind::Uint8Array => write!(f, "uint8array"),
             TypeExprKind::Media { kind, .. } => write!(f, "{}", format!("{kind:?}").to_lowercase()),
             TypeExprKind::Optional { inner, .. } => {
                 write_postfix_base(f, inner)?;
@@ -475,12 +390,12 @@ impl std::fmt::Display for TypeExprKind {
                 }
                 Ok(())
             }
-            TypeExprKind::Unknown { .. } => write!(f, "unknown"),
-            TypeExprKind::Type { .. } => write!(f, "reflect.Type"),
-            TypeExprKind::Rust { .. } => write!(f, "$rust_type"),
-            TypeExprKind::Error { .. } => write!(f, "error"),
-            TypeExprKind::Missing { .. } => write!(f, "?"),
-            TypeExprKind::Infer { .. } => write!(f, "_"),
+            TypeExprKind::Unknown => write!(f, "unknown"),
+            TypeExprKind::Type => write!(f, "reflect.Type"),
+            TypeExprKind::Rust => write!(f, "$rust_type"),
+            TypeExprKind::Error => write!(f, "error"),
+            TypeExprKind::Missing => write!(f, "?"),
+            TypeExprKind::Infer => write!(f, "_"),
         }
     }
 }
@@ -689,10 +604,25 @@ pub struct AstSourceMap {
     pub expr_spans: Arena<TextRange>,
     pub stmt_spans: Arena<TextRange>,
     pub pattern_spans: Arena<TextRange>,
+    /// The NAME token of each `Pattern::Bind`, as distinct from
+    /// [`Self::pattern_spans`], which covers the whole pattern (`x: T`, and
+    /// for a `let` the keyword too). A rename replaces an identifier and
+    /// nothing else, and go-to-definition should land on the name rather
+    /// than highlight the binding, so the two spans cannot be the same
+    /// entry. Absent for binds the compiler synthesizes, which have no name
+    /// token to point at.
+    pub bind_name_spans: HashMap<PatId, TextRange>,
+    /// The NAME token of each body `type T = …` binding, as distinct from its
+    /// statement's span. Absent when the statement has no name token.
+    pub type_binding_name_spans: HashMap<StmtId, TextRange>,
     pub match_arm_spans: Arena<TextRange>,
     pub type_annotation_spans: Arena<TextRange>,
     pub catch_arm_spans: Arena<TextRange>,
-    /// For `MemberAccess` expressions, the span of just the member name (after the dot).
+    /// For `MemberAccess` and `QualifiedPath` expressions, the span of just
+    /// the member name (after the dot). Both name one member of one
+    /// receiver, differing only in how the receiver is written, so both
+    /// record it here — an editor asking "what name is at this offset"
+    /// must not have to know which spelling produced it.
     pub member_access_member_spans: HashMap<ExprId, TextRange>,
     /// For multi-segment `Path` expressions, per-segment spans.
     /// `path_segment_spans[expr_id][i]` is the `TextRange` of `segments[i]`.
@@ -705,11 +635,6 @@ pub struct AstSourceMap {
     pub object_field_name_spans: HashMap<(ExprId, ExprId), TextRange>,
     /// For lambda expressions, the spans of their parameter names in declaration order.
     pub lambda_parameter_spans: HashMap<ExprId, Vec<TextRange>>,
-    /// For `unreflect(value)` type-argument slots, the span of the WHOLE slot
-    /// (marker, parens and all), keyed by the carrier expression inside it.
-    /// The carrier's own span covers only `value`, so diagnostics about the
-    /// slot itself would otherwise have no range to point at.
-    pub unreflect_arg_spans: HashMap<ExprId, TextRange>,
     /// Ids of compiler-synthesized nodes — desugarings that have no
     /// user-written source of their own (e.g. the `string.from(${…})` wrapper
     /// and the concat accumulator that backtick interpolation lowers to). Their
@@ -730,6 +655,8 @@ impl AstSourceMap {
             expr_spans: Arena::new(),
             stmt_spans: Arena::new(),
             pattern_spans: Arena::new(),
+            bind_name_spans: HashMap::new(),
+            type_binding_name_spans: HashMap::new(),
             match_arm_spans: Arena::new(),
             type_annotation_spans: Arena::new(),
             catch_arm_spans: Arena::new(),
@@ -738,7 +665,6 @@ impl AstSourceMap {
             call_arg_label_spans: HashMap::new(),
             object_field_name_spans: HashMap::new(),
             lambda_parameter_spans: HashMap::new(),
-            unreflect_arg_spans: HashMap::new(),
             synthetic_exprs: HashSet::new(),
             synthetic_stmts: HashSet::new(),
             synthetic_patterns: HashSet::new(),
@@ -786,12 +712,22 @@ impl AstSourceMap {
         Self::span_at(&self.expr_spans, id)
     }
 
-    /// Look up the member-name span for a `MemberAccess` expression.
+    /// The member-name span recorded for `id`, or `None` when this
+    /// expression names no member.
+    ///
+    /// Prefer this over [`Self::member_access_member_span`] wherever the
+    /// answer must be a NAME — a rename or a reference highlight. The
+    /// fallback that accessor applies is the whole expression, which is
+    /// never a name.
+    pub fn member_name_span(&self, id: ExprId) -> Option<TextRange> {
+        self.member_access_member_spans.get(&id).copied()
+    }
+
+    /// Look up the member-name span for a `MemberAccess` or `QualifiedPath`
+    /// expression.
     /// Returns the full expression span as fallback if no member span was recorded.
     pub fn member_access_member_span(&self, id: ExprId) -> TextRange {
-        self.member_access_member_spans
-            .get(&id)
-            .copied()
+        self.member_name_span(id)
             .unwrap_or_else(|| self.expr_span(id))
     }
 
@@ -823,17 +759,17 @@ impl AstSourceMap {
             .unwrap_or_else(|| self.expr_span(id))
     }
 
-    /// Look up the span of the `unreflect(...)` type-argument slot whose
-    /// carrier expression is `id`. Falls back to the carrier's own span when
-    /// the slot was not recorded (a synthesized marker, for instance).
-    pub fn unreflect_arg_span(&self, id: ExprId) -> TextRange {
-        self.unreflect_arg_spans
-            .get(&id)
-            .copied()
-            .unwrap_or_else(|| self.expr_span(id))
+    /// Look up the source span of a pattern by its `PatId`.
+    /// The name token of a `Pattern::Bind`, when it was written in source.
+    pub fn bind_name_span(&self, id: PatId) -> Option<TextRange> {
+        self.bind_name_spans.get(&id).copied()
     }
 
-    /// Look up the source span of a pattern by its `PatId`.
+    /// The name token of a body `type T = …` binding, when it was written.
+    pub fn type_binding_name_span(&self, id: StmtId) -> Option<TextRange> {
+        self.type_binding_name_spans.get(&id).copied()
+    }
+
     pub fn pattern_span(&self, id: PatId) -> TextRange {
         Self::span_at(&self.pattern_spans, id)
     }
@@ -986,21 +922,6 @@ pub enum Expr {
     /// not the surrounding `catch`.
     Return {
         value: Option<ExprId>,
-    },
-    /// BEP-034 `spawn name_expr? (with expr (, expr)*)? { body }`. The body is
-    /// always a block expression that runs on a freshly-spawned green thread;
-    /// the optional `name` is any expression that evaluates to a string and
-    /// surfaces in debug / stack traces.
-    Spawn {
-        /// Optional human-readable label for the spawn.
-        name: Option<ExprId>,
-        /// BEP-034 spawn options: the `with expr (, expr)*` clause. Each entry
-        /// is an arbitrary expression; in v1 TIR requires exactly one, a call
-        /// to `baml.spawn.options(...)`. Empty when there is no `with` clause.
-        with_exprs: Vec<ExprId>,
-        /// Body of the spawn (`{...}`) — always an `Expr::Block` after
-        /// CST lowering.
-        body: ExprId,
     },
     /// BEP-034 `await expr` — prefix form. Suspends the current thread
     /// until `expr`'s future settles, then unwraps the value or re-throws
@@ -1222,15 +1143,28 @@ impl CallArg {
     }
 }
 
+/// The right-hand side of a body-level `type T = …;` binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeBindingValue {
+    /// `unreflect(expr)`: the runtime type is the `reflect.Type` value the
+    /// operand evaluates to, evaluated once when the statement runs.
+    Runtime(ExprId),
+    /// A static type: the runtime type is its template, realized in the
+    /// enclosing frame when the statement runs.
+    Static(TypeExpr),
+}
+
 /// Statements — modeled after `Stmt` in `body.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Expr(ExprId),
-    /// Evaluate a runtime `type` value once and bind its exact identity to a
-    /// lexical type parameter for the remainder of the enclosing block.
+    /// `type T = …;` inside a body: bind a rigid, block-scoped type parameter
+    /// `T` for the remainder of the enclosing block. The parameter is opaque
+    /// to static checking either way; only where its runtime type comes from
+    /// differs (see [`TypeBindingValue`]).
     TypeBinding {
         name: Name,
-        value: TypeExpr,
+        value: TypeBindingValue,
     },
     Let {
         /// The binding pattern. A `: T` annotation lives inside the pattern
@@ -1371,9 +1305,6 @@ pub enum Pattern {
     /// is irrefutable against scrutinee `int` but refutable against `int|str`.
     /// Cannot carry a `: T` ascription.
     Type(TypeExpr),
-    /// `unreflect(expr)` — identity-filter against a runtime minted type.
-    /// This pattern narrows no static shape; its operand is checked as `type`.
-    Unreflect(ExprId),
 
     // ── Combinators (combine other patterns) ─────────────────────────────
     /// `p1 | p2 | ...` — alternation. Length always `>= 2`. Every alternative
@@ -1437,7 +1368,7 @@ impl Pattern {
         out: &mut Vec<&'a Name>,
     ) {
         match self {
-            Pattern::Wildcard | Pattern::Type(_) | Pattern::Unreflect(_) => {}
+            Pattern::Wildcard | Pattern::Type(_) => {}
             Pattern::Bind { name, subpat } => {
                 out.push(name);
                 if let Some(sp) = subpat {
@@ -1520,7 +1451,6 @@ pub type Literal = baml_base::Literal;
 pub enum LetOrigin {
     Source,
     Client,
-    RetryPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1561,10 +1491,17 @@ impl FunctionMetadata {
     }
 }
 
+/// The source form a [`Stmt::While`] was written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopOrigin {
     While,
-    For,
+    /// A C-style `for (init; cond; step)`. `init` is the `let` statement the
+    /// desugaring placed before the loop; its bindings are per-iteration
+    /// (each iteration's closures see their own copy, as in JS and Go), which
+    /// MIR lowering implements by re-celling them at the top of the step.
+    For {
+        init: StmtId,
+    },
 }
 
 /// Binary operators — matches those supported in `body.rs`.
@@ -1661,9 +1598,6 @@ pub enum Item {
     Enum(EnumDef),
     Interface(InterfaceDef),
     TypeAlias(TypeAliasDef),
-    Client(ClientDef),
-    TemplateString(TemplateStringDef),
-    RetryPolicy(RetryPolicyDef),
     Let(LetDef),
     ImplementsFor(ImplementsForDef),
 }
@@ -1790,6 +1724,22 @@ pub enum BuiltinKind {
     /// the array of futures; the result is the `int` index of the first to
     /// settle.
     AwaitAny,
+    /// `baml.spawn.__spawn` — lowered to a `Terminator::Spawn` suspend point,
+    /// not a normal call. The single argument is the `baml.spawn.Plan<T, E>`
+    /// to run; the result is the new task's `Future<T, E>`.
+    Spawn,
+}
+
+impl BuiltinKind {
+    /// Whether the builtin is lowered where it is called instead of compiled
+    /// into a callable: it has no function value, so it may only be the callee
+    /// of a direct call.
+    pub const fn lowers_at_call_site(self) -> bool {
+        match self {
+            BuiltinKind::Vm | BuiltinKind::Io => false,
+            BuiltinKind::Intrinsic | BuiltinKind::AwaitAny | BuiltinKind::Spawn => true,
+        }
+    }
 }
 
 /// Source geometry of an LLM function's prompt literal.
@@ -1823,9 +1773,9 @@ pub struct LlmBodyDef {
     /// any value other than an absent field or a literal empty list (`tools
     /// []`). A non-literal expression (`tools: shared()`) counts as `true`
     /// even if it evaluates empty — the compile-time signal is conservative.
-    /// PPIR skips `$stream` synthesis when set (streaming does not run the
-    /// tool loop); `ai.stream.from_spec`'s runtime empty-toolbox check covers the
-    /// dynamic cases.
+    /// No `@stream` companion is synthesized when set (streaming does not run
+    /// the tool loop); `ai.stream.from_spec`'s runtime empty-toolbox check covers
+    /// the dynamic cases.
     pub has_tools: bool,
     pub span: TextRange,
 }
@@ -2021,39 +1971,8 @@ pub struct TypeAliasDef {
     pub docstring: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientDef {
-    pub name: Name,
-    pub config_items: Vec<ConfigItemDef>,
-    pub span: TextRange,
-    pub name_span: TextRange,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigItemDef {
-    pub key: Name,
-    pub value: std::string::String,
-    pub span: TextRange,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplateStringDef {
-    pub name: Name,
-    pub params: Vec<Param>,
-    pub span: TextRange,
-    pub name_span: TextRange,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetryPolicyDef {
-    pub name: Name,
-    pub config_items: Vec<ConfigItemDef>,
-    pub span: TextRange,
-    pub name_span: TextRange,
-}
-
 /// A top-level let binding. Source `let` declarations and compiler-generated
-/// client/retry-policy bindings share the same `$init` pipeline.
+/// client bindings share the same `$init` pipeline.
 /// Carries an optional `ExprBody` initializer that flows through TIR type-checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LetDef {

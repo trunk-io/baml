@@ -99,7 +99,7 @@ export class BamlPrompt {
         const argsProto = encodeCallArgs({ self: this }, { syncMode: true, callId, functionName: fqn });
         const callCtxBinding = attachCallContext(options?.$ctx, callId);
         try {
-            return decodeCallResult(getRuntime().callFunctionSync(argsProto, null, null));
+            return decodeCallResult(getRuntime().callFunctionSync(argsProto, null));
         }
         finally {
             callCtxBinding.detach();
@@ -110,7 +110,7 @@ export class BamlPrompt {
         const argsProto = encodeCallArgs({ self: this }, { callId, functionName: fqn });
         const callCtxBinding = attachCallContext(options?.$ctx, callId);
         try {
-            return decodeCallResult(await getRuntime().callFunction(argsProto, null, null));
+            return decodeCallResult(await getRuntime().callFunction(argsProto, null));
         }
         finally {
             callCtxBinding.detach();
@@ -168,12 +168,10 @@ function setInboundValue(iv, value, ctx) {
         iv.boolValue = value;
     }
     else if (typeof value === 'number') {
-        if (Number.isInteger(value)) {
-            iv.intValue = value;
-        }
-        else {
-            iv.floatValue = value;
-        }
+        // JavaScript has one numeric type. Preserve that ambiguity on the
+        // inbound wire so contextual BAML typing can select `int` or `float`;
+        // a JavaScript `bigint` remains the unambiguous `bigint_value` below.
+        iv.jsNumberValue = value;
     }
     else if (typeof value === 'bigint') {
         // Hex / base sixteen on the wire. BigInt.prototype.toString(16)

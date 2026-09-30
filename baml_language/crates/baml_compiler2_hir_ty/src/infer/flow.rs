@@ -140,7 +140,7 @@ impl InferenceContext<'_> {
     fn drop_members_by_truthiness(scrut: &Ty, drop_truthy: bool) -> Ty {
         use crate::infer::truthy::{Truthiness, truthiness};
         let members: Vec<Ty> = match scrut.kind() {
-            InferTy::Union(members, _) => members.to_vec(),
+            InferTy::Union(members) => members.to_vec(),
             _ => vec![scrut.clone()],
         };
         let dropped = if drop_truthy {
@@ -261,7 +261,7 @@ impl InferenceContext<'_> {
     /// (never a fabricated narrower type), everything dropped is `never`.
     pub(super) fn subtract_narrow(&mut self, scrut: &Ty, matched: &Ty) -> Ty {
         let members: Vec<Ty> = match scrut.kind() {
-            InferTy::Union(members, _) => members.to_vec(),
+            InferTy::Union(members) => members.to_vec(),
             _ => vec![scrut.clone()],
         };
         let kept: Vec<Ty> = members
@@ -300,7 +300,8 @@ impl InferenceContext<'_> {
             (None, None) => base,
             (Some(live), None) | (None, Some(live)) => live,
             (Some(then_flow), Some(else_flow)) => {
-                let mut merged = base;
+                // Facts invalidated on both paths must not reappear from base.
+                let mut merged = FxHashMap::default();
                 let keys: FxHashSet<BindingId> =
                     then_flow.keys().chain(else_flow.keys()).copied().collect();
                 for binding in keys {

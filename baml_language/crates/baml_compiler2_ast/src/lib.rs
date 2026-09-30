@@ -10,7 +10,6 @@
 pub mod ast;
 pub mod cleanup_guard;
 pub(crate) mod companions;
-pub(crate) mod disambiguate;
 pub mod docstring;
 pub(crate) mod lower_cst;
 pub(crate) mod lower_expr_body;
@@ -24,13 +23,12 @@ pub use ast::*;
 /// Re-exported from [`baml_base::escape::unescape_string_literal`] so existing
 /// callers don't need to change their import path.
 pub use baml_base::escape::unescape_string_literal;
-pub use disambiguate::{FIELD_ATTR_NAMES, is_field_attr};
 pub use docstring::extract_docstring;
 pub use lower_cst::{
-    lower_file, lower_file_with_path, lower_file_with_path_and_test_owner,
+    SHORTHAND_PROVIDERS, lower_file, lower_file_with_path, lower_file_with_path_and_test_owner,
     lower_session_file_with_path_and_test_owner,
 };
-pub use lower_expr_body::{EnvVarRef, synthesize_spec_stream_body};
+pub use lower_expr_body::EnvVarRef;
 pub use lowering_diagnostic::LoweringDiagnostic;
 // Re-exported so callers of `TypeExprKind::at(span)` can name the span type
 // without depending on `text_size` directly.
@@ -126,7 +124,8 @@ pub fn lower_bigint_literal(
     let digits = text
         .strip_suffix('n')
         .unwrap_or_else(|| unreachable!("BIGINT_LITERAL missing 'n' suffix: {text:?}"));
-    match baml_base::num_lit::parse_bigint_literal(digits) {
+    match baml_base::num_lit::parse_bigint_literal_with_max_bits(digits, baml_type::MAX_BIGINT_BITS)
+    {
         Ok(v) => v,
         Err(e) => {
             push_num_lit_error(e, token_range, diags);
@@ -179,41 +178,29 @@ mod tests {
     }
 
     /// Build a `TypeExpr` value for use in `assert_eq!` comparisons.
-    /// All spans are zeroed. Attrs go inside the variant constructor:
+    /// All spans are zeroed:
     ///
     /// ```ignore
-    /// type_expr!(Path("Foo", Attr("stream.done")))
-    /// type_expr!(WithAttrs((List(String)), Attr("stream.done")))
-    /// type_expr!(Union((Path("A")), (Path("B", Attr("stream.done")))))
+    /// type_expr!(Path("Foo"))
+    /// type_expr!(Union((Path("A")), (List(String))))
     /// ```
     macro_rules! type_expr {
-        // ── Helper: build attr vec from Attr("name") args ──
-        (@attrs) => { vec![] };
-        (@attrs $(, Attr($attr_name:expr))+) => {
-            vec![$(crate::ast::RawAttribute {
-                name: baml_base::Name::new($attr_name),
-                args: vec![],
-                span: text_size::TextRange::default(),
-            }),+]
-        };
-
         // ── Leaves ──
-        (Int $(, Attr($a:expr))*) => { TypeExprKind::Int { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (Bigint $(, Attr($a:expr))*) => { TypeExprKind::Bigint { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (Float $(, Attr($a:expr))*) => { TypeExprKind::Float { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (String $(, Attr($a:expr))*) => { TypeExprKind::String { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (Bool $(, Attr($a:expr))*) => { TypeExprKind::Bool { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (Null $(, Attr($a:expr))*) => { TypeExprKind::Null { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (Never $(, Attr($a:expr))*) => { TypeExprKind::Never { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
-        (Rust $(, Attr($a:expr))*) => { TypeExprKind::Rust { attrs: type_expr!(@attrs $(, Attr($a))*) }.at(text_size::TextRange::default()) };
+        (Int) => { TypeExprKind::Int.at(text_size::TextRange::default()) };
+        (Bigint) => { TypeExprKind::Bigint.at(text_size::TextRange::default()) };
+        (Float) => { TypeExprKind::Float.at(text_size::TextRange::default()) };
+        (String) => { TypeExprKind::String.at(text_size::TextRange::default()) };
+        (Bool) => { TypeExprKind::Bool.at(text_size::TextRange::default()) };
+        (Null) => { TypeExprKind::Null.at(text_size::TextRange::default()) };
+        (Never) => { TypeExprKind::Never.at(text_size::TextRange::default()) };
+        (Rust) => { TypeExprKind::Rust.at(text_size::TextRange::default()) };
 
         // ── Path ──
-        (Path($name:expr $(, Attr($a:expr))*)) => {
+        (Path($name:expr)) => {
             TypeExprKind::Path {
                 segments: vec![baml_base::Name::new($name)],
                 generic_args: vec![],
                 associated_type_bindings: vec![],
-                attrs: type_expr!(@attrs $(, Attr($a))*),
             }
             .at(text_size::TextRange::default())
         };
@@ -222,14 +209,12 @@ mod tests {
         (Optional($($inner:tt)+)) => {
             TypeExprKind::Optional {
                 inner: Box::new(type_expr!($($inner)+)),
-                attrs: vec![],
             }
             .at(text_size::TextRange::default())
         };
         (List($($inner:tt)+)) => {
             TypeExprKind::List {
                 inner: Box::new(type_expr!($($inner)+)),
-                attrs: vec![],
             }
             .at(text_size::TextRange::default())
         };
@@ -238,17 +223,9 @@ mod tests {
         (Union($(($($variant:tt)+)),+ $(,)?)) => {
             TypeExprKind::Union {
                 variants: vec![$(type_expr!(($($variant)+))),+],
-                attrs: vec![],
             }
             .at(text_size::TextRange::default())
         };
-
-        // ── Attach attrs to any type: WithAttrs((List(String)), Attr("stream.done")) ──
-        (WithAttrs(($($inner:tt)+), $(Attr($a:expr)),+)) => {{
-            let mut te = type_expr!($($inner)+);
-            *te.attrs_mut() = type_expr!(@attrs $(, Attr($a))+);
-            te
-        }};
 
         // ── Paren passthrough: ((Int)) → type_expr!(Int) ──
         (($($inner:tt)+)) => {
@@ -260,66 +237,21 @@ mod tests {
     /// replacing them with `TextRange::default()`. This allows `assert_eq!`
     /// comparison against hand-built expected values.
     fn strip_spans(expr: &TypeExpr) -> TypeExpr {
-        fn strip_attr(attr: &crate::ast::RawAttribute) -> crate::ast::RawAttribute {
-            crate::ast::RawAttribute {
-                name: attr.name.clone(),
-                args: attr
-                    .args
-                    .iter()
-                    .map(|a| crate::ast::RawAttributeArg {
-                        key: a.key.clone(),
-                        value: a.value.clone(),
-                        span: text_size::TextRange::default(),
-                    })
-                    .collect(),
-                span: text_size::TextRange::default(),
-            }
-        }
-
-        fn strip_attrs(attrs: &[crate::ast::RawAttribute]) -> Vec<crate::ast::RawAttribute> {
-            attrs.iter().map(strip_attr).collect()
-        }
-
         let __stripped = match &expr.kind {
-            TypeExprKind::Unreflect { operand, attrs } => TypeExprKind::Unreflect {
-                operand: *operand,
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Int { attrs } => TypeExprKind::Int {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Bigint { attrs } => TypeExprKind::Bigint {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Float { attrs } => TypeExprKind::Float {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::String { attrs } => TypeExprKind::String {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Bool { attrs } => TypeExprKind::Bool {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Null { attrs } => TypeExprKind::Null {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Uint8Array { attrs } => TypeExprKind::Uint8Array {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Never { attrs } => TypeExprKind::Never {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Void { attrs } => TypeExprKind::Void {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Rust { attrs } => TypeExprKind::Rust {
-                attrs: strip_attrs(attrs),
-            },
+            TypeExprKind::Int => TypeExprKind::Int,
+            TypeExprKind::Bigint => TypeExprKind::Bigint,
+            TypeExprKind::Float => TypeExprKind::Float,
+            TypeExprKind::String => TypeExprKind::String,
+            TypeExprKind::Bool => TypeExprKind::Bool,
+            TypeExprKind::Null => TypeExprKind::Null,
+            TypeExprKind::Uint8Array => TypeExprKind::Uint8Array,
+            TypeExprKind::Never => TypeExprKind::Never,
+            TypeExprKind::Void => TypeExprKind::Void,
+            TypeExprKind::Rust => TypeExprKind::Rust,
             TypeExprKind::Path {
                 segments,
                 generic_args,
                 associated_type_bindings,
-                attrs,
             } => TypeExprKind::Path {
                 segments: segments.clone(),
                 generic_args: generic_args.iter().map(strip_spans).collect(),
@@ -330,47 +262,38 @@ mod tests {
                         ty: Box::new(strip_spans(&binding.ty)),
                     })
                     .collect(),
-                attrs: strip_attrs(attrs),
             },
             TypeExprKind::AssociatedTypeProjection {
                 base,
                 interface,
                 member,
-                attrs,
             } => TypeExprKind::AssociatedTypeProjection {
                 base: Box::new(strip_spans(base)),
                 interface: interface
                     .as_ref()
                     .map(|interface| Box::new(strip_spans(interface))),
                 member: member.clone(),
-                attrs: strip_attrs(attrs),
             },
-            TypeExprKind::Optional { inner, attrs } => TypeExprKind::Optional {
+            TypeExprKind::Optional { inner } => TypeExprKind::Optional {
                 inner: Box::new(strip_spans(inner)),
-                attrs: strip_attrs(attrs),
             },
-            TypeExprKind::List { inner, attrs } => TypeExprKind::List {
+            TypeExprKind::List { inner } => TypeExprKind::List {
                 inner: Box::new(strip_spans(inner)),
-                attrs: strip_attrs(attrs),
             },
-            TypeExprKind::Map { key, value, attrs } => TypeExprKind::Map {
+            TypeExprKind::Map { key, value } => TypeExprKind::Map {
                 key: Box::new(strip_spans(key)),
                 value: Box::new(strip_spans(value)),
-                attrs: strip_attrs(attrs),
             },
-            TypeExprKind::Union { variants, attrs } => TypeExprKind::Union {
+            TypeExprKind::Union { variants } => TypeExprKind::Union {
                 variants: variants.iter().map(strip_spans).collect(),
-                attrs: strip_attrs(attrs),
             },
-            TypeExprKind::Literal { value, attrs } => TypeExprKind::Literal {
+            TypeExprKind::Literal { value } => TypeExprKind::Literal {
                 value: value.clone(),
-                attrs: strip_attrs(attrs),
             },
             TypeExprKind::Function {
                 params,
                 ret,
                 throws,
-                attrs,
             } => TypeExprKind::Function {
                 params: params
                     .iter()
@@ -382,27 +305,13 @@ mod tests {
                     .collect(),
                 ret: Box::new(strip_spans(ret)),
                 throws: throws.as_ref().map(|throws| Box::new(strip_spans(throws))),
-                attrs: strip_attrs(attrs),
             },
-            TypeExprKind::Media { kind, attrs } => TypeExprKind::Media {
-                kind: *kind,
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Unknown { attrs } => TypeExprKind::Unknown {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Type { attrs } => TypeExprKind::Type {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Error { attrs } => TypeExprKind::Error {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Missing { attrs } => TypeExprKind::Missing {
-                attrs: strip_attrs(attrs),
-            },
-            TypeExprKind::Infer { attrs } => TypeExprKind::Infer {
-                attrs: strip_attrs(attrs),
-            },
+            TypeExprKind::Media { kind } => TypeExprKind::Media { kind: *kind },
+            TypeExprKind::Unknown => TypeExprKind::Unknown,
+            TypeExprKind::Type => TypeExprKind::Type,
+            TypeExprKind::Error => TypeExprKind::Error,
+            TypeExprKind::Missing => TypeExprKind::Missing,
+            TypeExprKind::Infer => TypeExprKind::Infer,
         };
         __stripped.at(text_size::TextRange::default())
     }
@@ -463,31 +372,24 @@ mod tests {
     }
 
     #[test]
-    fn call_unreflect_bare_path_keeps_its_operand() {
+    fn type_binding_lowers_its_marker_to_a_runtime_operand() {
         let function = first_function(parse_and_lower(
-            "function main(t: reflect.Type) -> reflect.Type { return reflect.Type.of<unreflect(t)>() }",
+            "function main(t: reflect.Type) -> reflect.Type { type T = unreflect(t); return reflect.Type.of<T>() }",
         ));
         let Some(crate::ast::FunctionBodyDef::Expr(body, _)) = function.body else {
             panic!("expected expression body")
         };
         let operand = body
-            .exprs
+            .stmts
             .iter()
-            .find_map(|(_, expr)| match expr {
-                Expr::Call { type_args, .. } => type_args.iter().find_map(|arg| {
-                    if let TypeExprKind::Unreflect {
-                        operand: Some(operand),
-                        ..
-                    } = &arg.kind
-                    {
-                        Some(*operand)
-                    } else {
-                        None
-                    }
-                }),
+            .find_map(|(_, stmt)| match stmt {
+                Stmt::TypeBinding {
+                    value: crate::ast::TypeBindingValue::Runtime(operand),
+                    ..
+                } => Some(*operand),
                 _ => None,
             })
-            .expect("expected unreflect type argument");
+            .expect("expected a runtime type binding");
         assert!(
             matches!(&body.exprs[operand], Expr::Path(path) if path.len() == 1 && path[0].as_str() == "t"),
             "unreflect operand lowered as {:?}",
@@ -496,17 +398,59 @@ mod tests {
     }
 
     #[test]
-    fn nested_unreflect_type_arguments_allocate_each_carrier_once() {
+    fn type_binding_with_a_static_type_keeps_the_type() {
         let function = first_function(parse_and_lower(
-            "function main(t: reflect.Type) -> reflect.Type { return reflect.Type.of<unreflect(make<unreflect(t)>())>() }",
+            "function main() -> int { type T = int[]; 0 }",
         ));
-        let Some(crate::ast::FunctionBodyDef::Expr(_, source_map)) = function.body else {
+        let Some(crate::ast::FunctionBodyDef::Expr(body, _)) = function.body else {
             panic!("expected expression body")
         };
+        assert!(body.stmts.iter().any(|(_, stmt)| matches!(
+            stmt,
+            Stmt::TypeBinding {
+                value: crate::ast::TypeBindingValue::Static(ty),
+                ..
+            } if matches!(ty.kind, TypeExprKind::List { .. })
+        )));
+    }
+
+    #[test]
+    fn unreflect_outside_a_type_binding_is_one_lowering_diagnostic_each() {
+        // Every inline position reports the same diagnostic and lowers to
+        // the error sentinel: a call slot, an annotation, a pattern, and a
+        // marker nested inside a binding's static type.
+        let source = "function main(t: reflect.Type, v: int) -> int {\n  \
+             let a = identity<unreflect(t)>(v)\n  \
+             let b: unreflect(t)? = null\n  \
+             let c = v is unreflect(t)\n  \
+             type T = Wrapper<unreflect(t)>\n  \
+             0\n\
+             }";
+        let (_, diags) = parse_and_lower_with_diagnostics(source);
+        let outside = diags
+            .iter()
+            .filter(|diag| {
+                matches!(
+                    diag,
+                    crate::LoweringDiagnostic::UnreflectOutsideTypeBinding { .. }
+                )
+            })
+            .count();
+        // The marker nested inside a binding's static type is the one
+        // position with its own advice: the statement it is already in.
+        let nested = diags
+            .iter()
+            .filter(|diag| {
+                matches!(
+                    diag,
+                    crate::LoweringDiagnostic::UnreflectNestedInTypeBinding { .. }
+                )
+            })
+            .count();
         assert_eq!(
-            source_map.unreflect_arg_spans.len(),
-            2,
-            "the outer call operand and nested type operand must each be lowered exactly once"
+            (outside, nested),
+            (3, 1),
+            "unexpected diagnostics: {diags:#?}"
         );
     }
 
@@ -1237,7 +1181,6 @@ class Response {
                 ],
                 generic_args: vec![],
                 associated_type_bindings: vec![],
-                attrs: vec![]
             }
         );
     }
@@ -1345,7 +1288,6 @@ interface Response {
                 ],
                 generic_args: vec![],
                 associated_type_bindings: vec![],
-                attrs: vec![]
             }
         );
     }
@@ -1624,7 +1566,7 @@ class Media {
             .expect("expected _data field");
 
         match &field.type_expr.kind {
-            TypeExprKind::Rust { .. } => {}
+            TypeExprKind::Rust => {}
             other => panic!("expected TypeExprKind::Rust, got {other:?}"),
         }
     }
@@ -1736,10 +1678,7 @@ class Media {
             let data_field = c.fields.iter().find(|f| f.name.as_str() == "_data");
             assert!(data_field.is_some(), "expected _data field");
             assert!(
-                matches!(
-                    &data_field.unwrap().type_expr.kind,
-                    TypeExprKind::Rust { .. }
-                ),
+                matches!(&data_field.unwrap().type_expr.kind, TypeExprKind::Rust),
                 "_data field should have TypeExprKind::Rust"
             );
         } else {
@@ -1759,7 +1698,7 @@ function f() -> int throws never {
             .throws
             .expect("expected throws clause to be lowered into FunctionDef.throws");
         assert!(
-            matches!(throws.kind, TypeExprKind::Never { .. }),
+            matches!(throws.kind, TypeExprKind::Never),
             "expected throws type to lower as TypeExprKind::Never, got {:?}",
             throws.kind
         );
@@ -1882,8 +1821,6 @@ function f() -> int {
         }
     }
 
-    // ── Phase 1: retry_policy produces Item::Let with LetOrigin::RetryPolicy ──
-
     // ── Postfix type expression tests ────────────────────────────────────────
 
     fn first_type_alias(items: Vec<Item>) -> crate::ast::TypeAliasDef {
@@ -1995,7 +1932,7 @@ function f() -> int {
         assert!(
             matches!(
                 throws.as_deref().map(|t| &t.kind),
-                Some(TypeExprKind::Never { .. })
+                Some(TypeExprKind::Never)
             ),
             "expected explicit nested throws never to be preserved, got {throws:?}"
         );
@@ -2041,12 +1978,10 @@ function f() -> int {
         );
     }
 
-    // ── Phase 1: retry_policy produces Item::Let with LetOrigin::RetryPolicy ──
-
     #[test]
-    fn retry_policy_produces_let_item_with_retry_policy_origin() {
-        // Renamed behavior: retry_policy blocks are removed; retry composes
-        // at the client boundary (ai.Retry).
+    fn retry_policy_block_lowers_to_a_removal_diagnostic() {
+        // `retry_policy` blocks are removed; retry composes at the client
+        // boundary (ai.Retry).
         let source = r#"
 retry_policy MyRetry {
   max_retries 3
@@ -2088,313 +2023,86 @@ function main() -> string {
         );
     }
 
-    // ── Type attribute tests ─────────────────────────────────────────────────
+    // ── Field attribute tests ────────────────────────────────────────────────
 
-    fn first_class(items: Vec<Item>) -> crate::ast::ClassDef {
-        items
-            .into_iter()
-            .find_map(|item| {
-                if let Item::Class(c) = item {
-                    Some(c)
-                } else {
-                    None
-                }
+    /// Names of the attributes lowered onto each field, in field order.
+    fn field_attribute_names(fields: &[crate::ast::FieldDef]) -> Vec<Vec<&str>> {
+        fields
+            .iter()
+            .map(|field| {
+                field
+                    .attributes
+                    .iter()
+                    .map(|attr| attr.name.as_str())
+                    .collect()
             })
-            .expect("expected a ClassDef")
+            .collect()
     }
 
     #[test]
-    fn type_attr_before_field_attr_parses_as_type_attribute() {
-        // @stream.done is a type attribute, @alias("bar") is a field attribute.
-        // When @stream.done comes first, the parser should nest it inside TYPE_EXPR.
+    fn class_field_attributes_lower_onto_the_field() {
         let source = r#"
 class Foo {
-  foo Fizz @stream.done @alias("bar")
+  a Fizz @alias("bar") @stream.done
+  b A | B @custom("read-back")
+  c string?
+    @description("next line")
+  d string
 }
 "#;
-        let class = first_class(parse_and_lower(source));
-        let field = class
+        let class = parse_and_lower(source)
+            .into_iter()
+            .find_map(|item| match item {
+                Item::Class(class) => Some(class),
+                _ => None,
+            })
+            .expect("expected ClassDef");
+
+        assert_eq!(
+            field_attribute_names(&class.fields),
+            [
+                vec!["alias", "stream.done"],
+                vec!["custom"],
+                vec!["description"],
+                vec![]
+            ]
+        );
+        let types: Vec<_> = class
             .fields
             .iter()
-            .find(|f| f.name.as_str() == "foo")
-            .expect("expected field 'foo'");
-
-        // Field attribute: @alias("bar")
+            .map(|field| strip_spans(&field.type_expr))
+            .collect();
         assert_eq!(
-            field.attributes.len(),
-            1,
-            "expected 1 field attribute, got {:?}",
-            field.attributes
+            types,
+            [
+                type_expr!(Path("Fizz")),
+                type_expr!(Union((Path("A")), (Path("B")))),
+                type_expr!(Optional(String)),
+                type_expr!(String),
+            ]
         );
-        assert_eq!(field.attributes[0].name.as_str(), "alias");
+    }
 
-        // Type attribute: @stream.done should be on the TypeExpr
-        let type_expr = &field.type_expr;
-        let type_attrs = type_expr.attrs();
+    #[test]
+    fn interface_field_attributes_lower_onto_the_field() {
+        let source = r#"
+interface Named {
+  name string @alias("label")
+}
+"#;
+        let interface = parse_and_lower(source)
+            .into_iter()
+            .find_map(|item| match item {
+                Item::Interface(interface) => Some(interface),
+                _ => None,
+            })
+            .expect("expected InterfaceDef");
+
+        assert_eq!(field_attribute_names(&interface.fields), [vec!["alias"]]);
         assert_eq!(
-            type_attrs.len(),
-            1,
-            "expected 1 type attribute, got {type_attrs:?}"
+            strip_spans(&interface.fields[0].type_expr),
+            type_expr!(String)
         );
-        assert_eq!(type_attrs[0].name.as_str(), "stream.done");
-    }
-
-    #[test]
-    fn type_attr_after_field_attr_parses_as_type_attribute() {
-        // THE FIX: @alias("bar") before @stream.done now works correctly.
-        // Both attrs are consumed inside TYPE_EXPR, then disambiguation
-        // hoists @alias to FieldDef and keeps @stream.done on TypeExpr.
-        let source = r#"
-class Foo {
-  foo Fizz @alias("bar") @stream.done
-}
-"#;
-        let class = first_class(parse_and_lower(source));
-        let field = class
-            .fields
-            .iter()
-            .find(|f| f.name.as_str() == "foo")
-            .expect("expected field 'foo'");
-
-        // Field attribute: @alias("bar") — hoisted from TypeExpr to FieldDef
-        assert_eq!(
-            field.attributes.len(),
-            1,
-            "expected 1 field attribute, got {:?}",
-            field.attributes
-        );
-        assert_eq!(field.attributes[0].name.as_str(), "alias");
-
-        // Type attribute: @stream.done stays on the TypeExpr
-        assert_eq!(
-            strip_spans(&field.type_expr),
-            type_expr!(Path("Fizz", Attr("stream.done")))
-        );
-    }
-
-    #[test]
-    fn type_attrs_on_optional_type() {
-        let source = r#"
-class Foo {
-  bar int? @stream.done
-}
-"#;
-        let class = first_class(parse_and_lower(source));
-        let field = class
-            .fields
-            .iter()
-            .find(|f| f.name.as_str() == "bar")
-            .expect("expected field 'bar'");
-
-        let type_expr = &field.type_expr;
-        // Type should be Optional(Int)
-        assert!(
-            matches!(type_expr.kind, TypeExprKind::Optional { .. }),
-            "expected Optional type, got {type_expr:?}",
-        );
-        // @stream.done should be a type attribute
-        let type_attrs = type_expr.attrs();
-        assert_eq!(
-            type_attrs.len(),
-            1,
-            "expected 1 type attribute, got {type_attrs:?}"
-        );
-        assert_eq!(type_attrs[0].name.as_str(), "stream.done");
-    }
-
-    #[test]
-    fn type_attrs_on_array_type() {
-        let source = r#"
-class Foo {
-  items string[] @stream.done
-}
-"#;
-        let class = first_class(parse_and_lower(source));
-        let field = class
-            .fields
-            .iter()
-            .find(|f| f.name.as_str() == "items")
-            .expect("expected field 'items'");
-
-        let type_expr = &field.type_expr;
-        assert!(
-            matches!(type_expr.kind, TypeExprKind::List { .. }),
-            "expected List type, got {type_expr:?}",
-        );
-        let type_attrs = type_expr.attrs();
-        assert_eq!(
-            type_attrs.len(),
-            1,
-            "expected 1 type attribute, got {type_attrs:?}"
-        );
-        assert_eq!(type_attrs[0].name.as_str(), "stream.done");
-        // Type attribute: @stream.done stays on the TypeExpr
-        assert_eq!(
-            strip_spans(&field.type_expr),
-            type_expr!(WithAttrs((List(String)), Attr("stream.done")))
-        );
-    }
-
-    // ── Attribute disambiguation sanity checks ──────────────────────────────
-    //
-    // Comprehensive coverage lives in baml_tests/projects/attr_disambiguation/.
-    // These unit tests verify the core AST-level mechanics:
-    //  1. The bug fix (field-before-type ordering)
-    //  2. Union trailing attr → hoisted to FieldDef
-    //  3. Nested field attr → validation error
-
-    /// Helper: parse BAML source, lower to AST, and also return field-attr validation diagnostics.
-    fn parse_lower_validate(
-        source: &str,
-    ) -> (Vec<Item>, Vec<(std::string::String, text_size::TextRange)>) {
-        let root = parse(source);
-        let (items, diags, _env_var_refs) = lower_file(&root);
-        // Separate out field-attr-in-type-position diagnostics from other diagnostics.
-        let mut field_attr_errors = Vec::new();
-        let mut other_diags = Vec::new();
-        for d in diags {
-            match d {
-                crate::lowering_diagnostic::LoweringDiagnostic::FieldAttributeInTypePosition {
-                    attr_name,
-                    span,
-                } => {
-                    field_attr_errors.push((attr_name, span));
-                }
-                other => other_diags.push(other),
-            }
-        }
-        assert!(
-            other_diags.is_empty(),
-            "expected no non-field-attr diagnostics, got: {other_diags:#?}"
-        );
-        (items, field_attr_errors)
-    }
-
-    #[test]
-    fn field_attr_before_type_attr_disambiguated_correctly() {
-        // The core bug: @alias before @stream.done used to misclassify @stream.done.
-        let source = r#"
-class C {
-  f Foo @alias("x") @stream.done
-}
-"#;
-        let (items, diags) = parse_lower_validate(source);
-        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
-        let class = first_class(items);
-        let field = &class.fields[0];
-        assert_eq!(field.attributes.len(), 1);
-        assert_eq!(field.attributes[0].name.as_str(), "alias");
-        let te = &field.type_expr;
-        assert_eq!(te.attrs().len(), 1);
-        assert_eq!(te.attrs()[0].name.as_str(), "stream.done");
-    }
-
-    #[test]
-    fn custom_schema_attr_is_hoisted_but_stream_attr_stays_on_type() {
-        let source = r#"
-class C {
-  f string @custom("read-back") @stream.done
-}
-"#;
-        let (items, diags) = parse_lower_validate(source);
-        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
-        let class = first_class(items);
-        let field = &class.fields[0];
-        assert_eq!(field.attributes.len(), 1);
-        assert_eq!(field.attributes[0].name.as_str(), "custom");
-        assert_eq!(field.type_expr.attrs().len(), 1);
-        assert_eq!(field.type_expr.attrs()[0].name.as_str(), "stream.done");
-    }
-
-    #[test]
-    fn union_trailing_field_attr_hoisted_to_field() {
-        // A | B | C @alias("x") → @alias hoisted to FieldDef, Union has no attrs.
-        let source = r#"
-class C {
-  f A | B | C @alias("x")
-}
-"#;
-        let (items, diags) = parse_lower_validate(source);
-        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
-        let class = first_class(items);
-        let field = &class.fields[0];
-        assert_eq!(field.attributes.len(), 1);
-        assert_eq!(field.attributes[0].name.as_str(), "alias");
-        assert!(matches!(
-            &field.type_expr.kind,
-            TypeExprKind::Union { attrs, .. } if attrs.is_empty()
-        ));
-    }
-
-    #[test]
-    fn field_attr_in_nested_position_produces_diagnostic() {
-        // (Foo @alias("x"))[] → @alias inside parens is an error.
-        let source = r#"
-class C {
-  f (Foo @alias("x"))[]
-}
-"#;
-        let (_, diags) = parse_lower_validate(source);
-        assert_eq!(diags.len(), 1, "expected 1 diagnostic, got {diags:?}");
-        assert_eq!(diags[0].0, "alias");
-    }
-
-    #[test]
-    fn type_attr_on_inner_union_member_stays_on_member() {
-        // (A | B @stream.done) | C → @stream.done should apply to B specifically,
-        // not to the inner union (A | B).
-        let source = r#"
-class C {
-  f (A | B @stream.done) | C
-}
-"#;
-        let class = first_class(parse_and_lower(source));
-        let field = &class.fields[0];
-        assert_eq!(
-            strip_spans(&field.type_expr),
-            type_expr!(Union(
-                (Union((Path("A")), (Path("B", Attr("stream.done"))))),
-                (Path("C"))
-            ))
-        );
-    }
-
-    #[test]
-    fn paren_union_trailing_type_attr_stays_on_last_member() {
-        // (A | B | C @stream.done) → no trailing hoisting inside type expressions,
-        // so @stream.done stays on C, not on the inner union.
-        let source = r#"
-class C {
-  f (A | B | C @stream.done)
-}
-"#;
-        let (items, diags) = parse_lower_validate(source);
-        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
-        let class = first_class(items);
-        let field = &class.fields[0];
-
-        assert_eq!(
-            strip_spans(&field.type_expr),
-            type_expr!(Union(
-                (Path("A")),
-                (Path("B")),
-                (Path("C", Attr("stream.done")))
-            ))
-        );
-    }
-
-    #[test]
-    fn paren_union_trailing_field_attr_produces_diagnostic() {
-        // (A | B | C @alias("x")) → @alias is a field attr inside parens,
-        // should produce a diagnostic (can't be hoisted from nested position).
-        let source = r#"
-class C {
-  f (A | B | C @alias("x"))
-}
-"#;
-        let (_, diags) = parse_lower_validate(source);
-        assert_eq!(diags.len(), 1, "expected 1 diagnostic, got {diags:?}");
-        assert_eq!(diags[0].0, "alias");
     }
 
     // ─── BEP-049: backtick string literal lowering ────────────────────────────
@@ -2460,6 +2168,17 @@ function Demo() -> string {
     }
 
     #[test]
+    fn backtick_single_line_keeps_escaped_newline() {
+        let source = r#"
+function Demo() -> string {
+    `hostname\n`
+}
+"#;
+        let items = parse_and_lower(source);
+        assert_eq!(extract_first_string_literal(items), "hostname\n");
+    }
+
+    #[test]
     fn backtick_escapes_backtick_and_dollar() {
         let source = r#"
 function Demo() -> string {
@@ -2482,6 +2201,35 @@ function Demo() -> string {
 ";
         let items = parse_and_lower(source);
         assert_eq!(extract_first_string_literal(items), "line one\nline two");
+    }
+
+    #[test]
+    fn backtick_single_line_preserves_boundary_whitespace() {
+        let source = r#"
+function Demo() -> string {
+    `  padded content  `
+}
+"#;
+        let items = parse_and_lower(source);
+        assert_eq!(extract_first_string_literal(items), "  padded content  ");
+    }
+
+    #[test]
+    fn backtick_multiline_trims_boundary_layout() {
+        let source = [
+            "function Demo() -> string {",
+            "    `",
+            "",
+            "        line one",
+            "         ",
+            "        line two",
+            "",
+            "    `",
+            "}",
+        ]
+        .join("\n");
+        let items = parse_and_lower(&source);
+        assert_eq!(extract_first_string_literal(items), "line one\n\nline two");
     }
 
     #[test]
@@ -2646,15 +2394,15 @@ mod traverse_coverage_tests {
   let branched = `${if (n > 0)}pos${else}neg${endif}`
   return plain + looped + branched
 }"#,
-            // BEP-066 hides ordinary expression nodes inside type arguments,
-            // type bindings, and patterns. Canonical traversal must still see
-            // every one exactly once.
+            // A `type T = unreflect(t)` binding hides an ordinary expression
+            // node inside a statement. Canonical traversal must still see it
+            // exactly once.
             r#"function runtime_edges(t: reflect.Type, value: int) -> int throws never {
   type T = unreflect(t)
-  let called = identity<unreflect(t)>(value)
-  let tested = value is unreflect(t)
+  let called = identity<T>(value)
+  let tested = value is T
   match (value) {
-    unreflect(t) => called,
+    T => called,
     _ => if (tested) { value } else { 0 }
   }
 }"#,

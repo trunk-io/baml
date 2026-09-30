@@ -20,12 +20,9 @@
 //! }
 //! ```
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
-use baml_db::{Name, ProjectDatabase, SourceFile, SourceRoot, SourceRootKind, SourceRootSpec};
+use baml_db::ProjectDatabase;
 use bex_engine::{BexCallArg, BexEngine, BexExternalValue, FunctionCallContextBuilder};
 use bex_vm::debug::{BytecodeFormat, display_program};
 use bex_vm_types::{Function, Object, Program};
@@ -376,90 +373,7 @@ pub async fn try_call_by_name(
         .await
 }
 
-/// Test-database conveniences over [`ProjectDatabase`]'s source-root API.
-///
-/// Test fixtures overwhelmingly want one thing: a stdlib-equipped database
-/// with a single `Workspace` root that files are dropped into by path, plus
-/// the occasional source-bearing dependency package. This trait spells that
-/// out once so fixtures read `db.workspace(root)` / `db.file(path, text)`
-/// instead of repeating the root bookkeeping. It is test support only —
-/// production code adds roots and files explicitly.
-pub trait TestDbExt {
-    /// Install the stdlib sources and add the `Workspace` root at `root` for
-    /// the reserved `user` package.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the database already has a `Workspace` root (or `root` is
-    /// otherwise rejected — see [`baml_db::SourceRootError`]).
-    fn workspace(&mut self, root: &Path) -> SourceRoot;
-
-    /// Add a source-bearing `Dependency` root for `package` at
-    /// `<builtin>/<package>`.
-    ///
-    /// The `<builtin>/` prefix is deliberate: it is the emit layer's wire
-    /// contract for non-workspace units, so files added under this root
-    /// (`db.file("<builtin>/<package>/lib.baml", ...)`) ride the same emit
-    /// group as the stdlib and can be captured as a mountable
-    /// `PackageInterface` blob plus symbolic compilation units.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `package` is already served by another root or a mounted
-    /// blob (see [`baml_db::SourceRootError`]).
-    fn dependency(&mut self, package: &str) -> SourceRoot;
-
-    /// Add or update the file at `path`, owned by the live root whose path is
-    /// the longest prefix of `path`; a path under no root (e.g. the bare
-    /// `test.baml` most fixtures use) goes to the `Workspace` root.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `path` is under no root and the database has no `Workspace`
-    /// root — call [`TestDbExt::workspace`] first.
-    fn file(&mut self, path: impl AsRef<Path>, text: &str) -> SourceFile;
-}
-
-impl TestDbExt for ProjectDatabase {
-    fn workspace(&mut self, root: &Path) -> SourceRoot {
-        self.ensure_stdlib_sources();
-        self.add_source_root(SourceRootSpec {
-            path: root.to_path_buf(),
-            package: Name::new(baml_type::RESERVED_USER_PACKAGE),
-            kind: SourceRootKind::Workspace,
-        })
-        .unwrap_or_else(|err| {
-            panic!(
-                "cannot add the workspace source root at `{}`: {err}",
-                root.display()
-            )
-        })
-    }
-
-    fn dependency(&mut self, package: &str) -> SourceRoot {
-        self.add_source_root(SourceRootSpec {
-            path: PathBuf::from(format!("<builtin>/{package}")),
-            package: Name::new(package),
-            kind: SourceRootKind::Dependency,
-        })
-        .unwrap_or_else(|err| panic!("cannot add the dependency source root `{package}`: {err}"))
-    }
-
-    fn file(&mut self, path: impl AsRef<Path>, text: &str) -> SourceFile {
-        let path = path.as_ref();
-        let root = self
-            .source_root_for_path(path)
-            .or_else(|| self.workspace_root())
-            .unwrap_or_else(|| {
-                panic!(
-                    "no source root owns `{}` and the database has no workspace root; \
-                     call `TestDbExt::workspace` (or `db_with_root`) first",
-                    path.display()
-                )
-            });
-        self.add_or_update_file_in(root, path, text)
-    }
-}
+pub use baml_db::testing::TestDbExt;
 
 /// A fresh database with the stdlib installed and one `Workspace` root at
 /// `root` (package `user`) — [`ProjectDatabase::new`] followed by
@@ -577,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn optional_dropping_adapter_preserves_source_defaults() {
+    async fn narrowed_function_value_preserves_source_defaults() {
         let output = run_test(
             r#"
             function combine(x: int, a: int = 10, b: int = 100) -> int {
@@ -597,80 +511,8 @@ mod tests {
 
         assert_eq!(output.result, Ok(BexExternalValue::Int(16)));
         engine_snapshot!(
-            "optional_dropping_adapter_preserves_source_defaults_bytecode",
+            "narrowed_function_value_preserves_source_defaults_bytecode",
             output.bytecode
         );
-    }
-
-    #[tokio::test]
-    async fn optional_adapter_reorders_named_optional_params() {
-        let output = run_test(
-            r#"
-            function combine(x: int, a: int = 10, b: int = 100) -> int {
-              (x * 100) + (a * 10) + b
-            }
-
-            function main() -> int {
-              let f: (x: int, b?: int, a?: int) -> int throws never = combine;
-              f(1, b = 5, a = 2)
-            }
-            "#,
-            "main",
-            IndexMap::new(),
-            OptLevel::One,
-        )
-        .await;
-
-        assert_eq!(output.result, Ok(BexExternalValue::Int(125)));
-    }
-
-    #[tokio::test]
-    async fn optional_adapter_applies_to_concrete_call_argument() {
-        let output = run_test(
-            r#"
-            function combine(x: int, a: int = 10, b: int = 100) -> int {
-              x + a + b
-            }
-
-            function apply(f: (x: int, b?: int) -> int) -> int {
-              f(1, b = 5)
-            }
-
-            function main() -> int {
-              apply(combine)
-            }
-            "#,
-            "main",
-            IndexMap::new(),
-            OptLevel::One,
-        )
-        .await;
-
-        assert_eq!(output.result, Ok(BexExternalValue::Int(16)));
-    }
-
-    #[tokio::test]
-    async fn optional_adapter_applies_to_generic_call_argument() {
-        let output = run_test(
-            r#"
-            function combine(x: int, a: int = 10, b: int = 100) -> int {
-              x + a + b
-            }
-
-            function apply<T>(f: (x: T, b?: int) -> T, value: T) -> T {
-              f(value, b = 5)
-            }
-
-            function main() -> int {
-              apply(combine, 1)
-            }
-            "#,
-            "main",
-            IndexMap::new(),
-            OptLevel::One,
-        )
-        .await;
-
-        assert_eq!(output.result, Ok(BexExternalValue::Int(16)));
     }
 }

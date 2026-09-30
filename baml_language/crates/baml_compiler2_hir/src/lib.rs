@@ -12,6 +12,7 @@
 //! - Per-item queries: `function_signature`, `function_body`
 //! - Cross-file aggregation: `namespace_items`, `package_items`
 
+mod attrs;
 pub mod body;
 pub mod body_type_refs;
 mod builder;
@@ -20,10 +21,12 @@ pub mod diagnostic;
 pub mod file_package;
 pub mod ids;
 pub mod inputs;
+pub mod item_data;
 pub mod item_tree;
 pub mod loc;
 pub mod namespace;
 pub mod package;
+pub mod resolve;
 pub mod scope;
 pub mod semantic_index;
 pub mod signature;
@@ -32,7 +35,7 @@ pub mod type_ref;
 use std::sync::Arc;
 
 use baml_base::SourceFile;
-pub use builder::{KNOWN_TYPE_ATTRS, SemanticIndexBuilder};
+pub use builder::SemanticIndexBuilder;
 pub use semantic_index::{ExprMetadataKey, ExprMetadataScope, PathResolution};
 
 use crate::{
@@ -46,9 +49,9 @@ use crate::{
 /// Database trait for `compiler2_hir` queries — the base of the compiler2
 /// `Db` trait chain.
 ///
-/// Provides the source-root table (which files exist, grouped into packages)
-/// plus the compile-cache seed inputs ([`inputs`]). Use `file_semantic_index`
-/// for HIR queries.
+/// Provides the source-root table (the packages, their files, and their
+/// dependency edges) plus the compile-cache seed inputs ([`inputs`]). Use
+/// `file_semantic_index` for HIR queries.
 #[salsa::db]
 pub trait Db: salsa::Database {
     /// The ordered set of source roots in this database.
@@ -99,19 +102,11 @@ pub trait Db: salsa::Database {
         None
     }
 
-    /// Source-less dependency packages mounted into this database as serialized
-    /// `PackageInterface` blobs, keyed by the package name (the mount alias).
-    ///
-    /// When present (BEP-066 mounted-package linking), each entry makes its name a *dependency*
-    /// of every user package (`package_dependencies`) whose `package_interface`
-    /// is served straight from the blob — the mounted package has **no source
-    /// files** (`package_items` is empty; that is the point). Cross-package
-    /// resolution for a mounted name goes through the interface rows instead of
-    /// raw items. Names colliding with the reserved package set (the stdlib
-    /// packages, `user`, `root`, `env`) are ignored entirely — see
-    /// `crate::package::mounted_package_names`. Defaults to `None`:
-    /// every other database resolves dependencies from source only.
-    fn mounted_packages(&self) -> Option<inputs::MountedPackages> {
+    /// Where the language packages are installed (see
+    /// [`package::lang_roots`]). Defaults to `None`: a database with no
+    /// stdlib knows no language package, and every identity test against
+    /// one is `false`.
+    fn lang_roots_input(&self) -> Option<inputs::LangRootsInput> {
         None
     }
 }
@@ -130,8 +125,8 @@ pub trait Db: salsa::Database {
 /// only ever shift *user* indices.
 ///
 /// Whole-program consumers only (check drivers, emit, MIR tags, caches).
-/// Package-scoped readers use [`package::package_files`] so edits in one
-/// root cannot invalidate another package's file-set-derived queries.
+/// Package-scoped readers use `root.files(db)` so edits in one root cannot
+/// invalidate another package's file-set-derived queries.
 pub fn compiler2_all_files(db: &dyn Db) -> Vec<baml_base::SourceFile> {
     let roots = db.source_roots().roots(db);
     debug_assert!(
@@ -180,8 +175,7 @@ unsafe impl salsa::Update for FileAst {
 /// CST → AST lowering for one file, computed once and shared.
 ///
 /// Salsa-tracked because several different consumers need a file's AST items:
-/// both `file_semantic_index` queries (HIR + PPIR), `ppir_expansion_items`,
-/// PPIR's two project-wide expansion-map collectors, and the LSP check pass.
+/// `file_semantic_index` and the LSP check pass.
 /// Before this query existed each of them re-lowered the syntax tree from
 /// scratch; the repeated CST traversal was ~31% of cold-compile CPU on the
 /// test corpus (see `crates/tools_compile_profile/README.md`, July 2026 audit).
@@ -259,12 +253,24 @@ pub fn file_symbol_contributions(
 /// Not tracked — the item tree is cached via `file_semantic_index`.
 ///
 /// `pub(crate)`: the raw `ItemTree` is an implementation detail behind the
-/// PPIR item-data firewall (`baml_compiler2_ppir::item_data`). Consumers use
-/// the enumeration (`file_classes`/`file_functions`/…) and lookup
-/// (`class_data`/`function_data`/…) queries there, never the tree itself.
+/// [`item_data`] firewall. Consumers use the enumeration
+/// (`file_classes`/`file_functions`/…) and lookup (`class_data`/
+/// `function_data`/…) queries there, never the tree itself.
 pub(crate) fn file_item_tree(db: &dyn Db, file: SourceFile) -> Arc<ItemTree> {
     let index = file_semantic_index(db, file);
     Arc::clone(&index.item_tree)
+}
+
+/// Returns the item-tree source map for a file.
+///
+/// `pub(crate)`: spans are served by the per-item `*_source_map` queries in
+/// [`item_data`].
+pub(crate) fn file_item_tree_source_map(
+    db: &dyn Db,
+    file: SourceFile,
+) -> Arc<crate::item_tree::ItemTreeSourceMap> {
+    let index = file_semantic_index(db, file);
+    Arc::clone(&index.item_tree_source_map)
 }
 
 /// Returns the `ScopeBindings` for a given scope.

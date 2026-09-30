@@ -4,7 +4,10 @@
 //! corpus-scale check is the differential MIR gate; these pin the
 //! per-road recording semantics the gate builds on.
 
-use baml_compiler2_hir_ty::infer::{CallTypeArgPlan, MemberResolution, RuntimeCheck, infer_body};
+use baml_compiler2_hir_ty::{
+    infer::{CallTypeArgPlan, MemberResolution, MethodCallee, Receiver, infer_body},
+    render::Viewpoint,
+};
 
 use crate::engine::TestDbExt;
 
@@ -15,8 +18,8 @@ fn member_resolutions(source: &str) -> Vec<(String, String)> {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut out = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
@@ -30,21 +33,59 @@ fn member_resolutions(source: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The dispatch MODE of a resolution. A class-inherent method spells its
+/// binding too, as the historical names did; an interface method's binding
+/// is the separate axis [`receiver`] reads.
 fn kind(resolution: &MemberResolution<'_>) -> &'static str {
     match resolution {
         MemberResolution::Field { .. } => "Field",
         MemberResolution::Variant { .. } => "Variant",
         MemberResolution::Free { .. } => "Free",
-        MemberResolution::BoundMethod { .. } => "BoundMethod",
-        MemberResolution::UnboundMethod { .. } => "UnboundMethod",
-        MemberResolution::InterfaceVirtualMethod { .. } => "InterfaceVirtualMethod",
-        MemberResolution::InterfaceConcreteMethod { .. } => "InterfaceConcreteMethod",
+        MemberResolution::Method {
+            callee: MethodCallee::Inherent(_),
+            receiver: Receiver::Bound,
+        } => "BoundMethod",
+        MemberResolution::Method {
+            callee: MethodCallee::Inherent(_),
+            receiver: Receiver::Unbound,
+        } => "UnboundMethod",
+        MemberResolution::Method {
+            callee: MethodCallee::Virtual { .. },
+            ..
+        } => "InterfaceVirtualMethod",
+        MemberResolution::Method {
+            callee: MethodCallee::Concrete { .. },
+            ..
+        } => "InterfaceConcreteMethod",
         MemberResolution::InterfaceVirtualField { .. } => "InterfaceVirtualField",
-        MemberResolution::External(_) => "External",
-        MemberResolution::ExternalField { .. } => "ExternalField",
-        MemberResolution::ExternalVariant { .. } => "ExternalVariant",
-        MemberResolution::ExternalInterfaceVirtualField { .. } => "ExternalInterfaceVirtualField",
     }
+}
+
+/// Every recorded METHOD resolution in `source` with whether the access
+/// binds its receiver, as sorted `(snippet, "Bound" | "Unbound")` pairs.
+fn method_receivers(source: &str) -> Vec<(String, &'static str)> {
+    let mut db = crate::compiler2_tir::support::make_db();
+    let file = db.file("test.baml", source);
+    let mut out = Vec::new();
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
+            continue;
+        };
+        let result = infer_body(&db, owner);
+        for (&expr, resolution) in &result.member_resolutions {
+            let MemberResolution::Method { receiver, .. } = resolution else {
+                continue;
+            };
+            let range = source_map.expr_span(expr);
+            let receiver = match receiver {
+                Receiver::Bound => "Bound",
+                Receiver::Unbound => "Unbound",
+            };
+            out.push((source[range].to_string(), receiver));
+        }
+    }
+    out.sort();
+    out
 }
 
 #[test]
@@ -156,6 +197,64 @@ function mr_concrete(d: Dog) -> string throws never {
     );
 }
 
+/// The binding axis is independent of the dispatch mode: `recv.m()` binds
+/// its receiver whether the callee is inherent, a virtual slot, or a
+/// statically-matched impl; `I.m(recv)` and `(C as I).m(recv)` never do —
+/// there `self` is the written first argument.
+#[test]
+fn records_method_binding_axis() {
+    let source = r#"
+interface Counter {
+    function start(self) -> int throws never
+}
+class Tally {
+    n int
+    implements Counter {
+        function start(self) -> int throws never {
+            self.n
+        }
+    }
+}
+function mr_bound(t: Tally, c: Counter) -> int throws never {
+    t.start() + c.start()
+}
+function mr_unbound(t: Tally) -> int throws never {
+    Counter.start(t) + (Tally as Counter).start(t)
+}
+"#;
+    let kinds = member_resolutions(source);
+    let receivers = method_receivers(source);
+    assert!(
+        kinds.contains(&("t.start".into(), "InterfaceConcreteMethod".into()))
+            && receivers.contains(&("t.start".into(), "Bound")),
+        "concrete receiver access is Bound: {kinds:?} / {receivers:?}"
+    );
+    assert!(
+        kinds.contains(&("c.start".into(), "InterfaceVirtualMethod".into()))
+            && receivers.contains(&("c.start".into(), "Bound")),
+        "existential receiver access is Bound: {kinds:?} / {receivers:?}"
+    );
+    assert!(
+        kinds.contains(&("Counter.start".into(), "InterfaceVirtualMethod".into()))
+            && receivers.contains(&("Counter.start".into(), "Unbound")),
+        "interface-qualified access is Unbound: {kinds:?} / {receivers:?}"
+    );
+    assert!(
+        receivers.iter().any(
+            |(snippet, receiver)| snippet.ends_with("Counter).start") && *receiver == "Unbound"
+        ),
+        "written-qualifier access is Unbound: {receivers:?}"
+    );
+    assert!(
+        !receivers.iter().any(|(snippet, receiver)| {
+            (snippet == "t.start" || snippet == "c.start") && *receiver == "Unbound"
+        }) && !receivers
+            .iter()
+            .any(|(snippet, receiver)| snippet.contains("Counter") && *receiver == "Bound"),
+        "no access records both bindings: {receivers:?}"
+    );
+}
+
 #[test]
 fn records_variant() {
     let resolutions = member_resolutions(
@@ -198,8 +297,8 @@ function mr_chain(p: Person) -> string throws never {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut ladders = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
@@ -210,7 +309,7 @@ function mr_chain(p: Person) -> string throws never {
                 .segments
                 .iter()
                 .map(|segment| {
-                    let ty = segment.ty.render_canonical();
+                    let ty = segment.ty.render_with(&Viewpoint::canonical(&db));
                     match &segment.resolution {
                         Some(resolution) => format!("{ty}/{}", kind(resolution)),
                         None => ty,
@@ -256,8 +355,8 @@ function cp_use() -> int throws never {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut plans = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
@@ -267,7 +366,7 @@ function cp_use() -> int throws never {
             let type_args: Vec<String> = plan
                 .type_args
                 .iter()
-                .map(|ty| ty.render_canonical())
+                .map(|ty| ty.render_with(&Viewpoint::canonical(&db)))
                 .collect();
             let bindings: Vec<String> = plan
                 .bindings
@@ -322,8 +421,8 @@ function rt_owner_use() -> RtBox<int> throws never {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut seen = false;
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
@@ -343,13 +442,13 @@ function rt_owner_use() -> RtBox<int> throws never {
             assert_eq!(plan.own_offset, 0);
             assert!(matches!(
                 plan.slots.as_slice(),
-                [CallTypeArgPlan::Static { ty, .. }]
-                    if ty.render_canonical() == "int"
+                [CallTypeArgPlan { ty, .. }]
+                    if ty.render_with(&Viewpoint::canonical(&db)) == "int"
             ));
             assert_eq!(
                 plan.type_args
                     .iter()
-                    .map(|ty| ty.render_canonical())
+                    .map(|ty| ty.render_with(&Viewpoint::canonical(&db)))
                     .collect::<Vec<_>>(),
                 vec!["int"]
             );
@@ -359,103 +458,16 @@ function rt_owner_use() -> RtBox<int> throws never {
 }
 
 #[test]
-fn runtime_call_plan_preserves_mixed_slots_and_precise_deferrals() {
-    let source = r#"
-interface RtAnchor {}
-interface RtStatic {}
-class RtGood { implements RtStatic {} }
-function rt_mix<A extends RtAnchor, B extends RtStatic>(a: A, b: B, plain: int) -> A throws never {
-    a
-}
-function rt_use(runtime_t: reflect.Type, good: RtGood) -> RtAnchor throws never {
-    rt_mix<unreflect(runtime_t), RtGood>(42, good, 7)
-}
-"#;
-    let mut db = crate::compiler2_tir::support::make_db();
-    let file = db.file("test.baml", source);
-    let mut seen = false;
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
-            continue;
-        };
-        let result = infer_body(&db, owner);
-        assert!(
-            result
-                .type_of_expr
-                .values()
-                .chain(result.call_plans.values().flat_map(|plan| &plan.type_args))
-                // Groundness itself is type-enforced now (the plain artifact
-                // has no variable variant); what remains checkable is that
-                // finalize did not leak whole-table error residue.
-                .any(|ty| !matches!(ty, baml_type::Ty::Error { .. })),
-            "final inference tables must not be all-error"
-        );
-        for (&call, plan) in &result.call_plans {
-            if &source[source_map.expr_span(call)]
-                != "rt_mix<unreflect(runtime_t), RtGood>(42, good, 7)"
-            {
-                continue;
-            }
-            seen = true;
-            assert_eq!(plan.slots.len(), 2);
-            assert!(matches!(
-                &plan.slots[0],
-                CallTypeArgPlan::Runtime { occurrence_ty, parameter, .. }
-                    if occurrence_ty.render_canonical() == "user.RtAnchor"
-                        && parameter.name().as_str() == "A"
-            ));
-            assert!(matches!(
-                &plan.slots[1],
-                CallTypeArgPlan::Static { ty, .. }
-                    if ty.render_canonical() == "user.RtGood"
-            ));
-            assert_eq!(
-                plan.type_args
-                    .iter()
-                    .map(|ty| ty.render_canonical())
-                    .collect::<Vec<_>>(),
-                vec!["user.RtAnchor", "user.RtGood"]
-            );
-            assert_eq!(
-                plan.deferred_checks
-                    .iter()
-                    .filter(|check| matches!(check, RuntimeCheck::Argument { .. }))
-                    .count(),
-                1,
-                "only argument `a: A` depends on the runtime slot"
-            );
-            assert_eq!(
-                plan.deferred_checks
-                    .iter()
-                    .filter(|check| matches!(check, RuntimeCheck::Bound { .. }))
-                    .count(),
-                1,
-                "only A's bound is runtime-deferred; B's bound stays static"
-            );
-            assert_eq!(plan.bindings.len(), 3, "binding enrichment kept type slots");
-        }
-    }
-    assert!(seen, "runtime call plan was not recorded");
-}
-
-#[test]
 fn runtime_call_special_contracts_are_narrow_and_diagnostic() {
     use baml_compiler2_hir_ty::diagnostics::TirTypeError;
 
     let source = r#"
 function sc_id<T>(value: T) -> T throws never { value }
 function sc_contract<F>() -> null throws never { null }
-function __make_stream<T>(value: T) -> T throws never { value }
 
 function sc_bare() -> int throws never {
     let runtime_t = reflect.Type.of<int>();
     sc_id<runtime_t>(1)
-}
-function sc_bad_operand() -> int throws never {
-    sc_id<unreflect(42)>(42)
-}
-function sc_stream(runtime_t: reflect.Type) -> int throws never {
-    __make_stream<unreflect(runtime_t)>(1)
 }
 function sc_ordinary_contract() -> null throws never {
     sc_contract<(string) -> string>()
@@ -480,8 +492,8 @@ function sc_companion() -> baml.Map<string, int> throws never {
     let mut errors = Vec::new();
     let mut extraction_throws = None;
     let mut session_args = None;
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let source_map = baml_compiler2_ppir::body_source_map(&db, owner);
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let source_map = baml_compiler2_hir::body::body_source_map(&db, owner);
         let result = infer_body(&db, owner);
         errors.extend(result.diagnostics.iter().map(|diag| diag.error.clone()));
         let Some(source_map) = source_map else {
@@ -490,19 +502,18 @@ function sc_companion() -> baml.Map<string, int> throws never {
         for (&call, plan) in &result.call_plans {
             let snippet = &source[source_map.expr_span(call)];
             if snippet.starts_with("pkg.get_function") {
-                extraction_throws = plan.slots.first().and_then(|slot| match slot {
-                    CallTypeArgPlan::Static { ty, .. } => match ty {
-                        baml_type::Ty::Function { throws, .. } => Some(throws.render_canonical()),
-                        _ => None,
-                    },
-                    CallTypeArgPlan::Runtime { .. } => None,
+                extraction_throws = plan.slots.first().and_then(|slot| match &slot.ty {
+                    baml_type::Ty::Function { throws, .. } => {
+                        Some(throws.render_with(&Viewpoint::canonical(&db)))
+                    }
+                    _ => None,
                 });
             }
             if snippet.starts_with("session.eval") {
                 session_args = Some(
                     plan.type_args
                         .iter()
-                        .map(|ty| ty.render_canonical())
+                        .map(|ty| ty.render_with(&Viewpoint::canonical(&db)))
                         .collect::<Vec<_>>(),
                 );
             }
@@ -524,56 +535,46 @@ function sc_companion() -> baml.Map<string, int> throws never {
     )));
     assert!(errors.iter().any(|error| matches!(
         error,
-        TirTypeError::RuntimeTypeArgumentOnStreamingCall { callee_name }
-            if callee_name.as_str() == "__make_stream"
-    )));
-    assert!(errors.iter().any(|error| matches!(
-        error,
         TirTypeError::CannotConstructReflectionKind { class_name }
-            if class_name.render_user_facing() == "reflect.class.Type"
+            if Viewpoint::canonical(&db).path(class_name) == "reflect.class.Type"
     )));
     assert!(errors.iter().any(|error| matches!(
         error,
         TirTypeError::CannotConstructBuiltinCompanion { class_name, companion }
-            if class_name.render_user_facing() == "baml.Map" && companion.builtin == "map"
-    )));
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TirTypeError::TypeMismatch { expected, got }
-            if expected.render_canonical() == "reflect.Type | reflect.TypeView" && got.render_canonical() == "42"
+            if Viewpoint::canonical(&db).path(class_name) == "baml.Map" && companion.builtin == "map"
     )));
     assert_eq!(extraction_throws.as_deref(), Some("unknown"));
     assert_eq!(session_args, Some(vec!["unknown".to_string()]));
 }
 
+// The inference tables behind a scoped `type T = …` binding, which BAML
+// cannot observe: the call plan carries the binding's own rigid parameter
+// (marked by the scoped index bit) while the name is in scope, and the
+// shadowed static class again once the block closes. The observable
+// semantics live in `baml_src/ns_scoped_type_bindings` and the
+// `scoped_type_*` diagnostic projects.
 #[test]
-fn scoped_runtime_types_shadow_and_erase_at_block_exit() {
+fn scoped_type_bindings_are_rigid_frame_parameters() {
     use baml_compiler2_hir_ty::diagnostics::TirTypeError;
 
     let source = r#"
 class ScopeT {}
-function scope_id<X>(value: X) -> X throws never { value }
-function scope_use(runtime_t: reflect.Type) -> ScopeT throws never {
-    let escaped = {
+function scope_id<X>(value: unknown) -> reflect.Type throws never { reflect.Type.of<X>() }
+function scope_use(runtime_t: reflect.Type) -> reflect.Type throws never {
+    let inner = {
         type ScopeT = unreflect(runtime_t)
         scope_id<ScopeT>(1)
     }
-    scope_id<ScopeT>(ScopeT {})
+    scope_id<ScopeT>(3)
 }
-function scope_lambda(runtime_t: reflect.Type) -> ((int) -> unknown throws never) throws never {
-    {
-        type LambdaT = unreflect(runtime_t)
-        (x: int) -> { scope_id<LambdaT>(x) }
-    }
-}
-function scope_branch(runtime_t: reflect.Type, choose: bool) -> ScopeT throws never {
+function scope_branch(runtime_t: reflect.Type, choose: bool) -> reflect.Type throws never {
     let branch_value = if choose {
         type ScopeT = unreflect(runtime_t)
         scope_id<ScopeT>(2)
     } else {
-        null
+        scope_id<int>(0)
     }
-    scope_id<ScopeT>(ScopeT {})
+    scope_id<ScopeT>(4)
 }
 function scope_bad() -> null throws never {
     type Bad = unreflect(42)
@@ -588,48 +589,30 @@ function scope_shape_bad(runtime_t: reflect.Type) -> null throws never {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut saw_inner = false;
-    let mut saw_outer = false;
+    let mut saw_outer = 0;
     let mut saw_branch = false;
-    let mut saw_erased_block = false;
-    let mut saw_lambda_erasure = false;
     let mut saw_bad_operand = false;
     let mut saw_static_shape_error = false;
-    let mut runtime_checks = 0;
     let mut diagnostics = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
         diagnostics.extend(result.diagnostics.iter().map(|diag| diag.error.clone()));
-        runtime_checks += result.runtime_checks.len();
-        for check in &result.runtime_checks {
-            assert!(
-                matches!(
-                    check,
-                    baml_compiler2_hir_ty::infer::RuntimeCheck::Argument { expected, .. }
-                        if matches!(
-                            expected,
-                            baml_type::Ty::TypeVar(param, _)
-                                if param.index() & 0x8000_0000 != 0
-                        )
-                ),
-                "unexpected runtime check: {check:?}"
-            );
-        }
         saw_bad_operand |= result.diagnostics.iter().any(|diag| {
             matches!(
                 &diag.error,
                 TirTypeError::TypeMismatch { expected, got }
-                    if expected.render_canonical() == "reflect.Type | reflect.TypeView" && got.render_canonical() == "42"
+                    if expected.render_with(&Viewpoint::canonical(&db)) == "reflect.Type | reflect.TypeView" && got.render_with(&Viewpoint::canonical(&db)) == "42"
             )
         });
         saw_static_shape_error |= result.diagnostics.iter().any(|diag| {
             matches!(
                 &diag.error,
                 TirTypeError::TypeMismatch { expected, got }
-                    if expected.render_canonical() == "ShapeT[]"
-                        && got.render_canonical() == "42"
+                    if expected.render_with(&Viewpoint::canonical(&db)) == "ShapeT[]"
+                        && got.render_with(&Viewpoint::canonical(&db)) == "42"
             )
         });
 
@@ -645,7 +628,7 @@ function scope_shape_bad(runtime_t: reflect.Type) -> null throws never {
                 assert!(binding.parameter.index() & 0x8000_0000 != 0);
                 assert!(matches!(
                     plan.type_args.as_slice(),
-                    [ty] if matches!(ty, baml_type::Ty::TypeVar(param, _)
+                    [ty] if matches!(ty, baml_type::Ty::TypeVar(param)
                         if param == &binding.parameter)
                 ));
             }
@@ -654,276 +637,36 @@ function scope_shape_bad(runtime_t: reflect.Type) -> null throws never {
                 saw_branch = true;
                 assert!(matches!(
                     plan.type_args.as_slice(),
-                    [ty] if matches!(ty, baml_type::Ty::TypeVar(param, _)
+                    [ty] if matches!(ty, baml_type::Ty::TypeVar(param)
                         if param == &binding.parameter)
                 ));
             }
-            if snippet == "scope_id<ScopeT>(ScopeT {})" {
-                saw_outer = true;
+            if snippet == "scope_id<ScopeT>(3)" || snippet == "scope_id<ScopeT>(4)" {
+                saw_outer += 1;
                 assert!(matches!(
                     plan.type_args.as_slice(),
-                    [ty] if ty.render_canonical() == "user.ScopeT"
+                    [ty] if ty.render_with(&Viewpoint::canonical(&db)) == "user.ScopeT"
                 ));
             }
         }
-
-        let mut binding_blocks: Vec<_> = result
-            .type_of_expr
-            .iter()
-            .filter_map(|(&expr, ty)| {
-                let snippet = &source[source_map.expr_span(expr)];
-                snippet
-                    .contains("type ScopeT = unreflect(runtime_t)")
-                    .then_some((snippet.len(), ty))
-            })
-            .collect();
-        binding_blocks.sort_by_key(|(len, _)| *len);
-        if let Some((_, ty)) = binding_blocks.first() {
-            saw_erased_block = true;
-            assert_eq!(ty.render_canonical(), "unknown");
-        }
-
-        let mut lambda_binding_blocks: Vec<_> = result
-            .type_of_expr
-            .iter()
-            .filter_map(|(&expr, ty)| {
-                let snippet = &source[source_map.expr_span(expr)];
-                snippet
-                    .contains("type LambdaT = unreflect(runtime_t)")
-                    .then_some((snippet.len(), ty))
-            })
-            .collect();
-        lambda_binding_blocks.sort_by_key(|(len, _)| *len);
-        if let Some((_, ty)) = lambda_binding_blocks.first() {
-            saw_lambda_erasure = true;
-            assert!(matches!(
-                &**ty,
-                baml_type::Ty::Function { ret, .. }
-                    if ret.render_canonical() == "unknown"
-            ));
-        }
     }
-    assert!(saw_inner && saw_outer && saw_branch && saw_erased_block && saw_lambda_erasure);
-    assert_eq!(runtime_checks, 3, "each scoped dependent check is durable");
+    assert!(saw_inner && saw_branch);
+    assert_eq!(
+        saw_outer, 2,
+        "the static class is restored at both closing braces"
+    );
     assert!(
         saw_bad_operand,
         "type-binding operand must be checked below `type`"
     );
     assert!(
         saw_static_shape_error,
-        "a runtime-dependent type must retain its statically known shape"
+        "a literal is not a value of a rigid scoped type"
     );
     assert_eq!(
         diagnostics.len(),
         2,
         "valid scoped bindings must not create static-only errors: {diagnostics:?}"
-    );
-}
-
-#[test]
-fn unreflect_patterns_are_distinct_non_covering_and_effect_scoped() {
-    use baml_compiler2_hir_ty::diagnostics::TirTypeError;
-
-    let source = r#"
-class ScopeEffect {}
-function scope_effect_type() -> reflect.Type throws ScopeEffect { throw ScopeEffect {} }
-function pat_open(t: reflect.Type, x: int) -> string {
-    match (x) {
-        unreflect(t) => "left",
-        unreflect(t) => "right",
-    }
-}
-function pat_closed(t: reflect.Type, x: int) -> string {
-    match (x) {
-        unreflect(t) => "left",
-        unreflect(t) => "right",
-        _ => "fallback",
-    }
-}
-function pat_bad(x: int) -> bool { x is unreflect(42) }
-function pat_effect(x: int) -> bool { x is unreflect(scope_effect_type()) }
-function pat_default(flag: bool = 1 is unreflect(scope_effect_type())) -> null { null }
-function pat_catch() -> bool {
-    { throw ScopeEffect {} } catch (e) {
-        ScopeEffect => 1 is unreflect(scope_effect_type())
-    }
-}
-function pat_lambda() -> ((int) -> bool throws ScopeEffect) throws never {
-    (x: int) -> { x is unreflect(scope_effect_type()) }
-}
-"#;
-    let mut db = crate::compiler2_tir::support::make_db();
-    let file = db.file("test.baml", source);
-    let mut non_exhaustive = 0;
-    let mut unreachable = 0;
-    let mut pattern_types = 0;
-    let mut saw_bad_operand = false;
-    let mut saw_direct_effect = false;
-    let mut saw_catch_effect = false;
-    let mut saw_lambda_effect = false;
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
-            continue;
-        };
-        let result = infer_body(&db, owner);
-        let owner_name = match owner {
-            baml_compiler2_hir::body::BodyOwnerId::Function(function)
-            | baml_compiler2_hir::body::BodyOwnerId::ParameterDefaults(function) => {
-                baml_compiler2_ppir::item_data::function_data(&db, function)
-                    .name
-                    .as_str()
-            }
-            baml_compiler2_hir::body::BodyOwnerId::Let(_) => "<let>",
-        };
-        if owner_name == "pat_catch" {
-            saw_catch_effect = result.throws.render_canonical() == "user.ScopeEffect";
-        }
-        non_exhaustive += result
-            .diagnostics
-            .iter()
-            .filter(|diag| matches!(&diag.error, TirTypeError::NonExhaustiveMatch { .. }))
-            .count();
-        unreachable += result
-            .diagnostics
-            .iter()
-            .filter(|diag| matches!(&diag.error, TirTypeError::UnreachableArm))
-            .count();
-        saw_bad_operand |= result.diagnostics.iter().any(|diag| {
-            matches!(
-                &diag.error,
-                TirTypeError::TypeMismatch { expected, got }
-                    if expected.render_canonical() == "reflect.Type | reflect.TypeView" && got.render_canonical() == "42"
-            )
-        });
-        let inferred_body = baml_compiler2_ppir::body(&db, owner);
-        let inferred_body = inferred_body.expr_body().expect("expression body");
-        for (pat, ty) in &result.type_of_pat {
-            if matches!(
-                inferred_body.patterns[*pat],
-                baml_compiler2_ast::Pattern::Unreflect(_)
-            ) {
-                pattern_types += 1;
-                assert!(
-                    matches!(ty.render_canonical().as_str(), "int" | "1"),
-                    "runtime pattern did not preserve its scrutinee type: {ty:?}"
-                );
-            }
-        }
-        for (&expr, ty) in &result.type_of_expr {
-            let snippet = &source[source_map.expr_span(expr)];
-            if snippet == "x is unreflect(scope_effect_type())" {
-                saw_direct_effect |= result.throws.render_canonical() == "user.ScopeEffect";
-            }
-            if snippet.starts_with("(x: int) ->") {
-                saw_lambda_effect |= matches!(
-                    ty,
-                    baml_type::Ty::Function { throws, .. }
-                        if throws.render_canonical() == "user.ScopeEffect"
-                ) && result.throws.render_canonical() == "never";
-            }
-        }
-    }
-    let default_function = baml_compiler2_ppir::item_data::file_functions(&db, file)
-        .iter()
-        .copied()
-        .find(|function| {
-            baml_compiler2_ppir::item_data::function_data(&db, *function)
-                .name
-                .as_str()
-                == "pat_default"
-        })
-        .expect("pat_default function");
-    let default_owner = baml_compiler2_hir::body::BodyOwnerId::ParameterDefaults(default_function);
-    let default_result = infer_body(&db, default_owner);
-    let saw_default_effect = default_result.throws.render_canonical() == "user.ScopeEffect";
-    let default_body = baml_compiler2_ppir::body(&db, default_owner);
-    let default_body = default_body.expr_body().expect("default expression body");
-    for (pat, ty) in &default_result.type_of_pat {
-        if matches!(
-            default_body.patterns[*pat],
-            baml_compiler2_ast::Pattern::Unreflect(_)
-        ) {
-            pattern_types += 1;
-            assert_eq!(ty.render_canonical(), "1");
-        }
-    }
-    assert_eq!(non_exhaustive, 1, "runtime patterns do not prove coverage");
-    assert_eq!(unreachable, 0, "distinct runtime predicates stay reachable");
-    assert_eq!(
-        pattern_types, 9,
-        "every runtime pattern preserves scrutinee type"
-    );
-    assert!(
-        saw_bad_operand
-            && saw_direct_effect
-            && saw_default_effect
-            && saw_catch_effect
-            && saw_lambda_effect
-    );
-}
-
-#[test]
-fn records_function_adapter() {
-    let source = r#"
-function ea_flex(a: int, b: int = 2) -> int throws never {
-    a
-}
-function ea_take(f: (x: int, y: int = 9) -> int throws never) -> int throws never {
-    f(1)
-}
-function ea_wide(x: int, a: int = 10, b: int = 100) -> int throws never {
-    x + a + b
-}
-type EaTarget = (x: int, b?: int) -> int throws never
-function ea_take_union(f: string | EaTarget) -> int throws never {
-    0
-}
-function ea_string(value: string) -> string throws never {
-    value
-}
-type EaIncompatible = (value: int, extra?: int) -> int throws never
-function ea_take_erased(f: reflect.AnyFunction | EaIncompatible) -> int throws never {
-    0
-}
-function ea_ambiguous(x: int, b: int = 10, c: int = 100) -> int throws never {
-    x + b + c
-}
-type EaWithB = (x: int, b?: int) -> int throws never
-type EaWithC = (x: int, c?: int) -> int throws never
-function ea_take_ambiguous(f: EaWithB | EaWithC) -> int throws never {
-    0
-}
-function ea_use() -> int throws never {
-    ea_take(ea_flex)
-}
-function ea_use_union() -> int throws never {
-    ea_take_union(ea_wide)
-}
-function ea_use_erased() -> int throws never {
-    ea_take_erased(ea_string)
-}
-function ea_use_ambiguous() -> int throws never {
-    ea_take_ambiguous(ea_ambiguous)
-}
-"#;
-    let mut db = crate::compiler2_tir::support::make_db();
-    let file = db.file("test.baml", source);
-    let mut adjustments = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
-            continue;
-        };
-        let result = infer_body(&db, owner);
-        for (&expr, steps) in &result.expr_adjustments {
-            let range = source_map.expr_span(expr);
-            adjustments.push((source[range].to_string(), steps.len()));
-        }
-    }
-    adjustments.sort();
-    assert_eq!(
-        adjustments,
-        vec![("ea_flex".to_string(), 1), ("ea_wide".to_string(), 1)],
-        "runtime-incompatible functions record a FunctionAdapter for direct and union callback slots"
     );
 }
 
@@ -936,11 +679,11 @@ function pd_take(a: int, tag: string = "t", n: int = 1 + 2, bad: int = "x") -> i
 "#;
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
-    let functions = baml_compiler2_ppir::item_data::file_functions(&db, file);
+    let functions = baml_compiler2_hir::item_data::file_functions(&db, file);
     let function = *functions.first().expect("one function");
     let owner = baml_compiler2_hir::body::BodyOwnerId::ParameterDefaults(function);
     let result = infer_body(&db, owner);
-    let defaults = baml_compiler2_ppir::function_parameter_defaults(&db, function);
+    let defaults = baml_compiler2_hir::signature::function_parameter_defaults(&db, function);
     let rendered: Vec<String> = defaults
         .params
         .iter()
@@ -951,7 +694,7 @@ function pd_take(a: int, tag: string = "t", n: int = 1 + 2, bad: int = "x") -> i
             let ty = result
                 .type_of_expr
                 .get(&expr)
-                .map(|ty| ty.render_canonical())
+                .map(|ty| ty.render_with(&Viewpoint::canonical(&db)))
                 .unwrap_or_else(|| "<missing>".into());
             let mismatch = if result.type_mismatches.contains_key(&expr) {
                 " MISMATCH"
@@ -996,8 +739,8 @@ function de_probe() -> bool throws never {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut plans = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
@@ -1006,7 +749,7 @@ function de_probe() -> bool throws never {
             let args: Vec<String> = plan
                 .type_args
                 .iter()
-                .map(|ty| ty.render_canonical())
+                .map(|ty| ty.render_with(&Viewpoint::canonical(&db)))
                 .collect();
             plans.push(format!(
                 "{} -> {args:?}",
@@ -1041,8 +784,8 @@ function ir_probe() -> int {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut plans = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
@@ -1054,7 +797,7 @@ function ir_probe() -> int {
             plans.push(
                 plan.type_args[plan.own_offset..]
                     .iter()
-                    .map(|ty| ty.render_canonical())
+                    .map(|ty| ty.render_with(&Viewpoint::canonical(&db)))
                     .collect::<Vec<_>>(),
             );
         }
@@ -1142,12 +885,12 @@ function pa_probe() -> int {
     let mut db = crate::compiler2_tir::support::make_db();
     let file = db.file("test.baml", source);
     let mut renders = Vec::new();
-    for owner in baml_compiler2_ppir::file_body_owners(&db, file) {
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(&db, owner) else {
+    for owner in baml_compiler2_hir::body::file_body_owners(&db, file) {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(&db, owner) else {
             continue;
         };
         let result = infer_body(&db, owner);
-        let body = baml_compiler2_ppir::body(&db, owner);
+        let body = baml_compiler2_hir::body::body(&db, owner);
         let Some(arena) = body.expr_body() else {
             continue;
         };
@@ -1156,7 +899,7 @@ function pa_probe() -> int {
             if snippet.starts_with("let arr")
                 && let Some(ty) = result.type_of_pat.get(&pat_id)
             {
-                renders.push(ty.render_canonical());
+                renders.push(ty.render_with(&Viewpoint::canonical(&db)));
             }
         }
     }

@@ -3,35 +3,26 @@
 
 use std::path::{Path, PathBuf};
 
-use baml_base::{Name, SourceFile, SourceRoot, SourceRootKind};
-use baml_db::{ProjectDatabase, SourceRootSpec};
+use baml_base::{SourceFile, SourceRoot};
+use baml_db::ProjectDatabase;
+/// Root-aware fixture builders for a fresh [`ProjectDatabase`] — the one
+/// definition every test crate shares.
+pub(crate) use baml_db::testing::TestDbExt;
 use text_size::TextSize;
 
-/// Root-aware fixture builders for a fresh [`ProjectDatabase`].
-pub(crate) trait TestDbExt {
-    /// Load the stdlib and add the single `Workspace` root at `root`.
-    fn workspace(&mut self, root: &Path) -> SourceRoot;
-    /// Upsert `path` (which must lie under an existing root) with `text`.
-    fn file(&mut self, path: &Path, text: &str) -> SourceFile;
-}
-
-impl TestDbExt for ProjectDatabase {
-    fn workspace(&mut self, root: &Path) -> SourceRoot {
-        self.ensure_stdlib_sources();
-        self.add_source_root(SourceRootSpec {
-            path: root.to_path_buf(),
-            package: Name::new(baml_type::RESERVED_USER_PACKAGE),
-            kind: SourceRootKind::Workspace,
-        })
-        .unwrap_or_else(|e| unreachable!("fresh database accepts one workspace root: {e}"))
-    }
-
-    fn file(&mut self, path: &Path, text: &str) -> SourceFile {
-        let root = self
-            .source_root_for_path(path)
-            .unwrap_or_else(|| unreachable!("test files live under the workspace root"));
-        self.add_or_update_file_in(root, path, text)
-    }
+/// The exported interface of a package whose only source is `source`,
+/// encoded as the blob a consumer mounts — built in a throwaway database so
+/// the consumer's database holds the interface and nothing else.
+pub(crate) fn export_blob(package: &str, source: &str) -> Vec<u8> {
+    let mut db = ProjectDatabase::new();
+    db.workspace(Path::new("/ide-export"));
+    let root = db.dependency(package);
+    db.file(Path::new(&format!("<builtin>/{package}/lib.baml")), source);
+    baml_artifact::encode(
+        baml_artifact::ArtifactKind::PackageInterface,
+        &baml_compiler2_hir_ty::package_interface::export_interface(&db, root),
+    )
+    .unwrap_or_else(|e| unreachable!("a package interface serializes: {e}"))
 }
 
 // ── Cursor fixture machinery ─────────────────────────────────────────────────
@@ -205,6 +196,9 @@ pub(crate) fn offset_to_line_col(content: &str, offset: usize) -> (usize, usize)
 /// A test project with multiple BAML files for project-level IDE features.
 pub(crate) struct ProjectTest {
     pub(crate) db: ProjectDatabase,
+    /// The package every source was added under: the fixture's `Workspace`
+    /// root.
+    pub(crate) package: SourceRoot,
     pub(crate) files: Vec<SourceFile>,
 }
 
@@ -232,7 +226,7 @@ impl ProjectTestBuilder {
     /// Build the project test.
     pub(crate) fn build(self) -> ProjectTest {
         let mut db = ProjectDatabase::default();
-        db.workspace(Path::new("/test"));
+        let package = db.workspace(Path::new("/test"));
 
         let mut files: Vec<SourceFile> = Vec::new();
         for (filename, content) in &self.sources {
@@ -240,7 +234,7 @@ impl ProjectTestBuilder {
             files.push(db.file(&path, content));
         }
 
-        ProjectTest { db, files }
+        ProjectTest { db, package, files }
     }
 }
 

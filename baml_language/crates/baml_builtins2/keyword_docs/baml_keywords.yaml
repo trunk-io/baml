@@ -121,6 +121,26 @@ skip:
   details: |
     `@skip` takes no arguments and may appear at most once on a declaration.
 
+stream.done:
+  summary: "Holds a field at its default, or a whole class back, until the streamed value is complete. Takes no arguments."
+  syntax: |
+    class Article {
+      slug string @stream.done
+      body string
+    }
+  details: |
+    `@stream.done` applies to a class field: while the value is incomplete the partial parse uses the field's default, `""` for a string, rather than the text received so far. `@@stream.done` applies to a class: the object has no partial parse until every field is complete. Without either, a field streams its partial value whenever its type has one, which strings, arrays, maps, classes, and unions do. Takes no arguments, at most once per declaration.
+
+stream.must_exist:
+  summary: "Removes a class field's default, so the class has no partial parse until that field arrives. Takes no arguments."
+  syntax: |
+    class Invoice {
+      customer string
+      currency string @stream.must_exist
+    }
+  details: |
+    A class field normally has a default the partial parse uses before the field arrives, `""` for a string. `@stream.must_exist` makes that default `never`, and a class with any `never` field has no partial parse, so nothing is produced for `Invoice` until `currency` is present. Reach for it when a partial object missing that field would mislead. Applies to class fields only. Takes no arguments, at most once per declaration.
+
 function:
   summary: "Declares a named callable with typed parameters and a return type."
   syntax: |
@@ -360,7 +380,7 @@ type:
       reflect.Type.of<T>()
     }
   details: |
-    At top level, `type Name = ...` creates an alias. Inside an interface, `type Item`, `type Item extends Bound`, `type Item = Default`, and `type Item extends Bound = Default` declare associated types. Inside an `implements` block, bind associated types with `type Item = Concrete`. Inside a function, `type T = unreflect(t)` creates a scoped type binding from a runtime value. The old `type.of<T>()` shorthand and bare `type` value annotation do not exist; write `reflect.Type.of<T>()` and `reflect.Type`.
+    At top level, `type Name = ...` creates an alias. Inside an interface, `type Item`, `type Item extends Bound`, `type Item = Default`, and `type Item extends Bound = Default` declare associated types. Inside an `implements` block, bind associated types with `type Item = Concrete`. Inside a function, lambda, or block body, `type T = unreflect(t)` binds a block-scoped type parameter to a runtime type value (`t: reflect.Type | reflect.TypeView`, or a `reflect.class.PendingType` from a builder; an `unknown` must be narrowed first with `match` or `is`), and `type T = SomeType` binds one to a static type. `T` is a rigid type parameter for the rest of the block: nothing typed by `T` may leave the block except through a type that does not mention it, such as `unknown`. `unreflect` is legal only as the whole right-hand side of such a statement. The old `type.of<T>()` shorthand and bare `type` value annotation do not exist; write `reflect.Type.of<T>()` and `reflect.Type`.
 
 void:
   summary: "The return type of a function that produces no value."
@@ -937,7 +957,7 @@ await:
     let result = await future
 
 with:
-  summary: "Optional clause that attaches a runner to a test/testset or options to a spawn."
+  summary: "Optional clause that attaches a runner to a test/testset or modifiers to a spawn."
   syntax: |
     test "uses a quorum runner" with testing.Quorum(5, 3) {
       assert.is_true(true)
@@ -947,11 +967,11 @@ with:
       test "case" { assert.is_true(true) }
     }
 
-    let task = spawn with baml.spawn.options(group = g) {
+    let task = spawn with limit, retry {
       do_work()
     }
   details: |
-    `with` is a contextual keyword, not a general operator — it is only special right after a `test`/`testset` name (selecting the test runner expression) or after `spawn` (passing `baml.spawn.options(...)`). Everywhere else `with` is an ordinary identifier and may be used as a variable or field name.
+    `with` is a contextual keyword, not a general operator — it is only special right after a `test`/`testset` name (selecting the test runner expression) or after `spawn` (listing `baml.spawn.Modifier` values, applied left to right). Everywhere else `with` is an ordinary identifier and may be used as a variable or field name.
 
 # ── Cross-language SDKs (baml generate) ──────────────────────────────────────
 
@@ -1058,33 +1078,33 @@ pattern:
     Full guide: `baml describe patterns`. Match-arm reference: `baml describe match`.
 
 query:
-  summary: "SQL over the local profile store: `baml query \"SELECT …\"`."
+  summary: "SQL over the project's local recordings: `baml query \"SELECT …\"`."
   syntax: |
-    baml query "SHOW TABLES"
-    baml query "SELECT thread_id, status, total_errors, started_at FROM threads
-                WHERE parent_thread_id IS NULL ORDER BY started_at DESC LIMIT 20"
-    baml query "SELECT fqn, sum(calls_started) calls, sum(self_ns) self_ns
-                FROM call_path_stats GROUP BY fqn ORDER BY self_ns DESC LIMIT 10"
-    baml query "SELECT call_id, args['customer']['age'] AS age, output
-                FROM calls WHERE args['customer']['age'] >= 30" --format jsonl
-    baml query --schema --table calls
+    baml query "SELECT process_id, status, command, last_updated FROM processes"
+    baml query "SELECT span_name, status, duration FROM spans
+                WHERE span_type = 'future' AND parent_span_id IS NULL
+                ORDER BY start_time DESC LIMIT 20"
+    baml query "SELECT function_name, sum(invocation_count) calls, sum(self_time) self_ns
+                FROM profiler GROUP BY function_name ORDER BY self_ns DESC LIMIT 10"
+    baml query "SELECT span_id, input_args['customer']['age'] AS age, output_value
+                FROM spans WHERE input_args['customer']['age'] >= 30" --format jsonl
+    baml query "SELECT span_name, temporary_projections['cost'] FROM spans
+                WHERE temporary_projections IS NOT NULL"
+    baml query --schema --table spans
   details: |
-    Every `baml run`/`baml test` writes an execution profile under
-    `.baml/profiles-v1` (when profiling is enabled — `BAML_PROFILE=0`
-    disables it; `baml run -v` reports the profiler's status);
-    `baml query` binds that store into a fixed snapshot
-    and runs portable SQL (DataFusion dialect) over the versioned catalog.
-    Relations (`_v1` names with unversioned aliases): `threads` (one row per
-    logical thread; a row with `parent_thread_id IS NULL` is an execution and
-    carries status/duration/totals), `call_path_stats` (population-true
-    call-tree aggregates), `calls` (individually retained call spans with
-    virtual `args`/`output`/`error` value columns), `errors`,
-    `function_definitions`, `health`, plus the `hot_call_paths` view. Value
-    columns support
-    ordinary subscripts and comparisons — `args['customer']['age'] >= 30`,
-    `args = baml_value_json('{"x":1}')` — hydrated on demand and accounted in
-    the terminal outcome (`valueEvaluations`). Discovery: `--schema`,
-    `SHOW TABLES`, `SHOW COLUMNS FROM calls`, `DESCRIBE threads`,
-    `EXPLAIN <query>`. Output: `--format table|json|jsonl` (jsonl ends with a
-    `queryOutcome` frame). Exit codes: 0 complete, 1 evidence-incomplete,
-    2 invalid SQL/authorization, 3 budget, 4 cancelled, 5 store/internal.
+    Every `baml run`/`baml test` records to `.baml/btel`; the first query
+    builds `.baml/btel/query.sqlite` and later queries apply only new files.
+    Relations: `processes` (one row per process, with its status),
+    `spans` (completed function calls that were retained, and futures: a
+    root call is a future without a parent; `input_args`, `output_value`,
+    `error_value` (a `baml.errors.Context`) and `temporary_projections`
+    (model usage and cost) are BAML values), `span_announcements` (every
+    started span), and `profiler` (one row per calling-context node of an
+    ended process: invocations, outcomes, total/self/I/O time). Value columns
+    support ordinary subscripts and comparisons —
+    `input_args['customer']['age'] >= 30`,
+    `input_args = baml_value_json('{"x":1}')` — decoded on demand. `WITH
+    RECURSIVE` walks span trees through `parent_span_id`. Discovery:
+    `--schema`, `--explain`. Output: `--format table|json|jsonl` (jsonl ends
+    with an outcome frame). Exit codes: 0 complete, 1 evidence-incomplete,
+    2 invalid SQL, 3 budget, 4 cancelled, 5 index/internal.

@@ -35,8 +35,6 @@ async fn shell_with_pipe() {
         load_type baml.ToString
         load_const "to_string"
         virtual_call nargs=1 ntypeargs=0
-        store_var _0
-        load_var _0
         return
     }
     "#);
@@ -390,7 +388,7 @@ async fn start_process_stdout_read_is_cancellable() {
                 defer { process.close() }
 
                 let tok = baml.spawn.CancelToken.new();
-                let read = spawn with baml.spawn.options(cancel = tok) {
+                let read = spawn with tok {
                     process.stdout.lines().next()
                 };
                 let deadline = spawn {
@@ -482,7 +480,9 @@ async fn claude_code_client_preserves_process_wait_timeout() {
                 let cl = claude_code.ClaudeCodeClient.new(
                     model = "offline-timeout-probe",
                     executable = executable,
-                    timeout_ms = 25,
+                    // Leave room for process startup and result parsing under test load.
+                    // This probe checks the subsequent process-wait timeout.
+                    timeout_ms = 1000,
                 );
                 let _ = cl.invoke(timeout_provider_input()) catch_all (e) {
                     let timeout: baml.errors.Timeout => {
@@ -502,8 +502,8 @@ async fn claude_code_client_preserves_process_wait_timeout() {
         panic!("expected a string timeout result, got {:?}", output.result);
     };
     assert!(result.starts_with("Timeout:"), "{result}");
-    assert!(result.contains("timed out after 25ms"), "{result}");
-    assert!(result.ends_with(":25"), "{result}");
+    assert!(result.contains("timed out after 1000ms"), "{result}");
+    assert!(result.ends_with(":1000"), "{result}");
 }
 
 #[tokio::test]

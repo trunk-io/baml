@@ -32,6 +32,11 @@ pub fn external_to_outbound(
         // `LowerHex` impl handles the leading-minus sign convention.
         BexExternalValue::Bigint(bi) => Some(BamlValueVariant::BigintValue(format!("{bi:x}"))),
         BexExternalValue::Float(f) => Some(BamlValueVariant::FloatValue(*f)),
+        BexExternalValue::JsNumber(_) => {
+            return Err(CtypesError::InternalError(
+                "JavaScript number reached outbound encoding before type resolution".to_string(),
+            ));
+        }
         BexExternalValue::Bool(b) => Some(BamlValueVariant::BoolValue(*b)),
         BexExternalValue::String(s) => Some(BamlValueVariant::StringValue(s.to_string())),
         BexExternalValue::Array {
@@ -241,6 +246,11 @@ pub(crate) fn artifact_safe_external_to_outbound(
         BexExternalValue::Int(i) => Some(BamlValueVariant::IntValue(*i)),
         BexExternalValue::Bigint(bi) => Some(BamlValueVariant::BigintValue(format!("{bi:x}"))),
         BexExternalValue::Float(f) => Some(BamlValueVariant::FloatValue(*f)),
+        BexExternalValue::JsNumber(_) => {
+            return Err(CtypesError::InternalError(
+                "JavaScript number reached outbound encoding before type resolution".to_string(),
+            ));
+        }
         BexExternalValue::Bool(b) => Some(BamlValueVariant::BoolValue(*b)),
         BexExternalValue::String(s) => Some(BamlValueVariant::StringValue(s.to_string())),
         BexExternalValue::Array {
@@ -404,7 +414,7 @@ fn selected_union_option_index(
     union_type: &RuntimeTy,
     selected_option: &RuntimeTy,
 ) -> Result<u32, CtypesError> {
-    let RuntimeTy::Union(members, _) = union_type else {
+    let RuntimeTy::Union(members) = union_type else {
         return Err(CtypesError::UnionSelectedTypeNotMember {
             selected: selected_option.to_string(),
             union: union_type.to_string(),
@@ -568,7 +578,7 @@ pub fn build_to_host_call(
 mod tests {
     use std::sync::Arc;
 
-    use baml_type::{Freshness, Literal, Name, TyAttr, TypeName};
+    use baml_type::{Freshness, Literal, Name, TypeName};
     use bex_project::{
         BexExternalAdt, BexExternalValue, HostValueArc, HostValueKind, MediaContent, MediaValue,
         PromptAst, PromptAstSimple,
@@ -663,16 +673,8 @@ mod tests {
 
     #[test]
     fn outbound_union_matches_structurally_equivalent_selected_type() {
-        let declared = RuntimeTy::Literal(
-            Literal::String("draft".to_string()),
-            Freshness::Regular,
-            TyAttr::default(),
-        );
-        let rebuilt = RuntimeTy::Literal(
-            Literal::String("draft".to_string()),
-            Freshness::Fresh,
-            TyAttr::default(),
-        );
+        let declared = RuntimeTy::Literal(Literal::String("draft".to_string()), Freshness::Regular);
+        let rebuilt = RuntimeTy::Literal(Literal::String("draft".to_string()), Freshness::Fresh);
         assert_ne!(declared, rebuilt);
 
         let value = BexExternalValue::union(
@@ -696,7 +698,6 @@ mod tests {
                 (Name::new("Cause"), RuntimeTy::string()),
                 (Name::new("Code"), RuntimeTy::int()),
             ]),
-            TyAttr::default(),
         );
         let selected = RuntimeTy::Interface(
             interface_name,
@@ -705,7 +706,6 @@ mod tests {
                 (Name::new("Code"), RuntimeTy::int()),
                 (Name::new("Cause"), RuntimeTy::string()),
             ]),
-            TyAttr::default(),
         );
         let value = BexExternalValue::union(
             BexExternalValue::Instance {

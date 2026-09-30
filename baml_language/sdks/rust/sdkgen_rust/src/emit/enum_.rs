@@ -6,7 +6,7 @@
 //! The impl shape is pinned by the hand-written executable spec in
 //! `bridge_rust/tests/conversions.rs`.
 
-use baml_codegen_types::{Enum, Name};
+use baml_sdkgen_types::{Enum, Name};
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -15,7 +15,7 @@ use crate::idents;
 
 pub(crate) fn emit(name: &Name, enum_: &Enum) -> TokenStream {
     let fqn = name.to_string();
-    let ident = idents::ident(name.bare_name());
+    let ident = idents::ident(name.name().as_str());
     let docs = doc_attrs(enum_.docstring.as_deref());
 
     let mut variant_defs = Vec::new();

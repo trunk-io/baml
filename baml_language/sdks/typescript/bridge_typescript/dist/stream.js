@@ -26,6 +26,10 @@ import { encodeCallArgs, decodeCallResult } from './proto.js';
 function newFunctionCall() {
     return BigInt(nativeNewFunctionCall());
 }
+/**
+ * A live `ai.stream.Stream<T>`. A partial and the settled value share the one
+ * type: a partial is `T` parsed from the text received so far.
+ */
 export class BamlStream {
     _handle;
     _classFqn;
@@ -62,13 +66,13 @@ export class BamlStream {
         }
         const rt = getRuntime();
         const argsProto = encodeCallArgs({ self: this }, { syncMode: true, callId: newFunctionCall(), functionName: fqn });
-        const resultBytes = rt.callFunctionSync(argsProto, null, null);
+        const resultBytes = rt.callFunctionSync(argsProto, null);
         return decodeCallResult(resultBytes);
     }
     async _callAsync(fqn) {
         const rt = getRuntime();
         const argsProto = encodeCallArgs({ self: this }, { callId: newFunctionCall(), functionName: fqn });
-        const resultBytes = await rt.callFunction(argsProto, null, null);
+        const resultBytes = await rt.callFunction(argsProto, null);
         return decodeCallResult(resultBytes);
     }
 }

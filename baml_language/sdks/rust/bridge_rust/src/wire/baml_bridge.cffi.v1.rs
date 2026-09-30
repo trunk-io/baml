@@ -15,7 +15,6 @@ pub struct BamlHandle {
 /// Stdlib symbols with special host-side decoding rules today:
 ///    - baml.media.{Image,Audio,Video,Pdf}     -> ADT_MEDIA_*
 ///    - baml.llm.PromptAst                     -> ADT_PROMPT_AST
-///    - baml.llm.Collector                     -> ADT_COLLECTOR
 ///    - ai.stream.Stream                       -> ADT_TAGGED_HEAP_HANDLE
 ///    - ai.FunctionSpec                        -> ADT_FUNCTION_SPEC
 ///    - runtime-created nominal values         -> ADT_RUNTIME_VALUE
@@ -46,7 +45,6 @@ pub enum BamlHandleType {
     AdtMediaPdf = 9,
     AdtMediaGeneric = 10,
     AdtPromptAst = 11,
-    AdtCollector = 12,
     AdtType = 13,
     AdtTaggedHeapHandle = 14,
     /// Host-owned callable referenced via per-bridge HostValueRegistry.
@@ -87,7 +85,6 @@ impl BamlHandleType {
             Self::AdtMediaPdf => "ADT_MEDIA_PDF",
             Self::AdtMediaGeneric => "ADT_MEDIA_GENERIC",
             Self::AdtPromptAst => "ADT_PROMPT_AST",
-            Self::AdtCollector => "ADT_COLLECTOR",
             Self::AdtType => "ADT_TYPE",
             Self::AdtTaggedHeapHandle => "ADT_TAGGED_HEAP_HANDLE",
             Self::HostValueCallable => "HOST_VALUE_CALLABLE",
@@ -109,7 +106,6 @@ impl BamlHandleType {
             "ADT_MEDIA_PDF" => Some(Self::AdtMediaPdf),
             "ADT_MEDIA_GENERIC" => Some(Self::AdtMediaGeneric),
             "ADT_PROMPT_AST" => Some(Self::AdtPromptAst),
-            "ADT_COLLECTOR" => Some(Self::AdtCollector),
             "ADT_TYPE" => Some(Self::AdtType),
             "ADT_TAGGED_HEAP_HANDLE" => Some(Self::AdtTaggedHeapHandle),
             "HOST_VALUE_CALLABLE" => Some(Self::HostValueCallable),
@@ -978,7 +974,7 @@ impl MediaTypeEnum {
 pub struct InboundValue {
     #[prost(message, optional, tag = "1")]
     pub value_type: ::core::option::Option<BamlTy>,
-    #[prost(oneof = "inbound_value::Value", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16")]
+    #[prost(oneof = "inbound_value::Value", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17")]
     pub value: ::core::option::Option<inbound_value::Value>,
 }
 /// Nested message and enum types in `InboundValue`.
@@ -1024,6 +1020,12 @@ pub mod inbound_value {
         MediaValue(super::BamlValueMedia),
         #[prost(message, tag = "16")]
         PromptAstValue(super::BamlValuePromptAst),
+        /// A JavaScript `number`. Unlike `int_value` and `float_value`, this does
+        /// not choose a BAML numeric representation: an integral value may inhabit
+        /// either `int` or `float`, and the declared contextual type selects one.
+        /// Non-integral values can inhabit only `float`.
+        #[prost(double, tag = "17")]
+        JsNumberValue(f64),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

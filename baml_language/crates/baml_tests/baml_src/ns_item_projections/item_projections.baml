@@ -335,8 +335,9 @@ test "symbolic_qualifier_dispatches_per_instantiation" {
     assert.equal(s, "two")
 }
 
-// Runtime type arguments (`unreflect`) flow as ordinary operands through the
-// qualified spellings, exactly as static ones do.
+// A scoped runtime type (`type U = unreflect(t)`) flows through the qualified
+// spellings exactly as a static type argument does. `U` is rigid, so a value
+// of type `U` comes from an explicit `match` downcast, never from a literal.
 interface Stamper {
     function stamp<U>(self, u: U) -> string throws never
     function emboss<U>(u: U) -> string throws never
@@ -357,9 +358,15 @@ class Press {
 test "runtime_type_arguments_flow_through_qualified_spellings" {
     let p = Press {}
     let t = reflect.Type.of<int>()
-    assert.equal(Stamper.stamp<unreflect(t)>(p, 5), "stamp int")
-    assert.equal((Press as Stamper).stamp<unreflect(t)>(p, 5), "stamp int")
-    assert.equal((Press as Stamper).emboss<unreflect(t)>(5), "emboss int")
+    type U = unreflect(t)
+    match (5) {
+        let x: U => {
+            assert.equal(Stamper.stamp<U>(p, x), "stamp int")
+            assert.equal((Press as Stamper).stamp<U>(p, x), "stamp int")
+            assert.equal((Press as Stamper).emboss<U>(x), "emboss int")
+        },
+        _ => assert.is_true(false),
+    }
     assert.equal((Press as Stamper).emboss<string>("x"), "emboss string")
 }
 
@@ -436,4 +443,32 @@ test "selfless_member_through_the_type_carries_the_whole_frame" {
     // concrete function annotation is the available spelling here.
     let stamp: (int) -> string throws never = (Plate<int> as Embosser).emboss
     assert.equal(stamp(7), "emboss int")
+}
+
+// The turbofish VALUE form of an interface item: the written arguments ride
+// the same type-keyed callable the bare reference is — an interface item has
+// no global of its own to pool.
+interface Labeler {
+    function label_as<T>(self, tag: T) -> string throws never
+}
+
+class Parcel {
+    name string
+
+    implements Labeler {
+        function label_as<T>(self, tag: T) -> string throws never {
+            if reflect.Type.of<T>() == reflect.Type.of<int>() {
+                self.name + ":int"
+            } else {
+                self.name + ":other"
+            }
+        }
+    }
+}
+
+test "turbofish_value_of_an_interface_item" {
+    let f = Parcel.label_as<int>
+    assert.equal(f(Parcel { name: "c" }, 1), "c:int")
+    let g = Parcel.label_as<string>
+    assert.equal(g(Parcel { name: "d" }, "x"), "d:other")
 }

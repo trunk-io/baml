@@ -56,14 +56,14 @@ impl PlaygroundState {
             return;
         };
         wasm_bindgen_futures::spawn_local(async move {
-            bex_project::Bex::shutdown(installed.engine).await;
+            bex_project::Bex::shutdown(installed.engine, None).await;
         });
     }
 
     /// Install a freshly built engine, retiring whatever it replaces.
     fn install(&mut self, source_revision: SourceRevision, engine: BexEngine) {
         self.shutdown();
-        engine.activate_profiling();
+
         self.next_generation += 1;
         self.installed = Some(InstalledEngine {
             source_revision,
@@ -134,7 +134,7 @@ fn check_workspace_root(state: &GlobalState) -> Option<RootCheck> {
         }
         // The check above is a full sweep of the root, so `get_bytecode`'s own
         // error gate would re-derive what `has_errors` just proved.
-        match snap.db().get_bytecode_unchecked() {
+        match snap.db().get_bytecode_unchecked(entry.root) {
             Ok(program) => check.program = Some(Box::new(program)),
             Err(error) => check.emit_error = Some(error.to_string()),
         }
@@ -171,11 +171,11 @@ pub(crate) fn rebuild(
         }
         return;
     };
-    match BexEngine::new_with_deferred_profiling_and_runtime_compiler(
+    match BexEngine::new_with_runtime_compiler(
         *program,
         Arc::clone(sys_ops),
         Vec::new(),
-        Some(bex_project::runtime_compiler()),
+        bex_project::runtime_compiler(),
     ) {
         Ok(engine) => {
             engine.set_unhandled_spawn_error_handler(Some(Arc::new(|error| {
@@ -203,13 +203,6 @@ pub(crate) fn project_update(
     playground: &PlaygroundState,
 ) -> Option<(String, ProjectUpdate)> {
     let check = check_workspace_root(state)?;
-    let project = read(state, |snap| {
-        snap.roots()
-            .workspace_roots()
-            .next()
-            .map(|entry| entry.path.to_string_lossy().into_owned())
-    })
-    .flatten()?;
 
     let mut diagnostics = check.diagnostics;
     if let Some((revision, message)) = &playground.build_failure
@@ -229,9 +222,13 @@ pub(crate) fn project_update(
         .as_ref()
         .map_or(0, |installed| installed.generation);
 
-    let update = read(state, move |snap| {
+    read(state, move |snap| {
+        // The root and its listing come from one snapshot: the path the host
+        // addresses the project by names the root whose functions are listed.
+        let entry = snap.roots().workspace_roots().next()?;
+        let project = entry.path.to_string_lossy().into_owned();
         let db = snap.db();
-        let listing = baml_ide::list_functions_with_metadata(db);
+        let listing = baml_ide::list_functions_with_metadata(db, entry.root);
         let functions = listing
             .functions
             .into_iter()
@@ -264,7 +261,7 @@ pub(crate) fn project_update(
                     .map(|params| params.into_iter().map(Into::into).collect()),
             })
             .collect();
-        ProjectUpdate {
+        let update = ProjectUpdate {
             is_bex_current,
             generation,
             functions,
@@ -276,9 +273,10 @@ pub(crate) fn project_update(
                     .collect(),
             ),
             diagnostics,
-        }
-    })?;
-    Some((project, update))
+        };
+        Some((project, update))
+    })
+    .flatten()
 }
 
 /// One line per diagnostic, `file:line: message`, sorted so a rebuild that
@@ -286,29 +284,10 @@ pub(crate) fn project_update(
 fn flatten_diagnostics(
     documents: &[baml_lsp::diagnostics::PublishableDocument],
 ) -> Vec<ProjectDiagnostic> {
-    let mut out: Vec<ProjectDiagnostic> = documents
-        .iter()
-        .flat_map(|document| {
-            let filename = document
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            document.diagnostics.iter().map(move |diagnostic| {
-                let severity = match diagnostic.severity {
-                    Some(lsp_types::DiagnosticSeverity::ERROR) => "error",
-                    Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
-                    _ => "info",
-                };
-                ProjectDiagnostic {
-                    severity: severity.to_string(),
-                    message: format!(
-                        "{filename}:{}: {}",
-                        diagnostic.range.start.line + 1,
-                        diagnostic.message
-                    ),
-                }
-            })
+    let mut out: Vec<_> = baml_lsp::diagnostics::playground_diagnostics(documents)
+        .map(|(severity, message)| ProjectDiagnostic {
+            severity: severity.to_owned(),
+            message,
         })
         .collect();
     out.sort_by(|a, b| a.message.cmp(&b.message));
@@ -624,7 +603,7 @@ pub(crate) fn workspace_root(state: &GlobalState) -> Option<(String, String)> {
         snap.roots().workspace_roots().next().map(|entry| {
             (
                 entry.path.to_string_lossy().into_owned(),
-                entry.package.to_string(),
+                entry.spelling.to_string(),
             )
         })
     })

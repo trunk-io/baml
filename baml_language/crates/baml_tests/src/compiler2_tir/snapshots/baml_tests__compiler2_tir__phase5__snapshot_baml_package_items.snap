@@ -4,26 +4,23 @@ expression: output
 ---
 namespace baml:
   class Array<T> { methods: [filled, generate, length, at, push, pop, remove_at, concat, for_each, filter, filter_map, reverse, sort_by, sort_by_key, slice, join, map, some, every, find, find_index, find_last, find_last_index, includes, index_of, last_index_of, reduce, flat_map, clear, shift, unshift, insert, splice] }
-  class Bigint { methods: [abs, min, max, clamp, isqrt, pow, ilog, to_int, parse, random, _random_byte_count, _random_in_range] }
+  class Bigint { methods: [abs, isqrt, pow, ilog, to_int, parse, random, _random_byte_count, _random_in_range] }
   class Bool { methods: [random] }
-  type Comparable
   type Concrete
-  class Float { methods: [is_nan, is_infinite, is_finite, abs, min, max, clamp, floor, ceil, round, trunc, fract, ifloor, iceil, iround, itrunc, sqrt, pow, log, hypot, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh, to_radians, to_degrees, parse, random, _unit_from_draw, pi, e, golden_ratio, nan, inf] }
+  class Float { methods: [is_nan, is_infinite, is_finite, abs, signum, floor, ceil, round, trunc, fract, ifloor, iceil, iround, itrunc, sqrt, pow, log, exp, ln, log2, log10, cbrt, hypot, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh, to_radians, to_degrees, parse, random, _unit_from_draw, pi, e, golden_ratio, nan, inf, max_finite, min_finite, epsilon] }
   type FloatStats
   type FromJson
-  class Int { methods: [abs, min, max, clamp, isqrt, pow, ilog, leading_zeros, leading_ones, trailing_zeros, trailing_ones, count_zeros, count_ones, parse, random, _random_in_range, max_value, min_value] }
+  class Int { methods: [abs, isqrt, pow, ilog, leading_zeros, leading_ones, trailing_zeros, trailing_ones, count_zeros, count_ones, parse, random, _random_in_range, max_value, min_value] }
   class Map<K, V> { methods: [length, has, keys, values, set, get, delete, get_or_insert, clear] }
   class Null { methods: [] }
   type Sortable
-  class String { methods: [from, length, char_count, is_empty, byte_length, to_lower_case, to_upper_case, trim, trim_start, trim_end, includes, starts_with, ends_with, split, chars, lines, slice, replace, index_of, last_index_of, at, code_point_at, repeat, replace_all, is_numeric, is_alphabetic, is_alphanumeric, is_uppercase, is_lowercase, is_whitespace, is_control, is_graphic, is_ascii, is_ascii_numeric, is_ascii_alphabetic, is_ascii_alphanumeric, is_ascii_uppercase, is_ascii_lowercase, is_ascii_whitespace, is_ascii_control, is_ascii_graphic, is_ascii_hex, to_utf8, from_utf8, to_code_points, from_code_points] }
+  class String { methods: [from, length, char_count, is_empty, byte_length, to_lower_case, to_upper_case, trim, trim_start, trim_end, includes, starts_with, ends_with, split, chars, lines, slice, replace, index_of, last_index_of, at, code_point_at, repeat, replace_all, _as_string, _replace_literal, _replace_all_literal, is_numeric, is_alphabetic, is_alphanumeric, is_uppercase, is_lowercase, is_whitespace, is_control, is_graphic, is_ascii, is_ascii_numeric, is_ascii_alphabetic, is_ascii_alphanumeric, is_ascii_uppercase, is_ascii_lowercase, is_ascii_whitespace, is_ascii_control, is_ascii_graphic, is_ascii_hex, to_utf8, from_utf8, to_code_points, from_code_points] }
   type Summable
   class TaggedString { methods: [] }
   type ToJson
   type ToString
   class Uint8Array { methods: [length, at, push, pop, concat, includes, index_of, reverse, slice, zeroes, from_array, to_array, from_hex, to_hex, from_base64, to_base64, _to_string_impl, sort] }
   function _cleanup_begin<T>
-  function _compare_shim<T>
-  function _float_total_cmp
   function _from_json_shim<T>
   function _is_primitive_array<T>
   function _median_float
@@ -130,11 +127,14 @@ namespace baml.fs:
   function write_bytes
 namespace baml.future:
   class AllFailed<E> { methods: [] }
+  class Failure<E> { methods: [] }
   class Future<T, E> { methods: [cancel, is_settled, is_cancelled, is_result, is_error, state] }
+  class Panicked { methods: [] }
   enum State
+  class Success<T> { methods: [] }
   function __await_any<T, E>
   function all<T, E>
-  function all_complete<T, E>
+  function all_settled<T, E>
   function any<T, Err>
   function race<T, E>
   function with_timeout<T, E>
@@ -151,17 +151,15 @@ namespace baml.http:
   class Server { methods: [bind, serve, _serve] }
   class SseStream { methods: [next, close] }
   class TlsConfig { methods: [new, _new] }
+  type WsAccept
   function _fetch
   function _fetch_sse
   function _send
   function _timeout_nanos
   function fetch
   function fetch_sse
+  function reject_websocket
   function send
-namespace baml.id:
-  function current
-  function new
-  function set
 namespace baml.io:
   type Read
   type Write
@@ -234,6 +232,7 @@ namespace baml.ops:
   type Index
   type Multiply
   type Negate
+  enum Ordering
   type Remainder
   type ShiftLeft
   type ShiftRight
@@ -268,17 +267,33 @@ namespace baml.random:
   type Rng
   class SystemRandom { methods: [get] }
   class Xoshiro256PlusPlus { methods: [new, _new] }
+namespace baml.regex:
+  class Error { methods: [] }
+  enum ErrorKind
+  class Group { methods: [] }
+  class Match { methods: [] }
+  class Regex { methods: [has_match, match_once, match_all, match_full, split, _replace_template, _replace_all_template] }
+  function _compile
+  function _index_of_from
+  function _literal_match
+  function _replace
+  function _replace_literal_with<E>
+  function _replace_pattern_with<E>
+  function escape
+  function new
 namespace baml.sap:
   class _NoYield { methods: [] }
-  class _ParseCache<TStream, TFinal> { methods: [_parse_final, _parse_partial] }
-  function _new_parse_cache<TStream, TFinal>
+  class _ParseCache<T> { methods: [_parse_final, _parse_partial] }
+  function _new_parse_cache<T>
   function parse<T>
   function parse_type
 namespace baml.spawn:
   class CancelToken { methods: [new, any, cancel, is_cancelled] }
-  class Params<T, E> { methods: [] }
-  class TaskGroup { methods: [new, cancel, set_limit, limit, name, active_count, queued_count] }
-  function options<T, E>
+  class Limit { methods: [new, capacity, active_count, queued_count] }
+  type Modifier
+  class Plan<T, E> { methods: [new, wrap, with] }
+  class Root { methods: [new] }
+  function __spawn<T, E>
 namespace baml.sys:
   class Process { methods: [wait, kill, close] }
   class ProcessExit { methods: [ok] }
@@ -322,7 +337,8 @@ namespace baml.toml:
   function item_to_json
   function table_from_json
 namespace baml.ws:
-  class WsStream { methods: [send, next, close] }
+  class CloseEvent { methods: [] }
+  class WebSocket { methods: [send, next, close] }
   function _connect
   function connect
 namespace baml.yaml:

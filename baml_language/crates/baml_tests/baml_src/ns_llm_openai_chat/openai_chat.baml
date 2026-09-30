@@ -64,7 +64,7 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
     let args: map<string, unknown> = { "city": "SF" };
     let journal = ai.Journal {
         log: [
-            ai.events.UserMessage { content: "weather in SF?" },
+            ai.events.UserMessage.new("weather in SF?"),
             ai.events.AssistantMessage {
                 content: [
                     ai.content.Text { text: "checking" },
@@ -72,7 +72,7 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
                 ],
                 client_id: "openai-chat/gpt-4o-mini",
             },
-            ai.events.ToolCompleted { id: "call_1", output: "sunny in SF" },
+            ai.events.ToolCompleted.new("call_1", "sunny in SF"),
         ],
     };
     ai.ModelTurnInput {
@@ -1020,12 +1020,12 @@ function chat_stream_total_timeout_after_delta() -> string {
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
-            // The corpus runs every leaf concurrently, so leave connection
-            // headroom while keeping the next event past the total deadline.
+            // The corpus runs every leaf concurrently, so allow 10 seconds of
+            // connection headroom and keep the next event past the deadline.
             let cl = openai.ChatClient.new(
                 api_key = "k",
                 base_url = mock.base_url(),
-                request_timeout_ms = 30000,
+                request_timeout_ms = 10000,
             );
             let stream = cl.invoke_stream(_chat_input("hi"));
             let first = match (stream.next()) {
@@ -1043,7 +1043,7 @@ function chat_stream_total_timeout_after_delta() -> string {
 }
 
 test "chat_stream_total_timeout_after_delta" {
-    assert.equal(chat_stream_total_timeout_after_delta(), "30000|po|Timeout")
+    assert.equal(chat_stream_total_timeout_after_delta(), "10000|po|Timeout")
 }
 
 // SSE comment/heartbeat bytes are transport keepalives, not tokens: they must
@@ -1056,24 +1056,26 @@ function chat_stream_heartbeat_does_not_clear_ttft() -> string {
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
+            // The mock sends a heartbeat, then holds the data event for 10s, so
+            // only the 20ms TTFT can end this call, however slow the machine is.
             let cl = openai.ChatClient.new(
                 api_key = "k",
                 base_url = mock.base_url(),
-                request_timeout_ms = 1000,
+                request_timeout_ms = 15000,
                 time_to_first_token_timeout_ms = 20,
             );
             let outcome = `${cl.invoke_stream(_chat_input("hi")).final_turn().terminal_text() ?? ""}` catch_all (e) {
-                let timeout: baml.errors.Timeout => "Timeout",
+                let timeout: baml.errors.Timeout => `Timeout:${timeout.duration_ms ?? -1}`,
                 _ => `other:${e.to_string()}`,
             };
             `${cl.time_to_first_token_timeout_ms ?? -1}|${outcome}`
         },
-        chunk_delay_ms = 200,
+        chunk_delay_ms = 10000,
     )
 }
 
 test "chat_stream_heartbeat_does_not_clear_ttft" {
-    assert.equal(chat_stream_heartbeat_does_not_clear_ttft(), "20|Timeout")
+    assert.equal(chat_stream_heartbeat_does_not_clear_ttft(), "20|Timeout:20")
 }
 
 // `stream_options` is first-party OpenAI only: a compatible server that does not
@@ -1104,24 +1106,54 @@ function chat_generic_stream_time_to_first_token_timeout_ms() -> string {
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
+            // The mock holds the first event for 10s, so only the 20ms TTFT can
+            // end this call, however slow the machine is.
             let cl = openai.GenericClient.new(
                 model = "qwen3",
                 base_url = mock.base_url(),
-                request_timeout_ms = 1000,
+                request_timeout_ms = 15000,
                 time_to_first_token_timeout_ms = 20,
             );
             let outcome = `${cl.invoke_stream(_chat_input("hi")).final_turn().terminal_text() ?? ""}` catch_all (e) {
-                let timeout: baml.errors.Timeout => "Timeout",
+                let timeout: baml.errors.Timeout => `Timeout:${timeout.duration_ms ?? -1}`,
                 _ => `other:${e.to_string()}`,
             };
             `${cl.time_to_first_token_timeout_ms ?? -1}|${outcome}`
         },
-        first_event_delay_ms = 200,
+        first_event_delay_ms = 10000,
     )
 }
 
 test "chat_generic_stream_time_to_first_token_timeout_ms" {
-    assert.equal(chat_generic_stream_time_to_first_token_timeout_ms(), "20|Timeout")
+    assert.equal(chat_generic_stream_time_to_first_token_timeout_ms(), "20|Timeout:20")
+}
+
+// The opposite case: the mock sends the first event right away and the TTFT
+// limit is 60s, so only the event can end the wait. Catches a TTFT that fires
+// early or on every stream.
+function chat_generic_stream_ttft_allows_prompt_first_event() -> string {
+    root.llm_mock.mock_sse_serve(
+        [
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"content":"ok"}}]}`),
+            root.llm_mock.sse_data(`[DONE]`),
+        ],
+        (mock: root.llm_mock.MockSseServer) -> {
+            let cl = openai.GenericClient.new(
+                model = "qwen3",
+                base_url = mock.base_url(),
+                time_to_first_token_timeout_ms = 60000,
+            );
+            let outcome = `${cl.invoke_stream(_chat_input("hi")).final_turn().terminal_text() ?? ""}` catch_all (e) {
+                let timeout: baml.errors.Timeout => `Timeout:${timeout.duration_ms ?? -1}`,
+                _ => `other:${e.to_string()}`,
+            };
+            `${cl.time_to_first_token_timeout_ms ?? -1}|${outcome}`
+        },
+    )
+}
+
+test "chat_generic_stream_ttft_allows_prompt_first_event" {
+    assert.equal(chat_generic_stream_ttft_allows_prompt_first_event(), "60000|ok")
 }
 
 // Streamed tool calls arrive as id/name once and argument fragments after.
@@ -1741,7 +1773,7 @@ function live_openai_chat_answers() -> bool {
 
 function live_openai_chat_streams() -> bool {
     let cl = openai.ChatClient.new(model = "gpt-4o-mini", max_tokens = 16);
-    let stream = ai.stream.from_spec<string | null, string>(
+    let stream = ai.stream.from_spec<string>(
         ChatEcho@spec("Say pong."),
         client = cl,
     );
@@ -1779,4 +1811,113 @@ testset "live" with testing.Sequential() {
     } else {
         log.warn("live::openrouter not registered: OPENROUTER_API_KEY is unset")
     }
+}
+
+// ─── journal content blocks: media in tool results and user turns ─────────────
+//
+// Chat column of the lowering table (`_chat_lower_block` in chat.baml): a
+// `tool` message is text only, so every media kind in a result Degrades into
+// a trailing user turn; user turns Accept image, audio and pdf; video has no
+// part at all and is Rejected.
+
+function _chat_media_input(media: image | audio | video | pdf) -> ai.ModelTurnInput {
+    let spec = ChatEcho@spec("and tomorrow?");
+    ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: root.llm_mock.media_journal("openai-chat/gpt-4o-mini", media),
+        toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+        output_type: spec.output_type(),
+    }
+}
+
+// messages: [system, user, assistant(tool_calls), tool, tool, user(note +
+// image), user(text + image)]. Both tool messages keep plain-string content.
+function chat_journal_image_degrades() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let _ = cl.invoke(_chat_media_input(root.llm_mock.media_png()));
+            let body = mock.last_request().json();
+            [
+                baml.json.path<string>(body, ".messages[3].content"),
+                baml.json.path<string>(body, ".messages[4].tool_call_id"),
+                baml.json.path<string>(body, ".messages[4].content"),
+                baml.json.path<string>(body, ".messages[5].role"),
+                baml.json.path<string>(body, ".messages[5].content[0].text"),
+                baml.json.path<string>(body, ".messages[5].content[1].image_url.url"),
+                baml.json.path<string>(body, ".messages[6].role"),
+                baml.json.path<string>(body, ".messages[6].content[0].text"),
+                baml.json.path<string>(body, ".messages[6].content[1].type"),
+                baml.json.path_or<string>(body, ".messages[7].role", "absent"),
+            ].join("|")
+        },
+    )
+}
+
+test "chat_journal_image_degrades" {
+    assert.equal(
+        chat_journal_image_degrades(),
+        `sunny in SF|call_media|captured:|user|${root.llm_mock.degrade_note("capture")}|data:image/png;base64,SGVsbG8=|user|Screenshot after the tool ran:|image_url|absent`,
+    )
+}
+
+// messages: [system, user, assistant(tool_calls), tool(placeholder), tool,
+// user(note + audio)]: the two `tool` replies stay contiguous and the media
+// the first one could not carry follows the second.
+function chat_journal_parallel_results_stay_contiguous() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let spec = ChatEcho@spec("and tomorrow?");
+            let input = ai.ModelTurnInput {
+                prompt: spec.prompt_template,
+                journal: root.llm_mock.parallel_media_journal("openai-chat/gpt-4o-mini", root.llm_mock.media_mp3()),
+                toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+                output_type: spec.output_type(),
+            };
+            let _ = cl.invoke(input);
+            let body = mock.last_request().json();
+            [
+                baml.json.path<string>(body, ".messages[3].role"),
+                baml.json.path<string>(body, ".messages[3].tool_call_id"),
+                baml.json.path<string>(body, ".messages[3].content"),
+                baml.json.path<string>(body, ".messages[4].role"),
+                baml.json.path<string>(body, ".messages[4].tool_call_id"),
+                baml.json.path<string>(body, ".messages[5].role"),
+                baml.json.path<string>(body, ".messages[5].content[0].text"),
+                baml.json.path<string>(body, ".messages[5].content[1].type"),
+                baml.json.path_or<string>(body, ".messages[6].role", "absent"),
+            ].join("|")
+        },
+    )
+}
+
+test "chat_journal_parallel_results_stay_contiguous" {
+    assert.equal(
+        chat_journal_parallel_results_stay_contiguous(),
+        `tool|call_media|[audio]|tool|call_text|user|${root.llm_mock.degrade_note("capture")}|input_audio|absent`,
+    )
+}
+
+function chat_journal_video_rejected() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let clip = baml.media.Video.from_base64("QUJD", "video/mp4");
+            let detail = cl.invoke(_chat_media_input(clip)).stop_reason.to_string() catch_all (e) {
+                let invalid: ai.errors.InvalidRequest => invalid.detail,
+                _ => `unexpected error class: ${e.to_string()}`,
+            };
+            `${detail}|requests=${mock.request_count()}`
+        },
+    )
+}
+
+test "chat_journal_video_rejected" {
+    let got = chat_journal_video_rejected();
+    assert.contains(got, "OpenAI Chat Completions has no video input part");
+    assert.contains(got, "|requests=0")
 }

@@ -88,7 +88,7 @@ class Table {
 function table_from_json(j: baml.json.json) -> Table throws baml.json.DecodeError {
     match (j) {
         map<string, baml.json.json> => {
-            let items: map<string, Item> = map {  };
+            let items: map<string, Item> = map {};
             for (let key in j.keys()) {
                 items[key]
                     = match (j[key]) {
@@ -136,13 +136,14 @@ function item_to_json(item: Item) -> baml.json.json throws baml.json.Serializati
 ///
 /// # Throws
 ///
-/// - `baml.json.DecodeError` if `json` is `null`, or if a `null` appears as an
-///   array element anywhere beneath it. Nulls in *object* values are skipped
-///   by the `Table.from_json` this recurses through.
+/// - `baml.json.DecodeError` if `json` is `null` or `bigint`, or if either
+///   appears as an array element anywhere beneath it. Nulls in *object* values
+///   are skipped by the `Table.from_json` this recurses through.
 function item_from_json(json: baml.json.json) -> Item throws baml.json.DecodeError {
     match (json) {
         bool | int | float | string => json,
         null => throw baml.json.DecodeError { message: "TOML does not support null", path: "" },
+        bigint => throw baml.json.DecodeError { message: "TOML does not support bigint", path: "" },
         map<string, baml.json.json> => Table.from_json(json),
         baml.json.json[] => json.map(item_from_json),
     }

@@ -40,17 +40,7 @@ fn main() {
         // reads its args/env. No other thread can observe the environment.
         unsafe { std::env::set_var("DIVAN_MAX_TIME", "2") };
     }
-    // Hermetic wall-time: BAML profiling ships default-ON, which both skews
-    // per-call timings and can abort hot workloads outright when the event
-    // ring's overflow cap is hit (compute::fib32_recursive reproduced this at
-    // the 1 GiB cap on bare metal). Pin it OFF unless the caller explicitly
-    // chose a value; tracing cost is measured deliberately in the
-    // `profiling_overhead` bench target instead of contaminating every number
-    // here.
-    if std::env::var_os("BAML_PROFILE").is_none() {
-        // SAFETY: as above — single-threaded, before any engine reads env.
-        unsafe { std::env::set_var("BAML_PROFILE", "0") };
-    }
+
     divan::main();
 }
 
@@ -61,9 +51,9 @@ fn main() {
 /// Compile BAML source into a ready-to-run engine.
 fn compile_source(source: &str) -> (ProjectDatabase, BexEngine) {
     let mut db = ProjectDatabase::new();
-    db.workspace(Path::new("."));
+    let package = db.workspace(Path::new("."));
     db.file("bench.baml", source);
-    let bytecode = generate_project_bytecode(&db).expect("benchmark compilation failed");
+    let bytecode = generate_project_bytecode(&db, package).expect("benchmark compilation failed");
     let engine = BexEngine::new(bytecode, Arc::new(sys_native::SysOps::native()), vec![])
         .expect("benchmark engine creation failed");
     (db, engine)

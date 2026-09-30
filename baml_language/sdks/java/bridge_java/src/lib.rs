@@ -18,118 +18,49 @@
 
 use std::sync::{Arc, Once, OnceLock};
 
-use bex_project::{BexArgs, BexExternalAdt, CallId, MediaKind, MediaValue, RuntimeTy};
-use bridge_ctypes::{CffiHandleTableEntry, HANDLE_TABLE, kwargs_to_bex_values};
-use indexmap::IndexMap;
+use bex_project::{BexExternalAdt, MediaKind, MediaValue};
+use bridge_cffi::handle_cffi::media_kind_from_proto;
+use bridge_ctypes::{CffiHandleTableEntry, HANDLE_TABLE};
 use jni::{
     JNIEnv, JavaVM,
     objects::{GlobalRef, JByteArray, JClass, JString, JValue},
     sys::{jboolean, jint, jlong},
 };
-use prost::Message;
-
-/// Decoded `CallFunctionArgs` — the JVM analog of `bridge_python`'s
-/// `DecodedCallArgs`.
-struct DecodedCallArgs {
-    kwargs: BexArgs,
-    call_id: CallId,
-    target: bridge_ctypes::baml_bridge::cffi::call_function_args::CallTarget,
-    /// Explicit, named `TypeVar` bindings for a generic call, in De Bruijn
-    /// order (empty for non-generic calls). See `CallFunctionArgs.type_args`.
-    type_args: IndexMap<String, RuntimeTy>,
-    type_defs: IndexMap<String, bex_project::PortableTypeDef>,
-}
-
-/// Decode protobuf-encoded `CallFunctionArgs` bytes into `BexArgs`.
-///
-/// Returns a `BridgeError` (not a thrown exception) so the byte-returning
-/// call site can route the failure through `bridge_cffi::error_to_outbound`
-/// into the structured `BamlOutboundResult` envelope, exactly like
-/// `bridge_python` does — the Java side then decodes + raises uniformly.
-fn decode_args(args_proto: &[u8]) -> Result<DecodedCallArgs, bridge_cffi::BridgeError> {
-    use bridge_ctypes::baml_bridge::cffi::call_function_args::CallTarget;
-
-    let args = bridge_ctypes::baml_bridge::cffi::CallFunctionArgs::decode(args_proto)
-        .map_err(bridge_ctypes::CtypesError::from)?;
-
-    if args.call_id == 0 {
-        return Err(bridge_cffi::BridgeError::InvalidCallId);
-    }
-
-    let call_id = CallId(args.call_id);
-    let target = args
-        .call_target
-        .ok_or(bridge_cffi::BridgeError::MissingCallTarget)?;
-    if matches!(target, CallTarget::FunctionHandle(_)) && !args.type_args.is_empty() {
-        return Err(bridge_cffi::BridgeError::FunctionHandleTypeArgs);
-    }
-    let type_args = bridge_ctypes::proto_ty_args_to_named(&args.type_args)?;
-    let kwargs = kwargs_to_bex_values(args.kwargs, &HANDLE_TABLE)?;
-
-    Ok(DecodedCallArgs {
-        kwargs: kwargs.into(),
-        call_id,
-        target,
-        type_args: type_args.type_args,
-        type_defs: type_args.type_defs,
-    })
-}
 
 /// Shared synchronous call body. Mirrors `bridge_python`'s
 /// `call_function_sync`: pre-call host-boundary failures (uninitialized
 /// runtime, malformed args, no tokio runtime) are encoded into the
 /// `BamlOutboundResult` envelope rather than thrown, so the returned bytes
-/// decode + raise uniformly on the Java side. The `catch_unwind` + engine
-/// error handling already lives in `bridge_cffi::call_and_encode`.
+/// decode + raise uniformly on the Java side. Argument decoding, target
+/// pinning and the `catch_unwind` + engine error handling all live in
+/// `bridge_cffi::prepare_call` / `bridge_cffi::invoke_prepared`.
 fn call_sync_to_bytes(args_proto: &[u8]) -> Vec<u8> {
     let prepared = (|| -> Result<_, bridge_cffi::BridgeError> {
         let runtime = bridge_cffi::get_runtime()?;
-        let decoded = decode_args(args_proto)?;
+        let prepared = bridge_cffi::prepare_call(args_proto)?;
         let rt = bridge_cffi::get_tokio_runtime()?;
-        Ok((runtime, decoded, rt))
+        Ok((runtime, prepared, rt))
     })();
 
-    let (runtime, decoded, rt) = match prepared {
+    let (runtime, prepared, rt) = match prepared {
         Ok(v) => v,
         Err(e) => return bridge_cffi::error_to_outbound(e),
     };
 
-    let call_ctx = bridge_cffi::function_call_context_builder(decoded.call_id)
-        .with_type_args(decoded.type_args)
-        .with_type_defs(decoded.type_defs)
-        .build();
-
     // Block on the shared multi-thread tokio runtime, like the pyo3 sync path
     // (`rt.block_on(...)`). Returns the encoded `BamlOutboundResult` bytes.
-    match decoded.target {
-        bridge_ctypes::baml_bridge::cffi::call_function_args::CallTarget::FunctionName(
-            function_name,
-        ) => rt.block_on(bridge_cffi::call_and_encode(
-            runtime,
-            function_name,
-            decoded.kwargs,
-            call_ctx,
-        )),
-        bridge_ctypes::baml_bridge::cffi::call_function_args::CallTarget::FunctionHandle(
-            handle_key,
-        ) => rt.block_on(bridge_cffi::call_handle_and_encode(
-            runtime,
-            handle_key,
-            decoded.kwargs,
-            call_ctx,
-        )),
-    }
+    rt.block_on(bridge_cffi::invoke_prepared(runtime, prepared))
 }
 
 /// `baml_bridge.BamlFfi.nativeInitFromBytecode(byte[] bytecode, String metadata, String runtimeVersion, String toolchainVersion)`.
 ///
 /// Initialize the process-global runtime from serialized BAML bytecode
-/// (`bridge_cffi::initialize_runtime_from_bytecode`, the same path
+/// (`bridge_cffi::initialize_runtime_from_blob`, the same path
 /// `bridge_python` uses). Idempotent in the same sense as Python: the
 /// single-slot singleton is replaced, so a second call swaps the runtime.
 /// A setup failure is thrown as an unchecked `RuntimeException` (this is a
 /// handle-returning site with no envelope to ride, like Python's
-/// `initialize_runtime_from_bytecode` raising).
+/// `initialize_runtime_from_blob` raising).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeInitFromBytecode(
     mut env: JNIEnv<'_>,
@@ -211,8 +142,7 @@ pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeInitFromBytecode(
         }
     };
 
-    if let Err(e) =
-        bridge_cffi::initialize_runtime_from_bytecode(&bytes, embedded_baml_toml.as_deref())
+    if let Err(e) = bridge_cffi::initialize_runtime_from_blob(&bytes, embedded_baml_toml.as_deref())
     {
         throw_runtime_exception_exact(&mut env, &e.to_string());
     }
@@ -224,7 +154,7 @@ pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeShutdownRuntime(
     _class: JClass<'_>,
 ) {
     let result = bridge_cffi::get_tokio_runtime()
-        .and_then(|runtime| runtime.block_on(bridge_cffi::shutdown_runtime()));
+        .and_then(|runtime| runtime.block_on(bridge_cffi::shutdown_runtime(None)));
     if let Err(error) = result {
         throw_runtime_exception(&mut env, &format!("runtime shutdown failed: {error}"));
     }
@@ -370,12 +300,12 @@ pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeCallAsync<'local>(
 fn spawn_async_call(call_id: u64, args_proto: Vec<u8>) {
     let prepared = (|| -> Result<_, bridge_cffi::BridgeError> {
         let runtime = bridge_cffi::get_runtime()?;
-        let decoded = decode_args(&args_proto)?;
+        let prepared = bridge_cffi::prepare_call(&args_proto)?;
         let rt = bridge_cffi::get_tokio_runtime()?;
-        Ok((runtime, decoded, rt))
+        Ok((runtime, prepared, rt))
     })();
 
-    let (runtime, decoded, rt) = match prepared {
+    let (runtime, prepared, rt) = match prepared {
         Ok(v) => v,
         Err(e) => {
             // Same envelope bytes the sync path returns, delivered on this
@@ -385,34 +315,13 @@ fn spawn_async_call(call_id: u64, args_proto: Vec<u8>) {
         }
     };
 
-    let DecodedCallArgs {
-        kwargs,
-        call_id: engine_call_id,
-        target,
-        type_args,
-        type_defs,
-    } = decoded;
-    let call_ctx = bridge_cffi::function_call_context_builder(engine_call_id)
-        .with_type_args(type_args)
-        .with_type_defs(type_defs)
-        .build();
-
     rt.spawn(async move {
         // Inner task so a panic during result *encoding* is caught (via the
         // JoinError) and still delivered as an SdkPanic envelope, rather than
-        // silently dropping the task and hanging the future. `call_and_encode`
+        // silently dropping the task and hanging the future. `invoke_prepared`
         // already turns an engine-call panic into that envelope itself; this
         // guards the rarer encode-time panic, exactly as the C-ABI path does.
-        let inner = tokio::spawn(async move {
-            match target {
-                bridge_ctypes::baml_bridge::cffi::call_function_args::CallTarget::FunctionName(function_name) => {
-                    bridge_cffi::call_and_encode(runtime, function_name, kwargs, call_ctx).await
-                }
-                bridge_ctypes::baml_bridge::cffi::call_function_args::CallTarget::FunctionHandle(handle_key) => {
-                    bridge_cffi::call_handle_and_encode(runtime, handle_key, kwargs, call_ctx).await
-                }
-            }
-        });
+        let inner = tokio::spawn(bridge_cffi::invoke_prepared(runtime, prepared));
         let bytes = match inner.await {
             Ok(bytes) => bytes,
             Err(join_err) => encode_task_failure(join_err),
@@ -704,20 +613,6 @@ pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeCompleteHostCall<'local>(
 // C-string ABI, since the JNI layer already owns `String` conversion.
 // ===========================================================================
 
-/// Map a proto `MediaTypeEnum` discriminant (as passed from Java) to a
-/// `MediaKind`. Mirrors `bridge_cffi::ffi::handle::media_kind_from_proto`.
-fn media_kind_from_proto(kind: jint) -> Option<MediaKind> {
-    use bridge_ctypes::baml_bridge::cffi::MediaTypeEnum;
-    match kind {
-        x if x == MediaTypeEnum::Image as jint => Some(MediaKind::Image),
-        x if x == MediaTypeEnum::Audio as jint => Some(MediaKind::Audio),
-        x if x == MediaTypeEnum::Pdf as jint => Some(MediaKind::Pdf),
-        x if x == MediaTypeEnum::Video as jint => Some(MediaKind::Video),
-        x if x == MediaTypeEnum::Other as jint => Some(MediaKind::Generic),
-        _ => None,
-    }
-}
-
 /// Read a required `JString` argument into an owned `String`, throwing (and
 /// returning `None`) on a null pointer or invalid UTF-8.
 fn read_required_string(env: &mut JNIEnv<'_>, s: &JString<'_>, ctx: &str) -> Option<String> {
@@ -933,9 +828,11 @@ pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeMediaMimeType<'local>(
     }
 }
 
-/// `nativeHandleClone(long key) -> long`. Mint a new owned key pointing at the
-/// same underlying row (used to hand a fresh key to the engine on the inbound
-/// wire so the Java object keeps its own). Throws on an invalid key.
+/// `nativeHandleClone(long key) -> long`. Take one more ownership of the row
+/// behind `key` and return the key to release it through — a new key for an
+/// identity-free row (media), the SAME key for an engine-heap handle. Used to
+/// hand the engine its own ownership on the inbound wire so the Java object
+/// keeps its own. Throws on an invalid key.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeHandleClone(
     mut env: JNIEnv<'_>,
@@ -954,9 +851,11 @@ pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeHandleClone(
     }
 }
 
-/// `nativeHandleRelease(long key)`. Release one owned key. Best-effort: an
-/// invalid/stale key (double release, JVM teardown race) is silently ignored,
-/// matching `bridge_python`'s `BamlPyHandle::drop`.
+/// `nativeHandleRelease(long key)`. Release one ownership of `key`, exactly
+/// once per owner. An invalid/stale key (JVM teardown race) is silently
+/// ignored, matching `bridge_python`'s `BamlPyHandle::drop` — but a double
+/// release is NOT detectable for an engine-heap handle whose key other owners
+/// share: it silently takes a live co-owner's ownership.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_baml_1bridge_BamlFfi_nativeHandleRelease(
     _env: JNIEnv<'_>,

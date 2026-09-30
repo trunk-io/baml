@@ -59,18 +59,15 @@ fn main() {
         // SAFETY: single-threaded before divan or the engine reads the env.
         unsafe { std::env::set_var("DIVAN_MAX_TIME", "3") };
     }
-    if std::env::var_os("BAML_PROFILE").is_none() {
-        // SAFETY: as above; profiling must not contaminate wall-clock results.
-        unsafe { std::env::set_var("BAML_PROFILE", "0") };
-    }
+
     divan::main();
 }
 
 fn engine() -> Arc<BexEngine> {
     let mut db = ProjectDatabase::new();
-    db.workspace(Path::new("."));
+    let package = db.workspace(Path::new("."));
     db.file("package_compile_bench.baml", OUTER_SOURCE);
-    let program = generate_project_bytecode_with_opt(&db, OptLevel::One)
+    let program = generate_project_bytecode_with_opt(&db, package, OptLevel::One)
         .expect("compile Package.compile benchmark host");
     Arc::new(
         BexEngine::new_with_runtime_compiler(

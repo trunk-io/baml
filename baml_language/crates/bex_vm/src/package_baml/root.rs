@@ -11,34 +11,22 @@ use bex_vm_types::{
 use indexmap::IndexMap;
 
 use super::{
-    BamlPackageBaml, Continuation, NativeCallResult, PackageBamlImpl, PassThroughContinuation,
+    BamlPackageBaml, Continuation, NativeCallResult, PackageBamlImpl,
     array::{
         NaturalDomain, compare_natural_values, is_primitive_array_values,
         validate_natural_order_with_vm,
     },
-    make_compare_callee, make_to_string_callee,
+    make_to_string_callee,
 };
 use crate::{
     BexVm, VmPanic,
-    errors::{VmBamlError, VmRustFnError},
+    errors::{VmBamlError, VmInternalError, VmRustFnError},
 };
 
 impl BamlPackageBaml for PackageBamlImpl {
-    fn deep_copy(vm: &mut BexVm, value: &Value) -> Value {
+    fn deep_copy(vm: &mut BexVm, value: &Value) -> Result<Value, VmRustFnError> {
         let mut copied_objects = HashMap::new();
-        deep_copy_value_recursive(vm, *value, &mut copied_objects)
-    }
-
-    /// `baml._float_total_cmp(a, b)` — bit-exact `f64::total_cmp` three-way
-    /// comparison backing `Comparable for float`. Kept in lockstep with the
-    /// float domain of `compare_natural_values` (the `_rust_sort` fast path)
-    /// so the two sort paths can never disagree on a float ordering.
-    fn _float_total_cmp(a: f64, b: f64) -> i64 {
-        match a.total_cmp(&b) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }
+        Ok(deep_copy_value_recursive(vm, *value, &mut copied_objects)?)
     }
 
     /// `baml._is_primitive_array(arr)` — `Sortable.sort`'s dispatch guard:
@@ -52,7 +40,8 @@ impl BamlPackageBaml for PackageBamlImpl {
     /// Stable natural-order sort of a homogeneous primitive array, in place
     /// (the receiver's backing `Vec` is sorted or replaced; the returned value
     /// IS the receiver). The comparator is pure Rust — no per-pair yield to
-    /// BAML — and the float domain uses `f64::total_cmp`, so no domain throws.
+    /// BAML — and the float domain uses BAML's total float order, so no domain
+    /// throws.
     /// The validation rejections are defensive only: the `_is_primitive_array`
     /// guard plus `T[]` homogeneity make them unreachable from `Sortable.sort`.
     fn _rust_sort(vm: &mut BexVm, arr: &Value) -> NativeCallResult {
@@ -101,25 +90,6 @@ impl BamlPackageBaml for PackageBamlImpl {
             Err(e) => return NativeCallResult::Error(e.into()),
         }
         NativeCallResult::Done(*arr)
-    }
-
-    /// `baml._compare_shim(a, b)` — the dispatch shim for the `Sortable`
-    /// blanket `sort`'s comparator path. Resolves `Comparable.compare` on
-    /// `a`'s runtime class and yields to it with `b`; the comparison's `int`
-    /// result (or thrown error) is returned straight through. See
-    /// `make_compare_callee` for why the sort cannot dispatch `compare`
-    /// itself.
-    fn _compare_shim(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
-        let callee = match make_compare_callee(vm, *a) {
-            Ok(ptr) => ptr,
-            Err(e) => return NativeCallResult::Error(e),
-        };
-        NativeCallResult::YieldToCall {
-            callee,
-            args: vec![*b],
-            type_args: vec![],
-            continuation: Box::new(PassThroughContinuation),
-        }
     }
 
     /// `baml._to_string_default(value)` renders `value` for `string.from`,
@@ -224,9 +194,9 @@ impl BamlPackageBaml for PackageBamlImpl {
 
     /// `baml._median_float(values)` — native backing for `float[].median()`.
     ///
-    /// Sorts a copy with `f64::total_cmp` (BAML's total float ordering, matching
-    /// `float[].sort()`) so the caller's array is left untouched. Throws
-    /// `InvalidArgument` when `values` is empty.
+    /// Sorts a copy in BAML's total float order (matching `float[].sort()`) so
+    /// the caller's array is left untouched. Throws `InvalidArgument` when
+    /// `values` is empty.
     fn _median_float(vm: &BexVm, values: &[Value]) -> Result<f64, VmRustFnError> {
         if values.is_empty() {
             return Err(VmBamlError::InvalidArgument {
@@ -239,7 +209,7 @@ impl BamlPackageBaml for PackageBamlImpl {
             .enumerate()
             .map(|(index, value)| expect_float(vm, *value, "_median_float", index))
             .collect();
-        sorted.sort_by(f64::total_cmp);
+        sorted.sort_by(|a, b| bex_vm_types::float_order::cmp(*a, *b));
         let mid = sorted.len() / 2;
         if sorted.len() % 2 == 1 {
             Ok(sorted[mid])
@@ -339,7 +309,13 @@ pub(crate) fn render_to_string_honoring_overrides(
                 results: Vec::new(),
             }),
         },
-        Ok(None) => render_done(vm, value, &pending, &[]),
+        // Pass 1 collected `first_ptr` as an override; pass 2 must agree.
+        Ok(None) => NativeCallResult::Error(
+            crate::errors::VmInternalError::OverrideWalkSkew {
+                interface: "ToString",
+            }
+            .into(),
+        ),
     }
 }
 
@@ -378,20 +354,25 @@ impl Continuation for ToStringWalkContinuation {
                 .unwrap_or_default(),
         );
 
-        // Dispatch the next override, if any (and resolvable); otherwise render.
+        // Dispatch the next override, if any; otherwise render. Every pending
+        // pointer was collected as an override by pass 1, so a pass-2 miss is
+        // a skew between the two passes, not a fallback case.
         if let Some(&next_ptr) = self.pending.get(self.results.len()) {
-            match make_to_string_callee(vm, Value::object(next_ptr)) {
-                Err(e) => return NativeCallResult::Error(e.into()),
-                Ok(Some(callee)) => {
-                    return NativeCallResult::YieldToCall {
-                        callee,
-                        args: vec![],
-                        type_args: vec![],
-                        continuation: self,
-                    };
-                }
-                Ok(None) => {}
-            }
+            return match make_to_string_callee(vm, Value::object(next_ptr)) {
+                Err(e) => NativeCallResult::Error(e.into()),
+                Ok(Some(callee)) => NativeCallResult::YieldToCall {
+                    callee,
+                    args: vec![],
+                    type_args: vec![],
+                    continuation: self,
+                },
+                Ok(None) => NativeCallResult::Error(
+                    crate::errors::VmInternalError::OverrideWalkSkew {
+                        interface: "ToString",
+                    }
+                    .into(),
+                ),
+            };
         }
         render_done(vm, self.root, &self.pending, &self.results)
     }
@@ -788,13 +769,13 @@ fn deep_copy_value_recursive(
     vm: &mut BexVm,
     value: Value,
     copied_objects: &mut HashMap<HeapPtr, HeapPtr>,
-) -> Value {
-    match value.kind() {
+) -> Result<Value, VmInternalError> {
+    Ok(match value.kind() {
         ValueKind::OmittedArg | ValueKind::Null | ValueKind::Int(_) | ValueKind::Bool(_) => value,
 
         ValueKind::Object(ptr) => {
             if let Some(&new_ptr) = copied_objects.get(&ptr) {
-                return Value::object(new_ptr);
+                return Ok(Value::object(new_ptr));
             }
 
             // Futures are *handles*, not values: a `Future` is the user-
@@ -806,7 +787,7 @@ fn deep_copy_value_recursive(
             // (which would otherwise clone the `Future` struct uselessly).
             if matches!(vm.get_object(ptr), Object::Future(_)) {
                 copied_objects.insert(ptr, ptr);
-                return Value::object(ptr);
+                return Ok(Value::object(ptr));
             }
 
             let object = vm.get_object(ptr).clone();
@@ -829,7 +810,7 @@ fn deep_copy_value_recursive(
                     let snapshot = values.to_vec();
                     let mut new_values = Vec::with_capacity(snapshot.len());
                     for value in snapshot {
-                        new_values.push(deep_copy_value_recursive(vm, value, copied_objects));
+                        new_values.push(deep_copy_value_recursive(vm, value, copied_objects)?);
                     }
 
                     // no GC write barrier because it is all in gen0
@@ -852,7 +833,7 @@ fn deep_copy_value_recursive(
                     let snapshot = map.to_index_map();
                     let mut new_map = IndexMap::new();
                     for (key, value) in &snapshot {
-                        let new_value = deep_copy_value_recursive(vm, *value, copied_objects);
+                        let new_value = deep_copy_value_recursive(vm, *value, copied_objects)?;
                         new_map.insert(key.clone(), new_value);
                     }
 
@@ -872,7 +853,7 @@ fn deep_copy_value_recursive(
 
                     let mut new_fields = Vec::with_capacity(instance.fields.len());
                     for field in instance.field_values() {
-                        new_fields.push(deep_copy_value_recursive(vm, field, copied_objects));
+                        new_fields.push(deep_copy_value_recursive(vm, field, copied_objects)?);
                     }
 
                     let new_instance = Instance::new(
@@ -887,6 +868,9 @@ fn deep_copy_value_recursive(
 
                 // Bigint is behind Arc — clone() is cheap (increments refcount).
                 Object::Bigint(arc) => vm.tlab.alloc(Object::Bigint(std::sync::Arc::clone(&arc))),
+                Object::Function(f) if f.telemetry_function_id.is_some() => {
+                    vm.tlab.alloc_function(f)?
+                }
                 Object::Function(f) => vm.tlab.alloc(Object::Function(f)),
                 Object::Interface(i) => vm.tlab.alloc(Object::Interface(i)),
                 Object::Package(p) => vm.tlab.alloc(Object::Package(p)),
@@ -899,8 +883,6 @@ fn deep_copy_value_recursive(
                 // `Object::Future(_)` is short-circuited above; it can't
                 // reach this match arm.
                 Object::Future(_) => unreachable!("Future short-circuited above"),
-                Object::UnscheduledFuture(f) => vm.tlab.alloc(Object::UnscheduledFuture(f)),
-                Object::Collector(c) => vm.tlab.alloc(Object::Collector(c)),
                 // A deep copy denotes the same type: clone the `TypeValue`
                 // whole, definition overlay and owner edge included.
                 Object::Type(ty) => vm.tlab.alloc(Object::Type(ty)),
@@ -922,7 +904,7 @@ fn deep_copy_value_recursive(
 
             Value::object(new_ptr)
         }
-    }
+    })
 }
 
 // ── Helpers for the numeric-array reductions ──────────────────────────────────

@@ -40,7 +40,8 @@ pub enum DiagnosticPhase {
 ///
 /// The Borsh derives serialize the variant as a declaration-order
 /// discriminant for the per-file diagnostics cache; reordering variants is a
-/// wire-format break gated by the cache's `FORMAT_VERSION`.
+/// wire-format break gated by the cache's `FORMAT_VERSION`. A new variant is
+/// therefore appended at the end, whichever group below it belongs with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum DiagnosticId {
     // Parse errors (E0009, E0010)
@@ -187,9 +188,6 @@ pub enum DiagnosticId {
     MissingConfigBlock,
     MissingConfigKey,
     MalformedAttribute,
-
-    // Attribute disambiguation (E0106)
-    FieldAttributeInTypePosition,
 
     // Byte string literal errors (E0109)
     InvalidByteStringEscape,
@@ -384,10 +382,10 @@ pub enum DiagnosticId {
     /// A condition whose static type decides the branch (always truthy /
     /// always falsy) - B-1563 truthiness.
     ConditionAlwaysConstant,
-    /// An inline `unreflect(value)` type argument would escape its call: the
-    /// runtime type parameter is rigid for that one call, but the expression's
-    /// published type still mentions it. The lexical `type T = unreflect(v)`
-    /// binding is the spelling that outlives the call.
+    /// `unreflect(value)` was written somewhere other than as the whole
+    /// right-hand side of a body-level `type T = …;` binding. The binding is
+    /// the one spelling that lifts a runtime type; every other position names
+    /// the bound `T`.
     RuntimeTypeMustBeNamed,
     /// `reflect.function.Type.specialize` was given type arguments the
     /// callable cannot accept: the wrong number of them, one that fails a
@@ -396,6 +394,42 @@ pub enum DiagnosticId {
     ReflectSpecializationFailed,
     /// An ordinary inference variable remained unresolved at writeback (E0155).
     TypeMustBeKnown,
+    /// A builtin type spelling was written with type arguments or
+    /// associated-type bindings it does not take (`image<string>`,
+    /// `map<string>`), diagnosed at AST lowering before the arguments could
+    /// be silently erased.
+    InvalidBuiltinTypeArguments,
+    /// A value typed by a body-scoped `type T = …` binding would be
+    /// observable outside the block that binds `T`: the block's value, a
+    /// thrown type a published clause would carry, or a type still being
+    /// inferred that would be decided as one.
+    ScopedTypeEscapesBlock,
+    /// A value binding or body type binding took a name the compiler emits as
+    /// a path root in its desugars, which the binding would shadow.
+    ReservedBindingName,
+    /// A class literal named a class that holds a `$rust_type` field. That
+    /// state is created only by the class's own native functions; a literal
+    /// could only copy a handle out of another value, which relabels what the
+    /// handle means (its type arguments, or its class).
+    CannotConstructOpaqueClass,
+    /// Reserved (E0178): a value path into a package served from its
+    /// compiled interface that names a declaration the interface does not
+    /// carry. Not produced today — the interface cannot yet tell such a
+    /// declaration from a misspelling, so the path reports as an unresolved
+    /// name, as in source. Returns once the interface carries the names of
+    /// its unexported declarations. (Landed as E0173, which
+    /// `CannotConstructOpaqueClass` now uses, then held E0175, which
+    /// `AmbiguousUnion` now uses: a reserved code nothing produces is the one
+    /// safe to move.)
+    ServedInterfaceExportsFunctionsOnly,
+    /// A constant pattern passed to `baml.regex.new` does not compile (E0174).
+    InvalidRegexPattern,
+    /// An unparenthesized function/union boundary has two syntactic owners (E0175).
+    AmbiguousUnion,
+    /// A builtin the compiler lowers where it is called (`log.info`,
+    /// `baml.spawn.__spawn`, ...) was referenced as a value: it has no
+    /// function value, so it may only be called directly.
+    CallSiteBuiltinValue,
 }
 
 impl DiagnosticId {
@@ -525,9 +559,6 @@ impl DiagnosticId {
             DiagnosticId::MissingConfigKey => "E0104",
             DiagnosticId::MalformedAttribute => "E0105",
 
-            // Attribute disambiguation
-            DiagnosticId::FieldAttributeInTypePosition => "E0106",
-
             // Byte string literal errors
             DiagnosticId::InvalidByteStringEscape => "E0109",
 
@@ -606,7 +637,15 @@ impl DiagnosticId {
             DiagnosticId::RuntimeTypeMustBeNamed => "E0168",
             DiagnosticId::ReflectSpecializationFailed => "E0169",
             DiagnosticId::InterfaceMethodMissingThrows => "E0170",
+            DiagnosticId::InvalidRegexPattern => "E0174",
+            DiagnosticId::AmbiguousUnion => "E0175",
             DiagnosticId::TypeMustBeKnown => "E0155",
+            DiagnosticId::InvalidBuiltinTypeArguments => "E0171",
+            DiagnosticId::ScopedTypeEscapesBlock => "E0172",
+            DiagnosticId::CannotConstructOpaqueClass => "E0173",
+            DiagnosticId::ReservedBindingName => "E0176",
+            DiagnosticId::ServedInterfaceExportsFunctionsOnly => "E0178",
+            DiagnosticId::CallSiteBuiltinValue => "E0177",
         }
     }
 }
@@ -910,6 +949,12 @@ mod tests {
             vec![0]
         );
         assert_eq!(borsh::to_vec(&DiagnosticId::TypeMismatch).unwrap(), vec![3]);
+        // A late variant, so an insertion anywhere before it is caught too:
+        // new variants are appended.
+        assert_eq!(
+            borsh::to_vec(&DiagnosticId::ScopedTypeEscapesBlock).unwrap(),
+            vec![140]
+        );
         assert_eq!(borsh::to_vec(&Severity::Error).unwrap(), vec![0]);
         assert_eq!(borsh::to_vec(&Severity::Warning).unwrap(), vec![1]);
         assert_eq!(borsh::to_vec(&DiagnosticPhase::Parse).unwrap(), vec![0]);
@@ -924,5 +969,73 @@ mod tests {
             let bytes = borsh::to_vec(&id).unwrap();
             assert_eq!(borsh::from_slice::<DiagnosticId>(&bytes).unwrap(), id);
         }
+    }
+
+    /// Every variant, recovered from the declaration-order discriminant the
+    /// Borsh derive assigns. Deserializing `[i]` for ascending `i` enumerates
+    /// the enum without a hand-maintained list to fall out of date.
+    fn all_diagnostic_ids() -> Vec<DiagnosticId> {
+        (0..=u8::MAX)
+            .map_while(|byte| borsh::from_slice::<DiagnosticId>(&[byte]).ok())
+            .collect()
+    }
+
+    #[test]
+    fn a_code_is_shared_only_where_this_test_says_so() {
+        // Two ids may map to one code only when they are the same error to a
+        // reader. Everything else here is a pre-existing collision between
+        // unrelated errors: two authors reached for the next free number at
+        // the same time, and nothing failed. Adding a row is a decision, not
+        // a formality - a new id takes a fresh code.
+        const SHARED: &[(&str, &[&str])] = &[
+            ("E0010", &["UnexpectedToken", "InvalidSyntax"]),
+            // One error to a reader: the role-remapping config is invalid.
+            (
+                "E0044",
+                &[
+                    "RemapRolesNotMap",
+                    "RemapRoleValueNotString",
+                    "RemapRoleNotAllowed",
+                    "AllowedRolesEmpty",
+                    "AllowedRoleNotString",
+                ],
+            ),
+            ("E0093", &["DuplicateMethod", "InvalidCatchBindingType"]),
+            ("E0094", &["DuplicateBinding", "NonExhaustiveCatch"]),
+            ("E0112", &["IrrefutablePatternInIfLet", "UnknownInterface"]),
+            ("E0113", &["LetElseMustDiverge", "MissingInterfaceMethod"]),
+            (
+                "E0114",
+                &["IrrefutablePatternInLetElse", "DuplicateImplementsBlock"],
+            ),
+            (
+                "E0153",
+                &[
+                    "GenericSysOpMethodInInterfaceImpl",
+                    "BuiltinInterfaceNotImplementable",
+                ],
+            ),
+        ];
+
+        let mut by_code: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for id in all_diagnostic_ids() {
+            by_code
+                .entry(id.code())
+                .or_default()
+                .push(format!("{id:?}"));
+        }
+        let shared: Vec<(&str, Vec<String>)> = by_code
+            .into_iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .collect();
+        let expected: Vec<(&str, Vec<String>)> = SHARED
+            .iter()
+            .map(|(code, ids)| (*code, ids.iter().map(ToString::to_string).collect()))
+            .collect();
+        assert_eq!(
+            shared, expected,
+            "a diagnostic code is shared by ids this test does not list; give the new id its own code"
+        );
     }
 }

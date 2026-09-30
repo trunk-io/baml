@@ -12,37 +12,43 @@
 
 pub mod bytecode;
 pub mod errors;
+pub mod float_order;
 pub mod head_walk;
 pub mod heap_ptr;
 pub mod identity;
 pub mod indexable;
 pub mod lazy_biased_mutex;
+pub mod limit;
 pub mod link;
 pub mod relink;
 mod roots;
 pub mod runtime_compile;
-pub mod task_group;
+pub mod trace;
 pub mod type_head;
 pub mod types;
 pub mod unit;
 
 pub use bex_str::BexStr;
+pub use btel_types::{FunctionRegistration, TelemetryPolicyId};
 pub use bytecode::{BinOp, Bytecode, CmpOp, Instruction, JumpTableData, UnaryOp};
 pub use heap_ptr::HeapPtr;
 pub use indexable::{
     GlobalIndex, GlobalPool, ObjectIndex, ObjectPool, SharedGlobals, StackIndex, VmGlobals,
 };
+pub use limit::{Admission, AdmissionTicket, LimitInner, LimitSet};
 pub use link::LinkError;
 pub use roots::{PermitProof, RootHaver, WriteBarrier};
 pub use runtime_compile::{
     ArtifactKind, RuntimeCompileArtifact, RuntimeCompileArtifactSlot, RuntimeCompileDiagnostic,
-    RuntimeCompileMode, RuntimeCompileRequest, RuntimeDiagnosticSeverity, RuntimeMountedClass,
-    RuntimeMountedEnum, RuntimeMountedFieldAttrs, RuntimeMountedVariantAttrs, RuntimePackageMount,
-    RuntimeSessionCompileArtifact, RuntimeSessionCompileRequest, RuntimeSessionInitializer,
-    RuntimeSessionStep, RuntimeSessionStepKind, RuntimeSourceSpan, RuntimeTypeMount,
-    SessionContract, SessionEvalLease, SessionVisibleKind, SessionVisibleSymbol,
+    RuntimeCompileMode, RuntimeCompileRequest, RuntimeDiagnosticAnnotation,
+    RuntimeDiagnosticDetails, RuntimeDiagnosticHighlight, RuntimeDiagnosticHighlightKind,
+    RuntimeDiagnosticPhase, RuntimeDiagnosticRelatedInfo, RuntimeDiagnosticSeverity,
+    RuntimeMountedClass, RuntimeMountedEnum, RuntimeMountedFieldAttrs, RuntimeMountedVariantAttrs,
+    RuntimePackageIdentity, RuntimePackageMount, RuntimeSessionCompileArtifact,
+    RuntimeSessionCompileRequest, RuntimeSessionInitializer, RuntimeSessionStep,
+    RuntimeSessionStepKind, RuntimeSourceSpan, RuntimeTypeMount, SessionContract, SessionEvalLease,
+    SessionVisibleKind, SessionVisibleSymbol,
 };
-pub use task_group::{TaskGroupInner, TaskGroupPermit, TaskGroupTicket};
 pub use type_head::TypeHead;
 
 // ── The runtime's instantiation of the `baml_type` family ────────────────────
@@ -152,15 +158,14 @@ pub fn name_headed_realized(ty: &RealizedTy) -> Result<baml_type::RealizedTy, Un
     ty.try_map_heads(&mut |head| head.declared_name().ok_or(UnnameableHead(head.tag())))
 }
 pub use types::{
-    ArrayContainer, ArrayReadGuard, ArrayWriteGuard, AtomicValueSlot, BoundMethod, CaptureCategory,
-    CaptureOption, Class, ClassField, CleanupLatch, ClientBuildMeta, ClientBuildType, CollectorRef,
-    ConstValue, DeclarationName, Enum, EnumVariant, Function, FunctionCaptureProps, FunctionKind,
-    FunctionMeta, FunctionOrigin, Future, FutureRead, GenericFunction, HostClosure, Instance,
-    LockedContainer, LockedReadGuard, LockedWriteGuard, MapContainer, MapReadGuard, MapWriteGuard,
-    MediaValue, Object, ObjectType, PanicClass, Program, PromptAst, RetryPolicyMeta, SysOp,
-    SysOpErrorCategory, SysOpPanicCategory, Uint8ArrayContainer, Uint8ArrayReadGuard,
-    Uint8ArrayWriteGuard, UnscheduledFuture, Value, ValueKind, Variant, format_float,
-    sys_op_for_path, type_tags,
+    ArrayContainer, ArrayReadGuard, ArrayWriteGuard, AtomicValueSlot, BoundMethod, Class,
+    ClassField, CleanupLatch, ClientBuildMeta, ClientBuildType, ConstValue, DeclarationName, Enum,
+    EnumVariant, Function, FunctionKind, FunctionMeta, FunctionOrigin, Future, FutureRead,
+    GenericFunction, HostClosure, ImplCoherenceKey, Instance, InterfaceBound, LockedContainer,
+    LockedReadGuard, LockedWriteGuard, MapContainer, MapReadGuard, MapWriteGuard, MediaValue,
+    Object, ObjectType, PanicClass, Program, PromptAst, RetryPolicyMeta, SysOp, SysOpErrorCategory,
+    SysOpPanicCategory, Uint8ArrayContainer, Uint8ArrayReadGuard, Uint8ArrayWriteGuard, Value,
+    ValueKind, Variant, format_float, sys_op_for_path, type_tags,
 };
 pub use unit::{
     CompilationUnit, ExportTable, GenericFnKey, InitTail, LocalRef, ProgramImplRuleFrag,
@@ -190,6 +195,7 @@ pub use unit::{
 /// - For multi-threaded targets, it checks an atomic flag every `N` increments. If the flag is set, it returns `true`.
 ///   The flag should be set by another thread that wants to park the VM.
 pub struct EarlyYieldCheck {
+    gc_pressure: Option<::std::sync::Arc<::std::sync::atomic::AtomicBool>>,
     counter: u64,
     interval: u64,
     /// Only used in non-WASM targets, since WASM currently doesn't support threads.
@@ -198,14 +204,28 @@ pub struct EarlyYieldCheck {
     park_requested: ::std::sync::Arc<::std::sync::atomic::AtomicBool>,
 }
 
-/// Default poll interval: ~32M instructions (~1.5s at typical IPC).
+/// Legacy interval for checks constructed without allocation-pressure tracking.
+/// Production VMs set their interval through [`EarlyYieldCheck::with_gc_pressure`].
 pub const EARLY_YIELD_INTERVAL: u64 = 1 << 25;
 
 impl EarlyYieldCheck {
+    #[must_use]
+    pub fn with_gc_pressure(
+        mut self,
+        pressure: ::std::sync::Arc<::std::sync::atomic::AtomicBool>,
+        interval: u64,
+    ) -> Self {
+        assert!(interval > 0);
+        self.gc_pressure = Some(pressure);
+        self.interval = interval;
+        self.counter = interval;
+        self
+    }
     #[cfg(target_arch = "wasm32")]
     #[expect(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self {
+            gc_pressure: None,
             counter: EARLY_YIELD_INTERVAL,
             interval: EARLY_YIELD_INTERVAL,
         }
@@ -213,6 +233,7 @@ impl EarlyYieldCheck {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(park_requested: ::std::sync::Arc<::std::sync::atomic::AtomicBool>) -> Self {
         Self {
+            gc_pressure: None,
             counter: EARLY_YIELD_INTERVAL,
             interval: EARLY_YIELD_INTERVAL,
             park_requested,
@@ -229,6 +250,7 @@ impl EarlyYieldCheck {
             "early-yield interval must be greater than zero"
         );
         Self {
+            gc_pressure: None,
             counter: interval,
             interval,
             park_requested,
@@ -250,8 +272,22 @@ impl EarlyYieldCheck {
         }
         self.counter = self.interval;
 
+        if self
+            .gc_pressure
+            .as_ref()
+            .is_some_and(|p| p.load(::std::sync::atomic::Ordering::Relaxed))
+        {
+            return true;
+        }
+
         #[cfg(target_arch = "wasm32")]
         {
+            // Shorter polling must preserve cooperative yielding
+            // even when this VM has not itself spent the allocation budget.
+
+            if self.gc_pressure.is_some() {
+                return true;
+            }
             self.counter > (1 << 16)
         }
         #[cfg(not(target_arch = "wasm32"))]

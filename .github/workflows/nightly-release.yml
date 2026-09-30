@@ -92,44 +92,28 @@ jobs:
             echo "Local time is $local_now, not the midnight hour; the other cron entry owns tonight."
           fi
 
+      - name: Check out the nightly selection tool
+        if: ${{ steps.clock.outputs.proceed == 'true' }}
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: canary
+          path: nightly-dispatch-tools
+          fetch-depth: 10
+          sparse-checkout: tools/baml_nightly_select.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Select the newest green canary commit
         id: select
         if: ${{ steps.clock.outputs.proceed == 'true' }}
         run: |
           set -euo pipefail
-          # Off the workspace: this job never checks the repo out.
-          green="$RUNNER_TEMP/green-ci-runs.json"
-          commits="$RUNNER_TEMP/canary-commits.txt"
-          # The release attests its source against a successful `CI - BAML
-          # Language` push run on canary, so only such a commit is releasable.
-          gh run list --workflow ci.yaml --branch canary --event push \
-            --status success --limit 100 \
-            --json headSha,databaseId > "$green"
-          # Walk canary newest-first rather than trusting run order: runs are
-          # ordered by creation, which is not commit ancestry.
-          gh api "repos/$GH_REPO/commits?sha=canary&per_page=100" \
-            --jq '.[].sha' > "$commits"
-          sha=""
-          run_id=""
-          while IFS= read -r commit; do
-            id="$(jq -r --arg commit "$commit" \
-              '[.[] | select(.headSha == $commit) | .databaseId] | max // empty' \
-              "$green")"
-            if [[ -n "$id" ]]; then
-              sha="$commit"
-              run_id="$id"
-              break
-            fi
-          done < "$commits"
-          if [[ -z "$sha" ]]; then
-            echo "::error::no canary commit in the last 100 has a successful CI run, so nothing is releasable tonight"
-            exit 1
-          fi
-          {
-            echo "sha=$sha"
-            echo "run_id=$run_id"
-          } >> "$GITHUB_OUTPUT"
-          echo "Newest green canary commit: $sha (CI run $run_id)"
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 nightly-dispatch-tools/tools/baml_nightly_select.py \
+            --repo "$GH_REPO" \
+            --checkout nightly-dispatch-tools \
+            --observed-at "$observed_at" \
+            --output "$GITHUB_OUTPUT"
 
       - name: Decide whether canary moved since the last nightly
         id: decide
@@ -291,7 +275,7 @@ jobs:
     if: ${{ always() && github.repository == 'BoundaryML/baml' && needs.dispatch-nightly.result == 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: boundary-tools-dev
+    environment: infisical-github-baml-language-release
     permissions:
       actions: read
       contents: read
@@ -301,7 +285,7 @@ jobs:
           sparse-checkout: |
             .github/actions/setup-mise
             mise.toml
-            tools/notify-release-failure.py
+            tools/
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: ./.github/actions/setup-mise

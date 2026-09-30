@@ -12,10 +12,19 @@ class ModelTurnInput {
     output_type: reflect.Type,
 }
 
+/// A provider-decoded output. The wrapper distinguishes a decoded null from
+/// absence. Runners check its runtime type before returning it to callers.
+class ParsedOutput {
+    value: unknown,
+}
+
 class ModelTurn {
-    content: root.content.Block[],
+    parsed_output: ParsedOutput?,
+    content: root.content.ModelBlock[],
     stop_reason: root.content.StopReason,
     usage: root.events.Usage?,
+    // The model that answered, as the client named it; null when unknown.
+    model: string?,
     // Every HTTP exchange behind this turn, oldest first: failed legs from
     // retry/fallback wrappers, then the selected call (selected: true).
     calls: root.events.LLMCall[],
@@ -56,10 +65,13 @@ class ModelTurn {
 }
 
 interface Client {
-    function id(self) -> string throws never
+    function id(self) -> string throws never;
     /// Render the provider request shape without performing I/O. Reliability
     /// wrappers use this as a stable request-shape preview: they do not sleep,
     /// rotate, or try fallback members while rendering.
-    function render(self, input: ModelTurnInput) -> baml.http.Request throws root.errors.InvokeError
-    function invoke(self, input: ModelTurnInput) -> ModelTurn throws root.errors.InvokeError
+    function render(
+        self,
+        input: ModelTurnInput,
+    ) -> baml.http.Request throws root.errors.InvokeError;
+    function invoke(self, input: ModelTurnInput) -> ModelTurn throws root.errors.InvokeError;
 }

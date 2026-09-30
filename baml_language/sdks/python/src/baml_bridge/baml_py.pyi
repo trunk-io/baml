@@ -11,17 +11,12 @@ __all__ = [
     "BamlPyHandle",
     "BamlRuntime",
     "BamlVideo",
-    "Collector",
-    "FunctionLog",
     "FunctionResult",
     "HostSpanManager",
-    "LLMCall",
-    "Timing",
-    "Usage",
     "cancel_function_call",
     "flush_events",
-    "get_runtime",
     "get_bridge_runtime_version",
+    "get_runtime",
     "get_toolchain_version",
     "get_version",
     "lookup_host_value",
@@ -184,7 +179,7 @@ class BamlRuntime:
         * `files` - Map of filename to file content
         """
     @staticmethod
-    def initialize_runtime_from_bytecode(bytecode: typing.Sequence[builtins.int], embedded_baml_toml: typing.Optional[builtins.str] = None) -> BamlRuntime:
+    def initialize_runtime_from_blob(bytecode: typing.Sequence[builtins.int], embedded_baml_toml: typing.Optional[builtins.str] = None) -> BamlRuntime:
         r"""
         Initialize the process-global runtime from serialized BAML bytecode.
 
@@ -194,14 +189,15 @@ class BamlRuntime:
         # Arguments
         * `bytecode` - borsh-encoded BAML bytecode program
         """
-    def call_function(self, args_proto: bytes, ctx: typing.Optional["HostSpanManager"] = None, collectors: typing.Optional[typing.Sequence["Collector"]] = None) -> typing.Any:
+    def call_function(self, args_proto: bytes, ctx: typing.Optional["HostSpanManager"] = None) -> typing.Any:
         r"""
         Call a BAML function asynchronously.
         """
-    def call_function_sync(self, args_proto: bytes, ctx: typing.Optional["HostSpanManager"] = None, collectors: typing.Optional[typing.Sequence["Collector"]] = None) -> bytes:
+    def call_function_sync(self, args_proto: bytes, ctx: typing.Optional["HostSpanManager"] = None) -> bytes:
         r"""
         Call a BAML function synchronously (blocking).
         """
+
 @typing.final
 class BamlVideo:
     @staticmethod
@@ -227,93 +223,6 @@ class BamlVideo:
         """
     @classmethod
     def __get_pydantic_core_schema__(cls, _source_type: typing.Any, _handler: typing.Any) -> typing.Any: ...
-
-class Collector:
-    r"""
-    Python-facing Collector that tracks BAML function call logs.
-
-    Usage:
-    ```python
-    from baml_py import Collector
-    collector = Collector("my_collector")
-    result = await b.MyFunction("input", baml_options={"collector": collector})
-    print(collector.logs)
-    print(collector.usage)
-    ```
-    """
-    @property
-    def name(self) -> builtins.str:
-        r"""
-        The collector's name.
-        """
-    @property
-    def logs(self) -> builtins.list[FunctionLog]:
-        r"""
-        All function logs tracked by this collector, in insertion order.
-        """
-    @property
-    def last(self) -> typing.Optional[FunctionLog]:
-        r"""
-        The most recent function log, or None if empty.
-        """
-    @property
-    def usage(self) -> Usage:
-        r"""
-        Aggregate token usage across all tracked calls.
-        """
-    def __new__(cls, name: typing.Optional[builtins.str] = None) -> Collector: ...
-    def clear(self) -> builtins.int:
-        r"""
-        Clear all tracked logs and release event store references.
-        Returns the number of logs that were cleared.
-        """
-    def id(self, function_log_id: builtins.str) -> typing.Optional[FunctionLog]:
-        r"""
-        Look up a function log by its span ID string.
-        """
-    def __repr__(self) -> builtins.str: ...
-
-@typing.final
-class FunctionLog:
-    r"""
-    Read-only view of a single BAML function invocation.
-    """
-    @property
-    def id(self) -> builtins.str:
-        r"""
-        The span ID for this function invocation.
-        """
-    @property
-    def function_name(self) -> builtins.str:
-        r"""
-        The BAML function name.
-        """
-    @property
-    def timing(self) -> Timing:
-        r"""
-        Timing information (start time, duration).
-        """
-    @property
-    def usage(self) -> Usage:
-        r"""
-        Token usage for this function invocation.
-        """
-    @property
-    def calls(self) -> builtins.list[LLMCall]:
-        r"""
-        Child LLM calls made during this function invocation.
-        """
-    @property
-    def tags(self) -> builtins.dict[builtins.str, builtins.str]:
-        r"""
-        Tags (metadata) attached to this invocation.
-        """
-    @property
-    def result(self) -> typing.Optional[builtins.bytes]:
-        r"""
-        The result value as protobuf-encoded bytes, or None if not yet complete.
-        """
-    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class FunctionResult:
@@ -367,71 +276,24 @@ class HostSpanManager:
         Number of active spans (call depth).
         """
 
-@typing.final
-class LLMCall:
+def _handle_refcount(key: builtins.int) -> typing.Optional[builtins.int]:
     r"""
-    A single LLM call within a function invocation.
+    Test-only: the outstanding ownership count of a live key — the releases it
+    still owes — or `None` for a dead/unknown key. Lets an audit see an
+    exactly-once imbalance on a shared engine-heap key, which row counts hide.
     """
-    @property
-    def function_name(self) -> builtins.str:
-        r"""
-        The LLM function name.
-        """
-    @property
-    def provider(self) -> typing.Optional[builtins.str]:
-        r"""
-        The provider name, if known.
-        """
-    @property
-    def timing(self) -> Timing:
-        r"""
-        Timing information for this LLM call.
-        """
-    @property
-    def usage(self) -> Usage:
-        r"""
-        Token usage for this LLM call.
-        """
-    def __repr__(self) -> builtins.str: ...
 
-@typing.final
-class Timing:
+def _live_handle_count() -> builtins.int:
     r"""
-    Timing information for a span.
+    Test-only: return the number of live ordinary HANDLE_TABLE rows (a
+    refcounted engine-heap row counts once however many owners it has).
     """
-    @property
-    def start_time_utc_ms(self) -> builtins.int:
-        r"""
-        Start time as UTC milliseconds since epoch.
-        """
-    @property
-    def duration_ms(self) -> typing.Optional[builtins.int]:
-        r"""
-        Duration in milliseconds, or None if not yet complete.
-        """
-    def __repr__(self) -> builtins.str: ...
 
-@typing.final
-class Usage:
+def _release_wire_handle(key: builtins.int) -> None:
     r"""
-    Token usage from LLM calls.
+    Release a handle cloned for wire ownership when encoding aborts before the
+    engine can consume it.
     """
-    @property
-    def input_tokens(self) -> typing.Optional[builtins.int]:
-        r"""
-        Number of input tokens, or None if not reported.
-        """
-    @property
-    def output_tokens(self) -> typing.Optional[builtins.int]:
-        r"""
-        Number of output tokens, or None if not reported.
-        """
-    @property
-    def cached_input_tokens(self) -> typing.Optional[builtins.int]:
-        r"""
-        Number of cached input tokens, or None if not reported.
-        """
-    def __repr__(self) -> builtins.str: ...
 
 def _seed_function_ref_handle(global_index: builtins.int) -> tuple[builtins.int, builtins.int]:
     r"""
@@ -445,15 +307,11 @@ def _seed_generic_media_handle() -> tuple[builtins.int, builtins.int]:
     Test-only: seed an `Adt(Media(generic))` entry through the shared CFFI API.
     """
 
-def _release_wire_handle(key: builtins.int) -> None:
+def _seed_heap_handle(slab_key: builtins.int) -> tuple[builtins.int, builtins.int]:
     r"""
-    Release a handle cloned for wire ownership when encoding aborts before the
-    engine can consume it.
-    """
-
-def _live_handle_count() -> builtins.int:
-    r"""
-    Test-only: return the number of live ordinary HANDLE_TABLE keys.
+    Test-only: seed an engine-heap (`BexHeapHandle`) entry through the shared
+    CFFI API — the identity-bearing, deduplicating arm. Two seeds of one
+    `slab_key` share a key.
     """
 
 def cancel_function_call(call_id: builtins.int) -> builtins.bool: ...
@@ -463,6 +321,8 @@ def flush_events() -> None:
     No-op: tracing has been removed. Kept as a live symbol for ABI stability
     (SDK `atexit` + `__all__` reference it).
     """
+
+def get_bridge_runtime_version() -> builtins.str: ...
 
 def get_runtime() -> BamlRuntime:
     r"""
@@ -474,9 +334,9 @@ def get_runtime() -> BamlRuntime:
     site.
     """
 
-def get_version() -> builtins.str: ...
 def get_toolchain_version() -> builtins.str: ...
-def get_bridge_runtime_version() -> builtins.str: ...
+
+def get_version() -> builtins.str: ...
 
 def lookup_host_value(handle: BamlPyHandle) -> typing.Optional[typing.Any]:
     r"""
@@ -521,4 +381,13 @@ def release_host_callable(host_value_key: builtins.int) -> None:
     registered during a failed encode.
     """
 
-def shutdown_runtime() -> None: ...
+def shutdown_runtime(timeout: typing.Optional[builtins.float] = None) -> None:
+    r"""
+    Shut down the BAML runtime: wait for in-flight calls and spawned work,
+    report errors nothing observed, and release the runtime.
+
+    `timeout` (seconds) bounds the wait: once it passes, work still running is
+    cancelled and then abandoned. Without one the wait lasts as long as the
+    work does, as Python's own exit waits for non-daemon threads. Either way,
+    Ctrl+C ends it with `KeyboardInterrupt`.
+    """

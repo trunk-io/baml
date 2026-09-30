@@ -8,6 +8,7 @@ use std::fmt;
 use baml_base::{Name, Span};
 pub use baml_compiler2_ast::BuiltinKind;
 use baml_type::{RealizedTy, RuntimeTy, TyTemplate, TyTemplateInterface};
+use subenum::subenum;
 
 // ============================================================================
 // Optimization Level
@@ -34,44 +35,15 @@ pub enum OptLevel {
 // Function
 // ============================================================================
 
-/// A catch region recorded during MIR lowering.
-///
-/// Describes the try-body entry block and the handler block for a `catch`
-/// expression. The emitter uses this to build the bytecode exception table.
-#[derive(Debug, Clone)]
-pub struct CatchRegion {
-    /// First block of the try body.
-    pub body_entry: BlockId,
-    /// Handler block that receives the exception.
-    pub handler: BlockId,
-    /// Every block the protected body lowers into: `body_entry` plus the
-    /// blocks created while lowering the protected code (which includes any
-    /// nested construct's blocks — a throw in a nested handler's arm correctly
-    /// routes to THIS region's handler when no closer one covers it).
-    ///
-    /// The emitter builds the exception table from these blocks' exact PC
-    /// ranges. Coverage therefore does not depend on block layout: a
-    /// `[body_entry_pc, handler_pc)` span only works if every protected block
-    /// is laid out before the handler, and reverse-postorder layout does not
-    /// guarantee that — a direct `throw` block is a CFG leaf that sinks to the
-    /// end of the function, and a call-free block that can panic (division,
-    /// indexing) has no unwind edge to anchor it either. Both escaped their
-    /// handler when a throwing call elsewhere in the block pulled the handler
-    /// to a mid-function PC.
-    pub body_blocks: Vec<BlockId>,
-    /// All blocks making up the handler body (the arms). BEP-042 cause-chain: a
-    /// throw whose PC lies in any of these blocks is "during handling of"
-    /// `error_local`, so that error's `baml.errors.Context` becomes the new error's
-    /// cause. Captured as the blocks created while lowering the arms (plus the
-    /// handler block itself); empty means "never chains" (e.g. a defer pad).
-    /// Layout can fragment these across non-contiguous PCs, so the emitter must
-    /// take their union rather than a single `[handler, join)` span.
-    pub handler_body: Vec<BlockId>,
-    /// Frame-local slot for the caught error value.
+/// What the VM lands in a handler block with: the frame slots it writes the
+/// caught error and its `baml.errors.Context` into before jumping to the
+/// block. The context is the error's identity while it is in flight: a
+/// rethrow from the handler carries it, and a throw during the handler's body
+/// takes it as its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Landing {
     pub error_local: Local,
-    /// Frame-local slot for the stack trace value, if the catch clause
-    /// has a second binding: `catch (e, st) { ... }`
-    pub stack_trace_local: Option<Local>,
+    pub context_local: Local,
 }
 
 /// The bytecode body of a MIR function — blocks, locals, and associated data.
@@ -87,9 +59,6 @@ pub struct MirFunctionBody<'db> {
     pub entry: BlockId,
     /// Local variable declarations.
     pub locals: Vec<LocalDecl>,
-    /// Catch regions mapping try-body extents to handler blocks.
-    /// Populated during catch lowering; used by the emitter to build exception tables.
-    pub catch_regions: Vec<CatchRegion>,
 }
 
 impl<'db> MirFunctionBody<'db> {
@@ -103,13 +72,23 @@ impl<'db> MirFunctionBody<'db> {
         &self.locals[id.0]
     }
 
-    /// Iterate `(handler_block, error_local)` pairs derived from catch regions.
-    ///
-    /// Yields one entry per handler.
-    pub fn unwind_error_locals(&self) -> impl Iterator<Item = (BlockId, Local)> + '_ {
-        self.catch_regions
+    /// The handler blocks — those some block unwinds to — with what the VM
+    /// lands in each with.
+    pub fn handlers(&self) -> impl Iterator<Item = (BlockId, Landing)> + '_ {
+        self.blocks
             .iter()
-            .map(|r| (r.handler, r.error_local))
+            .filter_map(|block| block.landing.map(|landing| (block.id, landing)))
+    }
+
+    /// Whether `block` is a handler block.
+    pub fn is_handler(&self, block: BlockId) -> bool {
+        self.blocks[block.0].landing.is_some()
+    }
+
+    /// Iterate `(handler_block, error_local)` pairs, one per handler.
+    pub fn unwind_error_locals(&self) -> impl Iterator<Item = (BlockId, Local)> + '_ {
+        self.handlers()
+            .map(|(handler, landing)| (handler, landing.error_local))
     }
 }
 
@@ -157,10 +136,9 @@ pub struct RuntimeSignature {
     pub name: Option<String>,
     /// Display strings for the generic type parameters (`T extends Bound`).
     pub display_type_params: Vec<String>,
-    /// Runtime-checkable interface bounds, parallel to the callee frame's
-    /// De Bruijn generic parameter slots.  Kept separately from display text
-    /// so `unreflect(...)` calls can validate opaque runtime types before the
-    /// callee executes.
+    /// Interface bounds, parallel to the callee frame's De Bruijn generic
+    /// parameter slots. Kept as executable metadata (not display text) so
+    /// reflection and runtime specialization can check them.
     pub generic_param_bounds: Vec<Vec<RuntimeInterfaceBound>>,
     /// Display strings for the parameter types, parallel to `param_names`.
     pub display_param_types: Vec<String>,
@@ -179,6 +157,26 @@ pub struct RuntimeInterfaceBound {
     pub assoc: Vec<(baml_type::Name, baml_type::TyTemplate)>,
 }
 
+/// A point where lowering could not produce code for a CHECKED program: what
+/// the checker recorded and what lowering finds disagree, which is a compiler
+/// bug and never a user error (lowering runs only on a program with no
+/// errors). A function or initializer that hits one has no MIR — lowering
+/// answers with this instead, and the compile fails.
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+pub struct MirInternalError {
+    pub message: String,
+    /// The source being lowered when the inconsistency was found.
+    pub span: Option<Span>,
+}
+
+impl std::fmt::Display for MirInternalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MirInternalError {}
+
 /// A function represented as a control flow graph.
 #[derive(Debug, Clone)]
 pub struct MirFunction<'db> {
@@ -186,8 +184,10 @@ pub struct MirFunction<'db> {
     pub arity: usize,
     /// Source span for error reporting.
     pub span: Option<Span>,
-    /// Fully-qualified identity (e.g., "`user.my_func`", "baml.sys.panic").
-    pub item_ref: ItemRef<'db>,
+    /// The function's identity: its declaration, or — for a lambda or a
+    /// tagged-template body closure — the function it was lowered inside
+    /// plus its ordinal there. Names are rendered from it at emit's boundary.
+    pub identity: MirFunctionId<'db>,
     /// Whether this function has bytecode or is a builtin.
     pub kind: MirFunctionKind<'db>,
     /// Child lambda functions defined inside this function's body.
@@ -264,10 +264,15 @@ pub struct LocalDecl {
     /// This is debugger metadata used to resolve in-scope variables from
     /// source locations.
     pub scope_span: Option<Span>,
-    /// Whether this local is captured by a nested closure.
+    /// Whether a nested closure captures this local.
     ///
     /// When `true`, the local's stack slot holds an `Object::Cell` rather than
-    /// the value directly. Reads/writes go through `LoadDeref`/`StoreDeref`.
+    /// the value directly, and reads/writes go through `LoadDeref`/`StoreDeref`.
+    /// The slot holds a cell from the binding's [`StatementKind::FreshCell`]
+    /// onward — parameters from frame entry, where the emitter wraps them —
+    /// and every access is dominated by that statement (`verify_mir` checks
+    /// this). Set when the local is declared, from HIR's capture analysis;
+    /// nothing flips it afterwards.
     pub is_captured: bool,
 }
 
@@ -291,6 +296,26 @@ pub struct BasicBlock<'db> {
     pub span: Option<Span>,
     /// Source span for the terminator.
     pub terminator_span: Option<Span>,
+    /// The handler a throw or panic raised anywhere in this block unwinds to
+    /// — the lexically enclosing `catch` handler or `defer` landing pad — or
+    /// `None` to leave the frame. Fixed when the block is created, so a block
+    /// is always a maximal run of code under one handler, and the emitter
+    /// derives the exception table from it. A terminator that carries its own
+    /// `unwind` edge agrees with it by construction.
+    pub unwind: Option<BlockId>,
+    /// The innermost handler whose body this block is lexically part of: a
+    /// throw here is "during handling of" that handler's error and chains
+    /// onto its context (BEP-042 cause chain). A handler block is part of its
+    /// own body.
+    pub handling: Option<BlockId>,
+    /// Set on a handler block: what the VM lands here with.
+    pub landing: Option<Landing>,
+    /// Whether this block is part of a `defer` body, which runs shielded from
+    /// cancellation: a thread executing here (or in a callee called from
+    /// here) is not delivered `Cancelled` at its yield points, so cleanup may
+    /// suspend. Fixed at creation, like `unwind`; the emitter derives the
+    /// bytecode's shield table from it.
+    pub shielded: bool,
 }
 
 impl BasicBlock<'_> {
@@ -302,6 +327,10 @@ impl BasicBlock<'_> {
             terminator: None,
             span: None,
             terminator_span: None,
+            unwind: None,
+            handling: None,
+            landing: None,
+            shielded: false,
         }
     }
 
@@ -342,7 +371,12 @@ pub enum IntrinsicOp {
     /// `log.info`, `log.debug`, `log.warn`, `log.error` — emit a `$baml_log` event.
     Log(LogLevel),
     /// Bind an exact runtime type value into this bytecode frame's type slot.
-    BindType(usize),
+    ///
+    /// The slot is a frame type-argument index, the same space
+    /// `TyTemplate::TypeArgRef` reads, so it carries that space's width: emit
+    /// compares the two directly, and a lossy conversion there would decide a
+    /// soundness question (whether a template read is clobbered) by accident.
+    BindType(u32),
 }
 
 /// The kind of a MIR statement.
@@ -358,10 +392,20 @@ pub enum StatementKind<'db> {
     /// Drop a value (run destructor if any).
     Drop(Place),
 
-    /// Replace a captured local's cell with a fresh one.
-    /// Emitted at the top of for-loop iteration bodies so each iteration's
-    /// closures capture a distinct cell.
-    FreshCell(Local),
+    /// Give a captured local a new cell: the slot now points at a cell no
+    /// closure has captured yet.
+    ///
+    /// Emitted where the binding is created, so a declaration that runs once
+    /// per loop iteration hands each iteration's closures their own cell. The
+    /// new cell holds `null`, or — with `carry_value` — the value of the cell
+    /// it replaces, which is how a C-style `for` header binding is copied into
+    /// the next iteration before the step runs (JS/Go semantics).
+    ///
+    /// Only ever targets a local whose `is_captured` is set, and every read,
+    /// write, or closure capture of that local is dominated by one of its
+    /// `FreshCell`s: that is what makes a deref load discardable
+    /// ([`Rvalue::can_discard`]) and per-iteration closures correct.
+    FreshCell { local: Local, carry_value: bool },
 
     /// Compiler intrinsic — a void side effect (log, send event).
     /// Lowered from calls to `$compiler_intrinsic` functions.
@@ -441,6 +485,13 @@ pub enum Terminator<'db> {
 
     /// Call a function.
     Call {
+        /// Whether the final `args` operand is an invocation trace attachment,
+        /// rather than a callee parameter.
+        has_trace: bool,
+        /// The value slots this site was checked against, leading type
+        /// arguments excluded. `None` only for compiler-synthesized calls,
+        /// whose operands are already in the callee's own layout.
+        argument_layout: Option<baml_type::CallLayout>,
         /// The function to call.
         callee: Operand<'db>,
         /// Arguments to pass.
@@ -456,16 +507,6 @@ pub enum Terminator<'db> {
         /// calls to generic functions where at least one type argument is
         /// threaded at the call site (explicit `<T>` or type-arg forwarding).
         ntypeargs: usize,
-        /// At least one explicit type argument was supplied through
-        /// `unreflect(...)`. The emitter encodes this on the call instruction so
-        /// the VM performs M-5/M-6 checks only for marker-instantiated calls.
-        runtime_type_check: bool,
-        /// Hidden `boundary.LocalId` operand from call-site `$id = ...`.
-        ///
-        /// This is not part of ordinary call arity. Emitters push it above the
-        /// normal call payload and use an ID-aware bytecode call form.
-        runtime_id: Option<Operand<'db>>,
-        /// Where to store the result.
         destination: Place,
         /// Block to jump to after call returns normally.
         target: BlockId,
@@ -484,6 +525,11 @@ pub enum Terminator<'db> {
     /// materialized. This is the open-world replacement for the old
     /// compile-time type-tag switch.
     VirtualCall {
+        /// Whether the final `args` operand is an invocation trace attachment.
+        has_trace: bool,
+        /// The value slots this site was checked against (receiver included,
+        /// type arguments excluded); see [`Terminator::Call::argument_layout`].
+        argument_layout: Option<baml_type::CallLayout>,
         /// The interface to resolve against, as a template the emitter pushes
         /// with `LoadType`. Non-generic today (`baml.ops.Equals`/`Compare`); a
         /// parameterized interface bakes its arguments into the template.
@@ -500,12 +546,6 @@ pub enum Terminator<'db> {
         /// Number of leading `args` entries that are method-level type arguments.
         /// Zero for a non-generic method.
         ntypeargs: usize,
-        /// Whether this call carries an `unreflect(...)` type argument and must
-        /// execute the runtime generic gate before entering the resolved method.
-        runtime_type_check: bool,
-        /// Hidden `boundary.LocalId` operand from call-site `$id = ...`.
-        runtime_id: Option<Operand<'db>>,
-        /// Where to store the result.
         destination: Place,
         /// Block to jump to after the call returns normally.
         target: BlockId,
@@ -530,9 +570,6 @@ pub enum Terminator<'db> {
         callee: Operand<'db>,
         /// Arguments to the sys-op.
         args: Vec<Operand<'db>>,
-        /// Hidden `boundary.LocalId` operand from call-site `$id = ...`.
-        runtime_id: Option<Operand<'db>>,
-        /// Where to store the sys-op's return value.
         destination: Place,
         /// Block to resume at after the sys-op returns.
         target: BlockId,
@@ -540,30 +577,17 @@ pub enum Terminator<'db> {
         unwind: Option<BlockId>,
     },
 
-    /// BEP-034 `spawn name? { body }` — schedules a fresh BAML thread to
-    /// run `closure`'s body and yields a `Future<T, E>` handle.
-    ///
-    /// `closure` carries the body packaged via `MakeClosure` (a 0-arg
-    /// lambda that captures the surrounding bindings); `name` is an
-    /// optional human-readable label.
+    /// Launch a `baml.spawn.Plan<T, E>` as a new task and bind its
+    /// `Future<T, E>` into `future`. The plan carries everything the engine
+    /// needs — the body, its limits and cancel tokens, its cancellation
+    /// parent, and the future's types — so it is the only operand. Launching
+    /// never throws.
     Spawn {
-        /// Closure object representing the spawn body.
-        closure: Operand<'db>,
-        /// Optional name expression (string or null).
-        name: Operand<'db>,
-        /// Optional `baml.spawn.options(...)` config value from a `with`
-        /// clause (BEP-034 spawn options). `None` when there is no `with`
-        /// clause; the engine reads the config's `cancel` (and later
-        /// `group`/`detach`) to derive the spawn's effective cancel token.
-        /// Boxed to keep `Terminator`'s footprint down (clippy
-        /// `large_enum_variant`): `Spawn` is rare relative to `Call`/`Goto`.
-        config: Option<Box<Operand<'db>>>,
-        /// The `T`/`E` of the `Future<T, E>` this spawn yields. Boxed for the
-        /// same footprint reason as `config`.
-        future_ty: Box<SpawnFutureTy>,
-        /// Where to store the resulting Future handle.
+        /// The `baml.spawn.Plan` value.
+        plan: Operand<'db>,
+        /// Where the future handle is stored.
         future: Place,
-        /// Block to resume after the spawn schedules.
+        /// Block to continue at once the task is launched.
         resume: BlockId,
     },
 
@@ -609,10 +633,13 @@ pub enum Terminator<'db> {
         value: Operand<'db>,
     },
 
-    /// Re-throw a caught error value, preserving its original trace origin.
+    /// Re-throw a caught error value with the context it was caught with, so
+    /// it keeps its original trace and cause.
     Rethrow {
         /// The caught error value to rethrow.
         value: Operand<'db>,
+        /// Its `baml.errors.Context`: the landing's context local.
+        context: Operand<'db>,
     },
 
     /// If the value is a panic instance (`baml.panics.*`), throw it.
@@ -622,42 +649,34 @@ pub enum Terminator<'db> {
     /// panics the programmer didn't explicitly name.
     ThrowIfPanic {
         value: Operand<'db>,
+        /// The value's `baml.errors.Context`, carried by the rethrow.
+        context: Operand<'db>,
         otherwise: BlockId,
     },
 
-    /// Short-circuit `&&` / `||`.
+    /// Short-circuit `&&` / `||` / `??`.
     ///
-    /// Evaluates `operand` and peeks at the result (without popping):
-    /// - `&&` (`is_and = true`): if false, jump to `join` (value stays on stack);
-    ///   if true, pop and fall through to `eval_rhs`.
-    /// - `||` (`is_and = false`): if true, jump to `join` (value stays on stack);
-    ///   if false, pop and fall through to `eval_rhs`.
+    /// On the short-circuit edge, assign `operand` to `destination` and go
+    /// to `join`: when false for `&&`, true for `||`, or non-null for `??`.
+    /// Otherwise, go to `eval_rhs` without assigning `destination`.
     ///
     /// The `eval_rhs` block must assign to `destination` and then goto `join`.
-    /// At `join`, `destination` is on TOS from whichever path executed.
+    /// At `join`, `destination` holds the expression value. Stackification
+    /// decides whether that value lives on the operand stack or in a slot.
     ShortCircuit {
         operand: Operand<'db>,
-        is_and: bool,
+        kind: ShortCircuitKind,
         destination: Place,
         eval_rhs: BlockId,
         join: BlockId,
     },
 }
 
-/// The type arguments of the `Future<T, E>` a [`Terminator::Spawn`] yields.
-///
-/// Held as [`TyTemplate`]s rather than resolved types so a spawn inside a
-/// generic function (`fn f<T>(x: T) { spawn { x } }`) resolves against the
-/// frame's type arguments at runtime, exactly as an array literal's element
-/// type does. The runtime stores the resolved pair on the heap `Future` so
-/// reflection and `is`/`match` can see the future's generic parameters.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SpawnFutureTy {
-    /// The `T` of `Future<T, E>` — the value the spawned body returns.
-    pub returns: TyTemplate,
-    /// The `E` of `Future<T, E>` — what the spawned body may throw. A body that
-    /// statically cannot throw spells this `never`.
-    pub throws: TyTemplate,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortCircuitKind {
+    And,
+    Or,
+    Coalesce,
 }
 
 impl Terminator<'_> {
@@ -719,9 +738,19 @@ pub enum IndexKind {
 /// A place in memory (lvalue).
 ///
 /// Places represent locations that can be read from or written to.
+///
+/// Cell access is explicit. A local a closure captures
+/// ([`LocalDecl::is_captured`]) holds a cell pointer, and `Local(l)` names
+/// that pointer; `Capture(i)` names the pointer in a closure's capture array.
+/// Those two variants are also [`CellId`], the identity of a cell; the value
+/// behind one is `Deref(cell)`, and every read or write of a captured binding
+/// goes through it. Only a `MakeClosure` capture operand and a `FreshCell`
+/// target name the pointer bare. `verify_mir` checks all of this.
+#[subenum(CellId(derive(Copy)))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Place {
-    /// A local variable: `_1`
+    /// A local variable: `_1`. For a captured local, its cell pointer.
+    #[subenum(CellId)]
     Local(Local),
 
     /// Field access: `_1.field_idx`
@@ -734,12 +763,36 @@ pub enum Place {
         kind: IndexKind,
     },
 
-    /// A captured variable in a closure body, by capture index.
-    ///
-    /// `Capture(idx)` refers to the `idx`-th capture in the enclosing
-    /// `Object::Closure.captures` array.  Reads emit `LoadCapture(idx)` and
-    /// writes emit `StoreCapture(idx)`.  Only valid inside a lambda body.
+    /// The cell pointer in the `idx`-th slot of the enclosing
+    /// `Object::Closure.captures` array. Reading it bare emits `CaptureRef`
+    /// (forwarding the cell to a nested closure); the value behind it is
+    /// `Deref(Capture(idx))`. Only valid inside a lambda body.
+    #[subenum(CellId)]
     Capture(usize),
+
+    /// The value in a cell: `*_1`, `*capture[0]`.
+    ///
+    /// Reads emit `LoadDeref`/`LoadCapture` and writes `StoreDeref`/`StoreCapture`.
+    Deref(CellId),
+}
+
+impl CellId {
+    /// The local whose slot holds this cell's pointer, if it is a local's cell.
+    pub fn local(&self) -> Option<Local> {
+        match self {
+            CellId::Local(local) => Some(*local),
+            CellId::Capture(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for CellId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CellId::Local(l) => write!(f, "{l}"),
+            CellId::Capture(idx) => write!(f, "capture[{idx}]"),
+        }
+    }
 }
 
 impl Place {
@@ -749,10 +802,14 @@ impl Place {
     }
 
     /// Get the base local of this place, if it is rooted in a local.
+    ///
+    /// Transparent through `Deref`: the local whose cell holds the value is
+    /// still the local the place is rooted in.
     pub fn base_local(&self) -> Option<Local> {
         match self {
             Place::Local(l) => Some(*l),
             Place::Field { base, .. } | Place::Index { base, .. } => base.base_local(),
+            Place::Deref(cell) => cell.local(),
             Place::Capture(_) => None,
         }
     }
@@ -765,6 +822,7 @@ impl fmt::Display for Place {
             Place::Field { base, field } => write!(f, "{base}.{field}"),
             Place::Index { base, index, .. } => write!(f, "{base}[{index}]"),
             Place::Capture(idx) => write!(f, "capture[{idx}]"),
+            Place::Deref(cell) => write!(f, "*{cell}"),
         }
     }
 }
@@ -857,14 +915,6 @@ pub enum Rvalue<'db> {
     /// other coarse tag checks.
     IsTypeTag { operand: Operand<'db>, tag: i64 },
 
-    /// Runtime-mint identity filter used by `is unreflect(t)` patterns.
-    /// `type_value` evaluates to an `Object::Type`; the VM reconstructs the
-    /// nominal mint of `operand` and compares the two identity tokens.
-    RuntimeIsType {
-        operand: Operand<'db>,
-        type_value: Operand<'db>,
-    },
-
     /// Allocate a closure object from a child lambda function.
     ///
     /// `lambda_idx` indexes into `MirFunction::lambdas` of the enclosing function.
@@ -881,12 +931,10 @@ pub enum Rvalue<'db> {
         type_arg_templates: Vec<TyTemplate>,
     },
 
-    /// Create a bound method value from a method reference and its receiver.
-    ///
-    /// `item_ref` identifies the method (class + name).
-    /// `receiver` is the instance the method is bound to.
+    /// Create a bound method value from a class-inherent method and its
+    /// receiver: `receiver` is the instance the method is bound to.
     MakeBoundMethod {
-        item_ref: ItemRef<'db>,
+        func: baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>,
         receiver: Operand<'db>,
     },
 
@@ -930,11 +978,12 @@ pub enum Rvalue<'db> {
         /// The interface method's name.
         method: String,
         /// Method-level type-argument OPERANDS from the reference site,
-        /// appended to the resolved impl frame by the VM. Operands rather
-        /// than templates so a runtime type argument (`m<unreflect(t)>(…)`)
-        /// flows like any other — a written static argument is materialized
-        /// by the producer as a `LoadType` temp. The VM pops each as an
-        /// `Object::Type` either way.
+        /// appended to the resolved impl frame by the VM. Every argument is
+        /// a template today - a scoped `type T = …` slot included - so these
+        /// could be templates; they stay operands because the producer
+        /// materializes each as a `LoadType` temp anyway and the VM pops an
+        /// `Object::Type` either way, which keeps one stack discipline for
+        /// the whole call shape.
         type_args: Vec<Operand<'db>>,
     },
 
@@ -971,7 +1020,7 @@ pub enum Rvalue<'db> {
     /// fully-concrete case uses the pooled, interned `Constant::GenericFunction`
     /// instead.
     MakeGenericFunction {
-        item: ItemRef<'db>,
+        func: baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>,
         /// One template per type argument; may contain `TypeArgRef(N)`.
         type_arg_templates: Vec<TyTemplate>,
     },
@@ -982,7 +1031,7 @@ pub enum Rvalue<'db> {
     /// `LoadType` for each template then a `MakeGenericFunctionFromValue`
     /// instruction, which wraps the evaluated `value` in a `Closure` carrying
     /// the types as `captured_type_args`. Used when `lower_generic_apply`'s base
-    /// is not an `ItemRef`; the `ItemRef` cases use `Constant::GenericFunction`
+    /// is not a function ref; the function-ref cases use `Constant::GenericFunction`
     /// (concrete) or `MakeGenericFunction` (param-dependent) instead.
     MakeGenericFunctionFromValue {
         /// The callable value to specialize.
@@ -1005,6 +1054,83 @@ pub enum Rvalue<'db> {
     /// is baked by lowering; dynamically compiled code substitutes its owning
     /// runtime package at execution.
     CurrentPackage(String),
+}
+
+impl Rvalue<'_> {
+    /// Whether an unused evaluation can be erased, including its operand reads.
+    /// Allocation identity is unobservable when the result does not escape, but
+    /// evaluating an initializer can still fail (checked arithmetic or indexing).
+    pub fn can_discard(&self) -> bool {
+        self.can_discard_with(|_| false)
+    }
+
+    /// A bounds proof applies to this evaluation site, not to the entire local.
+    pub(crate) fn can_discard_with(&self, in_bounds: impl Fn(&Place) -> bool) -> bool {
+        fn read(place: &Place, in_bounds: &impl Fn(&Place) -> bool) -> bool {
+            match place {
+                // A deref load cannot fail: every access of a captured local is
+                // dominated by its `FreshCell` (`verify_mir`), so the cell exists.
+                Place::Local(_) | Place::Capture(_) | Place::Deref(_) => true,
+                // A fixed field projection is type-checked, not a user accessor.
+                // An indexing operation in its base still needs its own proof.
+                Place::Field { base, .. } => read(base, in_bounds),
+                Place::Index { base, .. } => read(base, in_bounds) && in_bounds(place),
+            }
+        }
+        let operand = |op: &Operand<'_>| match op {
+            Operand::Constant(_) => true,
+            Operand::Copy(place) | Operand::Move(place) => read(place, &in_bounds),
+        };
+        match self {
+            Self::Use(op) => operand(op),
+            Self::BinaryOp { op, left, right } => {
+                matches!(
+                    op,
+                    BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                ) && operand(left)
+                    && operand(right)
+            }
+            Self::UnaryOp { op, operand: arg } => {
+                matches!(op, UnaryOp::Not | UnaryOp::Truthy) && operand(arg)
+            }
+            Self::IsType { operand: arg, .. } | Self::IsTypeTag { operand: arg, .. } => {
+                operand(arg)
+            }
+            Self::TypeTag(place) | Self::Discriminant(place) | Self::Len(place) => {
+                read(place, &in_bounds)
+            }
+            Self::LoadType(_)
+            | Self::CurrentPackage(_)
+            | Self::Uint8Array(_)
+            | Self::MakeGenericFunction { .. } => true,
+            Self::Array(_, elements)
+            | Self::Aggregate {
+                fields: elements, ..
+            } => elements.iter().all(operand),
+            Self::Map(_, _, entries) => entries
+                .iter()
+                .all(|(key, value)| operand(key) && operand(value)),
+            Self::MakeClosure { captures, .. } => captures.iter().all(operand),
+            Self::MakeBoundMethod { receiver, .. } => operand(receiver),
+            Self::VirtualFieldAccess { receiver, .. } => {
+                // The type checker proves the implements rule and total field
+                // links (E0124). Resolution failure is a VM internal invariant
+                // violation, not a BAML panic; the receiver can still trap.
+                operand(receiver)
+            }
+            Self::MakeVirtualBoundMethod { .. }
+            | Self::MakeVirtualFunction { .. }
+            | Self::MakeGenericFunctionFromValue { .. } => false,
+        }
+    }
 }
 
 /// The kind of aggregate being constructed.
@@ -1079,143 +1205,152 @@ pub enum Constant<'db> {
     /// Carried from TIR resolution through lowering. Converted to a
     /// runtime string only in the emit phase, where it becomes a pooled
     /// function-value wrapper (see `emit_pooled_function_value`). Only for
-    /// items that ARE functions; a non-function global item read (a client,
-    /// a top-level `let`, ...) is [`Constant::GlobalItem`].
-    Function(ItemRef<'db>),
-    /// A non-function global item read (a `client<llm>` declaration, a
-    /// top-level `let`, a template string, ...): the value the program's
-    /// `$init` stored in the item's global slot. Emitted as a plain
-    /// `LoadGlobal`, never wrapped — the slot holds an ordinary value
-    /// (an instance, a closure, ...), not a `Function` object.
-    GlobalItem(ItemRef<'db>),
+    /// items that ARE functions; a top-level `let` read is
+    /// [`Constant::GlobalItem`].
+    Function(baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>),
+    /// A top-level `let` read (a `client` declaration is one): the value
+    /// the program's `$init` stored in the binding's global slot. Emitted as
+    /// a plain `LoadGlobal`, never wrapped — the slot holds an ordinary value
+    /// (an instance, a closure, ...), not a `Function` object. The only
+    /// non-function item that is a value; a type declaration in value
+    /// position is a checker error and never reaches here.
+    GlobalItem(baml_compiler2_hir::loc::LetLoc<'db>),
     /// A generic function instantiated with concrete type arguments
     /// (`foo<int>` referenced as a value). Emitted as a pooled, interned
     /// `Object::GenericFunction` so identical instantiations share one object
     /// (pointer-stable identity) and calling it seeds `frame.type_args`.
     GenericFunction {
         /// The base generic function.
-        item: ItemRef<'db>,
+        func: baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>,
         /// The concrete type arguments — fully realized (no type parameters),
         /// exactly what the runtime `Object::GenericFunction` carries.
         type_args: Vec<RealizedTy>,
     },
     /// An enum variant value.
     EnumVariant {
-        /// Structured reference to the enum type.
-        enum_ref: ItemRef<'db>,
+        /// The enum's declaration, wherever it lives.
+        enum_ref: baml_compiler2_hir_ty::extern_loc::EnumRef<'db>,
         /// The variant name within the enum.
         variant: Name,
     },
 }
 
-/// A structured reference to a named item (function, method, enum type).
-///
-/// Uses explicit fields for package, namespace, class, and name.
-/// No string-path encoding or display-logic special-casing.
+/// A function's identity in MIR: its declaration, or — for a lambda or a
+/// tagged-template body closure — the owner it was lowered inside plus its
+/// ordinal there. Rendered to a name only at emit's boundary
+/// ([`MirFunctionId::link_name`] / [`crate::function_link_name`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ItemRef<'db> {
-    /// A free function or top-level item: `baml.env.get`, `Foo`, `baml.sys.panic`
-    Free {
-        package: Name,
-        namespace: Vec<Name>,
-        name: Name,
+pub enum MirFunctionId<'db> {
+    Declared(baml_compiler2_hir::loc::FunctionLoc<'db>),
+    /// The `ordinal`-th synthetic function of its `kind` lowered inside
+    /// `parent`.
+    Synthetic {
+        parent: Box<FunctionOwner<'db>>,
+        kind: SyntheticKind,
+        ordinal: usize,
     },
-    /// A class method: `baml.Array.length`, `Baz.Greeting`
-    Method {
-        package: Name,
-        namespace: Vec<Name>,
-        class: Name,
-        name: Name,
-    },
-    /// An enum type reference: `HttpMethod`, `Color`
-    EnumType {
-        package: Name,
-        namespace: Vec<Name>,
-        name: Name,
-    },
-    /// An interface-machinery BODY: an impl block's provided method or an
-    /// interface's default body. An interface body is not itself a logical
-    /// item — its one identity is its DECLARATION, carried as the
-    /// [`InterfaceBodyRef::decl`] location; `display_owner` exists only so
-    /// bytecode and trace spellings keep their `<(target as iface)>` /
-    /// `Iface` form, and is never a key.
-    InterfaceBody(Box<InterfaceBodyRef<'db>>),
 }
 
-/// A reference to an interface-machinery body: the declaration — a body's
-/// one identity, carried as the `'db` location itself the way every other
-/// compiler layer carries declarations — plus display-only spelling parts.
-/// The ref itself is never serialized — rule / interface tables reference
-/// bodies by object index — but decompose DOES render the spelling as the
-/// unit export/import key (the U1-sanctioned link-internal string lane), so
-/// the spelling must be unique; coherence and the canonical
-/// `<(target as iface)>` rendering guarantee it, and decompose enforces it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InterfaceBodyRef<'db> {
-    pub package: Name,
-    pub namespace: Vec<Name>,
-    /// Display-only owner segment, exactly as the display convention renders
-    /// it: `<(target as iface)>` for an impl body, the interface's bare name
-    /// for a default body. Never an identity, never a key.
-    pub display_owner: Name,
-    /// The body's declaration.
-    pub decl: baml_compiler2_hir::loc::FunctionLoc<'db>,
-    pub method: Name,
+/// What a synthetic function was lowered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticKind {
+    /// A lambda expression.
+    Lambda,
+    /// A tagged template's body closure.
+    Tagged,
 }
 
-impl fmt::Display for ItemRef<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Always include the package prefix (including "user").
-        // All parts are joined with ".".
+/// Where a function body is lowered: a declared function, a top-level `let`
+/// initializer (lowered as a body, never a `MirFunction` of its own — it
+/// only ever OWNS synthetic functions), or a synthetic function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionOwner<'db> {
+    Function(baml_compiler2_hir::loc::FunctionLoc<'db>),
+    Let(baml_compiler2_hir::loc::LetLoc<'db>),
+    Synthetic(Box<MirFunctionId<'db>>),
+}
+
+impl MirFunctionId<'_> {
+    /// The name this function links and displays as — the declaration's
+    /// link name, or the synthetic spelling `<lambda(owner, i)>` /
+    /// `<tagged(owner, i)>` under an EMPTY package segment (the historical
+    /// rendering, which the bytecode display pins).
+    pub fn link_name(&self, db: &dyn crate::Db) -> String {
         match self {
-            ItemRef::Free {
-                package,
-                namespace,
-                name,
+            MirFunctionId::Declared(func) => crate::lower::definition_link_name(
+                db,
+                baml_compiler2_hir::contributions::Definition::Function(*func),
+            ),
+            MirFunctionId::Synthetic { .. } => format!(".{}", self.short_name(db)),
+        }
+    }
+
+    /// The spelling a nested synthetic function names its owner by: the
+    /// declaration's link-name tail (`definition_short_name` — `f`,
+    /// `Class.m`, `Interface.m`, `<(target as iface)>.m`), or the owner's
+    /// own synthetic spelling.
+    pub fn short_name(&self, db: &dyn crate::Db) -> String {
+        match self {
+            MirFunctionId::Declared(func) => crate::lower::definition_short_name(
+                db,
+                baml_compiler2_hir::contributions::Definition::Function(*func),
+            ),
+            MirFunctionId::Synthetic {
+                parent,
+                kind,
+                ordinal,
             } => {
-                let mut parts: Vec<&str> = vec![package.as_str()];
-                for ns in namespace {
-                    parts.push(ns.as_str());
-                }
-                parts.push(name.as_str());
-                write!(f, "{}", parts.join("."))
+                let kind = match kind {
+                    SyntheticKind::Lambda => "lambda",
+                    SyntheticKind::Tagged => "tagged",
+                };
+                format!("<{kind}({}, {ordinal})>", parent.short_name(db))
             }
-            ItemRef::Method {
-                package,
-                namespace,
-                class,
-                name,
-            } => {
-                let mut parts: Vec<&str> = vec![package.as_str()];
-                for ns in namespace {
-                    parts.push(ns.as_str());
-                }
-                parts.push(class.as_str());
-                parts.push(name.as_str());
-                write!(f, "{}", parts.join("."))
+        }
+    }
+
+    /// This identity as a [`fmt::Display`] value that renders
+    /// [`Self::link_name`] when formatted, not when created.
+    pub fn display<'a>(&'a self, db: &'a dyn crate::Db) -> impl fmt::Display + 'a {
+        // Assertion messages format their arguments only when they fire, so
+        // a caller that never fails never pays for `definition_link_name`.
+        struct Lazy<'a, 'db> {
+            db: &'a dyn crate::Db,
+            id: &'a MirFunctionId<'db>,
+        }
+        impl fmt::Display for Lazy<'_, '_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.id.link_name(self.db))
             }
-            ItemRef::EnumType {
-                package,
-                namespace,
-                name,
-            } => {
-                let mut parts: Vec<&str> = vec![package.as_str()];
-                for ns in namespace {
-                    parts.push(ns.as_str());
-                }
-                parts.push(name.as_str());
-                write!(f, "{}", parts.join("."))
+        }
+        Lazy { db, id: self }
+    }
+}
+
+impl<'db> FunctionOwner<'db> {
+    /// The spelling a synthetic function names this owner by — see
+    /// [`MirFunctionId::short_name`].
+    pub fn short_name(&self, db: &dyn crate::Db) -> String {
+        use baml_compiler2_hir::contributions::Definition;
+        match self {
+            FunctionOwner::Function(func) => {
+                crate::lower::definition_short_name(db, Definition::Function(*func))
             }
-            // Renders exactly as the pre-structural `Method` spelling did:
-            // `{package}.{ns…}.{display_owner}.{method}`.
-            ItemRef::InterfaceBody(body) => {
-                let mut parts: Vec<&str> = vec![body.package.as_str()];
-                for ns in &body.namespace {
-                    parts.push(ns.as_str());
-                }
-                parts.push(body.display_owner.as_str());
-                parts.push(body.method.as_str());
-                write!(f, "{}", parts.join("."))
+            FunctionOwner::Let(binding) => {
+                crate::lower::definition_short_name(db, Definition::Let(*binding))
+            }
+            FunctionOwner::Synthetic(id) => id.short_name(db),
+        }
+    }
+
+    /// The identity of a function built under this owner. A `let`
+    /// initializer is lowered as a body, so it never builds one.
+    pub fn into_identity(self) -> MirFunctionId<'db> {
+        match self {
+            FunctionOwner::Function(func) => MirFunctionId::Declared(func),
+            FunctionOwner::Synthetic(id) => *id,
+            FunctionOwner::Let(_) => {
+                unreachable!("a top-level let initializer is lowered as a body, never built")
             }
         }
     }

@@ -20,11 +20,8 @@
 //! - `ResolvedName::Item(Definition::TypeAlias(_))` — builds `TypeInfo::TypeAlias`
 //!   with the expansion type from `resolve_type_alias`.
 //!
-//! - `ResolvedName::Item(Definition::TemplateString(_))` — builds
-//!   `TypeInfo::TemplateString` (no further info available).
-//!
-//! - `ResolvedName::Item(Definition::Client(_) | Generator(_) | ...)` — builds
-//!   `TypeInfo::OtherItem` with the kind label.
+//! - `ResolvedName::Item(Definition::Let(_))` — builds `TypeInfo::OtherItem`
+//!   with the kind label the binding was written as (`client` or `let`).
 //!
 //! - `ResolvedName::Local { definition_site: Some(Parameter(idx)) }` — builds
 //!   `TypeInfo::LocalVar` with the parameter type from `function_signature`.
@@ -36,11 +33,10 @@
 //!
 //! - `ResolvedName::Unknown` or cursor not on a WORD token — returns `None`.
 
-use baml_base::{Name, SourceFile};
+use baml_base::{Name, SourceFile, SourceRoot};
 use baml_compiler_syntax::{SyntaxKind, SyntaxToken};
-use baml_compiler2_hir::{contributions::Definition, loc::FunctionLoc};
+use baml_compiler2_hir::{contributions::Definition, item_data, loc::FunctionLoc};
 use baml_compiler2_hir_ty::package_interface::ExportedFunction;
-use baml_compiler2_ppir::item_data;
 use baml_type::BuiltinTypeName;
 use serde::Serialize;
 use text_size::{TextRange, TextSize};
@@ -73,6 +69,11 @@ pub struct MethodSig {
     pub signature: String,
     /// `true` when the first parameter is named `self`.
     pub is_instance: bool,
+    /// For an implements-block method, the block's interface head with its
+    /// instantiation (`Multiply<int>`) — the label that tells two same-named
+    /// methods provided by different impls apart. `None` for an inherent
+    /// method.
+    pub implements: Option<String>,
 }
 
 /// Hover cap for an interface's rendered member list — see
@@ -100,14 +101,15 @@ pub enum TypeInfo {
         /// The function's full `///` docstring, if any.
         docstring: Option<String>,
     },
-    /// A class definition: name, fields (name + type string), implemented interfaces.
+    /// A class definition: name, fields (name + type string), methods. The
+    /// impls that apply to it are describe's `implementations` section, never
+    /// part of the body block (an in-body `implements` block is not special).
     Class {
         name: String,
         /// Generic type parameter names (e.g. `["T"]`). Rendered as `<T>` after
         /// the class name in the body block; empty for non-generic classes.
         generic_params: Vec<String>,
         fields: Vec<(String, String)>,
-        implements: Vec<String>,
         /// Instance + static methods (signatures only). Drives the hover hint
         /// and feeds the test/describe renderers; not shown inline in hover.
         methods: Vec<MethodSig>,
@@ -119,10 +121,15 @@ pub enum TypeInfo {
         /// `Foo`, `root.ns.Foo`, `baml.json.JsonObject`).
         canonical_fqn: String,
     },
-    /// An enum definition: name, variants.
+    /// An enum definition: name, variants, and the methods its impls provide.
     Enum {
         name: String,
         variants: Vec<String>,
+        /// Signatures only — the methods the enum's impls provide (an enum
+        /// carries no in-body block, but in-body is not special). Drives the
+        /// hover hint like a class's; not shown inline.
+        methods: Vec<MethodSig>,
+        canonical_fqn: String,
         owner: Option<String>,
     },
     /// An interface definition: header plus its declared member surface.
@@ -152,8 +159,6 @@ pub enum TypeInfo {
         expansion: String,
         owner: Option<String>,
     },
-    /// A template string: name only (no further type info).
-    TemplateString { name: String },
     /// A named binding or member slot: a local, a parameter, or a field.
     LocalVar {
         name: String,
@@ -179,7 +184,7 @@ pub enum TypeInfo {
     },
     /// Concise language documentation for a primitive, literal, or keyword.
     Documentation { label: String, detail: String },
-    /// A non-structural top-level item (client, generator, test, `retry_policy`).
+    /// A non-structural top-level item (a `client` or `let` binding).
     OtherItem { name: String, kind: &'static str },
 }
 
@@ -195,9 +200,7 @@ impl TypeInfo {
             | TypeInfo::Interface { owner, .. }
             | TypeInfo::TypeAlias { owner, .. }
             | TypeInfo::Symbol { owner, .. } => owner.as_deref(),
-            TypeInfo::TemplateString { .. }
-            | TypeInfo::Documentation { .. }
-            | TypeInfo::OtherItem { .. } => None,
+            TypeInfo::Documentation { .. } | TypeInfo::OtherItem { .. } => None,
         }
     }
 
@@ -210,7 +213,6 @@ impl TypeInfo {
             | TypeInfo::Symbol { docstring, .. } => docstring.as_deref(),
             TypeInfo::Enum { .. }
             | TypeInfo::TypeAlias { .. }
-            | TypeInfo::TemplateString { .. }
             | TypeInfo::LocalVar { .. }
             | TypeInfo::Documentation { .. }
             | TypeInfo::OtherItem { .. } => None,
@@ -327,23 +329,20 @@ impl TypeInfo {
                 name,
                 generic_params,
                 fields,
-                implements,
                 ..
             } => {
                 // Fields-only canonical body: `name: type,` with trailing comma,
-                // 4-space indent. Methods are never rendered here.
+                // 4-space indent. Methods and impls are never rendered here —
+                // describe lists them in their own sections (rustdoc's shape).
                 let generics = if generic_params.is_empty() {
                     String::new()
                 } else {
                     format!("<{}>", generic_params.join(", "))
                 };
-                let mut member_strs: Vec<String> = fields
+                let member_strs: Vec<String> = fields
                     .iter()
                     .map(|(n, t)| format!("    {n}: {t},"))
                     .collect();
-                for implements_block in implements {
-                    member_strs.extend(implements_block.lines().map(|line| format!("    {line}")));
-                }
 
                 if member_strs.is_empty() {
                     format!("class {name}{generics} {{}}")
@@ -364,7 +363,6 @@ impl TypeInfo {
             TypeInfo::TypeAlias {
                 name, expansion, ..
             } => format!("type {name} = {expansion}"),
-            TypeInfo::TemplateString { name } => format!("template_string {name}"),
             TypeInfo::LocalVar {
                 name, ty, is_let, ..
             } => {
@@ -392,12 +390,15 @@ impl TypeInfo {
 /// Returns `None` if the cursor is not on an identifier, or if the name
 /// cannot be resolved.
 pub fn type_at(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     file: SourceFile,
     offset: TextSize,
 ) -> Option<TypeInfo> {
     // ── Step 1: find the token at the cursor ─────────────────────────────────
     let token = crate::syntax::find_token_at_offset(db, file, offset)?;
+    // The reader is wherever the cursor is: paths in the answer are spelled
+    // from the file's package.
+    let viewer = baml_compiler2_hir::file_package::file_package(db, file).root;
 
     if let Some(info) = literal_type_info(&token) {
         return Some(info);
@@ -420,9 +421,11 @@ pub fn type_at(
     // templates hover their driver function.
     if let Some(position) = crate::resolve::template_position_at(db, file, offset) {
         return match position {
-            crate::resolve::TemplatePosition::Driver(func) => {
-                Some(type_info_for_definition(db, Definition::Function(func)))
-            }
+            crate::resolve::TemplatePosition::Driver(func) => Some(type_info_for_definition(
+                db,
+                viewer,
+                Definition::Function(func),
+            )),
             crate::resolve::TemplatePosition::DefaultText => Some(TypeInfo::Documentation {
                 label: "template string".to_string(),
                 detail: "Backtick template literal (BEP-049). `${…}` holes interpolate \
@@ -442,7 +445,7 @@ form stringifies each value and produces a `string`."
     // and navigation provably agree on `+`/`<`/`[` too.
     if token.kind() != SyntaxKind::WORD {
         let target = crate::resolve::symbol_at(db, file, offset)?;
-        return target_type_info(db, target);
+        return target_type_info(db, viewer, file, target);
     }
 
     let name_text = token.text();
@@ -461,26 +464,38 @@ form stringifies each value and produces a `string`."
     let Some(target) = crate::resolve::symbol_at(db, file, offset) else {
         return template_frame_param_info(db, file, offset, &name);
     };
-    target_type_info(db, target)
+    target_type_info(db, viewer, file, target)
 }
 
 /// Build `TypeInfo` for a resolved [`SymbolTarget`]. Every arm reads
 /// recorded compiler data (firewall items, source maps, inference records) —
 /// no span-equality matching, no name heuristics.
+/// `reader` is the file the hover is asked from: a served package's rows
+/// have no file of their own, so their types are spelled for the reader.
 fn target_type_info(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: SourceRoot,
+    reader: SourceFile,
     target: crate::resolve::SymbolTarget<'_>,
 ) -> Option<TypeInfo> {
+    use baml_compiler2_hir::loc::DeclRef;
+    use baml_compiler2_hir_ty::extern_loc::{
+        extern_class_row, extern_enum_row, extern_function_row, extern_interface_row,
+    };
+
     use crate::resolve::SymbolTarget;
 
     match target {
-        SymbolTarget::Item(def) => Some(type_info_for_definition(db, def)),
+        SymbolTarget::Item(def) => Some(type_info_for_definition(db, viewer, def)),
         SymbolTarget::Local {
             func,
             func_scope,
             binding,
         } => local_target_type_info(db, func, func_scope, binding),
-        SymbolTarget::Field { class, field_index } => {
+        SymbolTarget::Field {
+            class: DeclRef::Source(class),
+            field_index,
+        } => {
             let class_data = item_data::class_data(db, class);
             let field = class_data.fields.get(field_index)?;
             // Resolved field types (Salsa-cached), canonical — matching the
@@ -498,11 +513,11 @@ fn target_type_info(
                 name: field.name.as_str().to_string(),
                 ty,
                 is_let: false,
-                owner: Some(render::display_owner_ty(&self_ty)),
+                owner: Some(render::display_owner_ty(db, &self_ty)),
             })
         }
         SymbolTarget::Variant {
-            enum_loc,
+            enum_loc: DeclRef::Source(enum_loc),
             variant_index,
         } => {
             let enum_data = item_data::enum_data(db, enum_loc);
@@ -516,11 +531,13 @@ fn target_type_info(
             );
             Some(TypeInfo::Symbol {
                 declaration: format!("{}: {}", variant.name.as_str(), enum_data.name.as_str()),
-                owner: Some(qtn.to_string()),
+                owner: Some(render::canonical_path(db, &qtn)),
                 docstring: variant.docstring.clone(),
             })
         }
-        SymbolTarget::Method { func } => Some(TypeInfo::Symbol {
+        SymbolTarget::Method {
+            func: DeclRef::Source(func),
+        } => Some(TypeInfo::Symbol {
             declaration: resolved_function_sig_parts(db, func, None).render(
                 db,
                 func.file(db),
@@ -529,27 +546,6 @@ fn target_type_info(
             owner: method_owner_path(db, func),
             docstring: item_data::function_data(db, func).docstring.clone(),
         }),
-        SymbolTarget::InterfaceRequiredMethod {
-            iface,
-            method_index,
-        } => {
-            let iface_data = item_data::interface_data(db, iface);
-            let method = iface_data.required_methods.get(method_index)?;
-            let qtn = baml_compiler2_hir_ty::lower::qualify_def(
-                db,
-                Definition::Interface(iface),
-                &iface_data.name,
-            );
-            Some(TypeInfo::Symbol {
-                declaration: FnSigParts::of_interface_method(iface_data, method).render(
-                    db,
-                    iface.file(db),
-                    hover_sig_style(),
-                ),
-                owner: Some(qtn.to_string()),
-                docstring: method.docstring.clone(),
-            })
-        }
         SymbolTarget::AssociatedType { iface, assoc_index } => {
             let iface_data = item_data::interface_data(db, iface);
             let assoc = iface_data.associated_types.get(assoc_index)?;
@@ -561,11 +557,14 @@ fn target_type_info(
             );
             Some(TypeInfo::Symbol {
                 declaration,
-                owner: Some(qtn.to_string()),
+                owner: Some(render::canonical_path(db, &qtn)),
                 docstring: None,
             })
         }
-        SymbolTarget::InterfaceField { iface, field_index } => {
+        SymbolTarget::InterfaceField {
+            iface: DeclRef::Source(iface),
+            field_index,
+        } => {
             let iface_data = item_data::interface_data(db, iface);
             let field = iface_data.fields.get(field_index)?;
             let qtn = baml_compiler2_hir_ty::lower::qualify_def(
@@ -577,7 +576,61 @@ fn target_type_info(
                 name: field.name.as_str().to_string(),
                 ty: render::display_type_ref(&iface_data.type_refs, field.type_ref),
                 is_let: false,
-                owner: Some(qtn.to_string()),
+                owner: Some(render::canonical_path(db, &qtn)),
+            })
+        }
+        // A served package's rows, read whole: the resolved signature or
+        // field type and the owner, rendered as the source lane renders its
+        // own. A callable row carries no docstring; a field row's rides
+        // completion (a field hover has no docstring slot in either lane).
+        SymbolTarget::Field {
+            class: DeclRef::External(class),
+            field_index,
+        } => {
+            let row = extern_class_row(db, class);
+            let (name, ty, _) = row.fields.get(field_index)?;
+            Some(TypeInfo::LocalVar {
+                name: name.as_str().to_string(),
+                ty: render::display_ty_canonical_for_file(db, reader, ty),
+                is_let: false,
+                owner: Some(render::canonical_path(db, class.head(db))),
+            })
+        }
+        SymbolTarget::Variant {
+            enum_loc: DeclRef::External(enum_loc),
+            variant_index,
+        } => {
+            let row = extern_enum_row(db, enum_loc);
+            let variant = row.variants.get(variant_index)?;
+            let head = enum_loc.head(db);
+            Some(TypeInfo::Symbol {
+                declaration: format!("{}: {}", variant.as_str(), head.name().as_str()),
+                owner: Some(render::canonical_path(db, head)),
+                docstring: None,
+            })
+        }
+        SymbolTarget::Method {
+            func: DeclRef::External(func),
+        } => Some(TypeInfo::Symbol {
+            declaration: FnSigParts::of_exported(extern_function_row(db, func)).render(
+                db,
+                reader,
+                hover_sig_style(),
+            ),
+            owner: extern_owner_path(db, func),
+            docstring: None,
+        }),
+        SymbolTarget::InterfaceField {
+            iface: DeclRef::External(iface),
+            field_index,
+        } => {
+            let row = extern_interface_row(db, iface);
+            let (name, ty, _) = row.fields.get(field_index)?;
+            Some(TypeInfo::LocalVar {
+                name: name.as_str().to_string(),
+                ty: render::display_ty_canonical_for_file(db, reader, ty),
+                is_let: false,
+                owner: Some(render::canonical_path(db, iface.head(db))),
             })
         }
     }
@@ -585,7 +638,7 @@ fn target_type_info(
 
 /// `TypeInfo::LocalVar` for a local binding, from inference records.
 fn local_target_type_info(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     func: baml_compiler2_hir::loc::FunctionLoc<'_>,
     func_scope: baml_compiler2_hir::scope::FileScopeId,
     binding: baml_compiler2_hir::semantic_index::BindingId,
@@ -767,7 +820,7 @@ fn literal_type_info(token: &SyntaxToken) -> Option<TypeInfo> {
     })
 }
 
-fn builtin_type_info(db: &dyn baml_compiler2_ppir::Db, token: &SyntaxToken) -> Option<TypeInfo> {
+fn builtin_type_info(db: &dyn baml_compiler2_hir::Db, token: &SyntaxToken) -> Option<TypeInfo> {
     let builtin = BuiltinTypeName::from_alias(token.text())?;
     let detail = match builtin {
         BuiltinTypeName::Primitive(_) => {
@@ -776,7 +829,7 @@ fn builtin_type_info(db: &dyn baml_compiler2_ppir::Db, token: &SyntaxToken) -> O
             else {
                 return None;
             };
-            let data = baml_compiler2_ppir::item_data::class_data(db, class_loc);
+            let data = baml_compiler2_hir::item_data::class_data(db, class_loc);
             first_docstring_paragraph(data.docstring.as_deref()?)?
         }
         BuiltinTypeName::Void | BuiltinTypeName::Never | BuiltinTypeName::Unknown => {
@@ -812,9 +865,11 @@ fn keyword_type_info(keyword: &str) -> Option<TypeInfo> {
 /// from `file_package`'s components with no eliding and no special cases —
 /// the spelling changes automatically when workspace packages gain real
 /// names.
-fn owning_path(db: &dyn baml_compiler2_ppir::Db, file: SourceFile) -> String {
+fn owning_path(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> String {
     let pkg = baml_compiler2_hir::file_package::file_package(db, file);
-    let mut path = pkg.package.as_str().to_string();
+    let mut path = baml_compiler2_hir::package::spelling(db)
+        .of(pkg.root)
+        .to_string();
     for segment in &pkg.namespace_path {
         path.push('.');
         path.push_str(segment.as_str());
@@ -831,27 +886,62 @@ fn owning_path(db: &dyn baml_compiler2_ppir::Db, file: SourceFile) -> String {
 /// spells the interface's path. Full canonical paths throughout — member
 /// owners never elide.
 fn method_owner_path(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     func: baml_compiler2_hir::loc::FunctionLoc<'_>,
 ) -> Option<String> {
-    use baml_compiler2_ppir::item_data::MethodOwner;
+    use baml_compiler2_hir::item_data::MethodOwner;
 
     match item_data::method_owner(db, func)? {
         MethodOwner::Class(class) => {
             let self_ty = baml_compiler2_hir_ty::lower::class_self_ty(db, class);
-            Some(render::display_owner_ty(&self_ty))
+            Some(render::display_owner_ty(db, &self_ty))
         }
         MethodOwner::Interface(iface) => {
             let name = &item_data::interface_data(db, iface).name;
             let qtn =
                 baml_compiler2_hir_ty::lower::qualify_def(db, Definition::Interface(iface), name);
-            Some(qtn.to_string())
+            Some(render::canonical_path(db, &qtn))
         }
         MethodOwner::Impl(block) => {
             // `impl_facts` is `None` when the block's header does not resolve
             // to an interface — honest absence beats a wrong owner.
             let facts = baml_compiler2_hir_ty::impls::impl_facts(db, block).resolved()?;
-            Some(render::display_owner_ty(&facts.for_ty_pattern.to_plain()))
+            Some(render::display_owner_ty(
+                db,
+                &facts.for_ty_pattern.to_plain(),
+            ))
+        }
+    }
+}
+
+/// The owner a served package's callable hovers under — the same shape
+/// [`method_owner_path`] renders for source: a class method under the
+/// class's own type (its declared generics as its params), an interface
+/// method under the interface, an impl-provided method under the
+/// IMPLEMENTOR (the impl's for-target), a free function under none.
+fn extern_owner_path(
+    db: &dyn baml_compiler2_hir::Db,
+    func: baml_compiler2_hir_ty::extern_loc::ExternFunctionLoc<'_>,
+) -> Option<String> {
+    use baml_compiler2_hir_ty::{
+        callable::ExternalCallTarget,
+        extern_loc::{ExternRowAddr, extern_impl_row},
+        package_interface::mounted_type_row,
+    };
+    match func.addr(db) {
+        ExternRowAddr::Declared(ExternalCallTarget::Free { .. }) => None,
+        ExternRowAddr::Declared(ExternalCallTarget::Method { class, .. }) => Some(
+            render::display_owner_ty(db, &mounted_type_row(db, class)?.to_ty()),
+        ),
+        ExternRowAddr::Declared(ExternalCallTarget::Interface { interface, .. }) => {
+            Some(render::canonical_path(db, interface))
+        }
+        ExternRowAddr::ImplProvided { .. } => {
+            let block = func.impl_block(db)?;
+            Some(render::display_owner_ty(
+                db,
+                &extern_impl_row(db, block).for_ty_pattern,
+            ))
         }
     }
 }
@@ -860,7 +950,7 @@ fn method_owner_path(
 /// of the driver's `body` callback — the same signature slot inference
 /// injects interpolation names from.
 fn template_frame_param_info(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     file: SourceFile,
     offset: TextSize,
     name: &Name,
@@ -898,12 +988,12 @@ fn range_contains(range: TextRange, offset: TextSize) -> bool {
 }
 
 fn generic_type_parameter_info_at(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     file: SourceFile,
     offset: TextSize,
     name: &Name,
 ) -> Option<TypeInfo> {
-    use baml_compiler2_ppir::item_data;
+    use baml_compiler2_hir::item_data;
 
     let mut candidates: Vec<(TextSize, String, Option<String>)> = Vec::new();
 
@@ -930,7 +1020,9 @@ fn generic_type_parameter_info_at(
                 Some(item_data::MethodOwner::Impl(block)) => {
                     let subject = baml_compiler2_hir_ty::impls::impl_facts(db, block)
                         .resolved()
-                        .map(|facts| render::display_owner_ty(&facts.for_ty_pattern.to_plain()));
+                        .map(|facts| {
+                            render::display_owner_ty(db, &facts.for_ty_pattern.to_plain())
+                        });
                     match subject {
                         Some(subject) => format!("method {}.{}", subject, data.name.as_str()),
                         None => format!("function {}", data.name.as_str()),
@@ -963,7 +1055,7 @@ fn generic_type_parameter_info_at(
                     |facts| {
                         format!(
                             "implements for {}",
-                            render::display_owner_ty(&facts.for_ty_pattern.to_plain())
+                            render::display_owner_ty(db, &facts.for_ty_pattern.to_plain())
                         )
                     },
                 );
@@ -1037,13 +1129,18 @@ fn generic_type_parameter_info_at(
 
 // ── type_info_for_definition ──────────────────────────────────────────────────
 
-/// Build `TypeInfo` for a top-level item definition.
-pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definition<'_>) -> TypeInfo {
+/// Build `TypeInfo` for a top-level item definition. `viewer` is the package
+/// the reader is in: the addressable paths in the result are spelled from it.
+pub fn type_info_for_definition(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: SourceRoot,
+    def: Definition<'_>,
+) -> TypeInfo {
     match def {
         Definition::Function(func_loc) => {
             let file = func_loc.file(db);
             let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
-            let pkg_id = baml_compiler2_hir::package::PackageId::new(db, pkg_info.package.clone());
+            let pkg_id = pkg_info.root;
             let iface = baml_compiler2_hir_ty::package_interface::package_interface(db, pkg_id);
             let data = item_data::function_data(db, func_loc);
 
@@ -1108,7 +1205,7 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
         }
 
         Definition::Class(class_loc) => {
-            let class_data = baml_compiler2_ppir::item_data::class_data(db, class_loc);
+            let class_data = baml_compiler2_hir::item_data::class_data(db, class_loc);
             let class_name = class_data.name.as_str().to_string();
 
             // Use resolved field types (Salsa-cached), rendered canonically so
@@ -1123,18 +1220,9 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
                     )
                 })
                 .collect();
-            // `implements` targets and associated-type bindings are unresolved
-            // type references rendered via the arena-backed `TypeRef` renderer
-            // (byte-identical to `ast::TypeExpr`'s `Display`).
-            let implements = class_data
-                .implements
-                .iter()
-                .map(|block| render_implements_block(block, &class_data.type_refs))
-                .collect();
-
             let qtn = baml_compiler2_hir_ty::lower::qualify_def(db, def, &class_data.name);
-            let canonical_fqn = qtn.render_addressable();
-            let methods = class_method_sigs(db, class_loc);
+            let canonical_fqn = render::addressable_path(db, viewer, &qtn);
+            let methods = type_method_sigs(db, viewer, def);
 
             let generic_params =
                 render::render_generic_params(&class_data.generic_params, &class_data.type_refs);
@@ -1143,7 +1231,6 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
                 name: class_name,
                 generic_params,
                 fields,
-                implements,
                 methods,
                 docstring: class_data.docstring.clone(),
                 canonical_fqn,
@@ -1152,21 +1239,24 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
         }
 
         Definition::Enum(enum_loc) => {
-            let enum_data = baml_compiler2_ppir::item_data::enum_data(db, enum_loc);
+            let enum_data = baml_compiler2_hir::item_data::enum_data(db, enum_loc);
             let variants = enum_data
                 .variants
                 .iter()
                 .map(|v| v.name.as_str().to_string())
                 .collect();
+            let qtn = baml_compiler2_hir_ty::lower::qualify_def(db, def, &enum_data.name);
             TypeInfo::Enum {
                 name: enum_data.name.as_str().to_string(),
                 variants,
+                methods: type_method_sigs(db, viewer, def),
+                canonical_fqn: render::addressable_path(db, viewer, &qtn),
                 owner: Some(owning_path(db, enum_loc.file(db))),
             }
         }
 
         Definition::Interface(iface_loc) => {
-            let iface = baml_compiler2_ppir::item_data::interface_data(db, iface_loc);
+            let iface = baml_compiler2_hir::item_data::interface_data(db, iface_loc);
             let generic_params =
                 render::render_generic_params(&iface.generic_params, &iface.type_refs);
             let requires = iface
@@ -1201,12 +1291,12 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
                 default_methods,
                 docstring: iface.docstring.clone(),
                 owner: Some(owning_path(db, iface_loc.file(db))),
-                canonical_fqn: qtn.render_addressable(),
+                canonical_fqn: render::addressable_path(db, viewer, &qtn),
             }
         }
 
         Definition::TypeAlias(alias_loc) => {
-            let alias_data = baml_compiler2_ppir::item_data::type_alias_data(db, alias_loc);
+            let alias_data = baml_compiler2_hir::item_data::type_alias_data(db, alias_loc);
             let alias_name = alias_data.name.as_str().to_string();
 
             // Use the resolved (lowered) type for display.
@@ -1220,34 +1310,10 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
             }
         }
 
-        Definition::TemplateString(ts_loc) => {
-            let ts_data = baml_compiler2_ppir::item_data::template_string_data(db, ts_loc);
-            TypeInfo::TemplateString {
-                name: ts_data.name.as_str().to_string(),
-            }
-        }
-
-        Definition::Client(loc) => {
-            let data = baml_compiler2_ppir::item_data::client_data(db, loc);
-            TypeInfo::OtherItem {
-                name: data.name.as_str().to_string(),
-                kind: "client",
-            }
-        }
-
-        Definition::RetryPolicy(loc) => {
-            let data = baml_compiler2_ppir::item_data::retry_policy_data(db, loc);
-            TypeInfo::OtherItem {
-                name: data.name.as_str().to_string(),
-                kind: "retry_policy",
-            }
-        }
-
         Definition::Let(loc) => {
-            let data = baml_compiler2_ppir::item_data::let_data(db, loc);
+            let data = baml_compiler2_hir::item_data::let_data(db, loc);
             let kind = match data.origin {
                 baml_compiler2_ast::ast::LetOrigin::Client => "client",
-                baml_compiler2_ast::ast::LetOrigin::RetryPolicy => "retry_policy",
                 baml_compiler2_ast::ast::LetOrigin::Source => "let",
             };
             TypeInfo::OtherItem {
@@ -1258,42 +1324,8 @@ pub fn type_info_for_definition(db: &dyn baml_compiler2_ppir::Db, def: Definitio
     }
 }
 
-fn render_implements_block(
-    block: &baml_compiler2_ppir::item_data::ImplementsData,
-    store: &baml_compiler2_hir::type_ref::TypeRefStore,
-) -> String {
-    let mut members = Vec::new();
-
-    members.extend(block.field_links.iter().map(|link| {
-        format!(
-            "{} as {}",
-            link.interface_field.as_str(),
-            link.class_field.as_str()
-        )
-    }));
-    members.extend(block.associated_type_bindings.iter().map(|binding| {
-        let ty = binding
-            .type_ref
-            .map(|id| store.display(id).to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        format!("type {} = {}", binding.name.as_str(), ty)
-    }));
-
-    let target = store.display(block.target);
-    if members.is_empty() {
-        format!("implements {target} {{}}")
-    } else {
-        let members = members
-            .into_iter()
-            .map(|member| format!("    {member}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("implements {target} {{\n{members}\n}}")
-    }
-}
-
 fn display_surface_ty(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     file: SourceFile,
     ty: &baml_type::Ty,
 ) -> String {
@@ -1309,12 +1341,12 @@ fn function_param_matches_effect_slot(
     match ty {
         Ty::Function { throws, .. } => matches!(
             throws.as_ref(),
-            Ty::TypeVar(param, _) if param == effect_param
+            Ty::TypeVar(param) if param == effect_param
         ),
-        Ty::Union(members, _) => {
+        Ty::Union(members) => {
             let mut matched = false;
             for member in members {
-                if matches!(member, Ty::Null { .. }) {
+                if matches!(member, Ty::Null) {
                     continue;
                 }
                 if !function_param_matches_effect_slot(member, effect_param) {
@@ -1339,7 +1371,7 @@ fn callback_forwarding_note(
     let [only_fact] = throw_fact_refs.as_slice() else {
         return None;
     };
-    let Ty::TypeVar(effect_name, _) = only_fact else {
+    let Ty::TypeVar(effect_name) = only_fact else {
         return None;
     };
     if !baml_type::is_synthetic_effect_param(effect_name.name()) {
@@ -1378,7 +1410,7 @@ fn callback_forwarding_note(
 /// arena. Mirrors the structure already used by
 /// `completions.rs::find_binding_ty_for_local`.
 fn find_binding_ty_in_scopes(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     index: &baml_compiler2_hir::semantic_index::FileSemanticIndex<'_>,
     from_scope: baml_compiler2_hir::scope::FileScopeId,
     pat_id: baml_compiler2_ast::PatId,
@@ -1439,7 +1471,7 @@ pub(crate) fn method_sig_style() -> SigStyle {
 /// A `self` receiver stays bare (as written): the exported signature carries
 /// its resolved type, but the reader spelled none.
 pub fn resolved_function_sig_parts<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     func_loc: FunctionLoc<'db>,
     exported: Option<&'db ExportedFunction>,
 ) -> FnSigParts<'db> {
@@ -1481,8 +1513,8 @@ pub fn resolved_function_sig_parts<'db>(
 /// (`type Item extends Bar = Baz`). Shared by the interface body block and
 /// the associated-type hover.
 pub(crate) fn render_associated_type(
-    iface_data: &baml_compiler2_ppir::item_data::InterfaceData<'_>,
-    assoc: &baml_compiler2_ppir::item_data::AssociatedTypeData,
+    iface_data: &baml_compiler2_hir::item_data::InterfaceData<'_>,
+    assoc: &baml_compiler2_hir::item_data::AssociatedTypeData,
 ) -> String {
     let mut line = format!("type {}", assoc.name.as_str());
     if let Some(bound) = assoc.bound {
@@ -1499,7 +1531,7 @@ pub(crate) fn render_associated_type(
 /// An interface's method signatures, split `(required, defaulted)` — the
 /// hover renders signature-only methods ahead of default bodies.
 fn interface_method_sigs(
-    db: &dyn baml_compiler2_ppir::Db,
+    db: &dyn baml_compiler2_hir::Db,
     iface_loc: baml_compiler2_hir::loc::InterfaceLoc<'_>,
 ) -> (Vec<MethodSig>, Vec<MethodSig>) {
     let file = iface_loc.file(db);
@@ -1521,6 +1553,8 @@ fn interface_method_sigs(
                 .params
                 .first()
                 .is_some_and(|p| p.name.as_str() == "self"),
+            // An interface's own members belong to no implements block.
+            implements: None,
         };
         if item_data::function_has_body(db, method_loc) {
             defaulted.push(sig);
@@ -1531,18 +1565,27 @@ fn interface_method_sigs(
     (required, defaulted)
 }
 
-pub(crate) fn class_method_sigs(
-    db: &dyn baml_compiler2_ppir::Db,
-    class_loc: baml_compiler2_hir::loc::ClassLoc<'_>,
+pub(crate) fn type_method_sigs(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    definition: Definition<'_>,
 ) -> Vec<MethodSig> {
-    collect_class_methods_impl(db, class_loc)
-        .into_iter()
-        .map(|m| MethodSig {
-            name: m.name,
-            signature: m.signature,
-            is_instance: m.is_instance,
-        })
-        .collect()
+    let surface = collect_type_surface(db, viewer, definition);
+    let sig = |m: CollectedMethod, implements: Option<String>| MethodSig {
+        name: m.name,
+        signature: m.signature,
+        is_instance: m.is_instance,
+        implements,
+    };
+    let mut out: Vec<MethodSig> = surface.inherent.into_iter().map(|m| sig(m, None)).collect();
+    for imp in surface.impls {
+        out.extend(
+            imp.methods
+                .into_iter()
+                .map(|m| sig(m, Some(imp.label.clone()))),
+        );
+    }
+    out
 }
 
 /// A method gathered from a class (inherent or implements-block), before
@@ -1551,45 +1594,64 @@ pub(crate) struct CollectedMethod {
     pub(crate) name: String,
     pub(crate) signature: String,
     pub(crate) docstring: Option<String>,
-    pub(crate) file: SourceFile,
-    pub(crate) file_path: String,
-    pub(crate) item_range: TextRange,
+    /// Where the method's definition lives; `None` for a method of a
+    /// mounted or precompiled impl (a dependency's blanket impl applying to
+    /// this class), which has no source in this database.
+    pub(crate) location: Option<crate::describe::MemberLocation>,
     pub(crate) is_instance: bool,
 }
 
-/// Collect a class's method surface (resolved canonical signatures) —
-/// inherent methods in source order, then each implements-block's methods
-/// (post-erasure, methods live on their blocks: `MethodOwner::Impl`) —
-/// skipping language-internal plumbing. THE shared spine for
-/// [`class_method_sigs`] (hover) and describe's `collect_class_methods`.
-pub(crate) fn collect_class_methods_impl(
-    db: &dyn baml_compiler2_ppir::Db,
-    class_loc: baml_compiler2_hir::loc::ClassLoc<'_>,
-) -> Vec<CollectedMethod> {
+/// A concrete type's whole member surface, structured as rustdoc structures
+/// it: the type's INHERENT methods, then every impl that applies to it
+/// ([`baml_compiler2_hir_ty::method_resolution::impls_of_type`]: in-body,
+/// out-of-body in any file, blanket, mounted or precompiled — rustdoc parity)
+/// with the methods that impl provides listed UNDER it. An impl's methods
+/// belong to that instantiation and target — not every impl applies to every
+/// type the declaration heads — so they never join the inherent list. THE
+/// shared spine for [`type_method_sigs`] (hover) and describe's rows.
+pub(crate) struct TypeSurface<'db> {
+    pub(crate) inherent: Vec<CollectedMethod>,
+    pub(crate) impls: Vec<CollectedImpl<'db>>,
+}
+
+/// One impl that applies to a described type — see [`TypeSurface`].
+pub(crate) struct CollectedImpl<'db> {
+    /// `implement<T …> <Head> for <Target>` in canonical spelling
+    /// ([`render_impl_row`]).
+    pub(crate) display: String,
+    /// The impl's drill-in label ([`type_impl_label`]).
+    pub(crate) label: String,
+    /// The source block, when the impl has one in this database; `None`
+    /// for a mounted or precompiled impl (a dependency's).
+    pub(crate) block: Option<baml_compiler2_hir::loc::ImplLoc<'db>>,
+    /// The impl's associated-type bindings, `(name, canonical type)`.
+    pub(crate) associated_types: Vec<(String, String)>,
+    /// The impl's field links, `(interface field, class field)` — a source
+    /// block's only; a dependency's impl exports none.
+    pub(crate) field_links: Vec<(String, String)>,
+    /// The methods the impl provides, in declaration order (resolved
+    /// canonical signatures); an adopted default is not provided.
+    pub(crate) methods: Vec<CollectedMethod>,
+}
+
+/// Collect a concrete type's member surface (resolved canonical signatures),
+/// skipping language-internal plumbing. Empty for a declaration that is no
+/// concrete type.
+pub(crate) fn collect_type_surface<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    definition: Definition<'db>,
+) -> TypeSurface<'db> {
     use baml_compiler2_hir_ty::package_interface::ExportedType;
 
-    let file = class_loc.file(db);
-    let class_data = item_data::class_data(db, class_loc);
+    let file = definition.file(db);
 
-    // Resolved param/return/throws types come from the package interface,
-    // which lowers class methods 1:1 with `class_data.methods` (same order,
-    // including auto-derived entries), so positional indices line up.
-    let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
-    let pkg_id = baml_compiler2_hir::package::PackageId::new(db, pkg_info.package.clone());
-    let iface = baml_compiler2_hir_ty::package_interface::package_interface(db, pkg_id);
-    let exported = iface
-        .lookup_type(&pkg_info.namespace_path, &class_data.name)
-        .and_then(|t| match t {
-            ExportedType::Class { methods, .. } => Some(methods),
-            ExportedType::Enum { .. }
-            | ExportedType::Interface { .. }
-            | ExportedType::TypeAlias { .. } => None,
-        });
-
-    let file_path = file.path(db).display().to_string();
-    let collect = |method_loc: baml_compiler2_hir::loc::FunctionLoc<'_>,
-                   ef: Option<&ExportedFunction>,
-                   out: &mut Vec<CollectedMethod>| {
+    // A source method: signature from its item (resolved slots from the
+    // export), docstring, and its own definition site — which for an
+    // out-of-body impl may be another file than the type's.
+    let collect_source = |method_loc: baml_compiler2_hir::loc::FunctionLoc<'_>,
+                          ef: Option<&ExportedFunction>|
+     -> CollectedMethod {
         let m = item_data::function_data(db, method_loc);
         let is_instance = m.params.first().is_some_and(|p| p.name.as_str() == "self");
         let signature =
@@ -1598,73 +1660,394 @@ pub(crate) fn collect_class_methods_impl(
             .docstring
             .as_ref()
             .map(|d| d.lines().next().unwrap_or("").to_string());
-        out.push(CollectedMethod {
+        let method_file = method_loc.file(db);
+        CollectedMethod {
             name: m.name.as_str().to_string(),
             signature,
             docstring,
-            file,
-            file_path: file_path.clone(),
-            item_range: item_data::function_source_map(db, method_loc).span,
+            location: Some(crate::describe::MemberLocation {
+                file: method_file,
+                file_path: method_file.path(db).display().to_string(),
+                item_range: item_data::function_source_map(db, method_loc).span,
+            }),
             is_instance,
-        });
+        }
     };
 
-    let mut out = Vec::new();
-    for (idx, &method_loc) in class_data.methods.iter().enumerate() {
-        let m = item_data::function_data(db, method_loc);
-        if m.metadata.is_language_internal {
-            continue;
-        }
-        let ef = exported.and_then(|ms| exported_method(ms, idx, &m.name));
-        collect(method_loc, ef, &mut out);
-    }
-    for (method_loc, ef) in class_impl_methods(db, class_loc) {
-        collect(method_loc, ef, &mut out);
-    }
-    out
-}
-
-/// A class's implements-block methods, each paired with its resolved
-/// exported descriptor from the package interface's IMPL rows — the
-/// impl-side counterpart of the class methods' positional export pairing.
-/// The row is found by its coherence identity (interface instantiation +
-/// for-target), which covers in-body and merged out-of-body blocks alike;
-/// a `None` descriptor (mid-edit skew, unresolved header) falls back to
-/// written spellings at the renderer.
-pub(crate) fn class_impl_methods<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
-    class_loc: baml_compiler2_hir::loc::ClassLoc<'db>,
-) -> Vec<(
-    baml_compiler2_hir::loc::FunctionLoc<'db>,
-    Option<&'db ExportedFunction>,
-)> {
-    let file = class_loc.file(db);
-    let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
-    let pkg_id = baml_compiler2_hir::package::PackageId::new(db, pkg_info.package);
-    let iface = baml_compiler2_hir_ty::package_interface::package_interface(db, pkg_id);
-
-    let mut out = Vec::new();
-    for &block in item_data::class_impls(db, class_loc) {
-        let facts = baml_compiler2_hir_ty::impls::impl_facts(db, block).resolved();
-        let row = facts.and_then(|facts| {
-            let for_ty = facts.for_ty_pattern.to_plain();
-            let fact_iface = facts.interface.to_plain();
-            iface.impls.iter().find(|row| {
-                row.interface.name == fact_iface.name
-                    && row.for_ty_pattern == for_ty
-                    && row.interface.generics == fact_iface.generics
-            })
-        });
-        for &method_loc in &item_data::impl_block_data(db, block).methods {
-            let method = item_data::function_data(db, method_loc);
-            if method.metadata.is_language_internal {
+    // The inherent tier: a class's own methods. Resolved param/return/throws
+    // types come from the package interface, which lowers class methods 1:1
+    // with `class_data.methods` (same order, including auto-derived entries),
+    // so positional indices line up. Enums declare no inherent methods.
+    let mut inherent = Vec::new();
+    if let Definition::Class(class_loc) = definition {
+        let class_data = item_data::class_data(db, class_loc);
+        let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
+        let pkg_id = pkg_info.root;
+        let iface = baml_compiler2_hir_ty::package_interface::package_interface(db, pkg_id);
+        let exported = iface
+            .lookup_type(&pkg_info.namespace_path, &class_data.name)
+            .and_then(|t| match t {
+                ExportedType::Class { methods, .. } => Some(methods),
+                ExportedType::Enum { .. }
+                | ExportedType::Interface { .. }
+                | ExportedType::TypeAlias { .. } => None,
+            });
+        for (idx, &method_loc) in class_data.methods.iter().enumerate() {
+            let m = item_data::function_data(db, method_loc);
+            if m.metadata.is_language_internal {
                 continue;
             }
-            let ef = row.and_then(|row| row.methods.iter().find(|ef| ef.name == method.name));
-            out.push((method_loc, ef));
+            let ef = exported.and_then(|ms| exported_method(ms, idx, &m.name));
+            inherent.push(collect_source(method_loc, ef));
         }
     }
-    out
+
+    let impls = type_impls(db, viewer, definition)
+        .into_iter()
+        .map(|imp| CollectedImpl {
+            display: imp.display,
+            label: imp.label,
+            block: imp.block,
+            associated_types: imp.associated_types,
+            field_links: imp.field_links,
+            methods: imp
+                .methods
+                .into_iter()
+                .map(|func| match func {
+                    baml_compiler2_hir::loc::DeclRef::Source(method) => {
+                        collect_source(method, impl_method_row(db, func))
+                    }
+                    // A mounted/precompiled impl's method: fully resolved
+                    // signature, no docstring and no source to point at.
+                    baml_compiler2_hir::loc::DeclRef::External(method) => {
+                        let exported =
+                            baml_compiler2_hir_ty::extern_loc::extern_function_row(db, method);
+                        CollectedMethod {
+                            name: exported.name.as_str().to_string(),
+                            signature: render::FnSigParts::of_exported(exported).render(
+                                db,
+                                file,
+                                method_sig_style(),
+                            ),
+                            docstring: None,
+                            location: None,
+                            is_instance:
+                                baml_compiler2_hir_ty::package_interface::exported_takes_self(
+                                    exported,
+                                ),
+                        }
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+
+    TypeSurface { inherent, impls }
+}
+
+/// An impl's head with its instantiation — the interface's SHORT name plus
+/// written generic arguments and associated-type pins (`Multiply<int>`,
+/// `Iterator<Item = int>`). This is the display half of the impl's coherence
+/// identity (the constraint set stays off the label, per the keys/display
+/// split): it is what tells same-head impls of one class apart, so listings
+/// and drill-ins label impl-tier methods with it.
+pub(crate) fn render_impl_head(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    interface: &baml_type::interned::ClosedInterface,
+) -> String {
+    let iface = interface.to_plain();
+    let mut head = iface.name.name().as_str().to_string();
+    let mut args: Vec<String> = iface
+        .generics
+        .iter()
+        .map(|ty| render::display_addressable_ty(db, viewer, ty))
+        .collect();
+    args.extend(iface.associated_types.iter().map(|(name, ty)| {
+        format!(
+            "{} = {}",
+            name.as_str(),
+            render::display_addressable_ty(db, viewer, ty)
+        )
+    }));
+    if !args.is_empty() {
+        head.push('<');
+        head.push_str(&args.join(", "));
+        head.push('>');
+    }
+    head
+}
+
+/// An impl's for-target in the canonical owner spelling (`int`, `T[]`,
+/// `user.Foo`, or a bare `T` for a blanket impl).
+pub(crate) fn render_impl_target(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    for_ty: &baml_type::interned::ClosedTy,
+) -> String {
+    render::display_addressable_ty(db, viewer, &for_ty.to_plain())
+}
+
+/// The label a drill-in carries for an impl's method: the head alone when
+/// the impl is FOR this type (`Scale<int>`), the head with its for-pattern
+/// otherwise (`Concrete for T` — a blanket or pattern impl the type merely
+/// falls under).
+pub(crate) fn type_impl_label(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    self_ty: &baml_type::Ty,
+    resolved: &baml_compiler2_hir_ty::impls::ResolvedImpl<'_>,
+) -> String {
+    let head = render_impl_head(db, viewer, resolved.facts.interface());
+    if impl_is_for_type(self_ty, resolved) {
+        head
+    } else {
+        format!(
+            "{head} for {}",
+            render_impl_target(db, viewer, resolved.facts.for_ty_pattern())
+        )
+    }
+}
+
+/// `implement<T extends B, …> <Head> for <Target>`: the impl header in
+/// canonical spelling — its generic context first (with bounds, as written),
+/// then the head with its instantiation ([`render_impl_head`] — the SAME
+/// label drill-ins carry) and the for-target in the canonical owner spelling
+/// (`int`, `T[]`, `user.Foo`). The head keeps its SHORT name deliberately —
+/// under an interface every row names it, under a type the variation a
+/// reader scans for is the context, the instantiation and the target.
+pub(crate) fn render_impl_row(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    generic_params: &[(
+        baml_type::ParamTy,
+        Vec<baml_type::interned::ClosedInterface>,
+    )],
+    interface: &baml_type::interned::ClosedInterface,
+    for_ty: &baml_type::interned::ClosedTy,
+) -> String {
+    let mut row = String::from("implement");
+    if !generic_params.is_empty() {
+        let params: Vec<String> = generic_params
+            .iter()
+            .map(|(param, bounds)| {
+                let mut spelled = param.name().to_string();
+                if !bounds.is_empty() {
+                    spelled.push_str(" extends ");
+                    spelled.push_str(
+                        &bounds
+                            .iter()
+                            .map(|bound| render_impl_head(db, viewer, bound))
+                            .collect::<Vec<_>>()
+                            .join(" & "),
+                    );
+                }
+                spelled
+            })
+            .collect();
+        row.push('<');
+        row.push_str(&params.join(", "));
+        row.push('>');
+    }
+    row.push(' ');
+    row.push_str(&render_impl_head(db, viewer, interface));
+    row.push_str(" for ");
+    row.push_str(&render_impl_target(db, viewer, for_ty));
+    row
+}
+
+/// Whether `resolved` is an impl OF the described type — its for-pattern
+/// has the type's head: a class or enum by name, a builtin by kind (so the
+/// `baml.Array<T>` carrier, whose self type is `T[]`, owns
+/// `implements<T> … for T[]`) — as opposed to a blanket or pattern impl the
+/// type merely falls under.
+pub(crate) fn impl_is_for_type(
+    self_ty: &baml_type::Ty,
+    resolved: &baml_compiler2_hir_ty::impls::ResolvedImpl<'_>,
+) -> bool {
+    use baml_type::Ty;
+    match (&resolved.facts.for_ty_pattern().to_plain(), self_ty) {
+        (Ty::Class(pattern, ..), Ty::Class(own, ..)) | (Ty::Enum(pattern), Ty::Enum(own)) => {
+            pattern == own
+        }
+        (Ty::Class(..) | Ty::Enum(..), _) | (_, Ty::Class(..) | Ty::Enum(..)) => false,
+        // Builtins: the same kind of type (`T[]` for `int[]`, `string` for
+        // `string`); a builtin has no name to compare and its head IS its kind.
+        (pattern, own) => std::mem::discriminant(pattern) == std::mem::discriminant(own),
+    }
+}
+
+/// The exported descriptor of an impl-provided method, wherever its body
+/// lives: a served package's row itself; a source method's row from its own
+/// package's interface, paired through the impl's coherence identity
+/// (interface instantiation + for-target + constraint set — the ONE
+/// identity an exported impl row is addressed by, so this cannot drift from
+/// it). `None` on mid-edit skew, when the interface has not caught up with
+/// the source.
+pub(crate) fn impl_method_row<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    func: baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>,
+) -> Option<&'db ExportedFunction> {
+    use baml_compiler2_hir::{item_data::MethodOwner, loc::DeclRef};
+    use baml_compiler2_hir_ty::{
+        extern_loc::{exported_impl_identity, extern_function_row, impl_identity},
+        impls::{ResolvedImplFacts, impl_facts},
+    };
+
+    match func {
+        DeclRef::External(func) => Some(extern_function_row(db, func)),
+        DeclRef::Source(method) => {
+            let MethodOwner::Impl(block) = item_data::method_owner(db, method)? else {
+                return None;
+            };
+            let facts = impl_facts(db, block).resolved()?;
+            let identity = impl_identity(&ResolvedImplFacts::Source { block, facts });
+            let root = baml_compiler2_hir::file_package::file_package(db, block.file(db)).root;
+            let name = &item_data::function_data(db, method).name;
+            baml_compiler2_hir_ty::package_interface::package_interface(db, root)
+                .impls
+                .iter()
+                .find(|row| exported_impl_identity(row) == identity)?
+                .methods
+                .iter()
+                .find(|exported| exported.name == *name)
+        }
+    }
+}
+
+/// One impl that applies to a concrete type declaration, with the methods it
+/// provides — see [`type_impls`].
+pub(crate) struct TypeImpl<'db> {
+    /// [`render_impl_row`] of the impl header.
+    pub(crate) display: String,
+    /// [`type_impl_label`].
+    pub(crate) label: String,
+    /// The source block; `None` for a mounted or precompiled impl.
+    pub(crate) block: Option<baml_compiler2_hir::loc::ImplLoc<'db>>,
+    /// The impl's associated-type bindings, `(name, canonical type)` — what
+    /// the block binds, rendered from the resolved facts so a dependency's
+    /// impl answers too.
+    pub(crate) associated_types: Vec<(String, String)>,
+    /// The impl's field links, `(interface field, class field)`; a source
+    /// block's only.
+    pub(crate) field_links: Vec<(String, String)>,
+    /// The provided methods in declaration order, wherever their bodies
+    /// live; [`impl_method_row`] reads each one's exported descriptor.
+    pub(crate) methods: Vec<baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>>,
+}
+
+/// Every impl that applies to a concrete type declaration, impls OF the type
+/// first (in-body or out-of-body, any file), then the blanket/pattern impls
+/// it falls under — rustdoc's "Trait Implementations" then "Blanket
+/// Implementations" order — each with the methods it provides. The set is
+/// `impls_of_type`, the one completion enumerates from too. A source method
+/// is paired with its exported descriptor by the impl's coherence identity
+/// (interface instantiation + for-target + constraint set); a
+/// mounted/precompiled method IS its descriptor. Empty for a declaration
+/// that is no concrete type.
+pub(crate) fn type_impls<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    definition: Definition<'db>,
+) -> Vec<TypeImpl<'db>> {
+    use baml_compiler2_hir::loc::DeclRef;
+    use baml_compiler2_hir_ty::impls::ResolvedImplFacts;
+
+    let Some(self_ty) = baml_compiler2_hir_ty::lower::declaration_self_ty(db, definition) else {
+        return Vec::new();
+    };
+    let (own, other): (Vec<_>, Vec<_>) =
+        baml_compiler2_hir_ty::method_resolution::impls_of_type(db, viewer, &self_ty)
+            .into_iter()
+            .partition(|resolved| impl_is_for_type(&self_ty, resolved));
+
+    own.into_iter()
+        .chain(other)
+        .map(|resolved| {
+            let display = render_impl_row(
+                db,
+                viewer,
+                resolved.facts.generic_params(),
+                resolved.facts.interface(),
+                resolved.facts.for_ty_pattern(),
+            );
+            let label = type_impl_label(db, viewer, &self_ty, &resolved);
+            let associated_types = resolved
+                .facts
+                .associated_types()
+                .iter()
+                .map(|(name, ty)| {
+                    (
+                        name.as_str().to_string(),
+                        render::display_addressable_ty(db, viewer, &ty.to_plain()),
+                    )
+                })
+                .collect();
+            let (block, field_links, methods) = match &resolved.facts {
+                ResolvedImplFacts::Source { block, facts } => {
+                    let methods = facts
+                        .methods
+                        .iter()
+                        .copied()
+                        .filter(|&method_loc| {
+                            !item_data::function_data(db, method_loc)
+                                .metadata
+                                .is_language_internal
+                        })
+                        .map(DeclRef::Source)
+                        .collect();
+                    (Some(*block), impl_field_links(db, *block), methods)
+                }
+                ResolvedImplFacts::External { block, .. } => {
+                    (None, Vec::new(), exported_bodies(db, *block))
+                }
+            };
+            TypeImpl {
+                display,
+                label,
+                block,
+                associated_types,
+                field_links,
+                methods,
+            }
+        })
+        .collect()
+}
+
+/// A source impl block's field links, `(interface field, class field)`.
+pub(crate) fn impl_field_links(
+    db: &dyn baml_compiler2_hir::Db,
+    block: baml_compiler2_hir::loc::ImplLoc<'_>,
+) -> Vec<(String, String)> {
+    item_data::impl_block_data(db, block)
+        .field_links
+        .iter()
+        .map(|link| {
+            (
+                link.interface_field.as_str().to_string(),
+                link.class_field.as_str().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The bodies of an external impl: each provided method's row identity.
+fn exported_bodies<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    block: baml_compiler2_hir_ty::extern_loc::ExternImplLoc<'db>,
+) -> Vec<baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>> {
+    use baml_compiler2_hir::loc::DeclRef;
+    use baml_compiler2_hir_ty::extern_loc::{extern_impl_method, extern_impl_row};
+    extern_impl_row(db, block)
+        .methods
+        .iter()
+        .map(|exported| {
+            DeclRef::External(
+                extern_impl_method(db, block, &exported.name)
+                    .unwrap_or_else(|| unreachable!("a provided row of the block mints")),
+            )
+        })
+        .collect()
 }
 
 /// The exported signature lowered from the method at `idx`, when the
@@ -1893,16 +2276,28 @@ function main() -> int {
         assert_eq!(info_at(&test).to_describe_block(), "let x: int");
     }
 
+    /// The body block is FIELDS ONLY: an impl — in-body or out-of-body, the
+    /// syntax is not special — belongs to describe's implementations section,
+    /// where it lists its bindings and methods (rustdoc's shape).
     #[test]
-    fn class_info_lists_out_of_body_implements() {
+    fn class_info_block_is_fields_only_whatever_the_class_implements() {
         let test = CursorTest::new(
             r#"
 interface Animal {
   function speak(self) -> string throws never
 }
 
+interface Decoder<Input> {
+  type Output
+  function decode(self, raw: Input) -> Self.Output throws never
+}
+
 class Dog<[CURSOR] {
   name: string
+  implements Decoder<string> {
+    type Output = int
+    function decode(self, raw: string) -> Self.Output { return 1 }
+  }
 }
 
 implements Animal for Dog {
@@ -1912,35 +2307,7 @@ implements Animal for Dog {
         );
 
         let block = info_at(&test).to_describe_block();
-        assert!(
-            block.contains("implements Animal {}"),
-            "expected class info to surface out-of-body implements, got:\n{block}"
-        );
-    }
-
-    #[test]
-    fn class_info_shows_associated_type_bindings_in_implements() {
-        let test = CursorTest::new(
-            r#"
-interface Decoder<Input> {
-  type Output
-  function decode(self, raw: Input) -> Self.Output throws never
-}
-
-class IntDecoder<[CURSOR] {
-  implements Decoder<string> {
-    type Output = int
-    function decode(self, raw: string) -> Self.Output { return 1 }
-  }
-}
-"#,
-        );
-
-        let block = info_at(&test).to_describe_block();
-        assert!(
-            block.contains("type Output = int"),
-            "expected class info to include associated type bindings, got:\n{block}"
-        );
+        assert_eq!(block, "class Dog {\n    name: string,\n}", "got:\n{block}");
     }
 
     #[test]
@@ -2474,10 +2841,10 @@ function example(name: string) -> string {
 
     #[test]
     fn llm_prompt_hover_survives_companion_span_aliasing() {
-        // The demo-project crash: llm companions are PPIR-expansion items
-        // whose spans alias the prompt text; resolving through HIR's
-        // pre-expansion body query panicked "no entry found for key". All
-        // body reads go through PPIR's canonical accessors now.
+        // The demo-project crash: llm companions are synthesized items whose
+        // spans alias the prompt text; resolving through a pre-expansion body
+        // query panicked "no entry found for key". All body reads go through
+        // HIR's canonical accessors now.
         let test = CursorTest::new(
             r#"client Terra = openai.ResponsesClient.new(model = "gpt-5.6-terra");
 

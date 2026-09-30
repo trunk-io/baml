@@ -60,8 +60,8 @@ class ReadPipeLines {
     _pending: uint8array,
 
     implements root.iter.Iterable {
-        type Item = string
-        type Error = root.errors.Io
+        type Item = string;
+        type Error = root.errors.Io;
 
         function iter(
             self,
@@ -71,12 +71,12 @@ class ReadPipeLines {
     }
 
     implements root.iter.Iterator {
-        type Item = string
-        type Error = root.errors.Io
+        type Item = string;
+        type Error = root.errors.Io;
 
         /// Wait for and return the next line, or `Done` at EOF.
         function next(self) -> string | root.iter.Done throws root.errors.Io {
-            let line: string | root.iter.Done = root.iter.Done {  };
+            let line: string | root.iter.Done = root.iter.Done {};
             let framing = true;
             while (framing) {
                 match (self._pending.index_of(10)) {

@@ -34,6 +34,7 @@ mod kw {
     syn::custom_keyword!(satellite);
     syn::custom_keyword!(includes);
     syn::custom_keyword!(child);
+    syn::custom_keyword!(head);
     syn::custom_keyword!(methods);
 }
 
@@ -50,6 +51,8 @@ struct MemberInput {
     name: Ident,
     includes: Vec<Ident>,
     child: ChildRef,
+    /// `head: T` — this member's default for the family's head parameter.
+    head: Option<syn::Type>,
 }
 
 enum ChildRef {
@@ -131,12 +134,20 @@ fn parse_member(input: ParseStream) -> syn::Result<MemberInput> {
     } else {
         ChildRef::Named(content.parse::<Ident>()?)
     };
+    let mut head = None;
+    if content.peek(Token![,]) && content.peek2(kw::head) {
+        content.parse::<Token![,]>()?;
+        content.parse::<kw::head>()?;
+        content.parse::<Token![:]>()?;
+        head = Some(content.parse::<syn::Type>()?);
+    }
     let _trailing: Option<Token![,]> = content.parse()?;
 
     Ok(MemberInput {
         name,
         includes,
         child,
+        head,
     })
 }
 
@@ -194,6 +205,13 @@ pub(crate) struct Member {
     pub(crate) is_master: bool,
     /// `true` iff `child` points at this member itself.
     pub(crate) deep: bool,
+    /// This member's default for the head parameter, when it overrides the
+    /// master's (`head: DeclName`). A bare `Ty` in type position means
+    /// `Ty<DeclName>` while a bare `RuntimeTy` keeps meaning
+    /// `RuntimeTy<TypeName>`: the compile-time members carry the root-based
+    /// head, the wire members the name-based one, and each is what its
+    /// unqualified spelling denotes.
+    pub(crate) head: Option<syn::Type>,
 }
 
 /// A member's resolved nested-position type.
@@ -212,6 +230,28 @@ pub(crate) enum Child {
 }
 
 impl Member {
+    /// `generics` with this member's head default applied: the declaration
+    /// generics for the member's enum and its satellite twins. Defaults only
+    /// matter in declarations (`split_for_impl` strips them), so every impl
+    /// stays shared across the family regardless of which default a member
+    /// declares.
+    pub(crate) fn declaration_generics(&self, generics: &Generics) -> Generics {
+        let mut out = generics.clone();
+        if let Some(head) = &self.head {
+            let param = out
+                .params
+                .iter_mut()
+                .find_map(|p| match p {
+                    syn::GenericParam::Type(t) => Some(t),
+                    syn::GenericParam::Lifetime(_) | syn::GenericParam::Const(_) => None,
+                })
+                .expect("a member declaring `head:` needs the family to have a head parameter");
+            param.eq_token = Some(Default::default());
+            param.default = Some(head.clone());
+        }
+        out
+    }
+
     /// The family-member index feeding nested positions; `None` for an
     /// interned member (its children are handles, not a member type).
     pub(crate) fn child_member(&self) -> Option<usize> {
@@ -240,10 +280,6 @@ pub(crate) struct MVariant {
     pub(crate) axis: usize,
     /// Stable discriminant in the master enum. Gaps are wire-format tombstones.
     pub(crate) discriminant: u8,
-    /// Whether the variant carries a `TyAttr` (a named `attr` field or a
-    /// trailing tuple `TyAttr`). Attr-less template leaves get accessor
-    /// fallbacks instead of a compile error.
-    pub(crate) has_attr: bool,
 }
 
 impl Family {
@@ -313,6 +349,7 @@ impl Family {
                     child,
                     is_master: m.name == master_ident,
                     deep,
+                    head: m.head.clone(),
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;
@@ -398,37 +435,11 @@ fn resolve_variant(
             ));
         }
     };
-    // A variant need not carry a `TyAttr`: a template-only leaf (`TypeArgRef`)
-    // is pure structure with no streaming metadata. The generated
-    // `attr()`/`with_attr()` accessors fall back to `TyAttr::EMPTY` / identity
-    // for them (see `emit::attr_arm`). `has_attr` records which case applies so
-    // the accessor arms don't need to re-derive it.
-    let has_attr = carries_ty_attr(&variant.fields);
     Ok(MVariant {
         attrs,
         ident: variant.ident,
         fields: variant.fields,
         axis,
         discriminant,
-        has_attr,
     })
-}
-
-/// Every family variant must hold a `TyAttr` for the generated `attr`/`with_attr`
-/// accessors: in a field named `attr` (struct variants) or as the last
-/// positional (tuple variants). Validated up front so a non-conforming variant
-/// fails with a clear, spanned error instead of a cryptic one from the
-/// generated `match`.
-fn carries_ty_attr(fields: &Fields) -> bool {
-    fn is_ty_attr(ty: &syn::Type) -> bool {
-        matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "TyAttr"))
-    }
-    match fields {
-        Fields::Named(n) => n
-            .named
-            .iter()
-            .any(|f| f.ident.as_ref().is_some_and(|id| id == "attr") && is_ty_attr(&f.ty)),
-        Fields::Unnamed(u) => u.unnamed.last().is_some_and(|f| is_ty_attr(&f.ty)),
-        Fields::Unit => false,
-    }
 }

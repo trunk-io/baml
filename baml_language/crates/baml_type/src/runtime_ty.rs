@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    Freshness, Interface, Name, NotRuntimeTy, QualifiedTypeName, RuntimeFunctionParamTy,
-    RuntimeInterface, RuntimeTy, Ty, TyAttr, TypeName,
+    DeclName, Freshness, Head, Interface, Name, NotRuntimeTy, RuntimeFunctionParamTy,
+    RuntimeInterface, RuntimeTy, Ty, TypeName,
 };
 
 // Head-agnostic: none of these mention a nominal head, so they are defined for
@@ -27,62 +27,48 @@ use crate::{
 // The nominal constructors below stay at `TypeName`, since building a head from
 // a `&str` is exactly the thing only a name-headed type can do.
 impl<N: Clone> RuntimeTy<N> {
-    // --- Primitive constructors (default TyAttr) ---
+    // --- Primitive constructors ---
 
     /// `int` with default attributes.
     pub fn int() -> Self {
-        RuntimeTy::Int {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Int
     }
 
     /// `bigint` with default attributes.
     pub fn bigint() -> Self {
-        RuntimeTy::Bigint {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Bigint
     }
 
     /// `float` with default attributes.
     pub fn float() -> Self {
-        RuntimeTy::Float {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Float
     }
 
     /// `string` with default attributes.
     pub fn string() -> Self {
-        RuntimeTy::String {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::String
     }
 
     /// `bool` with default attributes.
     pub fn bool() -> Self {
-        RuntimeTy::Bool {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Bool
     }
 
     /// `null` with default attributes.
     pub fn null() -> Self {
-        RuntimeTy::Null {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Null
     }
 
     /// `uint8array` with default attributes.
     pub fn uint8array() -> Self {
-        RuntimeTy::Uint8Array {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Uint8Array
     }
 
-    // --- Compound constructors (default TyAttr) ---
+    // --- Compound constructors ---
 
     /// `T[]` (list) with default attributes.
     pub fn list(inner: RuntimeTy<N>) -> Self {
-        RuntimeTy::List(Box::new(inner), TyAttr::default())
+        RuntimeTy::List(Box::new(inner))
     }
 
     /// `map<K, V>` with default attributes.
@@ -90,71 +76,62 @@ impl<N: Clone> RuntimeTy<N> {
         RuntimeTy::Map {
             key: Box::new(key),
             value: Box::new(value),
-            attr: TyAttr::default(),
         }
     }
 
     /// `A | B | ...` (union) with default attributes.
     pub fn union(members: impl IntoIterator<Item = RuntimeTy<N>>) -> Self {
-        RuntimeTy::Union(members.into_iter().collect(), TyAttr::default())
+        RuntimeTy::Union(members.into_iter().collect())
     }
 
     /// `T?` (optional) — sugar for `T | null`. Mirrors [`Ty::optional`]: the
     /// result is flattened and idempotent.
     pub fn optional(inner: RuntimeTy<N>) -> Self {
         match inner {
-            RuntimeTy::Union(members, attr) => {
+            RuntimeTy::Union(members) => {
                 if members.iter().any(RuntimeTy::is_null) {
-                    RuntimeTy::Union(members, attr)
+                    RuntimeTy::Union(members)
                 } else {
                     let mut members = members.into_vec();
                     members.push(RuntimeTy::null());
-                    RuntimeTy::Union(members.into(), attr)
+                    RuntimeTy::Union(members.into())
                 }
             }
-            n @ RuntimeTy::Null { .. } => n,
-            other => RuntimeTy::Union(Box::new([other, RuntimeTy::null()]), TyAttr::default()),
+            n @ RuntimeTy::Null => n,
+            other => RuntimeTy::Union(Box::new([other, RuntimeTy::null()])),
         }
     }
 
     /// `unknown` (the top type) with default attributes.
     pub fn unknown() -> Self {
-        RuntimeTy::Unknown {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Unknown
     }
 
     /// Opaque resource handle type (file, socket, HTTP response body).
     pub fn resource() -> Self {
-        RuntimeTy::Resource {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Resource
     }
 
     /// Opaque structured prompt tree type for LLM calls.
     pub fn prompt_ast() -> Self {
-        RuntimeTy::PromptAst {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::PromptAst
     }
 
     /// Meta-type — a runtime value that wraps a [`RuntimeTy`].
     pub fn type_type() -> Self {
-        RuntimeTy::Type {
-            attr: TyAttr::default(),
-        }
+        RuntimeTy::Type
     }
 
     // --- Queries ---
 
     /// True if this is exactly the `null` type.
     pub fn is_null(&self) -> bool {
-        matches!(self, RuntimeTy::Null { .. })
+        matches!(self, RuntimeTy::Null)
     }
 
     /// True if this is a union that includes `null` — i.e. an optional type.
     pub fn is_nullable_union(&self) -> bool {
-        matches!(self, RuntimeTy::Union(members, _) if members.iter().any(RuntimeTy::is_null))
+        matches!(self, RuntimeTy::Union(members) if members.iter().any(RuntimeTy::is_null))
     }
 
     // --- Transforms ---
@@ -163,7 +140,7 @@ impl<N: Clone> RuntimeTy<N> {
     /// of [`RuntimeTy::optional`]; mirrors [`Ty::strip_null`].
     pub fn strip_null(&self) -> RuntimeTy<N> {
         match self {
-            RuntimeTy::Union(members, attr) => {
+            RuntimeTy::Union(members) => {
                 let non_null: Box<[RuntimeTy<N>]> =
                     members.iter().filter(|m| !m.is_null()).cloned().collect();
                 match non_null.len() {
@@ -172,7 +149,7 @@ impl<N: Clone> RuntimeTy<N> {
                         .into_iter()
                         .next()
                         .unwrap_or_else(|| unreachable!("len checked")),
-                    _ => RuntimeTy::Union(non_null, attr.clone()),
+                    _ => RuntimeTy::Union(non_null),
                 }
             }
             _ => self.clone(),
@@ -195,25 +172,17 @@ impl<N: Clone> RuntimeTy<N> {
 impl RuntimeTy {
     /// `Class(name)` with default attributes (local module path), no type args.
     pub fn class(name: &str) -> Self {
-        RuntimeTy::Class(
-            TypeName::local(name.into()),
-            Box::new([]),
-            TyAttr::default(),
-        )
+        RuntimeTy::Class(TypeName::local(name.into()), Box::new([]))
     }
 
     /// `Class(name, args)` — a parametric class instantiation.
     pub fn class_with_args(name: TypeName, args: Box<[RuntimeTy]>) -> Self {
-        RuntimeTy::Class(name, args, TyAttr::default())
+        RuntimeTy::Class(name, args)
     }
 
     /// `Class(name)` under the implicit `user` package, no type args.
     pub fn user_class(name: &str) -> Self {
-        RuntimeTy::Class(
-            TypeName::local(Name::new(name)),
-            Box::new([]),
-            TyAttr::default(),
-        )
+        RuntimeTy::Class(TypeName::local(Name::new(name)), Box::new([]))
     }
 }
 
@@ -233,17 +202,26 @@ impl<N: Clone + crate::HeadDisplay> std::fmt::Display for RuntimeTy<N> {
 /// [`RuntimeTy`]: the alias targets to expand and the set of recursive aliases
 /// to keep opaque. Built per package by the compiler (see
 /// `baml_compiler2_mir::resolved_aliases_for_package`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ResolvedAliases {
-    pub aliases: HashMap<QualifiedTypeName, Ty>,
-    pub recursive: HashSet<QualifiedTypeName>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAliases<N: Head = DeclName> {
+    pub aliases: HashMap<N, Ty<N>>,
+    pub recursive: HashSet<N>,
 }
 
-impl ResolvedAliases {
+impl<N: Head> Default for ResolvedAliases<N> {
+    fn default() -> Self {
+        Self {
+            aliases: HashMap::new(),
+            recursive: HashSet::new(),
+        }
+    }
+}
+
+impl<N: Head> ResolvedAliases<N> {
     /// Build the environment from the collected alias targets, computing
     /// the recursive set (DFS cycle detection) here - the one constructor,
     /// so a caller cannot pair aliases with a stale recursive set.
-    pub fn from_aliases(aliases: HashMap<QualifiedTypeName, Ty>) -> ResolvedAliases {
+    pub fn from_aliases(aliases: HashMap<N, Ty<N>>) -> Self {
         let mut recursive = HashSet::new();
         for name in aliases.keys() {
             let mut visited = HashSet::new();
@@ -264,7 +242,7 @@ impl ResolvedAliases {
     /// compiler bug — so it panics loudly rather than silently producing a
     /// degraded type. Callers that genuinely tolerate failure use
     /// [`lower_to_runtime`] directly.
-    pub fn convert(&self, ty: &Ty) -> RuntimeTy {
+    pub fn convert(&self, ty: &Ty<N>) -> RuntimeTy<N> {
         lower_to_runtime(ty, self).unwrap_or_else(|e| {
             unreachable!("{e}: an error-recovery type reached runtime lowering")
         })
@@ -282,35 +260,36 @@ impl ResolvedAliases {
 /// unfilled `Infer` hole: those exist only during compilation, so a type-checked program can
 /// never contain one. Reaching this boundary with one is a compiler bug — we
 /// surface it instead of erasing it to a degraded runtime type.
-pub fn lower_to_runtime(ty: &Ty, resolved: &ResolvedAliases) -> Result<RuntimeTy, NotRuntimeTy> {
+pub fn lower_to_runtime<N: Head>(
+    ty: &Ty<N>,
+    resolved: &ResolvedAliases<N>,
+) -> Result<RuntimeTy<N>, NotRuntimeTy> {
     Ok(match ty {
         // Primitives — same-named runtime variant.
-        Ty::Int { attr } => RuntimeTy::Int { attr: attr.clone() },
-        Ty::Bigint { attr } => RuntimeTy::Bigint { attr: attr.clone() },
-        Ty::Float { attr } => RuntimeTy::Float { attr: attr.clone() },
-        Ty::String { attr } => RuntimeTy::String { attr: attr.clone() },
-        Ty::Bool { attr } => RuntimeTy::Bool { attr: attr.clone() },
-        Ty::Null { attr } => RuntimeTy::Null { attr: attr.clone() },
-        Ty::Uint8Array { attr } => RuntimeTy::Uint8Array { attr: attr.clone() },
-        Ty::Media(kind, attr) => RuntimeTy::Media(*kind, attr.clone()),
+        Ty::Int => RuntimeTy::Int,
+        Ty::Bigint => RuntimeTy::Bigint,
+        Ty::Float => RuntimeTy::Float,
+        Ty::String => RuntimeTy::String,
+        Ty::Bool => RuntimeTy::Bool,
+        Ty::Null => RuntimeTy::Null,
+        Ty::Uint8Array => RuntimeTy::Uint8Array,
+        Ty::Media(kind) => RuntimeTy::Media(*kind),
 
         // Named types
-        Ty::Class(qtn, type_args, attr) => {
-            RuntimeTy::Class(qtn.clone(), lower_vec(type_args, resolved)?, attr.clone())
-        }
-        Ty::Interface(qtn, type_args, associated_bindings, attr) => {
+        Ty::Class(qtn, type_args) => RuntimeTy::Class(qtn.clone(), lower_vec(type_args, resolved)?),
+        Ty::Interface(qtn, type_args, associated_bindings) => {
             let resolved_args = lower_vec(type_args, resolved)?;
             let resolved_bindings = associated_bindings
                 .iter()
                 .map(|(name, ty)| Ok((name.clone(), lower_to_runtime(ty, resolved)?)))
                 .collect::<Result<Box<[_]>, NotRuntimeTy>>()?;
-            RuntimeTy::Interface(qtn.clone(), resolved_args, resolved_bindings, attr.clone())
+            RuntimeTy::Interface(qtn.clone(), resolved_args, resolved_bindings)
         }
-        Ty::Enum(qtn, attr) => RuntimeTy::Enum(qtn.clone(), attr.clone()),
-        Ty::TypeAlias(qtn, attr) => {
+        Ty::Enum(qtn) => RuntimeTy::Enum(qtn.clone()),
+        Ty::TypeAlias(qtn) => {
             if resolved.recursive.contains(qtn) {
                 // Keep recursive aliases opaque — they need runtime resolution
-                RuntimeTy::TypeAlias(qtn.clone(), attr.clone())
+                RuntimeTy::TypeAlias(qtn.clone())
             } else if let Some(target) = resolved.aliases.get(qtn) {
                 // Expand non-recursive aliases inline
                 lower_to_runtime(target, resolved)?
@@ -329,29 +308,18 @@ pub fn lower_to_runtime(ty: &Ty, resolved: &ResolvedAliases) -> Result<RuntimeTy
         }
 
         // EnumVariant → preserve variant-level type info
-        Ty::EnumVariant(qtn, variant, attr) => {
-            RuntimeTy::EnumVariant(qtn.clone(), variant.clone(), attr.clone())
-        }
+        Ty::EnumVariant(qtn, variant) => RuntimeTy::EnumVariant(qtn.clone(), variant.clone()),
 
         // Containers
-        Ty::List(inner, attr) => {
-            RuntimeTy::List(Box::new(lower_to_runtime(inner, resolved)?), attr.clone())
-        }
-        Ty::Map {
-            key: k,
-            value: v,
-            attr,
-        } => RuntimeTy::Map {
+        Ty::List(inner) => RuntimeTy::List(Box::new(lower_to_runtime(inner, resolved)?)),
+        Ty::Map { key: k, value: v } => RuntimeTy::Map {
             key: Box::new(lower_to_runtime(k, resolved)?),
             value: Box::new(lower_to_runtime(v, resolved)?),
-            attr: attr.clone(),
         },
-        Ty::Union(members, attr) => RuntimeTy::Union(lower_vec(members, resolved)?, attr.clone()),
+        Ty::Union(members) => RuntimeTy::Union(lower_vec(members, resolved)?),
         // Freshness is a compiler-only flag; runtime literal types are uniform,
         // so normalize to `Regular` at the boundary.
-        Ty::Literal(lit, _freshness, attr) => {
-            RuntimeTy::Literal(lit.clone(), Freshness::Regular, attr.clone())
-        }
+        Ty::Literal(lit, _freshness) => RuntimeTy::Literal(lit.clone(), Freshness::Regular),
 
         // Functions — preserve the param metadata; body type-vars (captured from
         // the enclosing context) are resolved faithfully by the recursive
@@ -360,7 +328,6 @@ pub fn lower_to_runtime(ty: &Ty, resolved: &ResolvedAliases) -> Result<RuntimeTy
             params,
             ret,
             throws,
-            attr,
         } => RuntimeTy::Function {
             params: params
                 .iter()
@@ -374,45 +341,44 @@ pub fn lower_to_runtime(ty: &Ty, resolved: &ResolvedAliases) -> Result<RuntimeTy
                 .collect::<Result<Box<[_]>, NotRuntimeTy>>()?,
             ret: Box::new(lower_to_runtime(ret, resolved)?),
             throws: Box::new(lower_to_runtime(throws, resolved)?),
-            attr: attr.clone(),
         },
 
         // Bottom, opaque-leaf, and reflection types map faithfully.
-        Ty::Never { attr } => RuntimeTy::Never { attr: attr.clone() },
-        Ty::Void { attr } => RuntimeTy::Void { attr: attr.clone() },
-        Ty::Unknown { attr } => RuntimeTy::Unknown { attr: attr.clone() },
-        Ty::RustType { attr } => RuntimeTy::RustType { attr: attr.clone() },
-        Ty::Type { attr } => RuntimeTy::Type { attr: attr.clone() },
-        Ty::Resource { attr } => RuntimeTy::Resource { attr: attr.clone() },
-        Ty::PromptAst { attr } => RuntimeTy::PromptAst { attr: attr.clone() },
-        Ty::TypeVar(name, attr) => RuntimeTy::TypeVar(name.clone(), attr.clone()),
+        Ty::Never => RuntimeTy::Never,
+        Ty::Void => RuntimeTy::Void,
+        Ty::Unknown => RuntimeTy::Unknown,
+        Ty::RustType => RuntimeTy::RustType,
+        Ty::Type => RuntimeTy::Type,
+        Ty::Resource => RuntimeTy::Resource,
+        Ty::PromptAst => RuntimeTy::PromptAst,
+        Ty::TypeVar(name) => RuntimeTy::TypeVar(name.clone()),
         Ty::AssociatedTypeProjection {
             base,
             interface,
             member,
-            attr,
         } => RuntimeTy::AssociatedTypeProjection {
             base: Box::new(lower_to_runtime(base, resolved)?),
             interface: Box::new(lower_interface_to_runtime(interface, resolved)?),
             member: member.clone(),
-            attr: attr.clone(),
         },
 
         // BEP-034: future types pass through unchanged with both
         // value and error type parameters mapped.
-        Ty::Future(value, error, attr) => RuntimeTy::Future(
+        Ty::Future(value, error) => RuntimeTy::Future(
             Box::new(lower_to_runtime(value, resolved)?),
             Box::new(lower_to_runtime(error, resolved)?),
-            attr.clone(),
         ),
         // Error-recovery sentinels cannot exist in a type-checked program.
-        Ty::Error { .. } => return Err(NotRuntimeTy { variant: "Error" }),
+        Ty::Error => return Err(NotRuntimeTy { variant: "Error" }),
     })
 }
 
 /// Lower each [`Ty`] in `tys`, short-circuiting on the first error-recovery
 /// sentinel encountered (at any nesting depth).
-fn lower_vec(tys: &[Ty], resolved: &ResolvedAliases) -> Result<Box<[RuntimeTy]>, NotRuntimeTy> {
+fn lower_vec<N: Head>(
+    tys: &[Ty<N>],
+    resolved: &ResolvedAliases<N>,
+) -> Result<Box<[RuntimeTy<N>]>, NotRuntimeTy> {
     tys.iter().map(|t| lower_to_runtime(t, resolved)).collect()
 }
 
@@ -420,10 +386,10 @@ fn lower_vec(tys: &[Ty], resolved: &ResolvedAliases) -> Result<Box<[RuntimeTy]>,
 /// projection) to its runtime form, lowering every generic argument and
 /// associated-type binding. Mirrors the `Ty::Interface` arm of
 /// [`lower_to_runtime`].
-fn lower_interface_to_runtime(
-    interface: &Interface,
-    resolved: &ResolvedAliases,
-) -> Result<RuntimeInterface, NotRuntimeTy> {
+fn lower_interface_to_runtime<N: Head>(
+    interface: &Interface<N>,
+    resolved: &ResolvedAliases<N>,
+) -> Result<RuntimeInterface<N>, NotRuntimeTy> {
     Ok(RuntimeInterface {
         name: interface.name.clone(),
         generics: lower_vec(&interface.generics, resolved)?,
@@ -435,11 +401,11 @@ fn lower_interface_to_runtime(
     })
 }
 
-fn has_cycle(
-    name: &QualifiedTypeName,
-    aliases: &HashMap<QualifiedTypeName, Ty>,
-    visited: &mut HashSet<QualifiedTypeName>,
-    stack: &mut HashSet<QualifiedTypeName>,
+fn has_cycle<N: Head>(
+    name: &N,
+    aliases: &HashMap<N, Ty<N>>,
+    visited: &mut HashSet<N>,
+    stack: &mut HashSet<N>,
 ) -> bool {
     if stack.contains(name) {
         return true;
@@ -456,26 +422,26 @@ fn has_cycle(
     result
 }
 
-fn ty_has_cycle(
-    ty: &Ty,
-    aliases: &HashMap<QualifiedTypeName, Ty>,
-    visited: &mut HashSet<QualifiedTypeName>,
-    stack: &mut HashSet<QualifiedTypeName>,
+fn ty_has_cycle<N: Head>(
+    ty: &Ty<N>,
+    aliases: &HashMap<N, Ty<N>>,
+    visited: &mut HashSet<N>,
+    stack: &mut HashSet<N>,
 ) -> bool {
     match ty {
-        Ty::TypeAlias(qn, _) if aliases.contains_key(qn) => has_cycle(qn, aliases, visited, stack),
-        Ty::List(inner, _) => ty_has_cycle(inner, aliases, visited, stack),
+        Ty::TypeAlias(qn) if aliases.contains_key(qn) => has_cycle(qn, aliases, visited, stack),
+        Ty::List(inner) => ty_has_cycle(inner, aliases, visited, stack),
         Ty::Map { key, value, .. } => {
             ty_has_cycle(key, aliases, visited, stack)
                 || ty_has_cycle(value, aliases, visited, stack)
         }
-        Ty::Union(types, _) => types
+        Ty::Union(types) => types
             .iter()
             .any(|t| ty_has_cycle(t, aliases, visited, stack)),
-        Ty::Class(_, type_args, _) => type_args
+        Ty::Class(_, type_args) => type_args
             .iter()
             .any(|t| ty_has_cycle(t, aliases, visited, stack)),
-        Ty::Interface(_, type_args, associated_bindings, _) => {
+        Ty::Interface(_, type_args, associated_bindings) => {
             type_args
                 .iter()
                 .any(|t| ty_has_cycle(t, aliases, visited, stack))
@@ -512,10 +478,6 @@ mod tests {
     use super::*;
     use crate::LoweringTy;
 
-    fn def() -> TyAttr {
-        TyAttr::default()
-    }
-
     /// The head-free constructors build at any head, while a bare path still
     /// means the compiler's.
     ///
@@ -526,7 +488,7 @@ mod tests {
     #[test]
     fn head_free_constructors_build_at_any_head() {
         let at_default = RuntimeTy::optional(RuntimeTy::list(RuntimeTy::int()));
-        let _: RuntimeTy<QualifiedTypeName> = at_default.clone();
+        let _: RuntimeTy<TypeName> = at_default.clone();
 
         // The same structure at a head that is not a name at all.
         let interned: RuntimeTy<u32> =
@@ -548,7 +510,7 @@ mod tests {
 
     /// `Ty::from(RuntimeTy::try_from(&ty)) == ty` for a set of deeply nested
     /// runtime types.
-    fn assert_round_trips(ty: Ty) {
+    fn assert_round_trips(ty: Ty<TypeName>) {
         let runtime =
             RuntimeTy::try_from(&ty).unwrap_or_else(|e| panic!("expected a runtime type, got {e}"));
         assert_eq!(Ty::from(runtime), ty);
@@ -557,86 +519,68 @@ mod tests {
     #[test]
     fn round_trip_nested_list_of_class() {
         // list<Class<int>>
-        let ty: Ty = Ty::List(
-            Box::new(Ty::Class(
-                qtn("Box"),
-                Box::new([Ty::Int { attr: def() }]),
-                def(),
-            )),
-            def(),
-        );
+        let ty: Ty<TypeName> = Ty::List(Box::new(Ty::Class(qtn("Box"), Box::new([Ty::Int]))));
         assert_round_trips(ty);
     }
 
     #[test]
     fn round_trip_map() {
-        let ty: Ty = Ty::Map {
-            key: Box::new(Ty::String { attr: def() }),
-            value: Box::new(Ty::List(Box::new(Ty::Bool { attr: def() }), def())),
-            attr: def(),
+        let ty: Ty<TypeName> = Ty::Map {
+            key: Box::new(Ty::String),
+            value: Box::new(Ty::List(Box::new(Ty::Bool))),
         };
         assert_round_trips(ty);
     }
 
     #[test]
     fn round_trip_union() {
-        let ty: Ty = Ty::Union(
-            Box::new([
-                Ty::Int { attr: def() },
-                Ty::String { attr: def() },
-                Ty::Null { attr: def() },
-            ]),
-            def(),
-        );
+        let ty: Ty<TypeName> = Ty::Union(Box::new([Ty::Int, Ty::String, Ty::Null]));
         assert_round_trips(ty);
     }
 
     #[test]
     fn round_trip_function() {
-        let ty: Ty = Ty::Function {
+        let ty: Ty<TypeName> = Ty::Function {
             params: Box::new([
-                crate::FunctionParamTy::required(Some(Name::new("a")), Ty::Int { attr: def() }),
+                crate::FunctionParamTy::required(Some(Name::new("a")), Ty::Int),
                 crate::FunctionParamTy::optional(
                     Some(Name::new("b")),
-                    Ty::List(Box::new(Ty::Float { attr: def() }), def()),
+                    Ty::List(Box::new(Ty::Float)),
                 ),
             ]),
-            ret: Box::new(Ty::Bool { attr: def() }),
-            throws: Box::new(Ty::Void { attr: def() }),
-            attr: def(),
+            ret: Box::new(Ty::Bool),
+            throws: Box::new(Ty::Void),
         };
         assert_round_trips(ty);
     }
 
     #[test]
     fn round_trip_interface_with_associated_bindings() {
-        let ty: Ty = Ty::Interface(
+        let ty: Ty<TypeName> = Ty::Interface(
             qtn("Iterator"),
-            Box::new([Ty::Int { attr: def() }]),
-            Box::new([(Name::new("Item"), Ty::String { attr: def() })]),
-            def(),
+            Box::new([Ty::Int]),
+            Box::new([(Name::new("Item"), Ty::String)]),
         );
         assert_round_trips(ty);
     }
 
     #[test]
     fn round_trip_associated_type_projection() {
-        let ty: Ty = Ty::AssociatedTypeProjection {
+        let ty: Ty<TypeName> = Ty::AssociatedTypeProjection {
             base: Box::new(Ty::type_var("T")),
-            interface: Box::new(Interface {
+            interface: Box::new(Interface::<TypeName> {
                 name: qtn("Iterator"),
                 generics: Box::new([]),
                 associated_types: Box::new([]),
             }),
             member: Name::new("Item"),
-            attr: def(),
         };
         assert_round_trips(ty);
     }
 
     #[test]
     fn nested_infer_in_list_blocks_conversion() {
-        let ty: LoweringTy = LoweringTy::List(Box::new(LoweringTy::Infer { attr: def() }), def());
+        let ty: LoweringTy<TypeName> = LoweringTy::List(Box::new(LoweringTy::Infer));
         assert_eq!(
             RuntimeTy::try_from(&ty),
             Err(NotRuntimeTy { variant: "Infer" })
@@ -645,10 +589,9 @@ mod tests {
 
     #[test]
     fn nested_error_in_map_value_blocks_conversion() {
-        let ty: Ty = Ty::Map {
-            key: Box::new(Ty::String { attr: def() }),
-            value: Box::new(Ty::Error { attr: def() }),
-            attr: def(),
+        let ty: Ty<TypeName> = Ty::Map {
+            key: Box::new(Ty::String),
+            value: Box::new(Ty::Error),
         };
         assert_eq!(
             RuntimeTy::try_from(&ty),
@@ -658,10 +601,7 @@ mod tests {
 
     #[test]
     fn nested_error_in_union_blocks_conversion() {
-        let ty: Ty = Ty::Union(
-            Box::new([Ty::Int { attr: def() }, Ty::Error { attr: def() }]),
-            def(),
-        );
+        let ty: Ty<TypeName> = Ty::Union(Box::new([Ty::Int, Ty::Error]));
         assert_eq!(
             RuntimeTy::try_from(&ty),
             Err(NotRuntimeTy { variant: "Error" })
@@ -670,11 +610,10 @@ mod tests {
 
     #[test]
     fn nested_infer_in_function_ret_blocks_conversion() {
-        let ty: LoweringTy = LoweringTy::Function {
+        let ty: LoweringTy<TypeName> = LoweringTy::Function {
             params: Box::new([]),
-            ret: Box::new(LoweringTy::Infer { attr: def() }),
-            throws: Box::new(LoweringTy::Void { attr: def() }),
-            attr: def(),
+            ret: Box::new(LoweringTy::Infer),
+            throws: Box::new(LoweringTy::Void),
         };
         assert_eq!(
             RuntimeTy::try_from(&ty),

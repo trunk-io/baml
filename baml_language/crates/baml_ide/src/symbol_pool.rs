@@ -1,37 +1,41 @@
 //! Conversion from the compiler2 HIR/TIR to `SymbolPool`.
 //!
-//! Walks each user-defined file via the `ppir` item-data firewall (enumeration
+//! Walks each user-defined file via the HIR item-data firewall (enumeration
 //! queries plus `*_data` lookups), resolves types via TIR, and populates a
 //! codegen-ready `SymbolPool` suitable for language-specific code generators
 //! such as `sdkgen_python_pydantic2`.
 
 use std::collections::HashMap;
 
-use baml_codegen_types::{self as cg, Origin, SymbolPool};
 use baml_compiler2_ast::{self as ast, FunctionOrigin};
-use baml_compiler2_hir::{compiler2_all_files, file_package, loc::FunctionLoc, package::PackageId};
+use baml_compiler2_hir::{
+    compiler2_all_files, file_package,
+    loc::FunctionLoc,
+    package::{Spelling, spelling},
+};
 use baml_db::{Name, ProjectDatabase};
-use baml_type::{Freshness, ParamTy, QualifiedTypeName, Ty as TirTy, TyAttr};
+use baml_sdkgen_types::{self as cg, Origin, SymbolPool};
+use baml_type::{DeclName, Freshness, ParamTy, Ty as TirTy};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `cg::Name` from a `QualifiedTypeName`. Preserves `pkg`, the full
-/// namespace path, and the bare name (including any `$stream` suffix).
-fn name_from_qtn(qtn: &QualifiedTypeName) -> cg::Name {
-    qtn.clone()
+/// Build a `cg::Name` from a `DeclName`. Preserves `pkg`, the full
+/// namespace path, and the bare name.
+fn name_from_qtn(spelling: &Spelling, qtn: &DeclName) -> cg::Name {
+    spelling.wire(qtn)
 }
 
 /// Is this lowered type function-shaped (directly or through union arms)?
 /// Used to keep the `injected` provenance mark off user parameters that merely
-/// reuse the `on_event` NAME on a `$`-suffixed function: the compiler-injected
-/// listener is always function-typed, so a `Foo$stream(on_event: string)`
-/// param stays a public user parameter.
+/// reuse the `on_event` NAME: the compiler-injected listener is always
+/// function-typed, so an `on_event: string` param stays a public user
+/// parameter.
 fn ty_is_function_shaped(ty: &cg::Ty) -> bool {
     match ty {
         cg::Ty::Function { .. } => true,
-        cg::Ty::Union(members, _) => members.iter().any(ty_is_function_shaped),
+        cg::Ty::Union(members) => members.iter().any(ty_is_function_shaped),
         _ => false,
     }
 }
@@ -113,20 +117,20 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
     let mut alias_caches: HashMap<
         Name,
         (
-            HashMap<QualifiedTypeName, TirTy>,
-            std::collections::HashSet<QualifiedTypeName>,
+            HashMap<DeclName, TirTy>,
+            std::collections::HashSet<DeclName>,
         ),
     > = HashMap::new();
+    let spelling = spelling(db);
 
     let mut pending_methods: Vec<PendingMethod> = Vec::new();
 
     for source_file in compiler2_all_files(db) {
         let pkg_info = file_package::file_package(db, source_file);
-        let pkg: Name = pkg_info.package.clone();
+        let pkg: Name = spelling.of(pkg_info.root).clone();
         let ns_path: Vec<Name> = pkg_info.namespace_path.clone();
 
-        let pkg_id = PackageId::new(db, pkg.clone());
-        let pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
+        let pkg_items = baml_compiler2_hir::package::package_items(db, pkg_info.root);
 
         let (alias_map, recursive_aliases) = alias_caches.entry(pkg.clone()).or_insert_with(|| {
             let mut aliases = HashMap::new();
@@ -143,8 +147,8 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             let resolved = baml_type::ResolvedAliases::from_aliases(aliases);
             (resolved.aliases, resolved.recursive)
         });
-        let alias_map: &HashMap<QualifiedTypeName, TirTy> = alias_map;
-        let recursive_aliases: &std::collections::HashSet<QualifiedTypeName> = recursive_aliases;
+        let alias_map: &HashMap<DeclName, TirTy> = alias_map;
+        let recursive_aliases: &std::collections::HashSet<DeclName> = recursive_aliases;
 
         let source_file_path: String = source_file.path(db).to_string_lossy().into_owned();
 
@@ -155,30 +159,30 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
         // generated SDKs.
         let mut non_free_function_locs: std::collections::HashSet<FunctionLoc> =
             std::collections::HashSet::new();
-        for &class_loc in baml_compiler2_ppir::item_data::file_classes(db, source_file) {
-            for &m in &baml_compiler2_ppir::item_data::class_data(db, class_loc).methods {
+        for &class_loc in baml_compiler2_hir::item_data::file_classes(db, source_file) {
+            for &m in &baml_compiler2_hir::item_data::class_data(db, class_loc).methods {
                 non_free_function_locs.insert(m);
             }
         }
-        for &iface_loc in baml_compiler2_ppir::item_data::file_interfaces(db, source_file) {
+        for &iface_loc in baml_compiler2_hir::item_data::file_interfaces(db, source_file) {
             // ALL interface methods: default (with a body) and required
             // (bodyless items under the unified method model) alike - a
             // required signature is an interface slot, not a callable.
-            for &m in &baml_compiler2_ppir::item_data::interface_data(db, iface_loc).methods {
+            for &m in &baml_compiler2_hir::item_data::interface_data(db, iface_loc).methods {
                 non_free_function_locs.insert(m);
             }
         }
         // ALL implements blocks, in-class and out-of-body alike: their
         // methods are Impl-owned (never in `class_data.methods`).
-        for &impl_loc in baml_compiler2_ppir::item_data::file_impls(db, source_file) {
-            for &m in &baml_compiler2_ppir::item_data::impl_block_data(db, impl_loc).methods {
+        for &impl_loc in baml_compiler2_hir::item_data::file_impls(db, source_file) {
+            for &m in &baml_compiler2_hir::item_data::impl_block_data(db, impl_loc).methods {
                 non_free_function_locs.insert(m);
             }
         }
 
         // Classes
-        for &class_loc in baml_compiler2_ppir::item_data::file_classes(db, source_file) {
-            let class = baml_compiler2_ppir::item_data::class_data(db, class_loc);
+        for &class_loc in baml_compiler2_hir::item_data::file_classes(db, source_file) {
+            let class = baml_compiler2_hir::item_data::class_data(db, class_loc);
             let cg_name = cg::Name::new(pkg.clone(), ns_path.clone(), class.name.clone());
             let class_generic_params =
                 baml_compiler2_hir_ty::lower::class_generic_frame(db, class_loc);
@@ -210,7 +214,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             // sit alongside their parent method in the same vec; their
             // shared span keeps them adjacent after sorting.
             for &method_loc in &class.methods {
-                let method = baml_compiler2_ppir::item_data::function_data(db, method_loc);
+                let method = baml_compiler2_hir::item_data::function_data(db, method_loc);
 
                 // Auto-derived methods (`to_json` / `from_json` synthesized
                 // by `auto_derive_json`) are language-level plumbing, not
@@ -234,14 +238,14 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                 // method (in-body or out-of-body) is Impl-owned and never lands
                 // here.
                 debug_assert!(
-                    baml_compiler2_ppir::item_data::method_interface_target(db, method_loc)
+                    baml_compiler2_hir::item_data::method_interface_target(db, method_loc)
                         .is_none(),
                     "interface targets are recorded on impl-block methods, which never appear \
                      in `class.methods`",
                 );
 
                 if matches!(
-                    baml_compiler2_ppir::function_body(db, method_loc).as_ref(),
+                    baml_compiler2_hir::body::function_body(db, method_loc).as_ref(),
                     baml_compiler2_hir::body::FunctionBody::Builtin(ast::BuiltinKind::Intrinsic)
                 ) {
                     continue;
@@ -261,7 +265,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                 // path). The method's own `generic_params` are its user +
                 // synthetic effect params; the enclosing class's params join
                 // only the lowering scope, not the method's declared generics.
-                let sig = baml_compiler2_ppir::item_data::elaborated_function_data(db, method_loc);
+                let sig = baml_compiler2_hir::item_data::elaborated_function_data(db, method_loc);
                 // Emitted generics are the method's *user* params only; effect
                 // params (see the free-function path) join only the lowering
                 // scope.
@@ -282,10 +286,10 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                     let tir_ty = baml_compiler2_hir_ty::lower::reject_holes(
                         &ctx.lower_type_ref(type_refs, id),
                     );
-                    convert_tir_to_codegen_ty(&tir_ty, alias_map, recursive_aliases)
+                    convert_tir_to_codegen_ty(spelling, &tir_ty, alias_map, recursive_aliases)
                 };
                 let method_defaults =
-                    baml_compiler2_ppir::function_parameter_defaults(db, method_loc);
+                    baml_compiler2_hir::signature::function_parameter_defaults(db, method_loc);
 
                 // The compiler injects a `client` override on LLM methods and
                 // on the `@build_request`/`@stream` companions. It is an
@@ -295,7 +299,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                 // longer the last param); `on_event` stays — its function type
                 // is representable and part of the SDK surface.
                 let strips_injected_client =
-                    baml_compiler2_ppir::item_data::function_llm_meta(db, method_loc).is_some()
+                    baml_compiler2_hir::item_data::function_llm_meta(db, method_loc).is_some()
                         || method.name.as_str().ends_with("@stream")
                         || method.name.as_str().ends_with("@build_request");
 
@@ -324,12 +328,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                     })
                     .collect();
 
-                let return_type = sig.return_type.map_or(
-                    cg::Ty::Void {
-                        attr: TyAttr::default(),
-                    },
-                    lower,
-                );
+                let return_type = sig.return_type.map_or(cg::Ty::Void, lower);
 
                 let cg_method = cg::Function {
                     name: method.name.clone(),
@@ -342,7 +341,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                     origin: Origin {
                         source_file_path: source_file_path.clone(),
                         span_start: u32::from(
-                            baml_compiler2_ppir::item_data::function_source_map(db, method_loc)
+                            baml_compiler2_hir::item_data::function_source_map(db, method_loc)
                                 .span
                                 .start(),
                         ),
@@ -372,7 +371,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                     origin: Origin {
                         source_file_path: source_file_path.clone(),
                         span_start: u32::from(
-                            baml_compiler2_ppir::item_data::class_source_map(db, class_loc)
+                            baml_compiler2_hir::item_data::class_source_map(db, class_loc)
                                 .span
                                 .start(),
                         ),
@@ -382,8 +381,8 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
         }
 
         // Enums
-        for &enum_loc in baml_compiler2_ppir::item_data::file_enums(db, source_file) {
-            let enum_def = baml_compiler2_ppir::item_data::enum_data(db, enum_loc);
+        for &enum_loc in baml_compiler2_hir::item_data::file_enums(db, source_file) {
+            let enum_def = baml_compiler2_hir::item_data::enum_data(db, enum_loc);
             let cg_name = cg::Name::new(pkg.clone(), ns_path.clone(), enum_def.name.clone());
             let variants = enum_def
                 .variants
@@ -403,7 +402,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                     origin: Origin {
                         source_file_path: source_file_path.clone(),
                         span_start: u32::from(
-                            baml_compiler2_ppir::item_data::enum_source_map(db, enum_loc)
+                            baml_compiler2_hir::item_data::enum_source_map(db, enum_loc)
                                 .span
                                 .start(),
                         ),
@@ -413,8 +412,8 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
         }
 
         // Type aliases
-        for &alias_loc in baml_compiler2_ppir::item_data::file_type_aliases(db, source_file) {
-            let alias = baml_compiler2_ppir::item_data::type_alias_data(db, alias_loc);
+        for &alias_loc in baml_compiler2_hir::item_data::file_type_aliases(db, source_file) {
+            let alias = baml_compiler2_hir::item_data::type_alias_data(db, alias_loc);
             if let Some(resolved) = resolve_type_ref(
                 db,
                 &alias.type_refs,
@@ -426,8 +425,8 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             ) {
                 let cg_name = cg::Name::new(pkg.clone(), ns_path.clone(), alias.name.clone());
 
-                let qtn = QualifiedTypeName::new(
-                    pkg_info.package.clone(),
+                let qtn = DeclName::in_root(
+                    pkg_info.root,
                     pkg_info.namespace_path.clone(),
                     alias.name.clone(),
                 );
@@ -442,11 +441,9 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                         origin: Origin {
                             source_file_path: source_file_path.clone(),
                             span_start: u32::from(
-                                baml_compiler2_ppir::item_data::type_alias_source_map(
-                                    db, alias_loc,
-                                )
-                                .span
-                                .start(),
+                                baml_compiler2_hir::item_data::type_alias_source_map(db, alias_loc)
+                                    .span
+                                    .start(),
                             ),
                         },
                     }),
@@ -458,11 +455,11 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
         // so they don't double-emit. Companion functions (names containing `$`)
         // flow through as their own pool entries; parent and companion alike are
         // inserted directly, keyed on the suffixed name.
-        for &func_loc in baml_compiler2_ppir::item_data::file_functions(db, source_file) {
+        for &func_loc in baml_compiler2_hir::item_data::file_functions(db, source_file) {
             if non_free_function_locs.contains(&func_loc) {
                 continue;
             }
-            let func = baml_compiler2_ppir::item_data::function_data(db, func_loc);
+            let func = baml_compiler2_hir::item_data::function_data(db, func_loc);
 
             // Internal-origin functions (e.g. `<Client>$new` synthesized for
             // primitive clients) are runtime plumbing, not user-callable —
@@ -478,7 +475,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             }
 
             if matches!(
-                baml_compiler2_ppir::function_body(db, func_loc).as_ref(),
+                baml_compiler2_hir::body::function_body(db, func_loc).as_ref(),
                 baml_compiler2_hir::body::FunctionBody::Builtin(ast::BuiltinKind::Intrinsic)
             ) {
                 continue;
@@ -500,7 +497,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             // references the effect param, so a raw lowering would leave it a
             // dangling, undeclared typevar and collapse the callback's own
             // `throws` to `Never`.
-            let sig = baml_compiler2_ppir::item_data::elaborated_function_data(db, func_loc);
+            let sig = baml_compiler2_hir::item_data::elaborated_function_data(db, func_loc);
             // Effect params (minted for a callback whose `throws` is inferred)
             // join only the lowering *scope*, so the callback and the inferred
             // outer `throws` resolve to real typevars instead of dangling /
@@ -521,9 +518,10 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             let lower = |id| {
                 let tir_ty =
                     baml_compiler2_hir_ty::lower::reject_holes(&ctx.lower_type_ref(type_refs, id));
-                convert_tir_to_codegen_ty(&tir_ty, alias_map, recursive_aliases)
+                convert_tir_to_codegen_ty(spelling, &tir_ty, alias_map, recursive_aliases)
             };
-            let func_defaults = baml_compiler2_ppir::function_parameter_defaults(db, func_loc);
+            let func_defaults =
+                baml_compiler2_hir::signature::function_parameter_defaults(db, func_loc);
             // The compiler injects a `client: ai.Client? = null` override onto
             // every LLM function (and its `@stream`/`@build_request`
             // companions, where it is retyped `ai.stream.StreamingClient?`).
@@ -537,7 +535,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
             // function type is representable and it is part of the SDK
             // surface.
             let strips_injected_client =
-                baml_compiler2_ppir::item_data::function_llm_meta(db, func_loc).is_some()
+                baml_compiler2_hir::item_data::function_llm_meta(db, func_loc).is_some()
                     || func.name.as_str().ends_with("@stream")
                     || func.name.as_str().ends_with("@build_request");
             let arguments: Vec<cg::FunctionArgument> = sig
@@ -562,12 +560,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                 })
                 .collect();
 
-            let return_type = sig.return_type.map_or(
-                cg::Ty::Void {
-                    attr: TyAttr::default(),
-                },
-                lower,
-            );
+            let return_type = sig.return_type.map_or(cg::Ty::Void, lower);
 
             let cg_func = cg::Function {
                 name: func.name.clone(),
@@ -580,7 +573,7 @@ pub fn build_symbol_pool(db: &ProjectDatabase) -> SymbolPool {
                 origin: Origin {
                     source_file_path: source_file_path.clone(),
                     span_start: u32::from(
-                        baml_compiler2_ppir::item_data::function_source_map(db, func_loc)
+                        baml_compiler2_hir::item_data::function_source_map(db, func_loc)
                             .span
                             .start(),
                     ),
@@ -622,14 +615,15 @@ fn resolve_type_ref(
     id: Option<baml_compiler2_hir::type_ref::TypeRefId>,
     file: baml_base::SourceFile,
     generic_params: &[ParamTy],
-    alias_map: &HashMap<QualifiedTypeName, TirTy>,
-    recursive_aliases: &std::collections::HashSet<QualifiedTypeName>,
+    alias_map: &HashMap<DeclName, TirTy>,
+    recursive_aliases: &std::collections::HashSet<DeclName>,
 ) -> Option<cg::Ty> {
     let id = id?;
     let ctx = baml_compiler2_hir_ty::lower::lower_ctx_for_file(db, file)
         .with_frame(generic_params.to_vec());
     let tir_ty = baml_compiler2_hir_ty::lower::reject_holes(&ctx.lower_type_ref(store, id));
     Some(convert_tir_to_codegen_ty(
+        spelling(db),
         &tir_ty,
         alias_map,
         recursive_aliases,
@@ -647,12 +641,17 @@ fn resolve_type_ref(
 fn resolve_throws<'db>(
     db: &'db ProjectDatabase,
     func_loc: FunctionLoc<'db>,
-    alias_map: &HashMap<QualifiedTypeName, TirTy>,
-    recursive_aliases: &std::collections::HashSet<QualifiedTypeName>,
+    alias_map: &HashMap<DeclName, TirTy>,
+    recursive_aliases: &std::collections::HashSet<DeclName>,
 ) -> Option<cg::Ty> {
     match &baml_compiler2_hir_ty::callable::callable_throws(db, func_loc).0 {
-        TirTy::Never { .. } => None,
-        ty => Some(convert_tir_to_codegen_ty(ty, alias_map, recursive_aliases)),
+        TirTy::Never => None,
+        ty => Some(convert_tir_to_codegen_ty(
+            spelling(db),
+            ty,
+            alias_map,
+            recursive_aliases,
+        )),
     }
 }
 
@@ -663,58 +662,51 @@ fn resolve_throws<'db>(
 /// the way to generators. Canonicalization is centralized on `CodegenTy` and
 /// recursively normalizes every container.
 fn convert_tir_to_codegen_ty(
+    spelling: &Spelling,
     ty: &TirTy,
-    _alias_map: &HashMap<QualifiedTypeName, TirTy>,
-    _recursive_aliases: &std::collections::HashSet<QualifiedTypeName>,
+    _alias_map: &HashMap<DeclName, TirTy>,
+    _recursive_aliases: &std::collections::HashSet<DeclName>,
 ) -> cg::Ty {
-    convert_tir_leaf(ty).canonicalize()
+    convert_tir_leaf(spelling, ty).canonicalize()
 }
 
-fn convert_tir_leaf(ty: &TirTy) -> cg::Ty {
-    // Each recursive invocation reads the attribute from its own source node,
-    // so nested SAP/streaming annotations survive the codegen boundary.
-    let attr = || ty.attr().clone();
-    let convert = |ty: &TirTy| convert_tir_leaf(ty);
+fn convert_tir_leaf(spelling: &Spelling, ty: &TirTy) -> cg::Ty {
+    let convert = |ty: &TirTy| convert_tir_leaf(spelling, ty);
     match ty {
-        TirTy::Int { .. } => cg::Ty::Int { attr: attr() },
-        TirTy::Bigint { .. } => cg::Ty::Bigint { attr: attr() },
-        TirTy::Float { .. } => cg::Ty::Float { attr: attr() },
-        TirTy::String { .. } => cg::Ty::String { attr: attr() },
-        TirTy::Bool { .. } => cg::Ty::Bool { attr: attr() },
-        TirTy::Null { .. } => cg::Ty::Null { attr: attr() },
-        TirTy::Uint8Array { .. } => cg::Ty::Uint8Array { attr: attr() },
-        TirTy::Media(kind, _) => cg::Ty::Media(*kind, attr()),
-        TirTy::Literal(literal, _, _) => {
-            cg::Ty::Literal(literal.clone(), Freshness::Regular, attr())
-        }
-        TirTy::Class(qtn, type_args, _) => cg::Ty::Class(
-            name_from_qtn(qtn),
+        TirTy::Int => cg::Ty::Int,
+        TirTy::Bigint => cg::Ty::Bigint,
+        TirTy::Float => cg::Ty::Float,
+        TirTy::String => cg::Ty::String,
+        TirTy::Bool => cg::Ty::Bool,
+        TirTy::Null => cg::Ty::Null,
+        TirTy::Uint8Array => cg::Ty::Uint8Array,
+        TirTy::Media(kind) => cg::Ty::Media(*kind),
+        TirTy::Literal(literal, _) => cg::Ty::Literal(literal.clone(), Freshness::Regular),
+        TirTy::Class(qtn, type_args) => cg::Ty::Class(
+            name_from_qtn(spelling, qtn),
             type_args.iter().map(convert).collect(),
-            attr(),
         ),
-        TirTy::Interface(qtn, generics, associated_types, _) => cg::Ty::Interface(
-            name_from_qtn(qtn),
+        TirTy::Interface(qtn, generics, associated_types) => cg::Ty::Interface(
+            name_from_qtn(spelling, qtn),
             generics.iter().map(convert).collect(),
             associated_types
                 .iter()
                 .map(|(name, ty)| (name.clone(), convert(ty)))
                 .collect(),
-            attr(),
         ),
-        TirTy::Enum(qtn, _) => cg::Ty::Enum(name_from_qtn(qtn), attr()),
-        TirTy::EnumVariant(qtn, variant, _) => {
-            cg::Ty::EnumVariant(name_from_qtn(qtn), variant.clone(), attr())
+        TirTy::Enum(qtn) => cg::Ty::Enum(name_from_qtn(spelling, qtn)),
+        TirTy::EnumVariant(qtn, variant) => {
+            cg::Ty::EnumVariant(name_from_qtn(spelling, qtn), variant.clone())
         }
-        TirTy::TypeAlias(qtn, _) => cg::Ty::TypeAlias(name_from_qtn(qtn), attr()),
-        TirTy::List(inner, _) => cg::Ty::List(Box::new(convert(inner)), attr()),
+        TirTy::TypeAlias(qtn) => cg::Ty::TypeAlias(name_from_qtn(spelling, qtn)),
+        TirTy::List(inner) => cg::Ty::List(Box::new(convert(inner))),
         TirTy::Map {
             key: k, value: v, ..
         } => cg::Ty::Map {
             key: Box::new(convert(k)),
             value: Box::new(convert(v)),
-            attr: attr(),
         },
-        TirTy::Union(members, _) => cg::Ty::Union(members.iter().map(convert).collect(), attr()),
+        TirTy::Union(members) => cg::Ty::Union(members.iter().map(convert).collect()),
         TirTy::Function {
             params,
             ret,
@@ -731,26 +723,23 @@ fn convert_tir_leaf(ty: &TirTy) -> cg::Ty {
                 .collect(),
             ret: Box::new(convert(ret)),
             throws: Box::new(convert(throws)),
-            attr: attr(),
         },
-        TirTy::Future(value, error, _) => {
-            cg::Ty::Future(Box::new(convert(value)), Box::new(convert(error)), attr())
+        TirTy::Future(value, error) => {
+            cg::Ty::Future(Box::new(convert(value)), Box::new(convert(error)))
         }
-        TirTy::RustType { .. } => cg::Ty::RustType { attr: attr() },
-        TirTy::Type { .. } => cg::Ty::Type { attr: attr() },
-        TirTy::Resource { .. } => cg::Ty::Resource { attr: attr() },
-        TirTy::PromptAst { .. } => cg::Ty::PromptAst { attr: attr() },
-        TirTy::Void { .. } => cg::Ty::Void { attr: attr() },
-        TirTy::TypeVar(name, _) => cg::Ty::TypeVar(name.clone(), attr()),
-        TirTy::Unknown { .. } => cg::Ty::Unknown { attr: attr() },
-        TirTy::Never { .. } => cg::Ty::Never { attr: attr() },
+        TirTy::RustType => cg::Ty::RustType,
+        TirTy::Type => cg::Ty::Type,
+        TirTy::Resource => cg::Ty::Resource,
+        TirTy::PromptAst => cg::Ty::PromptAst,
+        TirTy::Void => cg::Ty::Void,
+        TirTy::TypeVar(name) => cg::Ty::TypeVar(name.clone()),
+        TirTy::Unknown => cg::Ty::Unknown,
+        TirTy::Never => cg::Ty::Never,
 
         // These are compiler recovery/inference states, not public API types.
         // Diagnostics have already been emitted; retain the historical opaque
         // fallback so code generation remains total in error-tolerant flows.
-        TirTy::AssociatedTypeProjection { .. } | TirTy::Error { .. } => {
-            cg::Ty::Unknown { attr: attr() }
-        }
+        TirTy::AssociatedTypeProjection { .. } | TirTy::Error => cg::Ty::Unknown,
     }
 }
 
@@ -763,48 +752,36 @@ mod tests {
     use std::path::Path;
 
     use baml_compiler2_hir::ids::{FunctionMarker, LocalItemId};
-    use baml_type::TyAttrValue;
 
     use super::*;
     use crate::test_support::TestDbExt;
 
-    fn codegen_attr() -> TyAttr {
-        TyAttr::default()
+    fn workspace_diagnostics(db: &ProjectDatabase) -> Vec<baml_compiler_diagnostics::Diagnostic> {
+        let files: std::collections::HashSet<_> = db
+            .workspace_files()
+            .iter()
+            .map(|file| file.file_id(db))
+            .collect();
+        baml_db::collect_compiler2_diagnostics(db)
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .primary_span()
+                    .is_some_and(|span| files.contains(&span.file_id))
+            })
+            .collect()
     }
 
     fn codegen_alias(name: cg::Name) -> cg::Ty {
-        cg::Ty::TypeAlias(name, codegen_attr())
+        cg::Ty::TypeAlias(name)
     }
 
     fn codegen_list(inner: cg::Ty) -> cg::Ty {
-        cg::Ty::List(Box::new(inner), codegen_attr())
+        cg::Ty::List(Box::new(inner))
     }
 
     fn codegen_union(members: Vec<cg::Ty>) -> cg::Ty {
-        cg::Ty::Union(members.into(), codegen_attr())
-    }
-
-    #[test]
-    fn tir_attributes_survive_recursive_codegen_lowering() {
-        let outer_attr = TyAttr {
-            sap_pending_never: TyAttrValue::Set,
-            ..TyAttr::default()
-        };
-        let inner_attr = TyAttr {
-            sap_parse_without_null: TyAttrValue::Set,
-            ..TyAttr::default()
-        };
-        let tir = TirTy::List(
-            Box::new(TirTy::String {
-                attr: inner_attr.clone(),
-            }),
-            outer_attr.clone(),
-        );
-
-        assert_eq!(
-            convert_tir_to_codegen_ty(&tir, &HashMap::new(), &std::collections::HashSet::new(),),
-            cg::Ty::List(Box::new(cg::Ty::String { attr: inner_attr }), outer_attr,)
-        );
+        cg::Ty::Union(members.into())
     }
 
     // ── Unit tests for pure helpers ─────────────────────────────────────────
@@ -836,12 +813,10 @@ mod tests {
 
     #[test]
     fn test_name_from_qtn_preserves_full_path() {
-        let qtn = QualifiedTypeName::new(
-            Name::new("user"),
-            vec![Name::new("foo")],
-            Name::new("Sentiment"),
-        );
-        let cg_name = name_from_qtn(&qtn);
+        let mut db = ProjectDatabase::new();
+        let root = db.workspace(Path::new("/tmp/symbol_pool_qtn_path"));
+        let qtn = DeclName::in_root(root, vec![Name::new("foo")], Name::new("Sentiment"));
+        let cg_name = name_from_qtn(spelling(&db), &qtn);
         assert_eq!(cg_name.package().as_str(), "user");
         assert_eq!(
             cg_name.namespace(),
@@ -850,15 +825,6 @@ mod tests {
             cg_name.namespace(),
         );
         assert_eq!(cg_name.name().as_str(), "Sentiment");
-        assert!(!cg_name.is_stream());
-    }
-
-    #[test]
-    fn test_name_from_qtn_stream_suffix() {
-        let qtn = QualifiedTypeName::new(Name::new("user"), vec![], Name::new("Resume$stream"));
-        let cg_name = name_from_qtn(&qtn);
-        assert!(cg_name.is_stream());
-        assert_eq!(cg_name.bare_name(), "Resume");
     }
 
     // ── Integration tests using ProjectDatabase ─────────────────────────────
@@ -1031,16 +997,16 @@ class Extractor {
 
     #[test]
     fn test_user_on_event_params_are_never_marked_injected() {
-        // A user may declare into the `$` suffix namespace and may name a
-        // parameter `on_event`; only the compiler-injected listener (function
-        // typed, on an LLM function or real companion) carries provenance.
+        // A user may name a parameter `on_event`; only the compiler-injected
+        // listener (function typed, on an LLM function or real companion)
+        // carries provenance.
         let root = Path::new("/tmp/user_on_event_params");
         let mut db = ProjectDatabase::new();
         db.workspace(root);
         db.file(
             root.join("main.baml").as_path(),
             r##"
-function Notify$stream(on_event: string) -> string {
+function Notify(on_event: string) -> string {
   on_event
 }
 
@@ -1052,7 +1018,7 @@ function Watch(on_event: ((string) -> void throws never)? = null) -> string {
         );
 
         let pool = build_symbol_pool(&db);
-        for bare in ["Notify$stream", "Watch"] {
+        for bare in ["Notify", "Watch"] {
             let key = cg::Name::new(Name::new("user"), vec![], Name::new(bare));
             let Some(cg::Symbol::Function(func)) = pool.get(&key) else {
                 panic!("missing function {bare}");
@@ -1092,7 +1058,7 @@ function extract(client: string, text: string) -> string {
 "##,
         );
 
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&db);
+        let diagnostics = workspace_diagnostics(&db);
         assert!(
             diagnostics.iter().any(|diag| {
                 diag.message
@@ -1177,10 +1143,10 @@ function extract(client: string, text: string) -> string {
     fn test_throws_reaches_symbol_pool() {
         fn walk(ty: &cg::Ty, out: &mut Vec<String>) {
             match ty {
-                cg::Ty::Class(n, _, _) | cg::Ty::Enum(n, _) | cg::Ty::TypeAlias(n, _) => {
+                cg::Ty::Class(n, _) | cg::Ty::Enum(n) | cg::Ty::TypeAlias(n) => {
                     out.push(n.name().as_str().to_string());
                 }
-                cg::Ty::Union(ms, _) => ms.iter().for_each(|m| walk(m, out)),
+                cg::Ty::Union(ms) => ms.iter().for_each(|m| walk(m, out)),
                 _ => {}
             }
         }
@@ -1386,15 +1352,15 @@ class GenericMirror<T> {
             .expect("clone instance method missing");
         assert!(matches!(
             &clone.arguments[0].ty,
-            cg::Ty::Union(members, _)
-                if members.iter().any(|ty| matches!(ty, cg::Ty::Class(name, args, _) if name == owner && args.is_empty()))
-                    && members.iter().any(|ty| matches!(ty, cg::Ty::Null { .. }))
+            cg::Ty::Union(members)
+                if members.iter().any(|ty| matches!(ty, cg::Ty::Class(name, args) if name == owner && args.is_empty()))
+                    && members.iter().any(|ty| matches!(ty, cg::Ty::Null))
         ));
         assert!(matches!(
             &clone.return_type,
             cg::Ty::Map { key, value, .. }
-                if matches!(key.as_ref(), cg::Ty::String { .. })
-                    && matches!(value.as_ref(), cg::Ty::Class(name, args, _) if name == owner && args.is_empty())
+                if matches!(key.as_ref(), cg::Ty::String)
+                    && matches!(value.as_ref(), cg::Ty::Class(name, args) if name == owner && args.is_empty())
         ));
 
         let pick = class
@@ -1404,15 +1370,15 @@ class GenericMirror<T> {
             .expect("pick instance method missing");
         assert!(matches!(
             &pick.arguments[0].ty,
-            cg::Ty::Union(members, _)
-                if members.iter().any(|ty| matches!(ty, cg::Ty::Class(name, args, _) if name == owner && args.is_empty()))
-                    && members.iter().any(|ty| matches!(ty, cg::Ty::Int { .. }))
+            cg::Ty::Union(members)
+                if members.iter().any(|ty| matches!(ty, cg::Ty::Class(name, args) if name == owner && args.is_empty()))
+                    && members.iter().any(|ty| matches!(ty, cg::Ty::Int))
         ));
         assert!(matches!(
             &pick.return_type,
-            cg::Ty::Union(members, _)
-                if members.iter().any(|ty| matches!(ty, cg::Ty::Class(name, args, _) if name == owner && args.is_empty()))
-                    && members.iter().any(|ty| matches!(ty, cg::Ty::String { .. }))
+            cg::Ty::Union(members)
+                if members.iter().any(|ty| matches!(ty, cg::Ty::Class(name, args) if name == owner && args.is_empty()))
+                    && members.iter().any(|ty| matches!(ty, cg::Ty::String))
         ));
 
         let wrap = class
@@ -1422,12 +1388,12 @@ class GenericMirror<T> {
             .expect("wrap static method missing");
         assert!(matches!(
             &wrap.arguments[0].ty,
-            cg::Ty::List(inner, _)
-                if matches!(inner.as_ref(), cg::Ty::Class(name, args, _) if name == owner && args.is_empty())
+            cg::Ty::List(inner)
+                if matches!(inner.as_ref(), cg::Ty::Class(name, args) if name == owner && args.is_empty())
         ));
         assert!(matches!(
             &wrap.return_type,
-            cg::Ty::Class(name, args, _) if name == owner && args.is_empty()
+            cg::Ty::Class(name, args) if name == owner && args.is_empty()
         ));
 
         let (generic_owner, generic_class) = pool
@@ -1447,22 +1413,22 @@ class GenericMirror<T> {
         let is_instantiated_self = |ty: &cg::Ty| {
             matches!(
                 ty,
-                cg::Ty::Class(name, args, _)
+                cg::Ty::Class(name, args)
                     if name == generic_owner
-                        && matches!(&**args, [cg::Ty::TypeVar(name, _)] if name.as_str() == "T")
+                        && matches!(&**args, [cg::Ty::TypeVar(name)] if name.as_str() == "T")
             )
         };
         assert!(matches!(
             &nested.arguments[0].ty,
-            cg::Ty::Union(members, _)
+            cg::Ty::Union(members)
                 if members.iter().any(&is_instantiated_self)
-                    && members.iter().any(|ty| matches!(ty, cg::Ty::Null { .. }))
+                    && members.iter().any(|ty| matches!(ty, cg::Ty::Null))
         ));
         assert!(matches!(
             &nested.return_type,
             cg::Ty::Map { key, value, .. }
-                if matches!(key.as_ref(), cg::Ty::String { .. })
-                    && matches!(value.as_ref(), cg::Ty::List(inner, _) if is_instantiated_self(inner))
+                if matches!(key.as_ref(), cg::Ty::String)
+                    && matches!(value.as_ref(), cg::Ty::List(inner) if is_instantiated_self(inner))
         ));
 
         let identity = generic_class
@@ -1500,7 +1466,6 @@ class GenericMirror<T> {
             "namespace_path mismatch: {:?}",
             key.namespace(),
         );
-        assert!(!key.is_stream(), "Sentiment must not be marked as stream");
     }
 
     /// Pure-expression functions (no `llm` declarative meta) must reach the
@@ -1554,7 +1519,7 @@ function top() -> int { 0 }
 "#,
         );
 
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&db);
+        let diagnostics = workspace_diagnostics(&db);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:#?}");
 
         let pool = build_symbol_pool(&db);
@@ -1593,7 +1558,7 @@ function passthrough(x: Marker) -> Marker { x }
 "#,
         );
 
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&db);
+        let diagnostics = workspace_diagnostics(&db);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:#?}");
 
         let pool = build_symbol_pool(&db);
@@ -1607,8 +1572,8 @@ function passthrough(x: Marker) -> Marker { x }
 
         for ty in [&function.arguments[0].ty, &function.return_type] {
             assert!(
-                matches!(ty, cg::Ty::Interface(name, generics, associated, _)
-                    if name.bare_name() == "Marker"
+                matches!(ty, cg::Ty::Interface(name, generics, associated)
+                    if name.name().as_str() == "Marker"
                         && generics.is_empty()
                         && associated.is_empty()),
                 "interface identity should survive in shared codegen IR: {ty:?}"
@@ -1641,7 +1606,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
 "#,
         );
 
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&db);
+        let diagnostics = workspace_diagnostics(&db);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:#?}");
 
         let pool = build_symbol_pool(&db);
@@ -1654,12 +1619,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
         let cg::Symbol::TypeAlias(text_decl) = &pool[&text] else {
             panic!("Text must be an alias")
         };
-        assert_eq!(
-            text_decl.resolves_to,
-            cg::Ty::String {
-                attr: codegen_attr()
-            }
-        );
+        assert_eq!(text_decl.resolves_to, cg::Ty::String);
 
         let cg::Symbol::TypeAlias(chain_decl) = &pool[&text_chain] else {
             panic!("TextChain must be an alias")
@@ -1671,12 +1631,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
         };
         assert_eq!(
             maybe_decl.resolves_to,
-            codegen_union(vec![
-                codegen_alias(text_chain.clone()),
-                cg::Ty::Null {
-                    attr: codegen_attr()
-                }
-            ])
+            codegen_union(vec![codegen_alias(text_chain.clone()), cg::Ty::Null])
         );
 
         let cg::Symbol::TypeAlias(rec_decl) = &pool[&rec] else {
@@ -1685,12 +1640,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
         assert!(rec_decl.recursive);
         assert_eq!(
             rec_decl.resolves_to,
-            codegen_union(vec![
-                cg::Ty::Int {
-                    attr: codegen_attr()
-                },
-                codegen_list(codegen_alias(rec.clone())),
-            ])
+            codegen_union(vec![cg::Ty::Int, codegen_list(codegen_alias(rec.clone())),])
         );
 
         let cg::Symbol::Class(holder) = &pool[&name("Holder")] else {
@@ -1711,25 +1661,15 @@ function normalize(value: null | string | null) -> null | string | null { value 
         assert_eq!(
             property("mapped"),
             &cg::Ty::Map {
-                key: Box::new(cg::Ty::String {
-                    attr: codegen_attr()
-                }),
+                key: Box::new(cg::Ty::String),
                 value: Box::new(codegen_list(codegen_alias(text_chain))),
-                attr: codegen_attr(),
             }
         );
 
         let cg::Symbol::Function(normalize) = &pool[&name("normalize")] else {
             panic!("normalize must be a function")
         };
-        let nullable_string = codegen_union(vec![
-            cg::Ty::String {
-                attr: codegen_attr(),
-            },
-            cg::Ty::Null {
-                attr: codegen_attr(),
-            },
-        ]);
+        let nullable_string = codegen_union(vec![cg::Ty::String, cg::Ty::Null]);
         assert_eq!(normalize.arguments[0].ty, nullable_string);
         assert_eq!(normalize.return_type, nullable_string);
         cg::validate_symbol_pool_map_keys(&pool).expect("canonical alias map keys must validate");
@@ -1746,7 +1686,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
             legal_root.join("main.baml").as_path(),
             "type Key = \"first\" | \"second\"\ntype KeyChain = Key\nclass Lookup { values map<KeyChain, int> }\n",
         );
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&legal_db);
+        let diagnostics = workspace_diagnostics(&legal_db);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:#?}");
         let legal_pool = build_symbol_pool(&legal_db);
         let lookup_name = cg::Name::new(Name::new("user"), vec![], Name::new("Lookup"));
@@ -1758,10 +1698,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
             lookup.properties[0].ty,
             cg::Ty::Map {
                 key: Box::new(codegen_alias(key_chain)),
-                value: Box::new(cg::Ty::Int {
-                    attr: codegen_attr()
-                }),
-                attr: codegen_attr(),
+                value: Box::new(cg::Ty::Int)
             }
         );
         cg::validate_symbol_pool_map_keys(&legal_pool)
@@ -1774,7 +1711,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
             illegal_root.join("main.baml").as_path(),
             "type BadKey = int\nclass Lookup { values map<BadKey, string> }\n",
         );
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&illegal_db);
+        let diagnostics = workspace_diagnostics(&illegal_db);
         assert!(
             diagnostics
                 .iter()
@@ -1803,7 +1740,7 @@ function normalize(value: null | string | null) -> null | string | null { value 
             "type Shared = int\nclass Right { value Shared }\n",
         );
 
-        let diagnostics = baml_db::collect_compiler2_diagnostics(&db);
+        let diagnostics = workspace_diagnostics(&db);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:#?}");
         let pool = build_symbol_pool(&db);
         let qualified = |namespace: &str, name: &str| {
@@ -1819,12 +1756,12 @@ function normalize(value: null | string | null) -> null | string | null { value 
         assert!(matches!(
             &pool[&left_alias],
             cg::Symbol::TypeAlias(alias)
-                if alias.resolves_to == cg::Ty::String { attr: codegen_attr() }
+                if alias.resolves_to == cg::Ty::String
         ));
         assert!(matches!(
             &pool[&right_alias],
             cg::Symbol::TypeAlias(alias)
-                if alias.resolves_to == cg::Ty::Int { attr: codegen_attr() }
+                if alias.resolves_to == cg::Ty::Int
         ));
 
         for (class_name, alias_name) in [

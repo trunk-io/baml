@@ -23,7 +23,7 @@
 //! ```
 
 // Re-export RuntimeTy and TypeName from baml_type for convenience
-pub use baml_type::{RuntimeTy, TyAttr, TypeName};
+pub use baml_type::{RuntimeTy, TypeName};
 use indexmap::IndexMap;
 
 /// Metadata about a union type, embedded with values from union-typed contexts.
@@ -60,7 +60,7 @@ impl UnionMetadata {
     /// Create metadata for a union type.
     pub fn new(union_type: RuntimeTy, selected_option: RuntimeTy) -> Self {
         let (is_optional, is_single_pattern) = match &union_type {
-            RuntimeTy::Union(members, _) => {
+            RuntimeTy::Union(members) => {
                 let is_optional = members.iter().any(RuntimeTy::is_null);
                 let non_null_count = members.iter().filter(|member| !member.is_null()).count();
                 (is_optional, non_null_count == 1)
@@ -81,7 +81,6 @@ impl UnionMetadata {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BexExternalAdt {
-    Collector(bex_vm_types::CollectorRef),
     /// A reflected type, carried at the sys-op lane's head so a definition
     /// table can be keyed by declaration identity rather than by name.
     ///
@@ -203,6 +202,14 @@ pub enum BexExternalValue {
     /// 64-bit floating point.
     Float(f64),
 
+    /// A JavaScript `number` whose BAML representation has not yet been
+    /// selected from contextual type information. Integral values can become
+    /// `Int` or `Float`; non-integral values can become only `Float`.
+    ///
+    /// This is an inbound bridge carrier and must be resolved before VM heap
+    /// materialization or outbound encoding.
+    JsNumber(f64),
+
     /// Boolean value.
     Bool(bool),
 
@@ -289,6 +296,22 @@ pub enum BexExternalValue {
     HostValue(std::sync::Arc<bex_resource_types::HostValueArc>),
 }
 
+/// Return the exact `i64` represented by an integral JavaScript number.
+///
+/// The upper bound is exclusive because `i64::MAX as f64` rounds to `2^63`.
+/// Checking it explicitly avoids Rust's saturating float-to-int cast turning
+/// that out-of-range value into `i64::MAX`.
+#[must_use]
+pub fn js_number_to_i64(value: f64) -> Option<i64> {
+    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+    const I64_MAX_PLUS_ONE_F64: f64 = 9_223_372_036_854_775_808.0;
+
+    (value.is_finite()
+        && value.fract() == 0.0
+        && (I64_MIN_F64..I64_MAX_PLUS_ONE_F64).contains(&value))
+    .then_some(value as i64)
+}
+
 impl std::fmt::Debug for BexExternalValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -296,6 +319,7 @@ impl std::fmt::Debug for BexExternalValue {
             Self::Int(v) => f.debug_tuple("Int").field(v).finish(),
             Self::Bigint(v) => f.debug_tuple("Bigint").field(v).finish(),
             Self::Float(v) => f.debug_tuple("Float").field(v).finish(),
+            Self::JsNumber(v) => f.debug_tuple("JsNumber").field(v).finish(),
             Self::Bool(v) => f.debug_tuple("Bool").field(v).finish(),
             Self::String(v) => f.debug_tuple("String").field(v).finish(),
             Self::Array {
@@ -363,6 +387,7 @@ impl PartialEq for BexExternalValue {
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Bigint(a), Self::Bigint(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::JsNumber(a), Self::JsNumber(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
             (
@@ -435,7 +460,6 @@ impl PartialEq for BexExternalValue {
 impl BexExternalAdt {
     pub fn type_name(&self) -> &'static str {
         match self {
-            BexExternalAdt::Collector(_) => "collector",
             BexExternalAdt::Type(_) | BexExternalAdt::TypeDef(_) => "type",
             BexExternalAdt::PromptAst(_) => "prompt_ast",
             BexExternalAdt::Media(_) => "media",
@@ -479,10 +503,8 @@ impl BexExternalValue {
     /// existing type-directed VM materialization can honor `value_type`, while
     /// explicitly distinguishing it from an actual declared union.
     pub fn typed(value: BexExternalValue, value_type: RuntimeTy) -> Self {
-        let mut metadata = UnionMetadata::new(
-            RuntimeTy::Union(Box::new([value_type.clone()]), TyAttr::default()),
-            value_type,
-        );
+        let mut metadata =
+            UnionMetadata::new(RuntimeTy::Union(Box::new([value_type.clone()])), value_type);
         metadata.is_inbound_type_annotation = true;
         BexExternalValue::Union {
             value: Box::new(value),
@@ -500,7 +522,7 @@ impl BexExternalValue {
         members: impl IntoIterator<Item = RuntimeTy>,
         selected: RuntimeTy,
     ) -> Self {
-        let union_type = RuntimeTy::Union(members.into_iter().collect(), TyAttr::default());
+        let union_type = RuntimeTy::Union(members.into_iter().collect());
         BexExternalValue::Union {
             value: Box::new(value),
             metadata: UnionMetadata::new(union_type, selected),
@@ -548,6 +570,7 @@ impl BexExternalValue {
             BexExternalValue::Int(_) => "int",
             BexExternalValue::Bigint(_) => "bigint",
             BexExternalValue::Float(_) => "float",
+            BexExternalValue::JsNumber(_) => "js_number",
             BexExternalValue::Bool(_) => "bool",
             BexExternalValue::String(_) => "string",
             BexExternalValue::Array { .. } => "array",
@@ -600,7 +623,7 @@ impl BexExternalValue {
     /// `baml.errors.Io { message: "boom" }` rather than
     /// `Instance { class_name: "baml.errors.Io", type_args: [], fields: {..} }`,
     /// and a generic instance's `type_args` are omitted entirely instead of
-    /// dumping `Class(QualifiedTypeName { .. }, [], TyAttr { .. })`.
+    /// dumping `Class(QualifiedTypeName { .. }, [])`.
     ///
     /// It is a pure structural pretty-printer, not the VM's `baml.ToString`
     /// dispatch: it runs without a live VM (e.g. after the VM has unwound on an
@@ -618,6 +641,7 @@ impl BexExternalValue {
                     format!("{s}.0")
                 }
             }
+            BexExternalValue::JsNumber(f) => f.to_string(),
             BexExternalValue::Bool(b) => b.to_string(),
             BexExternalValue::String(s) => format!("{s:?}"),
             BexExternalValue::Array { items, .. } => {
@@ -888,6 +912,21 @@ pub fn try_convert_rust_data(
 mod render_readable_tests {
     use super::*;
 
+    #[test]
+    fn js_number_to_i64_checks_integrality_and_exact_i64_bounds() {
+        assert_eq!(js_number_to_i64(0.0), Some(0));
+        assert_eq!(js_number_to_i64(-0.0), Some(0));
+        assert_eq!(js_number_to_i64(42.0), Some(42));
+        assert_eq!(js_number_to_i64(42.5), None);
+        assert_eq!(js_number_to_i64(f64::NAN), None);
+        assert_eq!(js_number_to_i64(f64::INFINITY), None);
+        assert_eq!(
+            js_number_to_i64(-9_223_372_036_854_775_808.0),
+            Some(i64::MIN)
+        );
+        assert_eq!(js_number_to_i64(9_223_372_036_854_775_808.0), None);
+    }
+
     /// A thrown error instance renders as `Class { field: value }`, not the
     /// Rust `Debug` shape `Instance { class_name: .., type_args: [], fields: .. }`.
     /// This is the exact B-623 repro.
@@ -904,7 +943,7 @@ mod render_readable_tests {
     }
 
     /// A generic error instance carrying a `Class(..)` in its `type_args` — the
-    /// shape that used to dump `Class(QualifiedTypeName { .. }, [], TyAttr { .. })`
+    /// shape that used to dump `Class(QualifiedTypeName { .. }, [])`
     /// under `Debug` — renders readably with the `type_args` omitted and no Rust
     /// internals leaked.
     #[test]
@@ -935,7 +974,7 @@ mod render_readable_tests {
             "unexpected render: {rendered}"
         );
         // The bug: `Debug` leaks Rust-internal shapes. The readable form must not.
-        for leak in ["Instance {", "QualifiedTypeName", "TyAttr", "Class("] {
+        for leak in ["Instance {", "QualifiedTypeName", "Class("] {
             assert!(!rendered.contains(leak), "leaked `{leak}` in: {rendered}");
         }
     }

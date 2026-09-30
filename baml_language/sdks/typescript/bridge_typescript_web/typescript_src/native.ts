@@ -376,17 +376,17 @@ export class HostSpanManager {
   contextDepth(): number { return 0; }
 }
 
-export class Timing {}
-export class Usage {}
-export class LlmCall {}
-export { LlmCall as LLMCall };
-export class FunctionLog {}
-export class Collector {
-  constructor(_name?: string | null) {}
-}
-
+/**
+ * Browsers initialize eagerly. The workerd entry point validates sources or
+ * bytecode immediately, but builds the engine and runs package initializers on
+ * the first function call, which must run inside a Worker handler.
+ *
+ * Failed validation preserves the previous runtime. After successful staging,
+ * an initializer failure is reported by calls until another runtime is staged.
+ * This recovery does not cover internal Rust panics or WebAssembly traps.
+ */
 export class BamlRuntime {
-  static initializeRuntimeFromBytecode(bytecode: Uint8Array, embeddedBamlToml?: string): BamlRuntime {
+  static initializeRuntimeFromBlob(bytecode: string | Uint8Array, embeddedBamlToml?: string): BamlRuntime {
     ensureWebSysopsConfigured();
     try {
       stageRuntimeBytecode(bytecode, embeddedBamlToml);
@@ -406,14 +406,14 @@ export class BamlRuntime {
     runtime = new BamlRuntime();
     return runtime;
   }
-  callFunctionSync(encodedArgs: Uint8Array, _ctx?: HostSpanManager | null, _collectors?: Collector[] | null): Uint8Array {
+  callFunctionSync(encodedArgs: Uint8Array, _ctx?: HostSpanManager | null): Uint8Array {
     try {
       return callWasmFunctionSync(encodedArgs);
     } catch (error) {
       throw wrapNativeError(error);
     }
   }
-  async callFunction(encodedArgs: Uint8Array, _ctx?: HostSpanManager | null, _collectors?: Collector[] | null): Promise<Uint8Array> {
+  async callFunction(encodedArgs: Uint8Array, _ctx?: HostSpanManager | null): Promise<Uint8Array> {
     try {
       return await callWasmFunction(encodedArgs);
     } catch (error) {

@@ -72,7 +72,7 @@ pub enum CollectionLevel {
 pub struct GcStats {
     /// Objects marked as live (copied).
     pub live_count: usize,
-    /// Objects collected (not copied).
+    /// Slots reclaimed (including unused TLAB reservations), not an object-death count.
     pub collected_count: usize,
     /// Which collection level was run.
     pub level: CollectionLevel,
@@ -80,43 +80,15 @@ pub struct GcStats {
     pub promoted_to_gen1: usize,
     /// Objects promoted from Gen1 to Gen2 during this cycle.
     pub promoted_to_gen2: usize,
+    /// Detailed diagnostics in profiling builds; a zero-sized marker otherwise.
+    pub profile: crate::GcProfile,
 }
 
 impl BexHeap {
-    /// Select the appropriate collection level based on current heap state.
-    ///
-    /// Returns `Some(level)` if GC should run, `None` if no collection is needed.
-    ///
-    /// Priority (highest first):
-    /// 1. **Major** — Gen2 size exceeds `gen2_collection_threshold`
-    /// 2. **Minor** — Gen1 size exceeds `gen1_collection_threshold`
-    /// 3. **Minor** — Allocation count since last GC >= 10,000 (Gen0 pressure)
-    /// 4. **None** — No collection needed
-    ///
-    /// Note: There is no Gen0-only collection; Gen0 allocation pressure triggers
-    /// a Minor GC (Gen0+Gen1) since that is the finest granularity available.
+    /// Automatic collections are full collections, requested by allocation spending.
+    /// This reads only atomics; moving collection still requires exclusive heap access.
     pub fn should_collect(&self) -> Option<CollectionLevel> {
-        // Check Gen2 first (highest priority — expensive to defer).
-        // SAFETY: Reading lengths at a check point; no mutation in progress.
-        let gen2_live = unsafe { self.gen2_ref().len() };
-        let gen2_threshold = self.gen2_collection_threshold();
-        if gen2_live > gen2_threshold {
-            return Some(CollectionLevel::Major);
-        }
-
-        // Check Gen1.
-        let gen1_live = unsafe { self.gen1_ref().len() };
-        let gen1_threshold = self.gen1_collection_threshold();
-        if gen1_live > gen1_threshold {
-            return Some(CollectionLevel::Minor);
-        }
-
-        // Check Gen0 allocation pressure (same threshold as legacy `should_gc`).
-        if self.allocs_since_gc() >= 10_000 {
-            return Some(CollectionLevel::Minor);
-        }
-
-        None
+        self.gc_policy.due().then_some(CollectionLevel::Major)
     }
 
     /// Run a full garbage collection with the given roots.
@@ -307,28 +279,42 @@ impl BexHeap {
     ) -> Vec<crate::UnhandledSpawnError> {
         let mut errors = Vec::new();
         for space in gens {
-            for i in 0..space.len() {
-                // SAFETY: GC safepoint and `i` is in bounds.
-                let ptr = unsafe { self.make_heap_ptr(space.get_ptr(i)) };
-                if forwarding.contains_key(&ptr) {
-                    continue;
-                }
-                // SAFETY: from-space is intact until the collection swap.
-                let Object::Future(future) = (unsafe { ptr.get() }) else {
-                    continue;
-                };
-                if future.is_observed() {
-                    continue;
-                }
-                if let FutureRead::Error(value) = future.read()
-                    && future.try_mark_reported()
-                {
-                    errors.push(crate::UnhandledSpawnError {
-                        future_id: future.id(),
-                        value,
-                        trace: future.error_trace(),
-                        cancelled: future.cancel_requested(),
-                    });
+            let len = space.len();
+            // Resolve each stable chunk once, rather than taking the storage
+            // read lock for every slot. GC has exclusive access, and this scan
+            // neither grows nor clears any of the spaces it reads.
+            for start in (0..len).step_by(ChunkedVec::<Object>::CHUNK_SIZE) {
+                // SAFETY: start < len, so this chunk exists. Its initialized
+                // slots remain valid for the entire scan (before the swap).
+                let chunk =
+                    unsafe { space.chunk_start_ptr(start / ChunkedVec::<Object>::CHUNK_SIZE) };
+                let count = (len - start).min(ChunkedVec::<Object>::CHUNK_SIZE);
+                for offset in 0..count {
+                    // SAFETY: offset is in this initialized chunk. No mutator
+                    // can write or reclaim this object while GC holds permits.
+                    let raw_ptr = unsafe { chunk.add(offset) };
+                    let Object::Future(future) = (unsafe { &*raw_ptr }) else {
+                        continue;
+                    };
+                    if future.is_observed() {
+                        continue;
+                    }
+                    // Only futures can contribute an unhandled error. In
+                    // particular, do not hash unused TLAB slots or instances.
+                    let ptr = unsafe { self.make_heap_ptr(raw_ptr.cast_mut()) };
+                    if forwarding.contains_key(&ptr) {
+                        continue;
+                    }
+                    if let FutureRead::Error(value) = future.read()
+                        && future.try_mark_reported()
+                    {
+                        errors.push(crate::UnhandledSpawnError {
+                            future_id: future.id(),
+                            value,
+                            trace: future.error_trace(),
+                            cancelled: future.was_cancelled(),
+                        });
+                    }
                 }
             }
         }
@@ -424,6 +410,8 @@ impl BexHeap {
         &self,
         roots: &[HeapPtr],
     ) -> (GcStats, Vec<HeapPtr>, HashMap<HeapPtr, HeapPtr>) {
+        // SAFETY: collection caller guarantees exclusive heap access.
+        let mut profile = unsafe { crate::gc_profile::GcProfiler::start(self, roots.len()) };
         // Track old -> new pointer mappings (forwarding pointers)
         let mut forwarding: HashMap<HeapPtr, HeapPtr> = HashMap::new();
 
@@ -445,6 +433,8 @@ impl BexHeap {
 
         // BFS from roots — copy every reachable object into inactive.
         let mut worklist: Vec<HeapPtr> = roots.to_vec();
+
+        profile.finish_phase(crate::gc_profile::HeapPhase::Prepare);
 
         while let Some(old_ptr) = worklist.pop() {
             // Skip already-forwarded objects.
@@ -484,6 +474,8 @@ impl BexHeap {
             self.add_references_to_worklist(obj, &mut worklist);
         }
 
+        profile.finish_phase(crate::gc_profile::HeapPhase::Trace);
+
         // Preserve unobserved spawn errors before reclaiming their futures.
         // SAFETY: GC safepoint; exclusive access.
         unsafe {
@@ -499,11 +491,19 @@ impl BexHeap {
             self.keepalive_finalizers_major(&mut forwarding);
         }
 
+        profile.finish_phase(crate::gc_profile::HeapPhase::Keepalive);
+
         // Patch all intra-heap pointers in the inactive space to their new locations.
         // SAFETY: All live objects have been copied; no VMs are executing.
         unsafe {
             self.fixup_references_in_inactive(&forwarding);
         }
+
+        // Resolve weak function lookups before destroying from-space. These
+        // pointers are deliberately absent from the root set.
+        self.update_function_lookup(&forwarding, CollectionLevel::Major);
+
+        profile.finish_phase(crate::gc_profile::HeapPhase::Fixup);
 
         // SAFETY: GC runs at safepoints.
         let live_count = unsafe { self.inactive_ref().len() };
@@ -549,6 +549,8 @@ impl BexHeap {
             self.debug_assert_post_major_no_dead_refs();
         }
 
+        profile.finish_phase(crate::gc_profile::HeapPhase::Reclaim);
+
         // Remap each root to its new location (or keep it if it was compile-time).
         let remapped_roots: Vec<HeapPtr> = roots
             .iter()
@@ -558,17 +560,20 @@ impl BexHeap {
         // Update the handle table so external handles point to new locations.
         self.update_handles(&forwarding);
 
-        // Update adaptive thresholds: all survivors are in Gen2 after a full GC.
-        self.update_thresholds_after_major(live_count);
+        self.gc_policy
+            .after_full(live_count.saturating_mul(size_of::<Object>()));
 
-        // Reset the Gen0 allocation counter — `should_collect` uses it to
-        // trigger pressure-based GC, and without the reset every subsequent
-        // check would re-trigger GC forever.
+        // Reset the actual-object counter used by GC profiling.
         self.reset_gc_counter();
 
+        profile.finish_phase(crate::gc_profile::HeapPhase::Bookkeeping);
+
+        // SAFETY: exclusive heap access is still held.
+        let profile = unsafe { profile.finish(self) };
         let stats = GcStats {
             live_count,
             collected_count,
+            profile,
             level: CollectionLevel::Major,
             promoted_to_gen1: 0,
             promoted_to_gen2: live_count,
@@ -660,15 +665,6 @@ impl BexHeap {
                 if let Some(ptr) = future_object_ref(fut) {
                     worklist.push(ptr);
                 }
-            }
-            Object::UnscheduledFuture(future) => {
-                if let Some(name_ptr) = future.name {
-                    worklist.push(name_ptr);
-                }
-                if let Some(config_ptr) = future.config {
-                    worklist.push(config_ptr);
-                }
-                worklist.push(future.closure);
             }
             Object::Package(package) => {
                 worklist.extend(package.classes.values().copied());
@@ -774,7 +770,7 @@ impl BexHeap {
             // A `type` value is exactly the type it denotes: every edge it has
             // is a head, walked below.
             | Object::Type(_)
-            | Object::Collector(_)
+
             | Object::Float(_) => {}
         }
 
@@ -897,21 +893,6 @@ impl BexHeap {
                 // SAFETY: GC holds exclusive access via the parked HeapGuard.
                 if let Some(value) = unsafe { fut.value_mut_for_fixup() } {
                     self.fixup_value(value, forwarding);
-                }
-            }
-            Object::UnscheduledFuture(future) => {
-                if let Some(name_ptr) = &mut future.name
-                    && let Some(&new_ptr) = forwarding.get(name_ptr)
-                {
-                    *name_ptr = new_ptr;
-                }
-                if let Some(config_ptr) = &mut future.config
-                    && let Some(&new_ptr) = forwarding.get(config_ptr)
-                {
-                    *config_ptr = new_ptr;
-                }
-                if let Some(&new_ptr) = forwarding.get(&future.closure) {
-                    future.closure = new_ptr;
                 }
             }
             Object::Package(package) => {
@@ -1059,7 +1040,6 @@ impl BexHeap {
             | Object::Bigint(_)
             | Object::Uint8Array(_)
             | Object::RustData(_)
-            | Object::Collector(_)
             | Object::Float(_) => {}
         }
 
@@ -1306,21 +1286,6 @@ impl BexHeap {
                     worklist.push(ptr);
                 }
             }
-            Object::UnscheduledFuture(future) => {
-                if let Some(name_ptr) = future.name
-                    && self.generation_of(name_ptr).is_young()
-                {
-                    worklist.push(name_ptr);
-                }
-                if let Some(config_ptr) = future.config
-                    && self.generation_of(config_ptr).is_young()
-                {
-                    worklist.push(config_ptr);
-                }
-                if self.generation_of(future.closure).is_young() {
-                    worklist.push(future.closure);
-                }
-            }
             Object::Package(package) => {
                 let refs = package
                     .classes
@@ -1454,7 +1419,6 @@ impl BexHeap {
             | Object::Bigint(_)
             | Object::Uint8Array(_)
             | Object::RustData(_)
-            | Object::Collector(_)
             | Object::Float(_) => {}
         }
 
@@ -1485,6 +1449,8 @@ impl BexHeap {
         &self,
         roots: &[HeapPtr],
     ) -> (GcStats, Vec<HeapPtr>, HashMap<HeapPtr, HeapPtr>) {
+        // SAFETY: collection caller guarantees exclusive heap access.
+        let mut profile = unsafe { crate::gc_profile::GcProfiler::start(self, roots.len()) };
         let mut forwarding: HashMap<HeapPtr, HeapPtr> = HashMap::new();
 
         self.bump_epoch();
@@ -1513,6 +1479,8 @@ impl BexHeap {
         }
 
         let mut promoted_to_gen2 = 0usize;
+
+        profile.finish_phase(crate::gc_profile::HeapPhase::Prepare);
 
         while let Some(old_ptr) = worklist.pop() {
             if forwarding.contains_key(&old_ptr) {
@@ -1545,6 +1513,8 @@ impl BexHeap {
             }
         }
 
+        profile.finish_phase(crate::gc_profile::HeapPhase::Trace);
+
         // Preserve unobserved spawn errors before reclaiming their futures.
         // SAFETY: GC safepoint; exclusive access.
         unsafe {
@@ -1559,6 +1529,8 @@ impl BexHeap {
         unsafe {
             self.keepalive_finalizers_minor(&mut forwarding, &mut promoted_to_gen2);
         }
+
+        profile.finish_phase(crate::gc_profile::HeapPhase::Keepalive);
 
         // Fix up references:
         // - Full fixup for inactive (new Gen1 — all objects are freshly copied).
@@ -1606,6 +1578,12 @@ impl BexHeap {
             }
         }
 
+        // Gen2 is not collected by a minor cycle. Missing forwarding entries
+        // there are retained; missing entries in young generations are dead.
+        self.update_function_lookup(&forwarding, CollectionLevel::Minor);
+
+        profile.finish_phase(crate::gc_profile::HeapPhase::Fixup);
+
         // Swap inactive ↔ Gen1; clear Gen0.
         // SAFETY: GC safepoint; exclusive access to all spaces.
         unsafe {
@@ -1616,6 +1594,8 @@ impl BexHeap {
         self.clear_tlab_canaries();
         // Poison/clear the old Gen1 (now in inactive).
         self.finalize_inactive_space();
+
+        profile.finish_phase(crate::gc_profile::HeapPhase::Reclaim);
 
         let new_gen1_count = unsafe { self.gen1_ref().len() };
         let total_live = new_gen1_count + promoted_to_gen2;
@@ -1628,18 +1608,17 @@ impl BexHeap {
 
         self.update_handles(&forwarding);
 
-        // Update adaptive thresholds based on post-collection Gen1 and Gen2 sizes.
-        let current_gen2_live = unsafe { self.gen2_ref().len() };
-        self.update_thresholds_after_minor(new_gen1_count, current_gen2_live);
-
-        // Reset the Gen0 allocation counter. Without this, `should_collect`
-        // would re-trigger Minor GC on every check after the first 10_000
-        // allocations, because the counter would never go below the threshold.
+        // A minor collection does not satisfy the full-GC allocation budget.
         self.reset_gc_counter();
 
+        profile.finish_phase(crate::gc_profile::HeapPhase::Bookkeeping);
+
+        // SAFETY: exclusive heap access is still held.
+        let profile = unsafe { profile.finish(self) };
         let stats = GcStats {
             live_count: total_live,
             collected_count: total_before.saturating_sub(total_live),
+            profile,
             level: CollectionLevel::Minor,
             promoted_to_gen1: new_gen1_count,
             promoted_to_gen2,
@@ -1677,6 +1656,63 @@ mod tests {
 
     use super::*;
     use crate::Tlab;
+
+    #[test]
+    fn unhandled_error_scan_covers_chunk_edges_and_preserves_observation() {
+        use bex_vm_types::types::{CancellationToken, FutureId};
+        for level in [CollectionLevel::Minor, CollectionLevel::Major] {
+            let heap = BexHeap::with_tlab_size(vec![], 1);
+            let mut tlab = Tlab::new(heap.clone());
+            for _ in 0..ChunkedVec::<Object>::CHUNK_SIZE - 1 {
+                tlab.alloc_float(0.0);
+            }
+            let mut rooted = None;
+            for id in 0..4 {
+                let ptr = tlab.alloc_future(Future::pending(
+                    FutureId::from_usize(id),
+                    RealizedTy::unknown(),
+                    RealizedTy::unknown(),
+                    CancellationToken::new(),
+                ));
+                let Object::Future(future) = (unsafe { ptr.get() }) else {
+                    unreachable!()
+                };
+                // SAFETY: private pending future, no producer or other holder.
+                assert!(unsafe {
+                    future.settle_error(heap.as_ref(), ptr, Value::int(id as i64), vec![])
+                });
+                if id == 2 {
+                    future.mark_observed();
+                }
+                if id == 3 {
+                    rooted = Some(ptr);
+                }
+            }
+            // The two unobserved dead errors straddle a storage chunk boundary;
+            // the remaining futures occupy a partially filled final chunk.
+            let (_, _, _) = unsafe { heap.collect_garbage_generational(&[rooted.unwrap()], level) };
+            let errors = heap.take_unhandled_spawn_errors();
+            assert_eq!(
+                errors
+                    .iter()
+                    .map(|e| e.future_id.as_usize())
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            assert_eq!(
+                errors.iter().map(|e| e.value).collect::<Vec<_>>(),
+                vec![Value::int(0), Value::int(1)]
+            );
+            // Dropping the last root makes the remaining unobserved error
+            // reportable. Already observed/reported errors must not reappear.
+            unsafe { heap.collect_garbage(&[]) };
+            let errors = heap.take_unhandled_spawn_errors();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].future_id.as_usize(), 3);
+            unsafe { heap.collect_garbage(&[]) };
+            assert!(heap.take_unhandled_spawn_errors().is_empty());
+        }
+    }
 
     #[test]
     fn test_gc_empty_heap() {
@@ -1760,7 +1796,6 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
-            ty_attr: baml_type::TyAttr::default(),
             owner: bex_vm_types::HeapPtr::null(),
         }))];
         let debug = HeapDebuggerConfig {
@@ -1795,25 +1830,23 @@ mod tests {
             )),
             fields: vec![bex_vm_types::ClassField {
                 name: "x".to_string(),
-                field_type: baml_type::RuntimeTy::Int {
-                    attr: baml_type::TyAttr::default(),
-                },
-                field_template: baml_type::TyTemplate::from(baml_type::RealizedTy::Int {
-                    attr: baml_type::TyAttr::default(),
-                }),
+                field_type: baml_type::RuntimeTy::Int,
+                field_template: baml_type::TyTemplate::from(baml_type::RealizedTy::Int),
                 description: None,
                 alias: None,
                 docstring: None,
                 other: Default::default(),
                 skip: false,
+                stream_done: false,
+                must_exist: false,
                 runtime_type: None,
             }],
             description: None,
             alias: None,
             docstring: None,
             other: Default::default(),
+            stream_done: false,
             type_tag: baml_type::typetag::TypeTag::from_i64(100),
-            ty_attr: baml_type::TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
             owner: bex_vm_types::HeapPtr::null(),
@@ -1943,31 +1976,6 @@ mod tests {
 
         // Intentionally pass no roots (caller forgot `collect_handle_roots`).
         let _ = unsafe { heap.collect_garbage(&[]) };
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "allocates ~15k objects to drive GC heuristics; runs for minutes under Miri and exercises collection policy, not unsafe memory paths"
-    )]
-    fn test_gc_heuristics() {
-        let heap = BexHeap::new(vec![]);
-        let mut tlab = Tlab::new(Arc::clone(&heap));
-
-        // Initially should not need GC
-        assert!(!heap.should_gc());
-
-        // Allocate many objects to trigger GC threshold
-        for i in 0..15_000 {
-            tlab.alloc_string(format!("obj{i}"));
-        }
-
-        // Should now recommend GC
-        assert!(heap.should_gc());
-
-        // Reset counter
-        heap.reset_gc_counter();
-        assert!(!heap.should_gc());
     }
 
     #[test]
@@ -2442,7 +2450,7 @@ mod tests {
 
     #[test]
     fn test_gc_traces_instance_class_and_fields() {
-        use baml_type::{Name, TyAttr, TypeName};
+        use baml_type::{Name, TypeName};
         use bex_vm_types::Class;
 
         let heap = BexHeap::new(vec![]);
@@ -2456,8 +2464,8 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
+            stream_done: false,
             type_tag: baml_type::typetag::TypeTag::from_i64(0),
-            ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
             owner: bex_vm_types::HeapPtr::null(),
@@ -2489,7 +2497,7 @@ mod tests {
 
     #[test]
     fn test_gc_traces_variant_enum() {
-        use baml_type::{Name, TyAttr, TypeName};
+        use baml_type::{Name, TypeName};
         use bex_vm_types::Enum;
 
         let heap = BexHeap::new(vec![]);
@@ -2503,7 +2511,6 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
-            ty_attr: TyAttr::default(),
             owner: bex_vm_types::HeapPtr::null(),
         })));
         let var_ptr = tlab.alloc_variant(enum_ptr, 1);
@@ -2594,32 +2601,6 @@ mod tests {
             panic!("not cell")
         };
         assert_eq!(c.load(), Value::int(42));
-    }
-
-    #[test]
-    fn test_gc_traces_unscheduled_spawn_closure() {
-        use bex_vm_types::UnscheduledFuture;
-
-        let heap = BexHeap::new(vec![]);
-        let mut tlab = Tlab::new(Arc::clone(&heap));
-
-        // The closure pointer is just a dummy String for tracing
-        // purposes — the GC only needs a valid HeapPtr to walk.
-        let closure = tlab.alloc_string("closure-stand-in".to_string());
-        let name = tlab.alloc_string("spawn-name".to_string());
-        let future_ptr = tlab.alloc(Object::UnscheduledFuture(Box::new(UnscheduledFuture {
-            closure,
-            name: Some(name),
-            config: None,
-            returns: RealizedTy::int(),
-            throws: RealizedTy::never(),
-        })));
-
-        let roots = vec![future_ptr];
-        let (stats, _new_roots, _) = unsafe { heap.collect_garbage(&roots) };
-
-        // future + closure + name
-        assert_eq!(stats.live_count, 3);
     }
 
     #[test]
@@ -2719,7 +2700,7 @@ mod tests {
 
     #[test]
     fn test_gc_leaf_class_preserved() {
-        use baml_type::{Name, TyAttr, TypeName};
+        use baml_type::{Name, TypeName};
         use bex_vm_types::Class;
 
         let heap = BexHeap::new(vec![]);
@@ -2731,8 +2712,8 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
+            stream_done: false,
             type_tag: baml_type::typetag::TypeTag::from_i64(42),
-            ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
             owner: bex_vm_types::HeapPtr::null(),
@@ -2748,7 +2729,7 @@ mod tests {
 
     #[test]
     fn test_gc_leaf_enum_preserved() {
-        use baml_type::{Name, TyAttr, TypeName};
+        use baml_type::{Name, TypeName};
         use bex_vm_types::Enum;
 
         let heap = BexHeap::new(vec![]);
@@ -2761,7 +2742,6 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
-            ty_attr: TyAttr::default(),
             owner: bex_vm_types::HeapPtr::null(),
         })));
 
@@ -2791,7 +2771,7 @@ mod tests {
     /// the head is repointed as both objects move.
     #[test]
     fn test_gc_traces_runtime_enum_definition_reached_through_a_head() {
-        use baml_type::{Name, TyAttr};
+        use baml_type::Name;
         use bex_vm_types::{Enum, EnumVariant, TypeHead, types::TypeValue};
 
         let heap = BexHeap::new(vec![]);
@@ -2813,13 +2793,11 @@ mod tests {
             docstring: None,
             other: Default::default(),
             type_tag,
-            ty_attr: TyAttr::default(),
             owner: bex_vm_types::HeapPtr::null(),
         })));
-        let type_ptr = tlab.alloc_type(TypeValue::new(RealizedTy::Enum(
-            TypeHead::new(enum_ptr, type_tag),
-            TyAttr::default(),
-        )));
+        let type_ptr = tlab.alloc_type(TypeValue::new(RealizedTy::Enum(TypeHead::new(
+            enum_ptr, type_tag,
+        ))));
 
         // Root only the type. Its head is the sole edge keeping the enum alive,
         // and must be traced and repointed as both objects move Gen0 → Gen1 →
@@ -2835,7 +2813,7 @@ mod tests {
         let Object::Type(type_value) = (unsafe { roots[0].get() }) else {
             panic!("root was not the runtime type value")
         };
-        let RealizedTy::Enum(head, _) = &type_value.ty else {
+        let RealizedTy::Enum(head) = &type_value.ty else {
             panic!("the type value no longer wraps an enum type")
         };
         assert_eq!(head.tag(), type_tag, "a move must not change identity");
@@ -2850,7 +2828,7 @@ mod tests {
     /// The same for a class, whose fields carry heads of their own.
     #[test]
     fn test_gc_traces_runtime_class_definition_reached_through_a_head() {
-        use baml_type::{Name, TyAttr};
+        use baml_type::Name;
         use bex_vm_types::{Class, ClassField, TypeHead, types::TypeValue};
 
         let heap = BexHeap::new(vec![]);
@@ -2861,23 +2839,23 @@ mod tests {
             name: type_name.clone(),
             fields: vec![ClassField {
                 name: "height_cm".to_string(),
-                field_type: bex_vm_types::RuntimeTy::Int {
-                    attr: TyAttr::default(),
-                },
+                field_type: bex_vm_types::RuntimeTy::Int,
                 field_template: bex_vm_types::TyTemplate::from(RealizedTy::int()),
                 description: Some("height in centimeters".to_string()),
                 alias: None,
                 docstring: None,
                 other: Default::default(),
                 skip: false,
+                stream_done: false,
+                must_exist: false,
                 runtime_type: None,
             }],
             description: None,
             alias: None,
             docstring: None,
             other: Default::default(),
+            stream_done: false,
             type_tag,
-            ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
             owner: bex_vm_types::HeapPtr::null(),
@@ -2885,7 +2863,6 @@ mod tests {
         let type_ptr = tlab.alloc_type(TypeValue::new(RealizedTy::Class(
             TypeHead::new(class_ptr, type_tag),
             Box::new([]),
-            TyAttr::default(),
         )));
 
         // No instance and no independently-rooted class exists: the sole edge
@@ -2904,7 +2881,7 @@ mod tests {
         let Object::Type(type_value) = (unsafe { roots[0].get() }) else {
             panic!("root was not the runtime type value")
         };
-        let RealizedTy::Class(head, _, _) = &type_value.ty else {
+        let RealizedTy::Class(head, _) = &type_value.ty else {
             panic!("the type value no longer wraps a class type")
         };
         assert_eq!(head.tag(), type_tag, "a move must not change identity");
@@ -3252,9 +3229,9 @@ mod tests {
 
     #[test]
     fn test_tracing_and_fixup_consistency_all_variants() {
-        use baml_type::{Name, TyAttr, TypeName};
+        use baml_type::{Name, TypeName};
         use bex_vm_types::{
-            Class, Enum, UnscheduledFuture,
+            Class, Enum,
             types::{Cell, Closure, Instance, Variant},
         };
 
@@ -3267,7 +3244,6 @@ mod tests {
         let leaf_for_map = tlab.alloc_string("in_map".to_string());
         let leaf_for_closure_cap = tlab.alloc_string("closure_cap".to_string());
         let leaf_for_cell = tlab.alloc_string("cell_value".to_string());
-        let leaf_for_future = tlab.alloc_string("future_arg".to_string());
 
         // A function stand-in (Class acts as a leaf here, needed by Closure).
         let leaf_func = tlab.alloc_string("func_placeholder".to_string());
@@ -3297,17 +3273,6 @@ mod tests {
         // --- Container: Object::Cell ---
         let cell_container = tlab.alloc(Object::Cell(Cell::new(Value::object(leaf_for_cell))));
 
-        // --- Container: Object::UnscheduledFuture ---
-        // After BEP-034 phase D′ the spawn case is all that's left;
-        // the closure pointer stands in as the traced HeapPtr.
-        let future_container = tlab.alloc(Object::UnscheduledFuture(Box::new(UnscheduledFuture {
-            closure: leaf_for_future,
-            name: None,
-            config: None,
-            returns: RealizedTy::int(),
-            throws: RealizedTy::never(),
-        })));
-
         // --- Container: Object::Instance ---
         // Instance requires a class pointer.
         let class_ptr = tlab.alloc(Object::Class(Box::new(Class {
@@ -3317,8 +3282,8 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
+            stream_done: false,
             type_tag: baml_type::typetag::TypeTag::from_i64(0),
-            ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
             owner: bex_vm_types::HeapPtr::null(),
@@ -3338,7 +3303,6 @@ mod tests {
             alias: None,
             docstring: None,
             other: Default::default(),
-            ty_attr: TyAttr::default(),
             owner: bex_vm_types::HeapPtr::null(),
         })));
         let variant_container = tlab.alloc(Object::Variant(Variant {
@@ -3353,7 +3317,6 @@ mod tests {
             map_container,
             closure_container,
             cell_container,
-            future_container,
             instance_container,
             variant_container,
         ];
@@ -3361,11 +3324,11 @@ mod tests {
         let (stats, new_roots, _fwd) = unsafe { heap.collect_garbage(&roots) };
 
         // All transitively reachable objects must survive.
-        // Containers: Array, Map, Closure, Cell, Future, Instance, Variant = 7
+        // Containers: Array, Map, Closure, Cell, Instance, Variant = 6
         // Leaves referenced by containers (some shared):
         //   leaf_for_array, leaf_for_map, leaf_for_closure_cap, leaf_func,
-        //   leaf_for_cell, leaf_for_future, leaf_string, class_ptr, enum_ptr = 9
-        // Total = 7 + 9 = 16, but >= 11 is the conservative bound.
+        //   leaf_for_cell, leaf_string, class_ptr, enum_ptr = 8
+        // Total = 6 + 8 = 14, but >= 11 is the conservative bound.
         assert!(
             stats.live_count >= 11,
             "expected at least 11 live objects; got {}",
@@ -3422,19 +3385,9 @@ mod tests {
         };
         assert_eq!(s, "cell_value");
 
-        // Future: closure HeapPtr should be the (forwarded) leaf string
-        // we used as a stand-in for the spawn-body closure.
-        let Object::UnscheduledFuture(pending) = (unsafe { new_roots[4].get() }) else {
-            panic!("new_roots[4] not UnscheduledFuture")
-        };
-        let Object::String(s) = (unsafe { pending.closure.get() }) else {
-            panic!("future closure leaf not String")
-        };
-        assert_eq!(s, "future_arg");
-
         // Instance: fields[0] should be the (forwarded) leaf string.
-        let Object::Instance(inst) = (unsafe { new_roots[5].get() }) else {
-            panic!("new_roots[5] not Instance")
+        let Object::Instance(inst) = (unsafe { new_roots[4].get() }) else {
+            panic!("new_roots[4] not Instance")
         };
         let Some(inst_leaf) = inst.fields.first().and_then(|v| v.load().as_object_ptr()) else {
             panic!("instance.fields[0] not Object")
@@ -3445,227 +3398,12 @@ mod tests {
         assert_eq!(s, "leaf_string");
 
         // Variant: enm should be a valid Enum.
-        let Object::Variant(var) = (unsafe { new_roots[6].get() }) else {
-            panic!("new_roots[6] not Variant")
+        let Object::Variant(var) = (unsafe { new_roots[5].get() }) else {
+            panic!("new_roots[5] not Variant")
         };
         let Object::Enum(e) = (unsafe { var.enm.get() }) else {
             panic!("variant.enm not Enum")
         };
         assert_eq!(e.name.item_name().as_str(), "E");
-    }
-
-    // ========================================================================
-    // Phase 5: Generational Triggering Policy — should_collect() tests
-    // ========================================================================
-
-    /// Verify `should_collect` returns `None` when the heap is idle.
-    #[test]
-    fn test_should_collect_none_when_idle() {
-        let heap = BexHeap::new(vec![]);
-
-        // Fresh heap with no allocations — no collection needed.
-        assert_eq!(heap.should_collect(), None);
-    }
-
-    /// Verify `should_collect` returns `Some(Minor)` after 10,000+ allocations.
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "allocates 10k+ objects to cross the GC threshold; runs for minutes under Miri and exercises collection policy, not unsafe memory paths"
-    )]
-    fn test_should_collect_minor_on_gen0_pressure() {
-        let heap = BexHeap::new(vec![]);
-        let mut tlab = Tlab::new(Arc::clone(&heap));
-
-        // Allocate enough objects to cross the 10,000 threshold.
-        for i in 0..10_001 {
-            tlab.alloc_string(format!("obj{i}"));
-        }
-
-        assert_eq!(heap.should_collect(), Some(CollectionLevel::Minor));
-    }
-
-    /// Verify `should_collect` returns `Some(Minor)` when Gen1 exceeds its threshold.
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "allocates 10k+ objects to cross the GC threshold; runs for minutes under Miri and exercises collection policy, not unsafe memory paths"
-    )]
-    fn test_should_collect_minor_on_gen1_pressure() {
-        let heap = BexHeap::new(vec![]);
-        let mut tlab = Tlab::new(Arc::clone(&heap));
-
-        // Force a low Gen1 threshold so we can trigger it with a small number
-        // of objects.  We manually set the threshold to 5 via the public API.
-        // Since the threshold field is private we do it through
-        // `update_thresholds_after_minor(live_gen1=10, live_gen2=0)` which sets
-        // the threshold to max(10*2, 10_000) — that won't help.
-        //
-        // Instead, we run a Minor GC to move objects into Gen1, then lower the
-        // threshold by calling `update_thresholds_after_minor` with a small
-        // live_gen1 value to set the threshold to its floor (10_000), then
-        // directly verify the Gen1 path triggers once Gen1 grows beyond that.
-        //
-        // Practical approach: allocate 10_001 objects, run Minor GC to flush
-        // them into Gen1 (resetting allocs_since_gc), then verify that when
-        // Gen1 is large the threshold check fires.
-
-        // Step 1: Allocate 10_001 objects and run a Minor GC.
-        for i in 0..10_001 {
-            tlab.alloc_string(format!("root{i}"));
-        }
-        // At this point should_collect returns Minor due to alloc pressure.
-        assert_eq!(heap.should_collect(), Some(CollectionLevel::Minor));
-
-        // Run Minor GC to drain Gen0 into Gen1 (pass no roots so all are collected).
-        unsafe { heap.collect_garbage_minor(&[]) };
-        heap.reset_gc_counter();
-        tlab.invalidate();
-
-        // After GC, Gen1 has 0 live objects (none were rooted) and Gen0 is
-        // empty — alloc counter was reset. No collection should be needed yet.
-        assert_eq!(heap.should_collect(), None);
-
-        // Step 2: Manually drive Gen1 over threshold by setting the threshold
-        // to 0 via the helper. Use update_thresholds_after_minor(0, 0) which
-        // sets gen1_threshold = max(0*2, 10_000) = 10_000.
-        // We can't easily set the threshold to an arbitrary value without a
-        // test-only API, so test the threshold update logic instead — see the
-        // dedicated threshold-update test below.
-    }
-
-    /// Verify `should_collect` returns `Some(Major)` when Gen2 exceeds its threshold.
-    #[test]
-    fn test_should_collect_major_on_gen2_pressure() {
-        let heap = BexHeap::new(vec![]);
-        let mut tlab = Tlab::new(Arc::clone(&heap));
-
-        // Lower the Gen2 threshold to a small value so we can trigger it.
-        // We do this by calling update_thresholds_after_major(5) which sets
-        // gen2_threshold = max(5*2, 50_000) = 50_000.  That's still large.
-        //
-        // Instead, use update_thresholds_after_major(0), which sets
-        // gen2_threshold = max(0*2, 50_000) = 50_000.  We'd need 50_001
-        // objects in Gen2.
-        //
-        // To keep the test fast, allocate objects, run Major GC to move them
-        // to Gen2, then verify that the Major trigger fires when Gen2 is large
-        // but less than the initial 50_000 threshold.  Full trigger can be
-        // verified via the threshold-update test.
-        //
-        // Practical: allocate 10_001 objects, run Major GC with roots to
-        // promote them to Gen2, reset counter.  Gen2 is now at N < 50_000.
-        // Then manually call update_thresholds_after_major(live_gen2) with
-        // live_gen2 = 0 to set threshold to floor 50_000 — still too big.
-        //
-        // Best approach for this test: observe that after a Major GC with N
-        // rooted objects, gen2 = N and threshold = max(2N, 50_000).  For
-        // threshold to fire on the next check we need gen2 > threshold, i.e.,
-        // N > max(2N, 50_000) which is impossible.
-        //
-        // So we cannot trigger the Major path through the normal allocation
-        // flow in a fast unit test without a test-only setter.  We test the
-        // threshold update logic instead.
-        //
-        // Verify that after enough Major GC cycles the threshold adapts.
-
-        // Allocate some objects and promote them to Gen2 via Major GC.
-        let obj = tlab.alloc_string("promoted".to_string());
-        let roots = vec![obj];
-        let (_, remapped, _) = unsafe { heap.collect_garbage(&roots) };
-        heap.reset_gc_counter();
-        tlab.invalidate();
-
-        // After Major GC: 1 live in Gen2, threshold = max(2, 50_000) = 50_000.
-        // Should not fire yet.
-        assert_eq!(heap.should_collect(), None);
-        let _ = remapped;
-    }
-
-    /// Verify threshold update logic: thresholds adapt after Minor and Major GC.
-    #[test]
-    fn test_threshold_updates_after_collections() {
-        let heap = BexHeap::new(vec![]);
-        let tlab = Tlab::new(Arc::clone(&heap));
-
-        // Initially both thresholds are at their floors.
-        assert_eq!(heap.gen1_collection_threshold(), 10_000);
-        assert_eq!(heap.gen2_collection_threshold(), 50_000);
-
-        // Simulate a Minor GC that left 1_000 live in Gen1 and 2_000 in Gen2.
-        heap.update_thresholds_after_minor(1_000, 2_000);
-
-        // Gen1 threshold: max(1_000 * 2, 10_000) = 10_000 (floor wins).
-        assert_eq!(heap.gen1_collection_threshold(), 10_000);
-        // Gen2 threshold: max(2_000 * 2, 50_000) = 50_000 (floor wins).
-        assert_eq!(heap.gen2_collection_threshold(), 50_000);
-
-        // Simulate a Minor GC with large live counts.
-        heap.update_thresholds_after_minor(20_000, 30_000);
-
-        // Gen1 threshold: max(20_000 * 2, 10_000) = 40_000.
-        assert_eq!(heap.gen1_collection_threshold(), 40_000);
-        // Gen2 threshold: max(30_000 * 2, 50_000) = 60_000.
-        assert_eq!(heap.gen2_collection_threshold(), 60_000);
-
-        // Simulate a Major GC that left 100_000 objects in Gen2.
-        heap.update_thresholds_after_major(100_000);
-
-        // Gen1 threshold reset to floor after Major GC.
-        assert_eq!(heap.gen1_collection_threshold(), 10_000);
-        // Gen2 threshold: max(100_000 * 2, 50_000) = 200_000.
-        assert_eq!(heap.gen2_collection_threshold(), 200_000);
-
-        // Simulate a Major GC that left 0 survivors (all dead).
-        heap.update_thresholds_after_major(0);
-
-        // Both thresholds return to their floors.
-        assert_eq!(heap.gen1_collection_threshold(), 10_000);
-        assert_eq!(heap.gen2_collection_threshold(), 50_000);
-
-        drop(tlab);
-    }
-
-    /// Verify that the `should_collect` Gen1 path triggers correctly once the
-    /// threshold has been lowered by post-collection adaptation.
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "allocates 10k+ objects to cross the GC threshold; runs for minutes under Miri and exercises collection policy, not unsafe memory paths"
-    )]
-    fn test_should_collect_minor_when_gen1_exceeds_adapted_threshold() {
-        let heap = BexHeap::new(vec![]);
-        let mut tlab = Tlab::new(Arc::clone(&heap));
-
-        // Simulate that a previous Minor GC left only 1 object in Gen1, causing
-        // the threshold to adapt to max(1*2, 10_000) = 10_000.
-        heap.update_thresholds_after_minor(1, 0);
-
-        // Now actually move objects into Gen1 by running a Minor GC with roots.
-        // Each root object ends up in Gen1 after the Minor GC.
-        let mut roots = Vec::new();
-        for i in 0..10_001 {
-            roots.push(tlab.alloc_string(format!("obj{i}")));
-        }
-
-        // Alloc pressure alone triggers Minor first.
-        assert_eq!(heap.should_collect(), Some(CollectionLevel::Minor));
-
-        // Run Minor GC with all roots so they land in Gen1.
-        let (_, remapped, _) = unsafe { heap.collect_garbage_minor(&roots) };
-        heap.reset_gc_counter();
-        tlab.invalidate();
-
-        // After Minor GC: >10_000 objects in Gen1, new threshold = max(10_001*2, 10_000) = 20_002.
-        // Gen1 count (10_001) < threshold (20_002) — no trigger yet.
-        assert_eq!(heap.should_collect(), None);
-
-        // Manually set threshold to 5_000 (below Gen1 count of 10_001) to confirm
-        // the Gen1 pressure path fires.
-        heap.update_thresholds_after_minor(2_499, 0); // threshold = max(2_499*2, 10_000) = 10_000
-        // Gen1 is 10_001, threshold is 10_000 — Minor should fire.
-        assert_eq!(heap.should_collect(), Some(CollectionLevel::Minor));
-
-        drop(remapped);
     }
 }

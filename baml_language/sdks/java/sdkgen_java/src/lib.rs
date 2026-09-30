@@ -8,7 +8,7 @@
 //! file), a per-package `Fns` holder binding free functions to the
 //! `baml_bridge.BamlFfi` runtime entry points, minted sealed-union
 //! types, a root `Baml.java` runtime anchor, and the compiled BAML
-//! bytecode as a base64 classpath resource (`inlinedbaml.b64` — Java
+//! bytecode as a base64 LZ4 classpath resource (`inlinedbaml.b64` — Java
 //! caps a static initializer at 64KB of JVM bytecode, so a
 //! `new byte[]{...}` literal like TS's `_inlinedbaml.ts` cannot work).
 //!
@@ -33,8 +33,8 @@ use std::{
 };
 
 use baml_base::qualified_name::{AI_FUNCTION_SPEC, AI_STREAM_DONE, AI_STREAM_STREAM};
-use baml_codegen_types::{Function, Symbol, SymbolPool, Ty};
-pub use baml_codegen_types::{NamingConvention, OutputType};
+use baml_sdkgen_types::{Function, Symbol, SymbolPool, Ty};
+pub use baml_sdkgen_types::{NamingConvention, OutputType};
 
 use crate::{
     emit::{render_class, render_enum, render_fns_holder, render_union},
@@ -291,10 +291,10 @@ fn to_source_code_internal(
             aliases: &aliases,
             pkg: pkg.clone(),
         };
-        let body = if let Ty::Union(items, _) = resolves_to {
+        let body = if let Ty::Union(items) = resolves_to {
             let arms: Vec<Ty> = items
                 .iter()
-                .filter(|t| !matches!(t, Ty::Null { .. }))
+                .filter(|t| !matches!(t, Ty::Null))
                 .cloned()
                 .collect();
             let (union_binary, arm_entries) = union_registration(&pkg, &ident, &arms, &aliases);
@@ -394,7 +394,7 @@ fn to_source_code_internal(
         ));
     }
     let anchor_body = format!(
-        "/**\n * Runtime anchor for the generated SDK: loading this class registers\n * the type map (BAML FQN \u{2194} generated class, with field declaration\n * order) and initializes the BAML runtime from the embedded bytecode\n * resource (idempotent) \u{2014} the Java analog of Python's root-package\n * import side effect. Every generated binding holder forces this via\n * {{@link #ensure()}}.\n */\npublic final class {anchor_ident} {{\n    private {anchor_ident}() {{}}\n\n    static {{\n{registrations}        try (java.io.InputStream in = {anchor_ident}.class.getResourceAsStream(\"/baml_sdk/inlinedbaml.b64\")) {{\n            if (in == null) {{\n                throw new IllegalStateException(\n                        \"baml_sdk/inlinedbaml.b64 not found on the classpath \u{2014} is the generated resource root registered?\");\n            }}\n            byte[] b64 = in.readAllBytes();\n            byte[] bytecode = java.util.Base64.getMimeDecoder().decode(b64);\n            baml_bridge.BamlFfi.initFromBytecode(bytecode);\n        }} catch (java.io.IOException e) {{\n            throw new java.io.UncheckedIOException(\"failed to read embedded BAML bytecode\", e);\n        }}\n    }}\n\n    /** Forces class initialization (and thus runtime init). No-op afterwards. */\n    public static void ensure() {{}}\n}}\n"
+        "/**\n * Runtime anchor for the generated SDK: loading this class registers\n * the type map (BAML FQN \u{2194} generated class, with field declaration\n * order) and initializes the BAML runtime from the embedded bytecode\n * resource (idempotent) \u{2014} the Java analog of Python's root-package\n * import side effect. Every generated binding holder forces this via\n * {{@link #ensure()}}.\n */\npublic final class {anchor_ident} {{\n    private {anchor_ident}() {{}}\n\n    static {{\n{registrations}        try (java.io.InputStream in = {anchor_ident}.class.getResourceAsStream(\"/baml_sdk/inlinedbaml.b64\")) {{\n            if (in == null) {{\n                throw new IllegalStateException(\n                        \"baml_sdk/inlinedbaml.b64 not found on the classpath \u{2014} is the generated resource root registered?\");\n            }}\n            byte[] bytecode = in.readAllBytes();\n            baml_bridge.BamlFfi.initFromBytecode(bytecode);\n        }} catch (java.io.IOException e) {{\n            throw new java.io.UncheckedIOException(\"failed to read embedded BAML bytecode\", e);\n        }}\n    }}\n\n    /** Forces class initialization (and thus runtime init). No-op afterwards. */\n    public static void ensure() {{}}\n}}\n"
     );
     let anchor_body = if embedded_baml_toml.is_some() {
         anchor_body.replace(
@@ -411,13 +411,15 @@ fn to_source_code_internal(
         with_package(&root, &anchor_body),
     );
 
-    // Compiled BAML bytecode as a base64 text resource. Base64 keeps
-    // the emitter's `HashMap<PathBuf, String>` contract (raw bytecode
-    // is not valid UTF-8) and dodges Java's 64KB static-initializer /
-    // constant-pool limits that rule out a byte-array literal.
+    // Compiled BAML bytecode as an embedded-bytecode text resource (base64
+    // of an LZ4 frame), passed to the bridge as raw bytes and decoded
+    // natively. Text keeps the emitter's
+    // `HashMap<PathBuf, String>` contract (raw bytecode is not valid
+    // UTF-8) and dodges Java's 64KB static-initializer / constant-pool
+    // limits that rule out a byte-array literal.
     out.insert(
         PathBuf::from("inlinedbaml.b64"),
-        base64_encode(baml_bytecode),
+        baml_sdkgen_types::embedded_bytecode_base64(baml_bytecode),
     );
     if let Some(embedded_baml_toml) = embedded_baml_toml {
         out.insert(
@@ -473,22 +475,22 @@ pub fn to_source_code_with_bytecode_and_metadata(
 /// literal value with no escaping.)
 pub(crate) fn signature_token(ty: &Ty, aliases: &AliasTable) -> String {
     match ty {
-        Ty::Int { .. } => "int".to_string(),
-        Ty::Bigint { .. } => "bigint".to_string(),
-        Ty::Float { .. } => "float".to_string(),
-        Ty::String { .. } => "string".to_string(),
-        Ty::Bool { .. } => "bool".to_string(),
-        Ty::Null { .. } => "null".to_string(),
-        Ty::Uint8Array { .. } => "uint8array".to_string(),
-        Ty::Void { .. } => "void".to_string(),
-        Ty::Unknown { .. } => "unknown".to_string(),
+        Ty::Int => "int".to_string(),
+        Ty::Bigint => "bigint".to_string(),
+        Ty::Float => "float".to_string(),
+        Ty::String => "string".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Null => "null".to_string(),
+        Ty::Uint8Array => "uint8array".to_string(),
+        Ty::Void => "void".to_string(),
+        Ty::Unknown => "unknown".to_string(),
         // A generic class carries its concrete type args in its identity token
         // (`Wrapper<int>` vs `Wrapper<string>`) — kept for parity with
         // `registry_arm_expr`, which distinguishes two instantiations so a union /
         // registry key can't silently first-win. (The class *descriptor* path
         // stays bare — see `descriptor_expr`'s `Class` arm — so class decode still
         // resolves by FQN.)
-        Ty::Class(name, args, _) => {
+        Ty::Class(name, args) => {
             let base = baml_fqn(name);
             if args.is_empty() {
                 base
@@ -497,13 +499,13 @@ pub(crate) fn signature_token(ty: &Ty, aliases: &AliasTable) -> String {
                 format!("{base}<{}>", inner.join(","))
             }
         }
-        Ty::Enum(name, _) | Ty::EnumVariant(name, _, _) => baml_fqn(name),
-        Ty::TypeAlias(name, _) => match aliases.get(name) {
+        Ty::Enum(name) | Ty::EnumVariant(name, _) => baml_fqn(name),
+        Ty::TypeAlias(name) => match aliases.get(name) {
             Some((resolved, false)) => signature_token(resolved, aliases),
             _ => baml_fqn(name),
         },
-        Ty::TypeVar(name, _) => format!("tv:{}", name.as_str()),
-        Ty::List(inner, _) => format!("list<{}>", signature_token(inner, aliases)),
+        Ty::TypeVar(name) => format!("tv:{}", name.as_str()),
+        Ty::List(inner) => format!("list<{}>", signature_token(inner, aliases)),
         Ty::Map { key, value, .. } => format!(
             "map<{},{}>",
             signature_token(key, aliases),
@@ -516,16 +518,16 @@ pub(crate) fn signature_token(ty: &Ty, aliases: &AliasTable) -> String {
             baml_base::Literal::String(v) => format!("lit:string:{v}"),
             baml_base::Literal::Bool(v) => format!("lit:bool:{v}"),
         },
-        Ty::Media(kind, _) => format!("media:{}", format!("{kind:?}").to_lowercase()),
+        Ty::Media(kind) => format!("media:{}", format!("{kind:?}").to_lowercase()),
         Ty::Function { .. } => "callable".to_string(),
-        Ty::RustType { .. } => "handle".to_string(),
+        Ty::RustType => "handle".to_string(),
         // Types the Java SDK does not model yet collapse to the opaque
         // `unknown` token (the conservative "?"-token fallback).
         Ty::Interface(..)
-        | Ty::Type { .. }
-        | Ty::Resource { .. }
-        | Ty::PromptAst { .. }
-        | Ty::Never { .. }
+        | Ty::Type
+        | Ty::Resource
+        | Ty::PromptAst
+        | Ty::Never
         | Ty::Future(..) => "unknown".to_string(),
         Ty::Union(..) => "union".to_string(), // banned by validate(); defensive
     }
@@ -534,7 +536,7 @@ pub(crate) fn signature_token(ty: &Ty, aliases: &AliasTable) -> String {
 /// The canonical dotted BAML FQN of a named type (`pkg.namespace….Name`),
 /// shared by [`signature_token`] and the typed decode-descriptor builders in
 /// [`crate::translate_ty`].
-pub(crate) fn baml_fqn(name: &baml_codegen_types::Name) -> String {
+pub(crate) fn baml_fqn(name: &baml_sdkgen_types::Name) -> String {
     let mut s = String::from(name.package().as_str());
     for seg in name.namespace() {
         s.push('.');
@@ -603,39 +605,10 @@ fn with_package(pkg: &PackagePath, body: &str) -> String {
     format!("package {};\n\n{body}", pkg.java_package())
 }
 
-/// Standard-alphabet base64 with padding, dependency-free. The
-/// bytecode payload is written once per fixture at build time, so
-/// encoder throughput is irrelevant.
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use baml_base::Name as BaseName;
-    use baml_codegen_types::{
+    use baml_sdkgen_types::{
         Class, ClassProperty, Enum, EnumVariant, Function, FunctionArgument, Name, Origin, Symbol,
         SymbolPool, Ty, TypeAlias,
     };
@@ -657,19 +630,15 @@ mod tests {
         }
     }
 
-    // Leaf-type constructors: the codegen `Ty` variants now carry a
-    // `TyAttr`, so these keep the fixture builders readable.
-    fn a() -> baml_base::TyAttr {
-        baml_base::TyAttr::EMPTY
-    }
+    // Type constructors that keep the fixture builders readable.
     fn t_int() -> Ty {
-        Ty::Int { attr: a() }
+        Ty::Int
     }
     fn t_float() -> Ty {
-        Ty::Float { attr: a() }
+        Ty::Float
     }
     fn t_string() -> Ty {
-        Ty::String { attr: a() }
+        Ty::String
     }
     fn nullary_fn(fn_name: &str, span: u32) -> Function {
         Function {
@@ -684,29 +653,29 @@ mod tests {
         }
     }
     fn t_uint8array() -> Ty {
-        Ty::Uint8Array { attr: a() }
+        Ty::Uint8Array
     }
     fn t_typevar(n: &str) -> Ty {
-        Ty::TypeVar(baml_codegen_types::ParamTy::new(0, BaseName::new(n)), a())
+        Ty::TypeVar(baml_sdkgen_types::ParamTy::new(0, BaseName::new(n)))
     }
     fn t_union(items: Vec<Ty>) -> Ty {
-        Ty::Union(items.into(), a())
+        Ty::Union(items.into())
     }
     fn t_list(inner: Ty) -> Ty {
-        Ty::List(Box::new(inner), a())
+        Ty::List(Box::new(inner))
     }
     fn t_alias(n: Name) -> Ty {
-        Ty::TypeAlias(n, a())
+        Ty::TypeAlias(n)
     }
     fn t_class(n: Name) -> Ty {
-        Ty::Class(n, Box::new([]), a())
+        Ty::Class(n, Box::new([]))
     }
     fn t_null() -> Ty {
-        Ty::Null { attr: a() }
+        Ty::Null
     }
     /// `T?` — a nullable BAML type (`T | null`).
     fn t_opt(inner: Ty) -> Ty {
-        Ty::Union(Box::new([inner, t_null()]), a())
+        Ty::Union(Box::new([inner, t_null()]))
     }
 
     fn class_sym_with_props(
@@ -1176,7 +1145,7 @@ mod tests {
 
     #[test]
     fn optional_args_emit_configurator_overload_and_opts_class() {
-        use baml_codegen_types::{DefaultLiteral, FunctionArgumentDefault};
+        use baml_sdkgen_types::{DefaultLiteral, FunctionArgumentDefault};
         // (required int x, optional int opt1 default, optional string opt2 default)
         let mut pool = SymbolPool::new();
         let f = Function {
@@ -1271,9 +1240,7 @@ mod tests {
 
     #[test]
     fn stream_options_include_client_and_preserve_event_callback_types() {
-        use baml_codegen_types::{
-            CallableParam, CodegenFunctionParamMode, FunctionArgumentDefault,
-        };
+        use baml_sdkgen_types::{CallableParam, CodegenFunctionParamMode, FunctionArgumentDefault};
 
         let mut pool = SymbolPool::new();
         let event = name("vendor", &["ai", "events"], "Event");
@@ -1284,9 +1251,8 @@ mod tests {
                 ty: t_class(event),
                 mode: CodegenFunctionParamMode::Required,
             }]),
-            ret: Box::new(Ty::Void { attr: a() }),
-            throws: Box::new(Ty::Never { attr: a() }),
-            attr: a(),
+            ret: Box::new(Ty::Void),
+            throws: Box::new(Ty::Never),
         };
         pool.insert(
             name("user", &[], "probe@stream"),
@@ -1319,7 +1285,7 @@ mod tests {
 
     #[test]
     fn optional_args_instance_method_puts_configurator_last() {
-        use baml_codegen_types::{DefaultLiteral, FunctionArgumentDefault};
+        use baml_sdkgen_types::{DefaultLiteral, FunctionArgumentDefault};
         let mut pool = SymbolPool::new();
         let n = name("user", &[], "OptBox");
         let probe = Function {
@@ -1372,7 +1338,7 @@ mod tests {
 
     #[test]
     fn optional_args_callable_mints_functional_interface_and_types_param() {
-        use baml_codegen_types::{CallableParam, CodegenFunctionParamMode};
+        use baml_sdkgen_types::{CallableParam, CodegenFunctionParamMode};
         // A free function taking a callable whose own type carries optionals
         // (`(x: int, y?: int, z?: int) -> int`): the param types as the minted
         // interface, and the interface file is emitted beside `Fns`.
@@ -1396,8 +1362,7 @@ mod tests {
                 },
             ]),
             ret: Box::new(t_int()),
-            throws: Box::new(Ty::Never { attr: a() }),
-            attr: a(),
+            throws: Box::new(Ty::Never),
         };
         let f = Function {
             name: BaseName::new("call_cb"),
@@ -1477,7 +1442,7 @@ mod tests {
         expected = "Java generation does not yet support optional parameters on returned callable"
     )]
     fn optional_returned_callable_fails_generation_instead_of_emitting_an_unsafe_cast() {
-        use baml_codegen_types::{CallableParam, CodegenFunctionParamMode};
+        use baml_sdkgen_types::{CallableParam, CodegenFunctionParamMode};
 
         let returned = Ty::Function {
             params: Box::new([CallableParam {
@@ -1486,8 +1451,7 @@ mod tests {
                 mode: CodegenFunctionParamMode::Optional,
             }]),
             ret: Box::new(t_int()),
-            throws: Box::new(Ty::Never { attr: a() }),
-            attr: a(),
+            throws: Box::new(Ty::Never),
         };
         let mut pool = SymbolPool::new();
         pool.insert(
@@ -1508,7 +1472,7 @@ mod tests {
 
     #[test]
     fn unnamed_returned_callable_uses_its_canonical_positional_wire_name() {
-        use baml_codegen_types::{CallableParam, CodegenFunctionParamMode};
+        use baml_sdkgen_types::{CallableParam, CodegenFunctionParamMode};
 
         let returned = Ty::Function {
             params: Box::new([CallableParam {
@@ -1517,8 +1481,7 @@ mod tests {
                 mode: CodegenFunctionParamMode::Required,
             }]),
             ret: Box::new(t_int()),
-            throws: Box::new(Ty::Never { attr: a() }),
-            attr: a(),
+            throws: Box::new(Ty::Never),
         };
         let mut pool = SymbolPool::new();
         pool.insert(
@@ -1638,16 +1601,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_class_emits_beside_base_with_suffix() {
-        let mut pool = SymbolPool::new();
-        let n = name("user", &["lorem"], "Resume$stream");
-        pool.insert(n.clone(), class_sym(&n, &[], 0));
-        let out = emit_sdk(&pool);
-        let file = &out[&PathBuf::from("lorem/Resume$stream.java")];
-        assert!(file.contains("public final class Resume$stream {"));
-    }
-
-    #[test]
     fn keyword_namespace_routes_to_escaped_package_dir() {
         let mut pool = SymbolPool::new();
         let n = name("user", &["void"], "VoidProbe");
@@ -1674,10 +1627,10 @@ mod tests {
         pool.insert(resp.clone(), class_sym(&resp, &[], 5));
         let out = emit_sdk(&pool);
         assert!(!out.contains_key(&PathBuf::from("baml/media/Image.java")));
-        assert!(!out.contains_key(&PathBuf::from("vendor/ai/stream/Stream.java")));
-        assert!(!out.contains_key(&PathBuf::from("vendor/ai/stream/Done.java")));
-        assert!(!out.contains_key(&PathBuf::from("vendor/ai/Prompt.java")));
-        assert!(!out.contains_key(&PathBuf::from("vendor/ai/FunctionSpec.java")));
+        assert!(!out.contains_key(&PathBuf::from("ai/stream/Stream.java")));
+        assert!(!out.contains_key(&PathBuf::from("ai/stream/Done.java")));
+        assert!(!out.contains_key(&PathBuf::from("ai/Prompt.java")));
+        assert!(!out.contains_key(&PathBuf::from("ai/FunctionSpec.java")));
         assert!(out.contains_key(&PathBuf::from("baml/http/Response.java")));
     }
 
@@ -1688,15 +1641,10 @@ mod tests {
             &[0, 1, 2, 253, 254, 255],
             NamingConvention::PreserveCase,
         );
-        assert_eq!(out[&PathBuf::from("inlinedbaml.b64")], "AAEC/f7/");
-    }
-
-    #[test]
-    fn base64_padding() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(
+            out[&PathBuf::from("inlinedbaml.b64")],
+            baml_sdkgen_types::embedded_bytecode_base64(&[0, 1, 2, 253, 254, 255])
+        );
     }
 
     // -- explicit generics: emitter surface ----------------------------------
@@ -1794,7 +1742,7 @@ mod tests {
 
     #[test]
     fn generic_optional_function_emits_full_overload_matrix() {
-        use baml_codegen_types::{DefaultLiteral, FunctionArgumentDefault};
+        use baml_sdkgen_types::{DefaultLiteral, FunctionArgumentDefault};
         // A generic (`<T>`) function with one optional arg → the worst-case
         // matrix: {opts?}×{types?}×{ctx?} = 8 pairs = 16 entry-point methods.
         let mut pool = SymbolPool::new();
@@ -2257,7 +2205,7 @@ mod tests {
 
     #[test]
     fn nullable_optional_setter_param_is_annotated() {
-        use baml_codegen_types::{DefaultLiteral, FunctionArgumentDefault};
+        use baml_sdkgen_types::{DefaultLiteral, FunctionArgumentDefault};
         // A nullable optional arg (`hint?: string?`) → its `$Opts` setter param
         // is `@Nullable`; a non-null optional's setter is not.
         let mut pool = SymbolPool::new();

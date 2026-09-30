@@ -109,7 +109,7 @@ unsafe impl salsa::Update for EvaluatedCalls<'_> {
 /// [`crate::infer::infer_body`]: `BodyOwnerId` is an ordinary enum, not a
 /// salsa struct, so it cannot key a tracked function itself.
 pub fn body_evaluated_calls<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     owner: BodyOwnerId<'db>,
 ) -> &'db [EvaluatedCall<'db>] {
     match owner {
@@ -122,7 +122,7 @@ pub fn body_evaluated_calls<'db>(
 
 #[salsa::tracked(returns(ref))]
 fn function_evaluated_calls<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     function: FunctionLoc<'db>,
 ) -> EvaluatedCalls<'db> {
     evaluated_calls_impl(db, BodyOwnerId::Function(function))
@@ -130,17 +130,17 @@ fn function_evaluated_calls<'db>(
 
 #[salsa::tracked(returns(ref))]
 fn let_evaluated_calls<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     let_binding: LetLoc<'db>,
 ) -> EvaluatedCalls<'db> {
     evaluated_calls_impl(db, BodyOwnerId::Let(let_binding))
 }
 
 fn evaluated_calls_impl<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     owner: BodyOwnerId<'db>,
 ) -> EvaluatedCalls<'db> {
-    let owner_body = baml_compiler2_ppir::body(db, owner);
+    let owner_body = baml_compiler2_hir::body::body(db, owner);
     let body: &ExprBody = match &owner_body {
         OwnerBody::Function(function) => match function.as_ref() {
             FunctionBody::Expr(body) => body,
@@ -171,17 +171,17 @@ fn evaluated_calls_impl<'db>(
         for node in body.reachable_excluding_lambdas(root) {
             let BodyNode::Expr(id) = node else { continue };
             // A `spawn { … }` body is a launch, not a stored thunk, so it runs
-            // during `$init` too (module docs, "Closures"). It is LOWERED as a
-            // lambda (`lower_spawn_expr`), which is exactly what the
-            // lambda-excluding walk stops at — so re-seed it here, the same way
-            // an IIFE is re-seeded below. Without this, io inside a spawn in a
-            // top-level initializer passes the check and dies at runtime as an
-            // opaque `InitFailed`, which is the failure this module exists to
-            // replace.
-            if let Expr::Spawn {
-                body: spawn_body, ..
-            } = &body.exprs[id]
-                && let Expr::Lambda(lambda) = &body.exprs[*spawn_body]
+            // during `$init` too (module docs, "Closures"). The sugar lowers it
+            // to a lambda marked `LambdaKind::Spawn` and hands it to
+            // `Plan.new`, so the lambda-excluding walk stops at it — re-seed it
+            // here, the same way an IIFE is re-seeded below. Without this, io
+            // inside a spawn in a top-level initializer passes the check and
+            // dies at runtime as an opaque `InitFailed`, which is the failure
+            // this module exists to replace. A plan built by hand is an
+            // ordinary stored closure and gets the ordinary treatment: nothing
+            // runs until it is launched.
+            if let Expr::Lambda(lambda) = &body.exprs[id]
+                && lambda.kind == baml_compiler2_ast::LambdaKind::Spawn
                 && let Some(lambda_body) = lambda.body
                 && seen_lambda_bodies.insert(lambda_body)
             {
@@ -232,46 +232,75 @@ fn evaluated_calls_impl<'db>(
 fn resolved_function<'db>(
     resolution: &crate::infer::MemberResolution<'db>,
 ) -> Option<FunctionLoc<'db>> {
-    use crate::infer::MemberResolution;
-    match resolution {
+    use baml_compiler2_hir::loc::DeclRef;
+
+    use crate::infer::{MemberResolution, MethodCallee};
+    let func = match resolution {
         MemberResolution::Free { func }
-        | MemberResolution::BoundMethod { func, .. }
-        | MemberResolution::UnboundMethod { func, .. }
-        | MemberResolution::InterfaceConcreteMethod { func, .. } => Some(*func),
-        MemberResolution::Field { .. }
+        | MemberResolution::Method {
+            callee: MethodCallee::Inherent(func) | MethodCallee::Concrete { func, .. },
+            ..
+        } => *func,
+        MemberResolution::Method {
+            callee: MethodCallee::Virtual { .. },
+            ..
+        }
+        | MemberResolution::Field { .. }
         | MemberResolution::Variant { .. }
-        | MemberResolution::InterfaceVirtualMethod { .. }
-        | MemberResolution::InterfaceVirtualField { .. } => None,
-        // BEP-066 source-less (externally minted) members: no FunctionLoc to
-        // walk, so the analysis skips them — same deliberate under-
-        // approximation as virtual dispatch (module docs).
-        MemberResolution::External(_)
-        | MemberResolution::ExternalField { .. }
-        | MemberResolution::ExternalVariant { .. }
-        | MemberResolution::ExternalInterfaceVirtualField { .. } => None,
+        | MemberResolution::InterfaceVirtualField { .. } => return None,
+    };
+    match func {
+        DeclRef::Source(func) => Some(func),
+        // A callee of a package served from its interface: no body to walk,
+        // so the analysis skips it — the same deliberate under-approximation
+        // as virtual dispatch (module docs).
+        DeclRef::External(_) => None,
     }
 }
 
 /// The fully-qualified name of `func` when it is an io sysop
 /// (`$rust_io_function`), else `None`.
-fn io_sysop_of<'db>(db: &'db dyn baml_compiler2_ppir::Db, func: FunctionLoc<'db>) -> Option<Name> {
+fn io_sysop_of<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    func: FunctionLoc<'db>,
+) -> Option<Name> {
     let body = baml_compiler2_hir::body::function_body(db, func);
     match body.as_ref() {
-        FunctionBody::Builtin(BuiltinKind::Io) => Some(qualified_name(db, func)),
+        FunctionBody::Builtin(BuiltinKind::Io) => Some(qualified_name(db, viewer, func)),
         _ => None,
     }
 }
 
-/// `func`'s user-facing dotted name (`baml.env.get`), rendered through the
-/// type system's own qualifier so the package half follows the one rule
-/// (dependency packages qualify; the user's own package never does).
-fn qualified_name<'db>(db: &'db dyn baml_compiler2_ppir::Db, func: FunctionLoc<'db>) -> Name {
-    let data = baml_compiler2_ppir::item_data::function_data(db, func);
+/// `func`'s user-facing dotted name (`baml.env.get`) as seen from `viewer`:
+/// a dependency package qualifies by its spelling, the viewer's own package
+/// never does.
+fn qualified_name<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    func: FunctionLoc<'db>,
+) -> Name {
+    let data = baml_compiler2_hir::item_data::function_data(db, func);
     let pkg = baml_compiler2_hir::file_package::file_package(db, func.file(db));
-    Name::new(
-        baml_type::QualifiedTypeName::new(pkg.package, pkg.namespace_path, data.name.clone())
-            .render_user_facing(),
-    )
+    let mut parts: Vec<&str> = Vec::new();
+    let spelled;
+    if pkg.root != viewer {
+        // The viewer's own edge name for the package, not its canonical
+        // spelling: a dependency reached under an alias is named in source by
+        // that alias, and a diagnostic that says otherwise names something the
+        // reader cannot find in their own file.
+        let viewpoint = crate::render::Viewpoint::user_facing(db, viewer);
+        spelled = match viewpoint.package_prefix(pkg.root) {
+            Some(prefix) => Name::new(prefix),
+            None => baml_compiler2_hir::package::spelling(db)
+                .of(pkg.root)
+                .clone(),
+        };
+        parts.push(spelled.as_str());
+    }
+    parts.extend(pkg.namespace_path.iter().map(Name::as_str));
+    parts.push(data.name.as_str());
+    Name::new(parts.join("."))
 }
 
 /// Whether `func` transitively reaches an io sysop, and which one.
@@ -282,7 +311,8 @@ fn qualified_name<'db>(db: &'db dyn baml_compiler2_ppir::Db, func: FunctionLoc<'
 /// sibling hops): a body already proven clean cannot become tainted, and a
 /// body already on the path is a cycle, which adds nothing either way.
 fn io_sysop_reached_from<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
     func: FunctionLoc<'db>,
     visited: &mut HashSet<FunctionLoc<'db>>,
 ) -> Option<Name> {
@@ -291,7 +321,7 @@ fn io_sysop_reached_from<'db>(
         if !visited.insert(func) {
             continue;
         }
-        if let Some(sysop) = io_sysop_of(db, func) {
+        if let Some(sysop) = io_sysop_of(db, viewer, func) {
             return Some(sysop);
         }
         // Reversed so the first-written callee is explored first — the search
@@ -312,10 +342,11 @@ fn io_sysop_reached_from<'db>(
 /// Returns at most one diagnostic — the first offending hop in the
 /// initializer — because every later one has the same cause and the same fix.
 pub fn let_init_io_diagnostics<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     let_loc: LetLoc<'db>,
 ) -> Vec<(TextRange, TirTypeError)> {
     let calls = body_evaluated_calls(db, BodyOwnerId::Let(let_loc));
+    let viewer = baml_compiler2_hir::file_package::file_package(db, let_loc.file(db)).root;
     if calls.is_empty() {
         return Vec::new();
     }
@@ -324,18 +355,19 @@ pub fn let_init_io_diagnostics<'db>(
     // is walked once, and the FIRST hop that reaches io is the one reported.
     let mut visited: HashSet<FunctionLoc<'db>> = HashSet::new();
     for (callee_expr, func) in calls {
-        let direct = io_sysop_of(db, *func);
+        let direct = io_sysop_of(db, viewer, *func);
         let sysop = match &direct {
             Some(sysop) => Some(sysop.clone()),
-            None => io_sysop_reached_from(db, *func, &mut visited),
+            None => io_sysop_reached_from(db, viewer, *func, &mut visited),
         };
         let Some(sysop) = sysop else { continue };
 
-        let Some(source_map) = baml_compiler2_ppir::body_source_map(db, BodyOwnerId::Let(let_loc))
+        let Some(source_map) =
+            baml_compiler2_hir::body::body_source_map(db, BodyOwnerId::Let(let_loc))
         else {
             return Vec::new();
         };
-        let data = baml_compiler2_ppir::item_data::let_data(db, let_loc);
+        let data = baml_compiler2_hir::item_data::let_data(db, let_loc);
         return vec![(
             source_map.expr_span(*callee_expr),
             TirTypeError::InitIoNotAllowed {
@@ -343,7 +375,7 @@ pub fn let_init_io_diagnostics<'db>(
                 is_client: matches!(data.origin, baml_compiler2_ast::ast::LetOrigin::Client),
                 sysop,
                 // A direct call needs no "via": the hop IS the sysop.
-                via: direct.is_none().then(|| qualified_name(db, *func)),
+                via: direct.is_none().then(|| qualified_name(db, viewer, *func)),
             },
         )];
     }

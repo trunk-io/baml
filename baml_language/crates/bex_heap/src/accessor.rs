@@ -450,6 +450,7 @@ fn owned_inner(
             BexExternalValue::Int(i) => Ok(BexExternalValue::Int(*i)),
             BexExternalValue::Bigint(b) => Ok(BexExternalValue::Bigint(b.clone())),
             BexExternalValue::Float(f) => Ok(BexExternalValue::Float(*f)),
+            BexExternalValue::JsNumber(f) => Ok(BexExternalValue::JsNumber(*f)),
             BexExternalValue::Bool(b) => Ok(BexExternalValue::Bool(*b)),
             BexExternalValue::String(s) => Ok(BexExternalValue::String(s.clone())),
             BexExternalValue::Array {
@@ -577,15 +578,12 @@ fn convert_object(
         Object::Enum(..) => unconvertible("enum"),
         Object::TypeAlias(..) => unconvertible("type alias"),
         Object::Future(..) => unconvertible("future"),
-        Object::UnscheduledFuture(..) => unconvertible("unscheduled_future"),
 
         Object::String(s) => Ok(BexExternalValue::String(s.clone())),
         // Deep-copy path for trace payloads: no declared type is available here,
         // so placeholder types with default attr are used.
         Object::Array(array) => Ok(BexExternalValue::Array {
-            element_type: RuntimeTy::Unknown {
-                attr: baml_type::TyAttr::default(),
-            },
+            element_type: RuntimeTy::Unknown,
             items: array
                 .to_vec()
                 .into_iter()
@@ -593,12 +591,8 @@ fn convert_object(
                 .collect::<Result<_, _>>()?,
         }),
         Object::Map(map) => Ok(BexExternalValue::Map {
-            key_type: RuntimeTy::String {
-                attr: baml_type::TyAttr::default(),
-            },
-            value_type: RuntimeTy::Unknown {
-                attr: baml_type::TyAttr::default(),
-            },
+            key_type: RuntimeTy::String,
+            value_type: RuntimeTy::Unknown,
             entries: map
                 .to_index_map()
                 .into_iter()
@@ -676,7 +670,6 @@ fn convert_object(
                 variant_name: variant_def.name.clone(),
             })
         }
-        Object::Collector(c) => Ok(BexExternalValue::Adt(BexExternalAdt::Collector(c.clone()))),
         // Only the described type crosses the boundary (BEP-066 H-4), and it
         // crosses onto the sys-op lane's head: identity plus the declaration's
         // own name, with no pointer to go stale if the collector runs while the

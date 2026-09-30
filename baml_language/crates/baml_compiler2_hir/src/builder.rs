@@ -8,12 +8,7 @@
 
 use std::sync::Arc;
 
-/// Known type-level attribute names (not field attrs, which are
-/// `disambiguate::FIELD_ATTR_NAMES`'s business). Public so completion can
-/// enumerate exactly what this validation accepts.
-pub const KNOWN_TYPE_ATTRS: &[&str] = &["stream.done", "stream.must_exist", "stream.with_state"];
-
-use baml_base::{Name, SourceFile};
+use baml_base::{AttributePosition, Name, SourceFile};
 use baml_compiler_diagnostics::{diagnostic::DiagnosticId, runtime_type::SerializedKeyContainer};
 use baml_compiler2_ast::{self as ast, LoweringDiagnostic};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -25,10 +20,7 @@ use crate::{
     file_package::file_package,
     ids::{FunctionMarker, LocalItemId},
     item_tree::{ImplBlock, ImplSubject, InterfaceFieldLink},
-    loc::{
-        ClassLoc, ClientLoc, EnumLoc, FunctionLoc, InterfaceLoc, LetLoc, RetryPolicyLoc,
-        TemplateStringLoc, TypeAliasLoc,
-    },
+    loc::{ClassLoc, EnumLoc, FunctionLoc, InterfaceLoc, LetLoc, TypeAliasLoc},
     scope::{FileScopeId, ItemScopeOwner, Scope, ScopeId, ScopeKind},
     semantic_index::{
         BindingId, DefinitionSite, ExprMetadataKey, ExprMetadataScope, FileSemanticIndex,
@@ -157,9 +149,11 @@ impl<'db> SemanticIndexBuilder<'db> {
 
         // Build scope chain: Project → Package → Namespace* → File
         self.push_scope(ScopeKind::Project, None, file_range);
+        // A structural scope: its name is never consulted for resolution; it
+        // carries the package's own name, when it declares one, for dumps.
         self.push_scope(
             ScopeKind::Package,
-            Some(pkg_info.package.clone()),
+            pkg_info.root.self_name(self.db),
             file_range,
         );
         for ns in &pkg_info.namespace_path {
@@ -334,6 +328,19 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.emit_duplicate_diagnostics(seen);
     }
 
+    /// Reject a value binding or body type binding that takes one of
+    /// [`DESUGAR_PATH_ROOTS`]: the compiler emits paths rooted at those names,
+    /// and a binding shadows a package root where an item does not, so it
+    /// would break every desugared path in scope.
+    fn reject_reserved_binding_name(&mut self, name: &Name, span: TextRange) {
+        if baml_base::lang::is_reserved_binding_name(name.as_str()) {
+            self.diagnostics.push(Hir2Diagnostic::ReservedBindingName {
+                name: name.clone(),
+                span,
+            });
+        }
+    }
+
     /// Emit `DuplicateDefinition` diagnostics for any name with more than one site.
     fn emit_duplicate_diagnostics(&mut self, seen: FxHashMap<Name, Vec<MemberSite>>) {
         let scope = self.current_scope_path();
@@ -345,19 +352,6 @@ impl<'db> SemanticIndexBuilder<'db> {
                     sites,
                 });
             }
-        }
-    }
-
-    fn walk_type_operands(
-        &mut self,
-        ty: &ast::TypeExpr,
-        body: &ast::ExprBody,
-        source_map: &ast::AstSourceMap,
-    ) {
-        let mut operands = Vec::new();
-        ty.unreflect_operands(&mut operands);
-        for operand in operands {
-            self.walk_expr(operand, body, source_map, true);
         }
     }
 
@@ -446,8 +440,21 @@ impl<'db> SemanticIndexBuilder<'db> {
     ) {
         match &body.stmts[stmt_id] {
             ast::Stmt::Expr(expr) => self.walk_expr(*expr, body, source_map, true),
-            ast::Stmt::TypeBinding { value, .. } => {
-                self.walk_type_operands(value, body, source_map);
+            ast::Stmt::TypeBinding { name, value } => {
+                // A body type binding shadows a package root in value paths
+                // just as a value binding does.
+                if let Some(span) = source_map.type_binding_name_span(stmt_id) {
+                    self.reject_reserved_binding_name(name, span);
+                }
+                match value {
+                    // The runtime operand is an ordinary expression in the
+                    // enclosing scope (`T` is not yet in scope while its own
+                    // operand runs).
+                    ast::TypeBindingValue::Runtime(operand) => {
+                        self.walk_expr(*operand, body, source_map, true);
+                    }
+                    ast::TypeBindingValue::Static(_) => {}
+                }
             }
             ast::Stmt::Let {
                 pattern,
@@ -623,26 +630,18 @@ impl<'db> SemanticIndexBuilder<'db> {
                 }
             }
             ast::Expr::Match {
-                scrutinee,
-                scrutinee_type,
-                arms,
+                scrutinee, arms, ..
             } => {
                 self.walk_expr(*scrutinee, body, source_map, true);
-                if let Some(type_id) = scrutinee_type {
-                    self.walk_type_operands(&body.type_annotations[*type_id], body, source_map);
-                }
                 for &arm_id in arms {
                     self.walk_match_arm(arm_id, body, source_map);
                 }
             }
-            ast::Expr::Is { scrutinee, pattern } => {
+            ast::Expr::Is { scrutinee, .. } => {
                 // `<expr> is <pattern>` is a one-shot pattern test that yields
                 // `bool`. Pattern bindings do NOT escape into the surrounding
-                // scope (use `match` / `let` if you need that). Runtime
-                // `unreflect(expr)` operands are ordinary expressions in the
-                // enclosing scope and therefore need the normal HIR path walk.
+                // scope (use `match` / `let` if you need that).
                 self.walk_expr(*scrutinee, body, source_map, true);
-                self.walk_pattern_expressions(*pattern, body, source_map);
             }
             ast::Expr::Catch { base, clauses } => {
                 self.walk_expr(*base, body, source_map, true);
@@ -662,19 +661,6 @@ impl<'db> SemanticIndexBuilder<'db> {
                 if let Some(value) = value {
                     self.walk_expr(*value, body, source_map, true);
                 }
-            }
-            ast::Expr::Spawn {
-                name,
-                with_exprs,
-                body: spawn_body,
-            } => {
-                if let Some(name) = name {
-                    self.walk_expr(*name, body, source_map, true);
-                }
-                for with_expr in with_exprs {
-                    self.walk_expr(*with_expr, body, source_map, true);
-                }
-                self.walk_expr(*spawn_body, body, source_map, true);
             }
             ast::Expr::Await { future } => {
                 self.walk_expr(*future, body, source_map, true);
@@ -708,34 +694,15 @@ impl<'db> SemanticIndexBuilder<'db> {
             ast::Expr::Unary { expr, .. } | ast::Expr::OptionalChain { expr } => {
                 self.walk_expr(*expr, body, source_map, true);
             }
-            ast::Expr::Call {
-                callee,
-                type_args,
-                args,
-            } => {
-                self.walk_expr(*callee, body, source_map, true);
-                for type_arg in type_args {
-                    self.walk_type_operands(type_arg, body, source_map);
-                }
-                for arg in args {
-                    self.walk_expr(arg.expr, body, source_map, true);
-                }
-            }
-            ast::Expr::OptionalCall { callee, args } => {
+            ast::Expr::Call { callee, args, .. } | ast::Expr::OptionalCall { callee, args } => {
                 self.walk_expr(*callee, body, source_map, true);
                 for arg in args {
                     self.walk_expr(arg.expr, body, source_map, true);
                 }
             }
             ast::Expr::Object {
-                type_args,
-                fields,
-                spreads,
-                ..
+                fields, spreads, ..
             } => {
-                for type_arg in type_args {
-                    self.walk_type_operands(type_arg, body, source_map);
-                }
                 for field in fields {
                     self.walk_expr(field.value, body, source_map, true);
                 }
@@ -754,12 +721,10 @@ impl<'db> SemanticIndexBuilder<'db> {
                     self.walk_expr(entry.value, body, source_map, true);
                 }
             }
-            ast::Expr::MemberAccess { base, .. } | ast::Expr::OptionalMemberAccess { base, .. } => {
+            ast::Expr::MemberAccess { base, .. }
+            | ast::Expr::OptionalMemberAccess { base, .. }
+            | ast::Expr::Upcast { base, .. } => {
                 self.walk_expr(*base, body, source_map, true);
-            }
-            ast::Expr::Upcast { base, target } => {
-                self.walk_expr(*base, body, source_map, true);
-                self.walk_type_operands(target, body, source_map);
             }
             ast::Expr::Index { base, index } | ast::Expr::OptionalIndex { base, index } => {
                 self.walk_expr(*base, body, source_map, true);
@@ -773,27 +738,19 @@ impl<'db> SemanticIndexBuilder<'db> {
                     self.resolve_path_expr(expr_id, root, use_scope, use_offset);
                 }
             }
-            ast::Expr::GenericApply { base, type_args } => {
+            ast::Expr::GenericApply { base, .. } => {
                 // `foo<int>` references the base callable; walk it so the path
                 // root is recorded for name resolution. Type args are types,
                 // not value references, so they need no walking here.
                 self.walk_expr(*base, body, source_map, true);
-                for type_arg in type_args {
-                    self.walk_type_operands(type_arg, body, source_map);
-                }
             }
             ast::Expr::Literal(_)
             | ast::Expr::ByteStringLiteral(_)
             | ast::Expr::Null
             | ast::Expr::Block { .. }
             | ast::Expr::Lambda(_)
+            | ast::Expr::QualifiedPath { .. }
             | ast::Expr::Missing => {}
-            ast::Expr::QualifiedPath {
-                qself, interface, ..
-            } => {
-                self.walk_type_operands(qself, body, source_map);
-                self.walk_type_operands(interface, body, source_map);
-            }
         }
     }
 
@@ -886,13 +843,6 @@ impl<'db> SemanticIndexBuilder<'db> {
         source_map: &ast::AstSourceMap,
         visible_from: TextSize,
     ) {
-        // Evaluate expression-bearing pattern atoms (currently
-        // `unreflect(expr)`) in the scope surrounding the bindings. This runs
-        // before any names from this pattern are installed, so a pattern
-        // cannot accidentally refer to a binding it is in the act of
-        // declaring.
-        self.walk_pattern_expressions(pat_id, body, source_map);
-
         // Walk the pattern structurally. `collect_pattern_names` returns the
         // set of names introduced and emits diagnostics for duplicate names
         // and Or-alternative mismatches as it goes.
@@ -908,6 +858,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         }
 
         for (name, (name_range, bind_pattern)) in names.names {
+            self.reject_reserved_binding_name(&name, name_range);
             self.scope_bindings[scope_id.index() as usize]
                 .bindings
                 .push(LocalBinding {
@@ -918,66 +869,6 @@ impl<'db> SemanticIndexBuilder<'db> {
                     name_range,
                     visible_from,
                 });
-        }
-    }
-
-    fn walk_pattern_expressions(
-        &mut self,
-        pat_id: ast::PatId,
-        body: &ast::ExprBody,
-        source_map: &ast::AstSourceMap,
-    ) {
-        match &body.patterns[pat_id] {
-            ast::Pattern::Type(ty) => self.walk_type_operands(ty, body, source_map),
-            ast::Pattern::Unreflect(operand) => {
-                self.walk_expr(*operand, body, source_map, true);
-            }
-            ast::Pattern::Bind { subpat, .. } => {
-                if let Some(subpat) = subpat {
-                    self.walk_pattern_expressions(*subpat, body, source_map);
-                }
-            }
-            ast::Pattern::Class {
-                generic_args,
-                associated_type_bindings,
-                fields,
-                ..
-            } => {
-                for ty in generic_args {
-                    self.walk_type_operands(ty, body, source_map);
-                }
-                for binding in associated_type_bindings {
-                    self.walk_type_operands(&binding.ty, body, source_map);
-                }
-                for field in fields {
-                    self.walk_pattern_expressions(field.pat, body, source_map);
-                }
-            }
-            ast::Pattern::Array {
-                prefix,
-                rest,
-                suffix,
-                ascription,
-            } => {
-                if let Some(ty) = ascription {
-                    self.walk_type_operands(ty, body, source_map);
-                }
-                for pattern in prefix {
-                    self.walk_pattern_expressions(*pattern, body, source_map);
-                }
-                if let Some(pattern) = rest.as_ref().and_then(|rest| rest.pat) {
-                    self.walk_pattern_expressions(pattern, body, source_map);
-                }
-                for pattern in suffix {
-                    self.walk_pattern_expressions(*pattern, body, source_map);
-                }
-            }
-            ast::Pattern::Or(patterns) => {
-                for pattern in patterns {
-                    self.walk_pattern_expressions(*pattern, body, source_map);
-                }
-            }
-            ast::Pattern::Wildcard => {}
         }
     }
 
@@ -1000,9 +891,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         diagnostics: &mut Vec<Hir2Diagnostic>,
     ) -> PatternNames {
         match &patterns[pat_id] {
-            ast::Pattern::Wildcard | ast::Pattern::Type(_) | ast::Pattern::Unreflect(_) => {
-                PatternNames::default()
-            }
+            ast::Pattern::Wildcard | ast::Pattern::Type(_) => PatternNames::default(),
             ast::Pattern::Bind { name, subpat } => {
                 let mut result = PatternNames::default();
                 result
@@ -1259,6 +1148,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         let scope_id = self.current_scope_id();
         self.lambda_scopes.push((key, scope_id));
         for (idx, param) in lambda.params.iter().enumerate() {
+            self.reject_reserved_binding_name(&param.name, param.name_span);
             self.scope_bindings[scope_id.index() as usize]
                 .params
                 .push((param.name.clone(), idx));
@@ -1269,17 +1159,6 @@ impl<'db> SemanticIndexBuilder<'db> {
 
         let metadata_scope = ExprMetadataScope::Body(scope_id);
         self.expr_metadata_scope_stack.push(metadata_scope);
-        for param in &lambda.params {
-            if let Some(ty) = &param.type_expr {
-                self.walk_type_operands(ty, body, source_map);
-            }
-        }
-        if let Some(ty) = &lambda.return_type {
-            self.walk_type_operands(ty, body, source_map);
-        }
-        if let Some(ty) = &lambda.throws {
-            self.walk_type_operands(ty, body, source_map);
-        }
         if let Some(lambda_body) = lambda.body {
             // The body shares this arena, but it still gets its own metadata
             // namespace keyed by the lambda's scope. That keeps HIR agreeing
@@ -1393,9 +1272,6 @@ impl<'db> SemanticIndexBuilder<'db> {
             ast::Item::Class(c) => self.lower_class(c),
             ast::Item::Enum(e) => self.lower_enum(e),
             ast::Item::TypeAlias(ta) => self.lower_type_alias(ta),
-            ast::Item::Client(c) => self.lower_client(c),
-            ast::Item::TemplateString(ts) => self.lower_template_string(ts),
-            ast::Item::RetryPolicy(rp) => self.lower_retry_policy(rp),
             ast::Item::Let(l) => self.lower_let(l),
             ast::Item::Interface(i) => self.lower_interface(i),
             ast::Item::ImplementsFor(imp) => self.lower_implements_for(imp),
@@ -1403,6 +1279,11 @@ impl<'db> SemanticIndexBuilder<'db> {
     }
 
     fn lower_function(&mut self, f: &ast::FunctionDef) -> LocalItemId<FunctionMarker> {
+        crate::attrs::reject_attributes(
+            &f.attributes,
+            AttributePosition::Function,
+            &mut self.diagnostics,
+        );
         let local_id = self.item_tree.alloc_function(f);
         let loc = FunctionLoc::new(self.db, self.file, local_id);
 
@@ -1423,6 +1304,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.record_scope_owner(scope_id, ItemScopeOwner::Function(local_id));
 
         for (idx, param) in f.params.iter().enumerate() {
+            self.reject_reserved_binding_name(&param.name, param.name_span);
             self.scope_bindings[scope_id.index() as usize]
                 .params
                 .push((param.name.clone(), idx));
@@ -1439,7 +1321,26 @@ impl<'db> SemanticIndexBuilder<'db> {
     }
 
     fn lower_class(&mut self, c: &ast::ClassDef) {
-        let local_id = self.item_tree.alloc_class(c);
+        let attrs = crate::attrs::lower_attributes(&c.attributes, &mut self.diagnostics);
+        let field_attrs: Vec<crate::item_tree::ClassFieldAttrs> = c
+            .fields
+            .iter()
+            .map(|f| crate::attrs::lower_attributes(&f.attributes, &mut self.diagnostics))
+            .collect();
+        crate::attrs::check_serialized_keys(
+            c.fields
+                .iter()
+                .zip(&field_attrs)
+                .map(|(f, attrs)| crate::attrs::SerializedMember {
+                    name: &f.name,
+                    name_span: f.name_span,
+                    alias: attrs.schema.alias.as_deref(),
+                    skip: attrs.skip,
+                }),
+            SerializedKeyContainer::Class,
+            &mut self.diagnostics,
+        );
+        let local_id = self.item_tree.alloc_class(c, attrs, field_attrs);
         let loc = ClassLoc::new(self.db, self.file, local_id);
         self.type_contributions.push((
             c.name.clone(),
@@ -1658,11 +1559,29 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.class_depth -= 1;
         // Required signatures are the SAME item kind, just bodyless
         // (r-a's shape); no body walk, so no scope coverage needed.
-        method_ids.extend(
-            i.required_methods
-                .iter()
-                .map(|m| self.item_tree.alloc_function_signature(m)),
+        method_ids.extend(i.required_methods.iter().map(|m| {
+            crate::attrs::reject_attributes(
+                &m.attributes,
+                AttributePosition::Function,
+                &mut self.diagnostics,
+            );
+            self.item_tree.alloc_function_signature(m)
+        }));
+
+        // An interface is a contract, not a data type: neither it nor its
+        // fields take attributes.
+        crate::attrs::reject_attributes(
+            &i.attributes,
+            AttributePosition::Interface,
+            &mut self.diagnostics,
         );
+        for field in &i.fields {
+            crate::attrs::reject_attributes(
+                &field.attributes,
+                AttributePosition::InterfaceField,
+                &mut self.diagnostics,
+            );
+        }
 
         let local_id = self.item_tree.alloc_interface(i, method_ids);
         self.record_scope_owner(interface_scope, ItemScopeOwner::Interface(local_id));
@@ -1712,7 +1631,25 @@ impl<'db> SemanticIndexBuilder<'db> {
     }
 
     fn lower_enum(&mut self, e: &ast::EnumDef) {
-        let local_id = self.item_tree.alloc_enum(e);
+        let attrs = crate::attrs::lower_attributes(&e.attributes, &mut self.diagnostics);
+        let variant_attrs: Vec<crate::item_tree::EnumVariantAttrs> = e
+            .variants
+            .iter()
+            .map(|v| crate::attrs::lower_attributes(&v.attributes, &mut self.diagnostics))
+            .collect();
+        crate::attrs::check_serialized_keys(
+            e.variants.iter().zip(&variant_attrs).map(|(v, attrs)| {
+                crate::attrs::SerializedMember {
+                    name: &v.name,
+                    name_span: v.name_span,
+                    alias: attrs.schema.alias.as_deref(),
+                    skip: attrs.skip,
+                }
+            }),
+            SerializedKeyContainer::Enum,
+            &mut self.diagnostics,
+        );
+        let local_id = self.item_tree.alloc_enum(e, attrs, variant_attrs);
         let loc = EnumLoc::new(self.db, self.file, local_id);
         self.type_contributions.push((
             e.name.clone(),
@@ -1758,57 +1695,6 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.pop_scope();
     }
 
-    fn lower_client(&mut self, c: &ast::ClientDef) {
-        let local_id = self.item_tree.alloc_client(c);
-        let loc = ClientLoc::new(self.db, self.file, local_id);
-        self.value_contributions.push((
-            c.name.clone(),
-            Contribution {
-                name_span: c.name_span,
-                definition: Definition::Client(loc),
-            },
-        ));
-
-        self.push_scope(ScopeKind::Item, Some(c.name.clone()), c.span);
-        let scope = self.current_scope_id();
-        self.record_scope_owner(scope, ItemScopeOwner::Client(local_id));
-        self.pop_scope();
-    }
-
-    fn lower_template_string(&mut self, ts: &ast::TemplateStringDef) {
-        let local_id = self.item_tree.alloc_template_string(ts);
-        let loc = TemplateStringLoc::new(self.db, self.file, local_id);
-        self.value_contributions.push((
-            ts.name.clone(),
-            Contribution {
-                name_span: ts.name_span,
-                definition: Definition::TemplateString(loc),
-            },
-        ));
-
-        self.push_scope(ScopeKind::Function, Some(ts.name.clone()), ts.span);
-        let scope = self.current_scope_id();
-        self.record_scope_owner(scope, ItemScopeOwner::TemplateString(local_id));
-        self.pop_scope();
-    }
-
-    fn lower_retry_policy(&mut self, rp: &ast::RetryPolicyDef) {
-        let local_id = self.item_tree.alloc_retry_policy(rp);
-        let loc = RetryPolicyLoc::new(self.db, self.file, local_id);
-        self.value_contributions.push((
-            rp.name.clone(),
-            Contribution {
-                name_span: rp.name_span,
-                definition: Definition::RetryPolicy(loc),
-            },
-        ));
-
-        self.push_scope(ScopeKind::Item, Some(rp.name.clone()), rp.span);
-        let scope = self.current_scope_id();
-        self.record_scope_owner(scope, ItemScopeOwner::RetryPolicy(local_id));
-        self.pop_scope();
-    }
-
     fn lower_let(&mut self, l: &ast::LetDef) {
         let local_id = self.item_tree.alloc_let(l);
         let loc = LetLoc::new(self.db, self.file, local_id);
@@ -1843,51 +1729,16 @@ impl<'db> SemanticIndexBuilder<'db> {
     fn validate_item_phase1(&mut self, item: &ast::Item, is_builtin_file: bool) {
         match item {
             ast::Item::Function(function) => {
-                self.validate_function_phase1(function, is_builtin_file, "function");
+                self.validate_function_phase1(function, is_builtin_file);
             }
             ast::Item::Class(class) => {
-                self.validate_internal_attributes(
-                    &class.attributes,
-                    is_builtin_file,
-                    "class",
-                    false,
-                );
-                self.validate_schema_attributes(&class.attributes);
                 for field in &class.fields {
                     let type_expr = &field.type_expr;
                     self.validate_type_expr_phase1(type_expr, type_expr.span, is_builtin_file);
-                    self.validate_internal_attributes(
-                        &field.attributes,
-                        is_builtin_file,
-                        "class field",
-                        false,
-                    );
-                    self.validate_schema_attributes(&field.attributes);
                 }
-                self.validate_alias_collisions(
-                    class
-                        .fields
-                        .iter()
-                        .map(|f| (&f.name, f.name_span, f.attributes.as_slice())),
-                    SerializedKeyContainer::Class,
-                    is_builtin_file,
-                );
                 for method in &class.methods {
-                    self.validate_function_phase1(method, is_builtin_file, "method");
+                    self.validate_function_phase1(method, is_builtin_file);
                 }
-            }
-            ast::Item::Enum(enm) => {
-                self.validate_schema_attributes(&enm.attributes);
-                for variant in &enm.variants {
-                    self.validate_schema_attributes(&variant.attributes);
-                }
-                self.validate_alias_collisions(
-                    enm.variants
-                        .iter()
-                        .map(|v| (&v.name, v.name_span, v.attributes.as_slice())),
-                    SerializedKeyContainer::Enum,
-                    is_builtin_file,
-                );
             }
             ast::Item::TypeAlias(alias) => {
                 if let Some(type_expr) = &alias.type_expr {
@@ -1898,20 +1749,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         }
     }
 
-    fn validate_function_phase1(
-        &mut self,
-        function: &ast::FunctionDef,
-        is_builtin_file: bool,
-        context: &'static str,
-    ) {
-        let is_host_bound = matches!(function.body, Some(ast::FunctionBodyDef::Builtin(_)));
-        self.validate_internal_attributes(
-            &function.attributes,
-            is_builtin_file,
-            context,
-            is_host_bound,
-        );
-
+    fn validate_function_phase1(&mut self, function: &ast::FunctionDef, is_builtin_file: bool) {
         for param in &function.params {
             if let Some(type_expr) = &param.type_expr {
                 self.validate_type_expr_phase1(type_expr, type_expr.span, is_builtin_file);
@@ -1931,6 +1769,7 @@ impl<'db> SemanticIndexBuilder<'db> {
                     ast::BuiltinKind::Io => "$rust_io_function",
                     ast::BuiltinKind::Intrinsic => "$compiler_intrinsic",
                     ast::BuiltinKind::AwaitAny => "$await_any",
+                    ast::BuiltinKind::Spawn => "$spawn",
                 };
                 self.diagnostics.push(Hir2Diagnostic::BuiltinOnlySyntax {
                     feature: feature.to_string(),
@@ -1966,189 +1805,6 @@ impl<'db> SemanticIndexBuilder<'db> {
         }
     }
 
-    fn validate_internal_attributes(
-        &mut self,
-        attributes: &[ast::RawAttribute],
-        is_builtin_file: bool,
-        context: &'static str,
-        is_host_bound: bool,
-    ) {
-        for attr in attributes {
-            let name = attr.name.as_str();
-            if !name.starts_with("internal.") {
-                continue;
-            }
-
-            if !is_builtin_file {
-                self.diagnostics.push(Hir2Diagnostic::BuiltinOnlySyntax {
-                    feature: format!("@@{name}"),
-                    span: attr.span,
-                });
-                continue;
-            }
-
-            match name {
-                "internal.opaque" => {
-                    if context != "class" {
-                        self.diagnostics
-                            .push(Hir2Diagnostic::InvalidAttributeContext {
-                                attr_name: attr.name.clone(),
-                                context,
-                                allowed_contexts: "builtin classes",
-                                span: attr.span,
-                            });
-                    }
-                }
-                "internal.uses" => {
-                    if !matches!(context, "function" | "method") || !is_host_bound {
-                        self.diagnostics
-                            .push(Hir2Diagnostic::InvalidAttributeContext {
-                                attr_name: attr.name.clone(),
-                                context,
-                                allowed_contexts: "host-bound builtin functions and methods",
-                                span: attr.span,
-                            });
-                        continue;
-                    }
-                    if attr.args.len() != 1 {
-                        self.diagnostics.push(Hir2Diagnostic::DiagnosticMessage {
-                            diagnostic_id: DiagnosticId::InvalidAttributeArg,
-                            message: format!(
-                                "Attribute `@@{name}` expects exactly one argument: `vm` or `engine_ctx`"
-                            ),
-                            span: attr.span,
-                        });
-                        continue;
-                    }
-                    let value = attr.args[0].value.as_str();
-                    if value != "vm" && value != "engine_ctx" {
-                        self.diagnostics.push(Hir2Diagnostic::DiagnosticMessage {
-                            diagnostic_id: DiagnosticId::InvalidAttributeArg,
-                            message: format!(
-                                "Attribute `@@{name}` only accepts `vm` or `engine_ctx`, got `{value}`"
-                            ),
-                            span: attr.args[0].span,
-                        });
-                    }
-                }
-                "internal.panics" => {
-                    if !matches!(context, "function" | "method") || !is_host_bound {
-                        self.diagnostics
-                            .push(Hir2Diagnostic::InvalidAttributeContext {
-                                attr_name: attr.name.clone(),
-                                context,
-                                allowed_contexts: "host-bound builtin functions and methods",
-                                span: attr.span,
-                            });
-                        continue;
-                    }
-                    for arg in &attr.args {
-                        let value = arg.value.as_str();
-                        if value != "HostPanic" && value != "baml.errors.HostPanic" {
-                            self.diagnostics.push(Hir2Diagnostic::DiagnosticMessage {
-                                diagnostic_id: DiagnosticId::InvalidAttributeArg,
-                                message: format!(
-                                    "Attribute `@@{name}` may only reference known builtin panic types; got `{value}`"
-                                ),
-                                span: arg.span,
-                            });
-                        }
-                    }
-                }
-                _ => {
-                    self.diagnostics
-                        .push(Hir2Diagnostic::UnknownInternalAttribute {
-                            attr_name: attr.name.clone(),
-                            span: attr.span,
-                            valid_attributes: vec![
-                                "internal.opaque",
-                                "internal.uses",
-                                "internal.panics",
-                            ],
-                        });
-                }
-            }
-        }
-    }
-
-    /// Validate `@description`, `@alias`, and `@skip` attribute usage.
-    ///
-    /// - `description` / `alias`: exactly 1 argument, must be a string literal
-    /// - `skip`: exactly 0 arguments
-    ///
-    /// Unknown attributes are silently passed through (e.g. `@stream.*` for PPIR).
-    fn validate_schema_attributes(&mut self, attributes: &[ast::RawAttribute]) {
-        // E0014: reject the same single-valued schema attribute appearing more
-        // than once on one declaration. `@alias`, `@description`, and `@skip`
-        // each take effect at most once — for valued attrs the last write
-        // silently wins and the earlier ones are dropped (Linear B-648) — so a
-        // repeat is always a mistake. Only these known single-valued attributes
-        // are checked; repeatable / pass-through attributes (`@stream.*`, etc.)
-        // are intentionally left alone. Occurrences are gathered in first-seen
-        // order so the emitted diagnostics are deterministic.
-        let mut occurrences: Vec<(&str, Vec<TextRange>)> = Vec::new();
-        for attr in attributes {
-            let name = attr.name.as_str();
-            let Some(spec) = baml_base::schema_attribute_spec(name) else {
-                continue;
-            };
-            if spec.repeatable {
-                continue;
-            }
-            if let Some(entry) = occurrences.iter_mut().find(|(n, _)| *n == name) {
-                entry.1.push(attr.span);
-            } else {
-                occurrences.push((name, vec![attr.span]));
-            }
-        }
-        for (name, sites) in occurrences {
-            if sites.len() >= 2 {
-                self.diagnostics.push(Hir2Diagnostic::DuplicateAttribute {
-                    attr_name: name.to_string(),
-                    sites,
-                });
-            }
-        }
-
-        for attr in attributes {
-            let Some(spec) = baml_base::schema_attribute_spec(attr.name.as_str()) else {
-                // Unknown attributes pass through (e.g. `@stream.*`).
-                continue;
-            };
-            match spec.arguments {
-                baml_base::SchemaAttributeArguments::String { .. } => {
-                    let attr_name = spec.name;
-                    if attr.args.len() != 1 {
-                        self.diagnostics.push(Hir2Diagnostic::DiagnosticMessage {
-                            diagnostic_id: DiagnosticId::InvalidAttributeArg,
-                            message: format!("`@{attr_name}` expects exactly one string argument"),
-                            span: attr.span,
-                        });
-                        continue;
-                    }
-                    let value = attr.args[0].value.as_str();
-                    if !is_string_literal(value) && !is_removed_hash_string(value) {
-                        self.diagnostics.push(Hir2Diagnostic::DiagnosticMessage {
-                            diagnostic_id: DiagnosticId::InvalidAttributeArg,
-                            message: format!(
-                                "`@{attr_name}` argument must be a string literal, got `{value}`"
-                            ),
-                            span: attr.args[0].span,
-                        });
-                    }
-                }
-                baml_base::SchemaAttributeArguments::None if !attr.args.is_empty() => {
-                    self.diagnostics.push(Hir2Diagnostic::DiagnosticMessage {
-                        diagnostic_id: DiagnosticId::UnexpectedAttributeArg,
-                        message: format!("`@{}` does not take any arguments", spec.name),
-                        span: attr.span,
-                    });
-                }
-                baml_base::SchemaAttributeArguments::None => {}
-            }
-        }
-    }
-
     /// Reject a class or enum whose members don't all serialize to distinct
     /// JSON keys.
     ///
@@ -2171,63 +1827,6 @@ impl<'db> SemanticIndexBuilder<'db> {
     /// left to the existing `DuplicateField` / duplicate-variant (E0012) checks
     /// to avoid double-reporting; this rule only fires when at least two
     /// *distinct* member names share a key.
-    fn validate_alias_collisions<'a>(
-        &mut self,
-        members: impl Iterator<Item = (&'a Name, TextRange, &'a [ast::RawAttribute])>,
-        container: SerializedKeyContainer,
-        is_builtin_file: bool,
-    ) {
-        // Builtin stdlib declarations carry no `@alias`, and type-level
-        // validation already skips them — stay consistent and avoid surprising
-        // the stdlib.
-        if is_builtin_file {
-            return;
-        }
-
-        let mut buckets: FxHashMap<String, Vec<(Name, TextRange)>> = FxHashMap::default();
-        for (name, name_span, attributes) in members {
-            let mut alias: Option<String> = None;
-            let mut skip = false;
-            for attr in attributes {
-                match attr.name.as_str() {
-                    "alias" if attr.args.len() == 1 => {
-                        // Last `@alias` wins, mirroring emit's `extract_schema_attrs`.
-                        if let Some(value) =
-                            ast::parse_string_attr_value(attr.args[0].value.as_str())
-                        {
-                            alias = Some(value);
-                        }
-                    }
-                    "skip" => skip = true,
-                    _ => {}
-                }
-            }
-            if skip {
-                continue;
-            }
-            let key = alias.unwrap_or_else(|| name.as_str().to_string());
-            buckets
-                .entry(key)
-                .or_default()
-                .push((name.clone(), name_span));
-        }
-
-        for (key, members) in buckets {
-            // Only a collision between two *distinct* member names is a new
-            // error; repeated identical names are already reported by the
-            // duplicate-definition checks.
-            let distinct = members.iter().any(|(name, _)| name != &members[0].0);
-            if members.len() >= 2 && distinct {
-                let sites = members.into_iter().map(|(_, span)| span).collect();
-                self.diagnostics.push(Hir2Diagnostic::DuplicateFieldAlias {
-                    key,
-                    sites,
-                    container,
-                });
-            }
-        }
-    }
-
     fn validate_type_expr_phase1(
         &mut self,
         type_expr: &ast::TypeExpr,
@@ -2244,78 +1843,11 @@ impl<'db> SemanticIndexBuilder<'db> {
                 span,
             });
         }
-
-        Self::collect_unknown_type_attrs(type_expr, &mut self.diagnostics);
-    }
-
-    fn collect_unknown_type_attrs(
-        type_expr: &ast::TypeExpr,
-        diagnostics: &mut Vec<Hir2Diagnostic>,
-    ) {
-        for attr in type_expr.attrs() {
-            let name = attr.name.as_str();
-            if !ast::is_field_attr(name) && !KNOWN_TYPE_ATTRS.contains(&name) {
-                diagnostics.push(Hir2Diagnostic::UnknownTypeAttribute {
-                    attr_name: attr.name.clone(),
-                    span: attr.span,
-                });
-            }
-        }
-
-        match &type_expr.kind {
-            ast::TypeExprKind::Optional { inner, .. } | ast::TypeExprKind::List { inner, .. } => {
-                Self::collect_unknown_type_attrs(inner, diagnostics);
-            }
-            ast::TypeExprKind::Map { key, value, .. } => {
-                Self::collect_unknown_type_attrs(key, diagnostics);
-                Self::collect_unknown_type_attrs(value, diagnostics);
-            }
-            ast::TypeExprKind::Union { variants, .. } => {
-                for v in variants {
-                    Self::collect_unknown_type_attrs(v, diagnostics);
-                }
-            }
-            ast::TypeExprKind::Function {
-                params,
-                ret,
-                throws,
-                ..
-            } => {
-                for p in params {
-                    Self::collect_unknown_type_attrs(&p.ty, diagnostics);
-                }
-                Self::collect_unknown_type_attrs(ret, diagnostics);
-                if let Some(throws) = throws {
-                    Self::collect_unknown_type_attrs(throws, diagnostics);
-                }
-            }
-            ast::TypeExprKind::Path {
-                generic_args,
-                associated_type_bindings,
-                ..
-            } => {
-                for arg in generic_args {
-                    Self::collect_unknown_type_attrs(arg, diagnostics);
-                }
-                for binding in associated_type_bindings {
-                    Self::collect_unknown_type_attrs(&binding.ty, diagnostics);
-                }
-            }
-            ast::TypeExprKind::AssociatedTypeProjection {
-                base, interface, ..
-            } => {
-                Self::collect_unknown_type_attrs(base, diagnostics);
-                if let Some(interface) = interface {
-                    Self::collect_unknown_type_attrs(interface, diagnostics);
-                }
-            }
-            _ => {}
-        }
     }
 
     fn type_expr_contains_rust(type_expr: &ast::TypeExpr) -> bool {
         match &type_expr.kind {
-            ast::TypeExprKind::Rust { .. } => true,
+            ast::TypeExprKind::Rust => true,
             ast::TypeExprKind::Optional { inner, .. } | ast::TypeExprKind::List { inner, .. } => {
                 Self::type_expr_contains_rust(inner)
             }
@@ -2403,13 +1935,13 @@ impl<'db> SemanticIndexBuilder<'db> {
                         .iter()
                         .any(|name| name == &segments[0]);
                 // A projection off one of the function's own generic params —
-                // e.g. `T.CompareError` for `<T extends Comparable>`, which parses
-                // as a dotted path at this phase. The concrete error is the
+                // e.g. `T.Error` for `<T extends Iface>`, which parses as a
+                // dotted path at this phase. The concrete error is the
                 // implementor's associated type, resolved at the call site; the
                 // host fn just propagates whatever the dispatched method throws
-                // (the declared `throws` is erased for builtins). Lets
-                // `_compare_shim` declare `throws T.CompareError` instead of an
-                // unconstrained error param that call sites cannot pin.
+                // (the declared `throws` is erased for builtins). Lets a builtin
+                // declare `throws T.Error` instead of an unconstrained error
+                // param that call sites cannot pin.
                 let is_generic_param_projection = segments.len() >= 2
                     && generic_args.is_empty()
                     && allowed_generic_params
@@ -2429,12 +1961,12 @@ impl<'db> SemanticIndexBuilder<'db> {
                 }
             }
             // A projection off one of the function's own generic params — e.g.
-            // `T.CompareError` for `<T extends Comparable>`. The concrete error is
-            // the implementor's associated type, resolved at the call site; the
-            // host fn just propagates whatever the dispatched method throws (the
-            // declared `throws` is erased for builtins), so this is sound. Lets
-            // `_compare_shim` declare `throws T.CompareError` rather than an
-            // unconstrained error param that call sites cannot pin.
+            // `T.Error` for `<T extends Iface>`. The concrete error is the
+            // implementor's associated type, resolved at the call site; the host
+            // fn just propagates whatever the dispatched method throws (the
+            // declared `throws` is erased for builtins), so this is sound. Lets a
+            // builtin declare `throws T.Error` rather than an unconstrained error
+            // param that call sites cannot pin.
             ast::TypeExprKind::AssociatedTypeProjection { base, .. }
                 if matches!(
                     &base.kind,
@@ -2446,29 +1978,28 @@ impl<'db> SemanticIndexBuilder<'db> {
             // `throws never` and `throws unknown` are the two explicit effect
             // bounds and are both valid for host-bound functions. The latter
             // is needed by continuations that execute user bytecode.
-            ast::TypeExprKind::Never { .. } | ast::TypeExprKind::Unknown { .. } => {}
+            ast::TypeExprKind::Never | ast::TypeExprKind::Unknown => {}
             _ => invalid.push(Self::render_type_expr(type_expr)),
         }
     }
 
     fn render_type_expr(type_expr: &ast::TypeExpr) -> String {
         match &type_expr.kind {
-            ast::TypeExprKind::Unreflect { .. } => "unreflect(…)".to_string(),
             ast::TypeExprKind::Path { segments, .. } => segments
                 .iter()
                 .map(Name::as_str)
                 .collect::<Vec<_>>()
                 .join("."),
             ast::TypeExprKind::AssociatedTypeProjection { .. } => type_expr.to_string(),
-            ast::TypeExprKind::Int { .. } => "int".to_string(),
-            ast::TypeExprKind::Bigint { .. } => "bigint".to_string(),
-            ast::TypeExprKind::Float { .. } => "float".to_string(),
-            ast::TypeExprKind::String { .. } => "string".to_string(),
-            ast::TypeExprKind::Bool { .. } => "bool".to_string(),
-            ast::TypeExprKind::Null { .. } => "null".to_string(),
-            ast::TypeExprKind::Never { .. } => "never".to_string(),
-            ast::TypeExprKind::Void { .. } => "void".to_string(),
-            ast::TypeExprKind::Uint8Array { .. } => "uint8array".to_string(),
+            ast::TypeExprKind::Int => "int".to_string(),
+            ast::TypeExprKind::Bigint => "bigint".to_string(),
+            ast::TypeExprKind::Float => "float".to_string(),
+            ast::TypeExprKind::String => "string".to_string(),
+            ast::TypeExprKind::Bool => "bool".to_string(),
+            ast::TypeExprKind::Null => "null".to_string(),
+            ast::TypeExprKind::Never => "never".to_string(),
+            ast::TypeExprKind::Void => "void".to_string(),
+            ast::TypeExprKind::Uint8Array => "uint8array".to_string(),
             ast::TypeExprKind::Media { kind, .. } => kind.to_string(),
             ast::TypeExprKind::Optional { inner, .. } => {
                 format!("{}?", Self::render_type_expr(inner))
@@ -2512,37 +2043,12 @@ impl<'db> SemanticIndexBuilder<'db> {
                     throws
                 )
             }
-            ast::TypeExprKind::Unknown { .. } => "unknown".to_string(),
-            ast::TypeExprKind::Type { .. } => "reflect.Type".to_string(),
-            ast::TypeExprKind::Rust { .. } => "$rust_type".to_string(),
-            ast::TypeExprKind::Error { .. } => "<error>".to_string(),
-            ast::TypeExprKind::Missing { .. } => "<unknown>".to_string(),
-            ast::TypeExprKind::Infer { .. } => "_".to_string(),
+            ast::TypeExprKind::Unknown => "unknown".to_string(),
+            ast::TypeExprKind::Type => "reflect.Type".to_string(),
+            ast::TypeExprKind::Rust => "$rust_type".to_string(),
+            ast::TypeExprKind::Error => "<error>".to_string(),
+            ast::TypeExprKind::Missing => "<unknown>".to_string(),
+            ast::TypeExprKind::Infer => "_".to_string(),
         }
     }
-}
-
-/// Check if an attribute argument value is a valid quoted string literal.
-///
-/// Accepts double-quoted (`"text"`) and single-quoted (`'text'`) strings.
-fn is_string_literal(value: &str) -> bool {
-    // Double-quoted
-    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        return true;
-    }
-    // Single-quoted
-    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-        return true;
-    }
-    false
-}
-
-fn is_removed_hash_string(value: &str) -> bool {
-    let hashes = value.bytes().take_while(|&b| b == b'#').count();
-    if hashes == 0 || value.len() < hashes * 2 + 2 {
-        return false;
-    }
-    let rest = &value[hashes..];
-    let closing = format!("\"{}", &value[..hashes]);
-    rest.starts_with('"') && rest.ends_with(&closing)
 }

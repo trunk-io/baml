@@ -146,10 +146,6 @@ macro_rules! walk_object_heads {
                         param.ty.$visit(f);
                     }
                 }
-                Object::UnscheduledFuture(fut) => {
-                    fut.returns.$visit(f);
-                    fut.throws.$visit(f);
-                }
                 Object::Future(fut) => fut.$visit(f),
                 Object::Array(array) => array.element_ty.$visit(f),
                 Object::Map(map) => {
@@ -166,7 +162,7 @@ macro_rules! walk_object_heads {
                 | Object::Bigint(_)
                 | Object::Uint8Array(_)
                 | Object::RustData(_)
-                | Object::Collector(_)
+
                 | Object::Float(_) => {}
                 #[cfg(feature = "heap_debug")]
                 Object::Sentinel(_) => {}

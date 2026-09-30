@@ -17,9 +17,10 @@ use crate::{
         CatchArmId, CatchClause, CatchClauseKind, DefaultExprId, Expr, ExprBody, ExprId, FieldPat,
         FunctionDefaults, LambdaDef, LambdaKind, LetDef, LetOrigin, Literal, LoopOrigin,
         MapExprEntry, MatchArm, MatchArmId, ObjectExprField, Param, PatId, Pattern, SpreadField,
-        Stmt, StmtId, TemplateIfBranch, TemplateSegment, TemplateTag, TypeAnnotId, TypeExpr,
-        TypeExprKind, UnaryOp,
+        Stmt, StmtId, TemplateIfBranch, TemplateSegment, TemplateTag, TypeAnnotId,
+        TypeBindingValue, TypeExpr, TypeExprKind, UnaryOp,
     },
+    lowering_diagnostic::TypeExprOwner,
 };
 
 /// A reference to an environment variable found in source code (`env.VAR_NAME`).
@@ -609,7 +610,6 @@ pub(crate) fn synthesize_llm_spec_body(
                 segments: vec![Name::new("ai"), Name::new("OutputFormat")],
                 generic_args: vec![],
                 associated_type_bindings: vec![],
-                attrs: vec![],
             })
             .at(span),
         ),
@@ -716,11 +716,14 @@ pub(crate) fn synthesize_llm_spec_body(
     //     lower_cst.rs). Static, so an unknown prefix is a compile error.
     //     Provider construction is pure — it never touches env.
     //   * anything else — an arbitrary expression, wrapped in
-    //     `ai.clients.resolve(...)` so every dynamic selector shape works:
-    //     an `ai.Client` value (identity), a runtime `"provider/model"`
-    //     string, or a `baml.env.Ref` (read at call time, then the string
-    //     path). Unknown prefixes / unset vars become typed runtime `ai`
-    //     errors rather than an opaque `InitFailed`.
+    //     `ai.clients.resolve(selector, providers)` so every dynamic selector
+    //     shape works: an `ai.Client` value (identity), a runtime
+    //     `"provider/model"` string, or a `baml.env.Ref` (read at call time,
+    //     then the string path). Unknown prefixes / unset vars become typed
+    //     runtime `ai` errors rather than an opaque `InitFailed`. The call is
+    //     compiler-assisted like every `ai.clients.resolve` call
+    //     (`complete_client_resolve_call`): the provider table rides along
+    //     as a lambda synthesized from `SHORTHAND_PROVIDERS`.
     let default_client = match client_spec {
         crate::lower_cst::LlmClientSpec::Provider { pkg, class, model } => {
             let model_lit = ctx.alloc_expr(Expr::Literal(Literal::String(model.clone())), span);
@@ -753,11 +756,16 @@ pub(crate) fn synthesize_llm_spec_body(
                 ]),
                 span,
             );
+            let args = ctx.complete_client_resolve_call(
+                resolve_callee,
+                vec![CallArg::positional(inner)],
+                span,
+            );
             ctx.alloc_expr(
                 Expr::Call {
                     callee: resolve_callee,
                     type_args: vec![],
-                    args: vec![CallArg::positional(inner)],
+                    args,
                 },
                 span,
             )
@@ -782,6 +790,124 @@ pub(crate) fn synthesize_llm_spec_body(
     );
 
     ctx.finish(Some(spec_obj))
+}
+
+/// Every prefix the `"provider/model"` shorthand knows, as a string array
+/// literal, for `ai.clients.resolve`'s error messages.
+fn synthesize_shorthand_prefixes(ctx: &mut LoweringContext, span: TextRange) -> ExprId {
+    let elements = crate::lower_cst::SHORTHAND_PROVIDERS
+        .iter()
+        .map(|(prefix, _, _)| {
+            ctx.alloc_expr(Expr::Literal(Literal::String((*prefix).to_string())), span)
+        })
+        .collect();
+    ctx.alloc_expr(Expr::Array { elements }, span)
+}
+
+/// The runtime half of the `"provider/model"` shorthand, as a lambda:
+///
+/// ```text
+/// (prefix: string, model: string) -> ai.Client? => match (prefix) {
+///     "openai" => openai.ResponsesClient.new(model = model),
+///     ...
+///     _ => null,
+/// }
+/// ```
+///
+/// Generated from `SHORTHAND_PROVIDERS`, the same table the literal-client
+/// lowering reads, and handed to `ai.clients.resolve` at each call site
+/// (`complete_client_resolve_call`). The lambda's range is an empty one at
+/// the call's end: lambda scopes are located by exact span within their
+/// owner, so it must not share a range with any lambda written at the call,
+/// nor with the prompt lambda synthesized into a spec body.
+fn synthesize_shorthand_providers(ctx: &mut LoweringContext, span: TextRange) -> ExprId {
+    let prefix_name = Name::new("prefix");
+    let model_name = Name::new("model");
+    let string_ty = || (TypeExprKind::String).at(span);
+    let param = |name: &Name| Param {
+        name: name.clone(),
+        type_expr: Some(string_ty()),
+        default: None,
+        span,
+        name_span: span,
+    };
+
+    let scrutinee = ctx.alloc_expr(Expr::Path(vec![prefix_name.clone()]), span);
+    let mut arms = Vec::with_capacity(crate::lower_cst::SHORTHAND_PROVIDERS.len() + 1);
+    for (prefix, pkg, class) in crate::lower_cst::SHORTHAND_PROVIDERS {
+        let pattern = ctx.alloc_pattern(
+            Pattern::Type(
+                (TypeExprKind::Literal {
+                    value: baml_base::Literal::String((*prefix).to_string()),
+                })
+                .at(span),
+            ),
+            span,
+        );
+        let ctor_callee = ctx.alloc_expr(
+            Expr::Path(vec![Name::new(*pkg), Name::new(*class), Name::new("new")]),
+            span,
+        );
+        let model = ctx.alloc_expr(Expr::Path(vec![model_name.clone()]), span);
+        let body = ctx.alloc_expr(
+            Expr::Call {
+                callee: ctor_callee,
+                type_args: vec![],
+                args: vec![CallArg::named("model", model)],
+            },
+            span,
+        );
+        arms.push(ctx.alloc_match_arm(
+            MatchArm {
+                pattern,
+                guard: None,
+                body,
+            },
+            span,
+        ));
+    }
+    let wildcard = ctx.alloc_pattern(Pattern::Wildcard, span);
+    let null = ctx.alloc_expr(Expr::Null, span);
+    arms.push(ctx.alloc_match_arm(
+        MatchArm {
+            pattern: wildcard,
+            guard: None,
+            body: null,
+        },
+        span,
+    ));
+    let body = ctx.alloc_expr(
+        Expr::Match {
+            scrutinee,
+            scrutinee_type: None,
+            arms,
+        },
+        span,
+    );
+
+    let client_ty = (TypeExprKind::Path {
+        segments: vec![Name::new("ai"), Name::new("Client")],
+        generic_args: vec![],
+        associated_type_bindings: vec![],
+    })
+    .at(span);
+    let return_type = (TypeExprKind::Optional {
+        inner: Box::new(client_ty),
+    })
+    .at(span);
+    let lambda_span = TextRange::empty(span.end());
+    ctx.alloc_expr(
+        Expr::Lambda(Box::new(LambdaDef {
+            kind: LambdaKind::Anonymous,
+            params: vec![param(&prefix_name), param(&model_name)],
+            defaults: FunctionDefaults::empty(),
+            return_type: Some(return_type),
+            throws: None,
+            body: Some(body),
+            span: lambda_span,
+        })),
+        lambda_span,
+    )
 }
 
 /// Synthesize the `@render_prompt` companion body: render the spec's prompt
@@ -1012,20 +1138,18 @@ pub(crate) fn synthesize_spec_agent_run_body(
     (body, source_map)
 }
 
-/// Synthesize the `@stream` companion body (built at PPIR level, where the
-/// stream-expanded return type is known) — one-turn streaming over the
+/// Synthesize the `@stream` companion body — one-turn streaming over the
 /// function's own spec:
 ///
 /// ```baml
-/// ai.stream.from_spec<Out$stream, Out>(Fn@spec(p1, p2), client = client)
+/// ai.stream.from_spec<Out>(Fn@spec(p1, p2), client = client)
 /// ```
 ///
-/// `type_args` is the explicit `<STREAM_EXPANDED, ORIGINAL>` pair, so the
-/// stdlib reifies both types from its own frame via `reflect.Type.of`.
-/// `client` is the companion's injected `ai.StreamingClient? = null`
-/// override; `from_spec` falls back to the spec's default client when it
-/// is null.
-pub fn synthesize_spec_stream_body(
+/// `type_args` is the explicit `<Out>`, so the stdlib reifies the type from
+/// its own frame via `reflect.Type.of`. `client` is
+/// the companion's injected `ai.stream.StreamingClient? = null` override;
+/// `from_spec` falls back to the spec's default client when it is null.
+pub(crate) fn synthesize_spec_stream_body(
     function_name: &str,
     params: &[Param],
     generic_param_names: &[Name],
@@ -1056,7 +1180,7 @@ pub fn synthesize_spec_stream_body(
         span,
     );
 
-    // ai.stream.from_spec<TS, TF>(spec, client = client, on_event = on_event)
+    // ai.stream.from_spec<Out>(spec, client = client, on_event = on_event)
     let stream_spec_callee = ctx.alloc_expr(
         Expr::Path(vec![
             Name::new("ai"),
@@ -1102,7 +1226,6 @@ fn companion_type_args(
                 segments: vec![name.clone()],
                 generic_args: vec![],
                 associated_type_bindings: vec![],
-                attrs: vec![],
             }
             .at(span)
         })
@@ -1255,119 +1378,30 @@ impl LoweringContext {
             .unwrap_or_else(|| self.alloc_expr(Expr::Missing, node.span_range()))
     }
 
-    fn attach_unreflect_operands(
-        ty: &mut TypeExpr,
-        operands: &std::collections::HashMap<TextRange, ExprId>,
-    ) {
-        match &mut ty.kind {
-            TypeExprKind::Unreflect { operand, .. } => {
-                *operand = operands.get(&ty.span).copied();
-            }
-            TypeExprKind::Path {
-                generic_args,
-                associated_type_bindings,
-                ..
-            } => {
-                for arg in generic_args {
-                    Self::attach_unreflect_operands(arg, operands);
-                }
-                for binding in associated_type_bindings {
-                    Self::attach_unreflect_operands(&mut binding.ty, operands);
-                }
-            }
-            TypeExprKind::AssociatedTypeProjection {
-                base, interface, ..
-            } => {
-                Self::attach_unreflect_operands(base, operands);
-                if let Some(interface) = interface {
-                    Self::attach_unreflect_operands(interface, operands);
-                }
-            }
-            TypeExprKind::Optional { inner, .. } | TypeExprKind::List { inner, .. } => {
-                Self::attach_unreflect_operands(inner, operands);
-            }
-            TypeExprKind::Map { key, value, .. } => {
-                Self::attach_unreflect_operands(key, operands);
-                Self::attach_unreflect_operands(value, operands);
-            }
-            TypeExprKind::Union { variants, .. } => {
-                for variant in variants {
-                    Self::attach_unreflect_operands(variant, operands);
-                }
-            }
-            TypeExprKind::Function {
-                params,
-                ret,
-                throws,
-                ..
-            } => {
-                for param in params {
-                    Self::attach_unreflect_operands(&mut param.ty, operands);
-                }
-                Self::attach_unreflect_operands(ret, operands);
-                if let Some(throws) = throws {
-                    Self::attach_unreflect_operands(throws, operands);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Allocate each runtime carrier in `type_expr` into this body's expression
-    /// arena, then attach those expression ids to the already-lowered type.
-    fn attach_body_type_operands(
-        &mut self,
-        type_expr: &baml_compiler_syntax::ast::TypeExpr,
-        ty: &mut TypeExpr,
-    ) {
-        let mut operands = std::collections::HashMap::new();
-        let mut preorder = type_expr.syntax().preorder();
-        while let Some(event) = preorder.next() {
-            let rowan::WalkEvent::Enter(node) = event else {
-                continue;
-            };
-            if node.kind() != SyntaxKind::UNREFLECT_TYPE {
-                continue;
-            }
-            let operand = self.lower_unreflect_operand(&node);
-            self.source_map
-                .unreflect_arg_spans
-                .insert(operand, node.span_range());
-            operands.insert(node.span_range(), operand);
-            // Lowering this outer operand recursively lowers any unreflect type
-            // arguments inside it. Do not allocate those nested carriers again.
-            preorder.skip_subtree();
-        }
-        Self::attach_unreflect_operands(ty, &operands);
-    }
-
-    /// Lower a type written inside this body, allocating each runtime carrier
-    /// into the body's expression arena before attaching it to the type atom.
+    /// Lower a type written inside this body, collecting its lowering
+    /// diagnostics with the body's.
     fn lower_body_type_expr(
         &mut self,
         type_expr: &baml_compiler_syntax::ast::TypeExpr,
     ) -> TypeExpr {
-        let mut ty = crate::lower_type_expr::lower_type_expr_node(type_expr, &mut self.diags);
-        self.attach_body_type_operands(type_expr, &mut ty);
-        ty
+        crate::lower_type_expr::lower_type_expr_node(
+            type_expr,
+            &mut self.diags,
+            TypeExprOwner::Body,
+        )
     }
 
-    /// Lower an associated binding written in this body through the same
-    /// body-aware road as every other type expression. The item-level helper
-    /// cannot allocate `unreflect(...)` carriers into this expression arena.
+    /// Lower an associated binding written in this body, collecting its
+    /// lowering diagnostics with the body's.
     fn lower_body_associated_type_binding(
         &mut self,
         binding: &baml_compiler_syntax::ast::AssociatedTypeDecl,
     ) -> Option<AssociatedTypeBinding> {
-        let name = binding.name()?;
-        let ty = binding
-            .default_or_binding()
-            .map(|ty| self.lower_body_type_expr(&ty))
-            .unwrap_or_else(|| TypeExprKind::Missing { attrs: vec![] }.at(TextRange::default()));
-        Some(AssociatedTypeBinding {
-            name: Name::new(name.text()),
-            ty: Box::new(ty),
-        })
+        crate::lower_type_expr::lower_associated_type_binding(
+            binding,
+            &mut self.diags,
+            TypeExprOwner::Body,
+        )
     }
 
     fn warn_const_introducer(&mut self, span: TextRange) {
@@ -1808,27 +1842,36 @@ impl LoweringContext {
         }
     }
 
-    /// Lower `spawn name_expr? { body }`. The CST shape is
-    /// `SPAWN_EXPR [ KW_SPAWN [expr] BLOCK_EXPR ]`.
+    /// Lower `spawn name_expr? (with expr (, expr)*)? { body }` (BEP-040). The
+    /// CST shape is `SPAWN_EXPR [ KW_SPAWN [expr] [KW_WITH expr (COMMA expr)*]
+    /// BLOCK_EXPR ]`.
     ///
-    /// To reuse the existing lambda machinery, the body is lowered as a
-    /// fresh 0-arg lambda (its own `ExprBody` + source map). The
-    /// `Expr::Spawn { body }` ID points at an `Expr::Lambda(func_def)`,
-    /// which the MIR lowering then handles via `lower_lambda` to emit
-    /// the proper `MakeClosure`. The name expression is parsed in the
-    /// outer context (where it can reference outer bindings).
+    /// `spawn` is sugar for an expression the user could have written:
     ///
-    /// That body-is-a-lambda invariant is upheld here rather than assumed
-    /// downstream: with no `BLOCK_EXPR` there is no lambda to build, so the
-    /// whole `spawn` lowers to [`Expr::Missing`] instead of a `Spawn` wrapping
-    /// a non-lambda body. Inference projects the body's return type and reads
-    /// its effective throws out of the lambda side table, neither of which
-    /// exists for a non-lambda.
+    /// ```baml
+    /// baml.spawn.__spawn(
+    ///     baml.spawn.Plan.new(body = () -> { body }, name = name_expr)
+    ///         .with(m1)
+    ///         .with(m2)
+    /// )
+    /// ```
+    ///
+    /// so typing, modifier application order, and `ApplyError` all fall out of
+    /// ordinary calls: nothing downstream knows about `spawn`. The body is a
+    /// fresh 0-arg lambda (its own `ExprBody` + source map); the name and the
+    /// modifiers are lowered in the outer context, where they can reference
+    /// outer bindings, and evaluate left to right, each applied before the next
+    /// is evaluated.
+    ///
+    /// With no `BLOCK_EXPR` there is no lambda to build, so the whole `spawn`
+    /// lowers to [`Expr::Missing`].
     fn lower_spawn_expr(&mut self, node: &SyntaxNode) -> ExprId {
         use baml_compiler_syntax::ast as cst_ast;
 
+        use crate::ast::CallArg;
+
         let mut name: Option<ExprId> = None;
-        let mut with_exprs: Vec<ExprId> = Vec::new();
+        let mut with_exprs: Vec<(ExprId, TextRange)> = Vec::new();
         let mut body_lambda: Option<ExprId> = None;
         // The CST is flat: `KW_SPAWN [name expr] [KW_WITH expr (COMMA expr)*]
         // BLOCK_EXPR`. We walk children-with-tokens so the `KW_WITH` token is
@@ -1875,7 +1918,7 @@ impl LoweringContext {
                     if let Some(expr) = expr {
                         let id = self.alloc_expr(expr, span);
                         if seen_with {
-                            with_exprs.push(id);
+                            with_exprs.push((id, span));
                         } else if name.is_none() {
                             name = Some(id);
                         }
@@ -1906,7 +1949,7 @@ impl LoweringContext {
                         Some(self.alloc_expr(Expr::Lambda(Box::new(fd)), child.span_range()));
                 }
             } else if seen_with {
-                with_exprs.push(self.lower_expr(child));
+                with_exprs.push((self.lower_expr(child), child.span_range()));
             } else if name.is_none() {
                 name = Some(self.lower_expr(child));
             }
@@ -1919,13 +1962,52 @@ impl LoweringContext {
         let Some(body) = body_lambda else {
             return self.alloc_expr(Expr::Missing, node.span_range());
         };
-        self.alloc_expr(
-            Expr::Spawn {
-                name,
-                with_exprs,
-                body,
+        let span = node.span_range();
+        let spawn_path = |member: &[&str]| {
+            Expr::Path(
+                ["baml", "spawn"]
+                    .iter()
+                    .chain(member)
+                    .map(|segment| Name::new(*segment))
+                    .collect(),
+            )
+        };
+        let plan_new = self.alloc_expr(spawn_path(&["Plan", "new"]), span);
+        let mut plan_args = vec![CallArg::named("body", body)];
+        plan_args.extend(name.map(|name| CallArg::named("name", name)));
+        let mut plan = self.alloc_expr(
+            Expr::Call {
+                callee: plan_new,
+                type_args: Vec::new(),
+                args: plan_args,
             },
-            node.span_range(),
+            span,
+        );
+        for (modifier, modifier_span) in with_exprs {
+            let with = self.alloc_expr(
+                Expr::MemberAccess {
+                    base: plan,
+                    member: Name::new("with"),
+                },
+                modifier_span,
+            );
+            plan = self.alloc_expr(
+                Expr::Call {
+                    callee: with,
+                    type_args: Vec::new(),
+                    args: vec![CallArg::positional(modifier)],
+                },
+                modifier_span,
+            );
+        }
+        let launch = self.alloc_expr(spawn_path(&["__spawn"]), span);
+        self.alloc_expr(
+            Expr::Call {
+                callee: launch,
+                type_args: Vec::new(),
+                args: vec![CallArg::positional(plan)],
+            },
+            span,
         )
     }
 
@@ -2787,15 +2869,8 @@ impl LoweringContext {
                     span: token.text_range(),
                 });
         }
-        if let Some(token) = &name_token
-            && token.text() == "$id"
-        {
-            self.diags
-                .push(LoweringDiagnostic::ReservedRuntimeIdBindingName {
-                    span: token.text_range(),
-                });
-        }
 
+        let name_span = name_token.as_ref().map(rowan::SyntaxToken::text_range);
         let name = name_token.map(|t| Name::new(t.text()));
 
         // The parser folds `: <pattern>` into BINDING_PATTERN as a
@@ -2809,7 +2884,11 @@ impl LoweringContext {
             Some(name) => Pattern::Bind { name, subpat },
             None => Pattern::Wildcard,
         };
-        self.alloc_pattern(pat, node.span_range())
+        let id = self.alloc_pattern(pat, node.span_range());
+        if let Some(span) = name_span {
+            self.source_map.bind_name_spans.insert(id, span);
+        }
+        id
     }
 
     /// Walk a pattern and emit `VoidInNonReturnPosition` for any `Pattern::Type`
@@ -2861,7 +2940,7 @@ impl LoweringContext {
                     );
                 }
             }
-            Pattern::Wildcard | Pattern::Unreflect(_) => {}
+            Pattern::Wildcard => {}
             Pattern::Bind { subpat, .. } => {
                 if let Some(sp) = subpat {
                     self.check_pattern_void_in_annotation(sp, context);
@@ -2882,15 +2961,7 @@ impl LoweringContext {
             return self.alloc_pattern(Pattern::Wildcard, node.span_range());
         };
         let ty = self.lower_body_type_expr(&type_expr);
-        if let TypeExprKind::Unreflect {
-            operand: Some(operand),
-            ..
-        } = ty.kind
-        {
-            self.alloc_pattern(Pattern::Unreflect(operand), node.span_range())
-        } else {
-            self.alloc_pattern(Pattern::Type(ty), node.span_range())
-        }
+        self.alloc_pattern(Pattern::Type(ty), node.span_range())
     }
 
     /// Lower a `DESTRUCTURE_PATTERN` (`(let|const)? PATH ('<' types '>')? '{' field_list '}'`).
@@ -2976,17 +3047,6 @@ impl LoweringContext {
         let pat = match value_pattern {
             Some(child) => self.lower_pattern(&child),
             None => {
-                // Shorthand `{ f }` → bind to a local of the same name. `_`
-                // canonicalises to `Wildcard`, same rule as elsewhere.
-                // A shorthand binding named `$id` would be silently dead
-                // (reads hit the runtime-identity special form first) —
-                // reject it like every other `$id` binding site.
-                if field_name.as_str() == "$id" {
-                    self.diags
-                        .push(LoweringDiagnostic::ReservedRuntimeIdBindingName {
-                            span: field_span,
-                        });
-                }
                 let synth = if field_name.as_str() == "_" {
                     Pattern::Wildcard
                 } else {
@@ -3362,7 +3422,7 @@ impl LoweringContext {
         let callee_generic_args = callee_node.as_ref().and_then(find_callee_generic_args);
         let type_args: Vec<TypeExpr> = callee_generic_args
             .as_ref()
-            .map(|ga| self.lower_call_generic_args_node(ga))
+            .map(|ga| self.lower_generic_args_node(ga))
             .unwrap_or_default();
         // Mark EVERY `GENERIC_ARGS` node in the callee subtree as consumed, so
         // lowering the callee/receiver below does not wrap any of them into an
@@ -3405,6 +3465,7 @@ impl LoweringContext {
             .map(|args_node| self.lower_call_args_node(&args_node))
             .unwrap_or_default();
         let (args, label_spans) = Self::finalize_call_args(lowered_args);
+        let args = self.complete_client_resolve_call(callee, args, node.span_range());
 
         let id = self.alloc_expr(
             Expr::Call {
@@ -3419,6 +3480,37 @@ impl LoweringContext {
             self.needs_chain_wrap.insert(id);
         }
         id
+    }
+
+    /// `ai.clients.resolve(selector)` is compiler-assisted: only the compiler
+    /// knows every provider (every provider package depends on `ai`, so `ai`
+    /// cannot name them), and the calling package reaches them all through
+    /// the prelude. So at each call site the compiler appends the provider
+    /// table — a constructor lambda and the list of prefixes it knows, both
+    /// synthesized from `SHORTHAND_PROVIDERS`, the one table the literal
+    /// `client "provider/model"` lowering reads too. A call that already
+    /// passes them is left alone.
+    fn complete_client_resolve_call(
+        &mut self,
+        callee: ExprId,
+        mut args: Vec<CallArg>,
+        span: TextRange,
+    ) -> Vec<CallArg> {
+        let is_resolve = matches!(
+            &self.exprs[callee],
+            Expr::Path(segments)
+                if segments.len() == 3
+                    && segments[0].as_str() == "ai"
+                    && segments[1].as_str() == "clients"
+                    && segments[2].as_str() == "resolve"
+        );
+        if is_resolve && args.len() == 1 {
+            let providers = synthesize_shorthand_providers(self, span);
+            args.push(CallArg::positional(providers));
+            let prefixes = synthesize_shorthand_prefixes(self, span);
+            args.push(CallArg::positional(prefixes));
+        }
+        args
     }
 
     fn finalize_call_args(
@@ -3505,13 +3597,6 @@ impl LoweringContext {
             .collect()
     }
 
-    /// Lower a call's generic arguments. Unlike type constructors and
-    /// value-position generic application, calls may contain the contextual
-    /// whole-slot `unreflect(expr)` form.
-    fn lower_call_generic_args_node(&mut self, ga: &SyntaxNode) -> Vec<TypeExpr> {
-        self.lower_generic_args_node(ga)
-    }
-
     /// If `node` has a direct, unconsumed `GENERIC_ARGS` child, wrap `base` in an
     /// `Expr::GenericApply` carrying its type args; otherwise return `base`.
     /// `range` spans the whole instantiation (`foo<int>`).
@@ -3586,13 +3671,6 @@ impl LoweringContext {
             return self.alloc_expr(Expr::Missing, node.span_range());
         }
 
-        // Check if single segment is a literal keyword.
-        //
-        // Note `$id` is deliberately NOT desugared here: a lone `$id` reaches
-        // the AST as a bare WORD token (the parser only builds PATH_EXPR for
-        // dotted paths), so the special form is owned downstream — TIR types
-        // the read as `string` (builder.rs `infer_path`) and MIR lowers reads
-        // to `baml.id.current()` / writes to `baml.id.set(...)` (lower.rs).
         if segments.len() == 1 {
             match segments[0].0.as_str() {
                 "true" => {
@@ -3736,7 +3814,7 @@ impl LoweringContext {
             })
             .and_then(baml_compiler_syntax::ast::TypeExpr::cast)
             .map(|te| self.lower_body_type_expr(&te))
-            .unwrap_or_else(|| TypeExprKind::Missing { attrs: Vec::new() }.at(node.span_range()));
+            .unwrap_or_else(|| TypeExprKind::Missing.at(node.span_range()));
 
         let id = self.alloc_expr(Expr::Upcast { base, target }, node.span_range());
         if self.needs_chain_wrap.remove(&base) {
@@ -3760,7 +3838,7 @@ impl LoweringContext {
             .children()
             .filter_map(baml_compiler_syntax::ast::TypeExpr::cast)
             .map(|te| self.lower_body_type_expr(&te));
-        let missing = || TypeExprKind::Missing { attrs: Vec::new() }.at(span);
+        let missing = || TypeExprKind::Missing.at(span);
         let qself = types.next().unwrap_or_else(missing);
         let interface = types.next().unwrap_or_else(missing);
 
@@ -3771,27 +3849,35 @@ impl LoweringContext {
             .filter_map(rowan::NodeOrToken::into_token)
             .filter(|token| !token.kind().is_trivia())
             .collect();
-        let member = tokens
+        let member_token = tokens
             .iter()
             .rposition(|token| token.kind() == SyntaxKind::DOT)
             .and_then(|dot| tokens.get(dot + 1))
             // The full member-name set, not just `WORD`: an interface method
             // may be named with a contextual keyword (`implements`, `extends`),
             // and the parser accepts those here.
-            .filter(|token| is_ident_token(token.kind()))
-            .map(|token| Name::new(token.text()));
-        let Some(member) = member else {
+            .filter(|token| is_ident_token(token.kind()));
+        let Some(member_token) = member_token else {
             return self.alloc_expr(Expr::Missing, span);
         };
+        let member = Name::new(member_token.text());
+        let member_range = member_token.text_range();
 
-        self.alloc_expr(
+        let id = self.alloc_expr(
             Expr::QualifiedPath {
                 qself,
                 interface,
                 member,
             },
             span,
-        )
+        );
+        // The member name is a reference to the interface's declaration, so
+        // it needs a span of its own: without one, a reader asking about
+        // `show` in `(B as Shows).show` gets back the whole projection.
+        self.source_map
+            .member_access_member_spans
+            .insert(id, member_range);
+        id
     }
 
     fn lower_env_access_expr(&mut self, node: &SyntaxNode) -> ExprId {
@@ -4401,7 +4487,7 @@ impl LoweringContext {
                 condition: cond,
                 body: loop_body,
                 after: step,
-                origin: LoopOrigin::For,
+                origin: LoopOrigin::For { init },
             },
             after_span,
         );
@@ -4531,17 +4617,9 @@ impl LoweringContext {
 
         let mut stmts: Vec<StmtId> = Vec::new();
         // let __tt_parts: string[] = [];
-        stmts.push(self.tt_let_typed_empty_list(
-            &parts,
-            TypeExprKind::String { attrs: Vec::new() }.at(span),
-            span,
-        ));
+        stmts.push(self.tt_let_typed_empty_list(&parts, TypeExprKind::String.at(span), span));
         // let __tt_values: unknown[] = [];
-        stmts.push(self.tt_let_typed_empty_list(
-            &values,
-            TypeExprKind::Unknown { attrs: Vec::new() }.at(span),
-            span,
-        ));
+        stmts.push(self.tt_let_typed_empty_list(&values, TypeExprKind::Unknown.at(span), span));
         // let __tt_cur = "";
         let at = TextRange::empty(span.start());
         let cur_init = self.alloc_expr(Expr::Literal(Literal::String(String::new())), at);
@@ -4677,7 +4755,7 @@ impl LoweringContext {
                             condition: *cond,
                             body: loop_body,
                             after: *step,
-                            origin: LoopOrigin::For,
+                            origin: LoopOrigin::For { init: *init },
                         },
                         span,
                     );
@@ -4745,7 +4823,6 @@ impl LoweringContext {
         let at = TextRange::empty(span.start());
         let list_ty = TypeExprKind::List {
             inner: Box::new(elem),
-            attrs: Vec::new(),
         }
         .at(span);
         let type_pat = self.alloc_pattern(Pattern::Type(list_ty), at);
@@ -5305,7 +5382,7 @@ impl LoweringContext {
         // recovery and ignored here — `LambdaDef` has nowhere to put them.
 
         // Lower parameter list — gives us Vec<Param>
-        let (mut params, defaults) = node
+        let (params, defaults) = node
             .children()
             .find(|n| n.kind() == SyntaxKind::PARAMETER_LIST)
             .and_then(ast::ParameterList::cast)
@@ -5320,24 +5397,6 @@ impl LoweringContext {
                 )
             })
             .unwrap_or_else(|| (Vec::new(), FunctionDefaults::empty()));
-
-        if let Some(parameter_list) = node
-            .children()
-            .find(|n| n.kind() == SyntaxKind::PARAMETER_LIST)
-            .and_then(ast::ParameterList::cast)
-        {
-            for parameter in parameter_list.params() {
-                let Some(type_expr) = parameter.ty() else {
-                    continue;
-                };
-                let span = parameter.syntax().span_range();
-                if let Some(lowered) = params.iter_mut().find(|param| param.span == span)
-                    && let Some(lowered_ty) = &mut lowered.type_expr
-                {
-                    self.attach_body_type_operands(&type_expr, lowered_ty);
-                }
-            }
-        }
 
         // Lower optional return type: the TYPE_EXPR that is a direct child of the
         // lambda node, appearing after PARAMETER_LIST but before THROWS_CLAUSE/BLOCK_EXPR.
@@ -5538,19 +5597,81 @@ impl LoweringContext {
         self.alloc_stmt(Stmt::Return(expr), node.span_range())
     }
 
+    /// `type T = RHS;` in a body. The RHS is either the whole marker
+    /// `unreflect(expr)` — the one position that lowers it — or a static
+    /// type, which takes the ordinary type road (where a nested `unreflect`
+    /// is rejected like every other inline occurrence).
     fn lower_type_binding_stmt(&mut self, node: &SyntaxNode) -> StmtId {
-        let name = node
+        let name_token = node
             .children_with_tokens()
             .filter_map(rowan::NodeOrToken::into_token)
-            .find(|token| token.kind() == SyntaxKind::WORD)
+            .find(|token| token.kind() == SyntaxKind::WORD);
+        let name = name_token
+            .as_ref()
             .map(|token| Name::new(token.text()))
             .unwrap_or_else(|| Name::new("<missing>"));
-        let value = node
+        let value = match node
             .children()
             .find_map(baml_compiler_syntax::ast::TypeExpr::cast)
-            .map(|ty| self.lower_body_type_expr(&ty))
-            .unwrap_or_else(|| TypeExprKind::Error { attrs: Vec::new() }.at(node.span_range()));
-        self.alloc_stmt(Stmt::TypeBinding { name, value }, node.span_range())
+        {
+            Some(type_expr) => {
+                match Self::whole_unreflect_marker(&type_expr) {
+                    Some(marker) => {
+                        TypeBindingValue::Runtime(self.lower_unreflect_operand(&marker))
+                    }
+                    None => {
+                        // `unreflect(…)` somewhere inside a static right-hand
+                        // side: the generic gate's "bind it first" advice would
+                        // point at the statement it is already in. Every
+                        // occurrence is reported, not just the first: the whole
+                        // right-hand side becomes the error type, so a second
+                        // marker would otherwise never be mentioned at all.
+                        let nested: Vec<SyntaxNode> = type_expr
+                            .syntax()
+                            .descendants()
+                            .filter(|node| node.kind() == SyntaxKind::UNREFLECT_TYPE)
+                            .collect();
+                        match nested.split_first() {
+                            Some((first, rest)) => {
+                                for marker in std::iter::once(first).chain(rest) {
+                                    self.diags.push(
+                                        LoweringDiagnostic::UnreflectNestedInTypeBinding {
+                                            span: marker.text_range(),
+                                        },
+                                    );
+                                }
+                                TypeBindingValue::Static(TypeExprKind::Error.at(first.text_range()))
+                            }
+                            None => TypeBindingValue::Static(self.lower_body_type_expr(&type_expr)),
+                        }
+                    }
+                }
+            }
+            None => TypeBindingValue::Static(TypeExprKind::Error.at(node.span_range())),
+        };
+        let stmt = self.alloc_stmt(Stmt::TypeBinding { name, value }, node.span_range());
+        if let Some(token) = name_token {
+            self.source_map
+                .type_binding_name_spans
+                .insert(stmt, token.text_range());
+        }
+        stmt
+    }
+
+    /// The `UNREFLECT_TYPE` node when `type_expr` is exactly `unreflect(expr)`:
+    /// not a union member, not under a postfix modifier, nothing else around
+    /// it. `unreflect(t)?` or `Wrapper<unreflect(t)>` are not the marker; they
+    /// take the static road and are diagnosed there.
+    fn whole_unreflect_marker(
+        type_expr: &baml_compiler_syntax::ast::TypeExpr,
+    ) -> Option<SyntaxNode> {
+        if type_expr.is_union() || !type_expr.postfix_modifiers().is_empty() {
+            return None;
+        }
+        type_expr
+            .syntax()
+            .children()
+            .find(|node| node.kind() == SyntaxKind::UNREFLECT_TYPE)
     }
 
     /// Lower the optional value of a `return` node — shared by `RETURN_STMT`
@@ -5707,7 +5828,7 @@ impl LoweringContext {
         //
         // C-style is desugared to:
         //   Stmt::Let { ... }   // init
-        //   Stmt::While { condition, body, after: Some(update_stmt), origin: LoopOrigin::For }
+        //   Stmt::While { condition, body, after: Some(update_stmt), origin: LoopOrigin::For { init } }
         // These two statements are wrapped in Expr::Block → Stmt::Expr so the
         // function can return a single StmtId.
         let range = node.span_range();
@@ -5866,7 +5987,7 @@ impl LoweringContext {
                 condition,
                 body,
                 after: after_stmt,
-                origin: LoopOrigin::For,
+                origin: LoopOrigin::For { init: init_stmt },
             },
             range,
         );
@@ -5982,7 +6103,6 @@ impl LoweringContext {
                     segments: vec![Name::new("testing"), Name::new("TestCollector")],
                     generic_args: vec![],
                     associated_type_bindings: vec![],
-                    attrs: vec![],
                 }
                 .at(span),
             ),

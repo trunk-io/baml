@@ -5,11 +5,11 @@
 
 interface Runner {
     /// The error surface of this runner (`never` if the runner cannot throw).
-    type Error = never
+    type Error = never;
 
     /// Execute one spec to completion. `Out` lives on the method and is
     /// inferred from the spec argument, so no call site needs to name it.
-    function run<Out>(self, spec: FunctionSpec<Out>) -> RunResult<Out> throws Self.Error
+    function run<Out>(self, spec: FunctionSpec<Out>) -> RunResult<Out> throws Self.Error;
 }
 
 class RunResult<Out> {
@@ -98,7 +98,7 @@ class Agent {
                     },
                 };
                 if let output: string = outcome {
-                    j.append_all([root.events.ToolCompleted { id: call.id, output: output }]);
+                    j.append_all([root.events.ToolCompleted.new(call.id, output)]);
                 }
                 null
             },
@@ -199,6 +199,12 @@ class Agent {
     }
 
     function _parses<Out>(self, turn: ModelTurn, candidate: string) -> bool {
+        if let parsed: ParsedOutput = turn.parsed_output {
+            return match (parsed.value) {
+                let value: Out => true,
+                _ => false,
+            };
+        }
         // A media-shaped `Out` is satisfied by the turn's blocks. When the turn
         // carries NONE, this falls through to the ordinary text parse rather
         // than declaring failure — that is sys_llm's `Ok(None)` -> SAP path
@@ -249,6 +255,23 @@ class Agent {
             if let rt: int = u.reasoning_tokens {
                 total.reasoning_tokens = (total.reasoning_tokens ?? 0) + rt;
             }
+            if let cw: int = u.cache_write_input_tokens {
+                total.cache_write_input_tokens = (total.cache_write_input_tokens ?? 0) + cw;
+            }
+            if let ui: int = u.uncached_input_tokens {
+                total.uncached_input_tokens = (total.uncached_input_tokens ?? 0) + ui;
+            }
+            // Recorded against the span running this call (the LLM function's,
+            // or the thread's), so baml query can price every turn.
+            let _ = trace._record_usage(
+                trace._usage_target(),
+                turn.model,
+                u.uncached_input_tokens ?? u.input_tokens,
+                u.output_tokens,
+                u.cached_input_tokens,
+                u.cache_write_input_tokens,
+                u.reasoning_tokens,
+            );
         }
         // every attempt commits: the journal is the complete record
         let batch: root.events.Event[] = [root.events.AssistantMessage { content: turn.content, client_id: c.id() }];
@@ -286,9 +309,9 @@ class Agent {
             turn
         } else if (attempts_left > 1) {
             batch.push(
-                root.events.UserMessage {
-                    content: "The reply did not match the required schema. Answer again with only the corrected value.",
-                },
+                root.events.UserMessage.new(
+                    "The reply did not match the required schema. Answer again with only the corrected value.",
+                ),
             );
             j.append_all(batch);
             self._attempt_turn<Out>(c, spec, j, total, attempts_left - 1)
@@ -321,7 +344,7 @@ class Agent {
             | baml.errors.Timeout
             | baml.errors.UnknownError
             | reflect.errors.CompilationError
-            | root.errors.Failure
+            | root.errors.Failure;
 
         function run<Out>(self, spec: FunctionSpec<Out>) -> RunResult<Out> {
             let schema_attempts = self._validated_schema_attempts();
@@ -334,6 +357,8 @@ class Agent {
                 output_tokens: 0,
                 cached_input_tokens: null,
                 reasoning_tokens: null,
+                cache_write_input_tokens: null,
+                uncached_input_tokens: null,
             };
             // the futility breaker: identical repeated failures stop the run
             let fail_counts: map<string, int> = {};
@@ -395,7 +420,12 @@ class Agent {
                     // absence is expressed: SAP answers `null` for `image?` /
                     // `image[]?` and `[]` for `image[]`, and only a required
                     // `image` fails there (`_parses` agrees, by construction).
-                    let value = if (self._has_media_output<Out>(turn)) {
+                    let value = if let parsed: ParsedOutput = turn.parsed_output {
+                        let typed: Out = parsed.value else {
+                            throw root.errors.ParseFailed { provider: selected.id(), raw_output: candidate }
+                        };
+                        typed
+                    } else if (self._has_media_output<Out>(turn)) {
                         self._media_value<Out>(turn, selected.id())
                     } else {
                         baml.sap.parse<Out>(candidate) catch_all (e) {

@@ -28,15 +28,7 @@ fn main() {
         eprintln!("Skipping compiler_benchmark in debug/test profile.");
         return;
     }
-    // Hermetic wall-time: pin BAML profiling OFF unless the caller explicitly
-    // chose a value, so compile timings don't include the default-ON tracing
-    // pipeline. See runtime_benchmark.rs for the full rationale; tracing cost
-    // is measured deliberately in the `profiling_overhead` bench target.
-    if std::env::var_os("BAML_PROFILE").is_none() {
-        // SAFETY: single-threaded at the very top of main, before any engine
-        // or divan code reads the environment.
-        unsafe { std::env::set_var("BAML_PROFILE", "0") };
-    }
+
     divan::main();
 }
 
@@ -77,7 +69,10 @@ fn build_db(root: &Path, sources: &ProjectSources) -> ProjectDatabase {
 
 /// Compile a populated database to bytecode, measuring only the compile step.
 fn compile(db: &ProjectDatabase) {
-    let program = generate_project_bytecode(db).expect("benchmark compilation failed");
+    let package = db
+        .workspace_root()
+        .unwrap_or_else(|| unreachable!("`build_db` adds one workspace root"));
+    let program = generate_project_bytecode(db, package).expect("benchmark compilation failed");
     black_box(program);
 }
 

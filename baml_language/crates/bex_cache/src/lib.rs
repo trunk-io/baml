@@ -101,12 +101,54 @@ use sha2::{Digest, Sha256};
 /// (an adopted interface default resolves at dispatch through the
 /// interface's `default_fn`, never through a baked row), rule fragments
 /// moved onto their declaring unit, and `ProgramMethodImplFrag` carries the
-/// body's code-bucket offset in that unit rather than a name. A body has no
-/// name-keyed coordinates on the PROGRAM wire — its spelling survives only
-/// as the `CompilationUnit`'s link-internal export/import key; compile
-/// boundaries read coordinates from the declaration-keyed placement
-/// registry, with a Pass-1 slot replay only at the stdlib-splice boundary.
-pub const FORMAT_VERSION: u32 = 11;
+/// body's code-bucket offset in that unit rather than a name. Nothing on the
+/// PROGRAM wire KEYS on a body's spelling any more: it survives as display
+/// data only (`Function::name`, and the per-instruction `OperandMeta` in
+/// `Bytecode::meta`) plus the `CompilationUnit`'s link-internal
+/// export/import key; compile boundaries read coordinates from the
+/// declaration-keyed placement registry, with a Pass-1 slot replay only at
+/// the stdlib-splice boundary. Two further changes ride this version:
+/// `MethodImpl::frame` follows the `[owner ++ own]` convention with NO
+/// associated-type slots (an adopted default's owner frame is
+/// `[Self, interface args..]`; a body's `Self.Assoc` reduces as a
+/// projection), and the generated `SysOp` enum's variants for in-class impl
+/// methods were respelled (`<Iface>For<Class>`), which reassigns
+/// discriminants — a wire AND host-ABI change for embedders matching on
+/// variant names.
+///
+/// Version 12: appended `PopJumpIfTrue`, `JumpIfFalseOrPop`,
+/// `JumpIfTrueOrPop`, and `JumpIfNotNullOrPop` to the instruction/opcode sets.
+///
+/// Version 13: removed `RuntimeIsType` from the instruction/opcode sets, so
+/// every opcode declared after it renumbers, and dropped the type-argument
+/// count flag bit from call instructions.
+///
+/// Version 14: `Bytecode::call_layouts` records each call site's argument layout.
+///
+/// Version 15: `CompilationUnit` gained `referenced_names` and
+/// `bakes_type_layout` — the incremental reverse-dependency edges, recorded
+/// by codegen at its resolution sites and carried with the unit. Previously
+/// the CLI reconstructed them from compiled operands joined against the
+/// runtime name maps, which silently severed every edge into a name class
+/// that left those maps (version 11 removed interface-machinery bodies from
+/// them, so direct calls to interface bodies stopped dirtying their
+/// callers).
+///
+/// Version 16: `DiagnosticId` dropped `FieldAttributeInTypePosition` (E0106,
+/// BEP-075 removed type attributes), shifting the borsh discriminants of all
+/// later variants.
+///
+/// Version 17: `Bytecode::shield_table` records the PC ranges of `defer`
+/// bodies, which run shielded from cancellation. The `Spawn` opcode yields a
+/// `baml.spawn.Plan` instead of a pre-allocated `UnscheduledFuture`, and moved
+/// to the end of the `Instruction` and `OpCode` enums (after `SetCallTrace`),
+/// changing its serialized discriminant. `Object`/`ObjectType` lost
+/// `UnscheduledFuture` from the middle of the enum, renumbering the Borsh
+/// discriminants after it, and `Rethrow`/`ThrowIfPanic` pop the caught error's
+/// context under its value, with every exception-table entry naming a context
+/// slot. (It is 17, not 16: version 16 is BEP-075's and shipped in 0.20.0, so
+/// reusing it would admit a released cache entry.)
+pub const FORMAT_VERSION: u32 = 17;
 
 const MAGIC: [u8; 4] = *b"BEXC";
 
@@ -268,7 +310,7 @@ pub struct ManifestFile {
     /// them. Re-seeded into the next compile's database so unchanged files
     /// never re-walk their bodies just to answer "what does the package
     /// throw" — the package-level solve then runs from facts alone.
-    pub throw_facts: Vec<baml_type::throw_facts::FunctionThrowFacts>,
+    pub throw_facts: Vec<baml_type::throw_facts::FunctionThrowFacts<baml_type::TypeName>>,
     /// Opaque borsh blob of the diagnostics `check_file` produced for this
     /// file on the compile that wrote the manifest (`borsh(Vec<CachedDiagnostic>)`,
     /// the typed form living in the CLI). Kept opaque here so `bex_cache` does
@@ -946,7 +988,7 @@ mod tests {
             defined_names: Vec<String>,
             referenced_names: Vec<String>,
             sig_referenced_names: Vec<String>,
-            throw_facts: Vec<baml_type::throw_facts::FunctionThrowFacts>,
+            throw_facts: Vec<baml_type::throw_facts::FunctionThrowFacts<baml_type::TypeName>>,
             diagnostics: Vec<u8>,
         }
         #[derive(borsh::BorshSerialize)]

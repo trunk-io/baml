@@ -3,16 +3,88 @@ source: crates/baml_tests/src/corpus.rs
 ---
 function fixtures.short_circuit_locals.chained_and(a: bool, b: bool, c: bool) -> bool {
     load_var a
-    jump_if_false L0
-    pop 1
+    jump_if_false_or_pop L0
     load_var b
-
-  L0:
-    jump_if_false L1
-    pop 1
+    jump_if_false_or_pop L0
     load_var c
 
+  L0:
+    return
+}
+
+function fixtures.short_circuit_locals.coalesced_lengths_compared_apart() -> bool {
+    load_type int
+    alloc_array 0
+    load_const 1
+    load_const "a"
+    load_type string
+    load_type int
+    alloc_map 1
+    init_instance user.fixtures.short_circuit_locals.ShortCircuitBox .items, .tags
+    store_var box
+    load_var box
+    load_field .items
+    store_var items
+    load_var box
+    load_field .tags
+    store_var tags
+    load_var items
+    load_const null
+    cmp_op ==
+    pop_jump_if_true L0
+    load_var items
+    container_len
+    jump L1
+
+  L0:
+    load_const null
+
   L1:
+    jump_if_not_null_or_pop L2
+    jump L3
+
+  L2:
+    store_var _8
+    jump L4
+
+  L3:
+    load_const -1
+    store_var _8
+
+  L4:
+    load_var tags
+    load_const null
+    cmp_op ==
+    pop_jump_if_true L5
+    load_var tags
+    container_len
+    jump L6
+
+  L5:
+    load_const null
+
+  L6:
+    jump_if_not_null_or_pop L7
+    jump L8
+
+  L7:
+    store_var _15
+    jump L9
+
+  L8:
+    load_const 0
+    store_var _15
+
+  L9:
+    load_var _8
+    load_const 0
+    cmp_int_op ==
+    jump_if_false_or_pop L10
+    load_var _15
+    load_const 1
+    cmp_int_op ==
+
+  L10:
     return
 }
 
@@ -20,21 +92,15 @@ function fixtures.short_circuit_locals.conditional_short_circuit(a: bool, b: boo
     load_const false
     store_var x
     load_var cond
-    pop_jump_if_false L2
+    pop_jump_if_false L1
     load_var a
-    jump_if_false L0
-    pop 1
-    jump L1
+    jump_if_false_or_pop L0
+    load_var b
 
   L0:
     store_var x
-    jump L2
 
   L1:
-    load_var b
-    store_var x
-
-  L2:
     load_var x
     return
 }
@@ -58,28 +124,19 @@ function fixtures.short_circuit_locals.conditional_short_circuit_in_loop(items: 
     store_var _7
     load_var _7
     is_type baml.iter.Done
-    pop_jump_if_false L1
-    jump L5
-
-  L1:
+    pop_jump_if_true L3
     load_var _7
     load_const 0
     cmp_int_op >
-    pop_jump_if_false L4
+    pop_jump_if_false L2
     load_var a
-    jump_if_false L2
-    pop 1
-    jump L3
+    jump_if_false_or_pop L1
+    load_var b
+
+  L1:
+    store_var x
 
   L2:
-    store_var x
-    jump L4
-
-  L3:
-    load_var b
-    store_var x
-
-  L4:
     load_var x
     pop_jump_if_false L0
     load_var hits
@@ -88,7 +145,7 @@ function fixtures.short_circuit_locals.conditional_short_circuit_in_loop(items: 
     store_var hits
     jump L0
 
-  L5:
+  L3:
     load_var hits
     return
 }
@@ -110,53 +167,39 @@ function fixtures.short_circuit_locals.initialized_local_in_branch_loop(items: i
     store_var _4
     load_var _4
     is_type baml.iter.Done
-    pop_jump_if_false L1
-    jump L5
-
-  L1:
-    load_const 0
-    store_var x
+    pop_jump_if_true L3
     load_var _4
     load_const 0
     cmp_int_op >
-    pop_jump_if_false L2
-    jump L3
+    pop_jump_if_true L1
+    load_const 2
+    jump L2
+
+  L1:
+    load_const 1
 
   L2:
-    load_const 2
-    store_var x
-    jump L4
-
-  L3:
-    load_const 1
-    store_var x
-
-  L4:
-    load_var2 5 2
+    load_var total
     bin_op +
     store_var total
     jump L0
 
-  L5:
+  L3:
     load_var total
     return
 }
 
 function fixtures.short_circuit_locals.mixed_join(a: bool, b: bool, cond: bool) -> bool {
     load_var cond
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const false
     jump L1
 
   L0:
-    load_const false
-    jump L2
-
-  L1:
     load_var a
-    jump_if_false L2
-    pop 1
+    jump_if_false_or_pop L1
     load_var b
 
-  L2:
+  L1:
     return
 }

@@ -16,6 +16,7 @@ use crate::{
     package_ai::{
         BamlClassPrompt, BamlNamespaceInternal, BamlPackageAi, PackageAiImpl, view as ai_view,
     },
+    vec_ext::VecExt,
 };
 
 #[derive(Default)]
@@ -121,7 +122,11 @@ fn trim_message_edges(sink: &mut PromptContentSink) {
             PromptAstSimple::String(text) => {
                 let trimmed = text.trim_end();
                 if trimmed.is_empty() {
-                    sink.parts.pop();
+                    // SAFETY: the loop matched the last part and has not removed it.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        sink.parts.no_return_pop();
+                    };
                 } else {
                     if trimmed.len() != text.len() {
                         let index = sink.parts.len() - 1;
@@ -258,7 +263,16 @@ impl PromptAssembly {
         let callee = match make_to_string_callee(vm, Value::object(next_ptr)) {
             Err(e) => return NativeCallResult::Error(e.into()),
             Ok(Some(callee)) => callee,
-            Ok(None) => return self.finish(vm),
+            // `pending` was collected by the override pre-order pass; a
+            // dispatch-pass miss is a skew between the two, not a fallback.
+            Ok(None) => {
+                return NativeCallResult::Error(
+                    crate::errors::VmInternalError::OverrideWalkSkew {
+                        interface: "ToString",
+                    }
+                    .into(),
+                );
+            }
         };
         NativeCallResult::YieldToCall {
             callee,

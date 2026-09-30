@@ -24,13 +24,16 @@ enum State {
 }
 
 class Future<T, E> {
-    /// Request cancellation of the future. If the future is already
-    /// settled, this is a no-op and returns `false`. Otherwise the
-    /// future's cancel token fires; the spawned thread will throw
-    /// `baml.panics.Cancelled` at its next `await` point.
+    /// Request cancellation of the future: fires its cancel token. A task that
+    /// has not started yet never starts; a running one throws
+    /// `baml.panics.Cancelled` at its next checkpoint (an `await` or an IO
+    /// call) and at every one after that, outside a `defer`. The task settles
+    /// the future: `Cancelled` once it unwinds or if it never started, `Ready`
+    /// with its value if it had no checkpoint left, or handled the panic and
+    /// completed. Until then the future stays `Pending`.
     ///
-    /// Returns `true` if a transition to the Cancelled state was
-    /// performed, `false` if the future was already settled.
+    /// Returns `true` if this call fired the token, `false` if the future was
+    /// already settled or cancellation was already requested.
     function cancel(self) -> bool throws never {
         $rust_function
     }
@@ -67,30 +70,69 @@ class Future<T, E> {
     }
 }
 
-/// BEP-034 combinators over a homogeneous array of futures (all sharing value
-/// type `T` and error type `E`). The inputs are already running, so awaiting
-/// them — even in a loop — runs them concurrently; the combinator just decides
-/// how to combine the results. Each returns a new `Future`, so they compose.
+// BEP-034 combinators over a homogeneous array of futures (all sharing value
+// type `T` and error type `E`). The inputs are already running, so awaiting
+// them — even in a loop — runs them concurrently; the combinator just decides
+// how to combine the results. Each returns a new `Future`, so they compose.
 
-/// Await every future and return their values in input order. Like `all`, but
-/// the losers KEEP RUNNING on a failure (they are not cancelled). Throws the
-/// first error encountered in input order.
-function all_complete<T, E>(futures: baml.future.Future<T, E>[]) -> baml.future.Future<T[], E> {
+/// A task returned a value.
+class Success<T> {
+    value: T,
+}
+
+/// A task threw a typed error.
+class Failure<E> {
+    error: E,
+}
+
+/// A task panicked, including cancellation (`baml.panics.Cancelled`).
+class Panicked {
+    panic: baml.panics.Panic,
+    context: baml.errors.Context,
+}
+
+/// Wait for every input and return one outcome per input, in input order.
+/// Typed errors become `Failure`; panics, including input cancellation, become
+/// `Panicked`. No input is cancelled because another input failed or panicked.
+/// An empty input returns an empty array.
+///
+/// Cancelling the collector stops the wait; it is not an input outcome. Inputs
+/// remain governed by their own cancellation tokens and task groups.
+function all_settled<T, E>(
+    futures: baml.future.Future<T, E>[],
+) -> baml.future.Future<(baml.future.Success<T> | baml.future.Failure<E> | baml.future.Panicked)[], never> {
     spawn {
-        futures.map((f) -> {
-            await f
-        })
+        let outcomes: (baml.future.Success<T> | baml.future.Failure<E> | baml.future.Panicked)[] = [];
+        for (let f in futures) {
+            // Wait for `f` to settle. Only the collector's own cancellation
+            // ends this wait early, and it propagates, stopping the collection.
+            let _ = baml.future.__await_any([f]);
+            // `f` has settled, so awaiting it only reads its outcome: a panic
+            // caught here, `Cancelled` included, is the input's.
+            let value = (await f) catch_all_panics (e, context) {
+                let panic: baml.panics.Panic => {
+                    outcomes.push(baml.future.Panicked { panic: panic, context: context });
+                    continue;
+                },
+                let error => {
+                    let failure: baml.future.Failure<E> = baml.future.Failure { error: error };
+                    outcomes.push(failure);
+                    continue;
+                },
+            };
+            let success: baml.future.Success<T> = baml.future.Success { value: value };
+            outcomes.push(success);
+        }
+        outcomes
     }
 }
 
-/// Await every future and return their values in input order, like
-/// `all_complete`, but on the FIRST failure the remaining futures are
-/// cancelled before the error is re-thrown (JS `Promise.all`). Use
-/// `all_complete` instead when losers have side effects that must finish.
+/// Await every future and return their values in input order. On the first
+/// observed typed error, cancel the remaining futures and rethrow that error.
+/// Use `all_settled` to let every input settle and inspect each outcome.
 ///
-/// Note: failures are observed in input order (not strictly first-to-fail in
-/// wall-clock time); the value contract — every value, or one error — is the
-/// same either way.
+/// Failures are observed in input order, not strictly first-to-fail in
+/// wall-clock time. Panics propagate normally.
 function all<T, E>(futures: baml.future.Future<T, E>[]) -> baml.future.Future<T[], E> {
     spawn {
         futures.map((f) -> {
@@ -253,7 +295,7 @@ function with_timeout<T, E>(
     body: () -> T throws E,
 ) -> T throws E | baml.errors.Timeout {
     let token = baml.spawn.CancelToken.new();
-    let work = spawn with baml.spawn.options(cancel = token) { body() };
+    let work = spawn with token { body() };
     let deadline = spawn {
         baml.sys.sleep(limit);
         token.cancel()
@@ -261,6 +303,10 @@ function with_timeout<T, E>(
     defer {
         deadline.cancel()
     }
+    // Wait for `work` to settle. Only the caller's own cancellation ends this
+    // wait early, and it propagates as itself, never as a timeout.
+    let _ = baml.future.__await_any([work]);
+    // `work` has settled, so awaiting it only reads its outcome.
     (await work) catch (e) {
         baml.panics.Cancelled => {
             if (!token.is_cancelled()) {

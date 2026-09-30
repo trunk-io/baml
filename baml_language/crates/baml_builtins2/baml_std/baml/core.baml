@@ -7,6 +7,7 @@
 /// live async state the runtime owns, not a value with contents to clone, so a
 /// future nested inside `value` is shared, not duplicated.
 //baml:mut_vm
+//baml:fallible
 function deep_copy<T>(value: T) -> T throws never {
     $rust_function
 }
@@ -15,9 +16,7 @@ function deep_copy<T>(value: T) -> T throws never {
 ///
 /// Use it to test whether a type is concrete, or as a bound restricting a type
 /// parameter to concrete types.
-interface Concrete {
-
-}
+interface Concrete {}
 
 implement<T> Concrete for T {
 

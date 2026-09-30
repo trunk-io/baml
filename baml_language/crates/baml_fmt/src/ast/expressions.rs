@@ -151,6 +151,9 @@ impl FromCST for Expression {
             SyntaxKind::INTEGER_LITERAL => Expression::Literal(Literal::Integer(
                 t::IntegerLiteral::new_from_span(elem.text_range()),
             )),
+            SyntaxKind::BIGINT_LITERAL => Expression::Literal(Literal::Bigint(
+                t::BigintLiteral::new_from_span(elem.text_range()),
+            )),
             SyntaxKind::FLOAT_LITERAL => Expression::Literal(Literal::Float(
                 t::FloatLiteral::new_from_span(elem.text_range()),
             )),
@@ -426,6 +429,7 @@ impl Printable for Expression {
 pub enum Literal {
     String(t::QuotedString),
     Integer(t::IntegerLiteral),
+    Bigint(t::BigintLiteral),
     Float(t::FloatLiteral),
     /// `true` / `false` / `null`.
     Keyword(t::KeywordLiteral),
@@ -436,6 +440,7 @@ impl FromCST for Literal {
         match elem.kind() {
             SyntaxKind::STRING_LITERAL => Ok(Literal::String(t::QuotedString::from_cst(elem)?)),
             SyntaxKind::INTEGER_LITERAL => Ok(Literal::Integer(t::IntegerLiteral::from_cst(elem)?)),
+            SyntaxKind::BIGINT_LITERAL => Ok(Literal::Bigint(t::BigintLiteral::from_cst(elem)?)),
             SyntaxKind::FLOAT_LITERAL => Ok(Literal::Float(t::FloatLiteral::from_cst(elem)?)),
             SyntaxKind::KW_TRUE | SyntaxKind::KW_FALSE | SyntaxKind::KW_NULL => {
                 Ok(Literal::Keyword(t::KeywordLiteral::from_cst(elem)?))
@@ -462,6 +467,7 @@ impl Literal {
                 }
             }
             Literal::Integer(i) => Some(usize::from(i.span().len())),
+            Literal::Bigint(i) => Some(usize::from(i.span().len())),
             Literal::Float(f) => Some(usize::from(f.span().len())),
             Literal::Keyword(k) => Some(usize::from(k.span().len())),
         }
@@ -473,6 +479,7 @@ impl Printable for Literal {
         match self {
             Literal::String(s) => printer.print_raw_token(s),
             Literal::Integer(i) => printer.print_raw_token(i),
+            Literal::Bigint(i) => printer.print_raw_token(i),
             Literal::Float(f) => printer.print_raw_token(f),
             Literal::Keyword(k) => printer.print_raw_token(k),
         }
@@ -482,6 +489,7 @@ impl Printable for Literal {
         match self {
             Literal::String(s) => s.leftmost_token(),
             Literal::Integer(i) => i.span(),
+            Literal::Bigint(i) => i.span(),
             Literal::Float(f) => f.span(),
             Literal::Keyword(k) => k.span(),
         }
@@ -490,6 +498,7 @@ impl Printable for Literal {
         match self {
             Literal::String(s) => s.rightmost_token(),
             Literal::Integer(i) => i.span(),
+            Literal::Bigint(i) => i.span(),
             Literal::Float(f) => f.span(),
             Literal::Keyword(k) => k.span(),
         }
@@ -3709,18 +3718,11 @@ impl KnownKind for BlockExpr {
 
 impl Printable for BlockExpr {
     fn print(&self, shape: Shape, printer: &mut Printer) -> PrintInfo {
-        // An empty block with no comment trapped inside collapses to `{}`
-        // (e.g. an empty match arm `null => {},` or an empty `if` body).
-        if self.stmts.is_empty() && self.expr.is_none() {
-            let (_, open_trailing) = printer.trivia.get_for_range_split(self.open_brace.span());
-            let (close_leading, _) = printer.trivia.get_for_range_split(self.close_brace.span());
-            if !open_trailing.iter().any(EmittableTrivia::is_comment)
-                && !close_leading.iter().any(EmittableTrivia::is_comment)
-            {
-                printer.print_raw_token(&self.open_brace);
-                printer.print_raw_token(&self.close_brace);
-                return PrintInfo::default_single_line();
-            }
+        if self.stmts.is_empty()
+            && self.expr.is_none()
+            && printer.try_print_empty_braces(&self.open_brace, &self.close_brace)
+        {
+            return PrintInfo::default_single_line();
         }
 
         printer.print_raw_token(&self.open_brace);
@@ -4106,8 +4108,13 @@ impl ObjectInitializer {
     /// Returns `None` if it can never be single-lined.
     pub(crate) fn single_line_width(&self, input: &Printer<'_>) -> Option<usize> {
         // Name { field1: v1, field2: v2 }
-        let mut len = self.name.single_line_width(input)? + const { " {  }".len() };
         let (_, open_trailing) = input.trivia.get_for_range_split(self.open_brace.span());
+        let mut len = self.name.single_line_width(input)?
+            + if self.has_content(input) {
+                const { " {  }".len() }
+            } else {
+                const { " {}".len() }
+            };
         len += open_trailing.try_squished_len(input.input)?;
         for (i, (field, comma)) in self.fields.iter().enumerate() {
             let (fld_leading, fld_trailing) = input.trivia.get_for_element(field);
@@ -4145,10 +4152,15 @@ impl ObjectInitializer {
     /// Should be passed a sub-printer to avoid printing trivia in the outer printer
     /// in the event that the printer is unable to fit the object initializer on a single line.
     fn try_print_single_line(&self, shape: &Shape, printer: &mut Printer) -> Option<PrintInfo> {
+        // An empty literal renders as `Name {}`: the padding spaces surround
+        // members or an interior comment, and there is neither.
+        let has_content = self.has_content(printer);
         printer.print(&self.name, Shape::unlimited_single_line());
         printer.print_str(" ");
         printer.print_raw_token(&self.open_brace);
-        printer.print_str(" ");
+        if has_content {
+            printer.print_str(" ");
+        }
         let (_, open_trailing) = printer.trivia.get_for_range_split(self.open_brace.span());
         printer.try_print_trivia_single_line_squished(open_trailing)?;
 
@@ -4186,7 +4198,9 @@ impl ObjectInitializer {
         }
         let (close_leading, _) = printer.trivia.get_for_range_split(self.close_brace.span());
         printer.try_print_trivia_single_line_squished(close_leading)?;
-        printer.print_str(" ");
+        if has_content {
+            printer.print_str(" ");
+        }
         printer.print_raw_token(&self.close_brace);
 
         if printer.output.len() > shape.width {
@@ -4194,6 +4208,17 @@ impl ObjectInitializer {
         } else {
             Some(PrintInfo::default_single_line())
         }
+    }
+
+    /// Whether anything sits between the braces on a single line: a member,
+    /// or an interior comment (the only trivia that prints there). An empty
+    /// literal takes no interior padding, as an empty map does.
+    fn has_content(&self, input: &Printer<'_>) -> bool {
+        let (_, open_trailing) = input.trivia.get_for_range_split(self.open_brace.span());
+        let (close_leading, _) = input.trivia.get_for_range_split(self.close_brace.span());
+        !self.fields.is_empty()
+            || open_trailing.iter().any(EmittableTrivia::is_comment)
+            || close_leading.iter().any(EmittableTrivia::is_comment)
     }
 }
 
@@ -4214,6 +4239,7 @@ impl Printable for ObjectInitializer {
 /// Corresponds to a [`SyntaxKind::MAP_LITERAL`] node.
 #[derive(Debug)]
 pub struct MapLiteral {
+    pub prefix: Option<t::Word>,
     pub open_brace: t::LBrace,
     pub fields: Vec<(ObjectField, Option<t::Comma>)>,
     pub close_brace: t::RBrace,
@@ -4226,6 +4252,10 @@ impl FromCST for MapLiteral {
 
         let mut it = SyntaxNodeIter::new(&node);
 
+        let prefix = it
+            .next_if_kind(SyntaxKind::WORD)
+            .map(t::Word::from_cst)
+            .transpose()?;
         let open_brace = it.expect_parse()?;
 
         let mut fields = Vec::new();
@@ -4258,6 +4288,7 @@ impl FromCST for MapLiteral {
         it.expect_end()?;
 
         Ok(MapLiteral {
+            prefix,
             open_brace,
             fields,
             close_brace,
@@ -4288,6 +4319,18 @@ impl PrintMultiLine for MapLiteral {
             first_line_offset: 0,
         };
 
+        if let Some(prefix) = &self.prefix {
+            printer.print_raw_token(prefix);
+            let (_, line_comment) = printer.print_trivia_all_trailing_for(prefix.span());
+            let (leading, _) = printer.trivia.get_for_range_split(self.open_brace.span());
+            if line_comment || !leading.is_empty() {
+                printer.print_newline();
+                printer.print_trivia_with_newline(leading, shape.indent);
+                printer.print_spaces(shape.indent);
+            } else {
+                printer.print_str(" ");
+            }
+        }
         printer.print_raw_token(&self.open_brace);
         printer.print_trivia_all_trailing_for(self.open_brace.span());
         printer.print_newline();
@@ -4333,6 +4376,20 @@ impl MapLiteral {
         } else {
             const { "{}".len() }
         };
+        if let Some(prefix) = &self.prefix {
+            len += const { "map ".len() };
+            let (_, trailing) = input.trivia.get_for_range_split(prefix.span());
+            let (leading, _) = input.trivia.get_for_range_split(self.open_brace.span());
+            len += trailing.try_squished_len(input.input)?;
+            len += leading.try_squished_len(input.input)?;
+            if trailing
+                .iter()
+                .chain(leading)
+                .any(EmittableTrivia::is_comment)
+            {
+                len += 1;
+            }
+        }
         for t in open_trailing {
             len += t.single_line_len(input.input)?;
         }
@@ -4390,6 +4447,21 @@ impl MapLiteral {
             || open_trailing.iter().any(EmittableTrivia::is_comment)
             || close_leading.iter().any(EmittableTrivia::is_comment);
 
+        if let Some(prefix) = &self.prefix {
+            printer.print_raw_token(prefix);
+            let (_, trailing) = printer.trivia.get_for_range_split(prefix.span());
+            let (leading, _) = printer.trivia.get_for_range_split(self.open_brace.span());
+            printer.print_str(" ");
+            printer.try_print_trivia_single_line_squished(trailing)?;
+            printer.try_print_trivia_single_line_squished(leading)?;
+            if trailing
+                .iter()
+                .chain(leading)
+                .any(EmittableTrivia::is_comment)
+            {
+                printer.print_str(" ");
+            }
+        }
         printer.print_raw_token(&self.open_brace);
         if has_content {
             printer.print_str(" ");
@@ -4449,7 +4521,9 @@ impl Printable for MapLiteral {
             .unwrap_or_else(|| self.print_multi_line(shape, printer))
     }
     fn leftmost_token(&self) -> TextRange {
-        self.open_brace.span()
+        self.prefix
+            .as_ref()
+            .map_or(self.open_brace.span(), t::Word::span)
     }
     fn rightmost_token(&self) -> TextRange {
         self.close_brace.span()
@@ -5053,7 +5127,12 @@ impl Printable for ThrowsClause {
     fn print(&self, shape: Shape, printer: &mut Printer) -> PrintInfo {
         let mut multi_lined = false;
         printer.print_raw_token(&self.keyword);
-        printer.print_str(" ");
+        printer.print_separator(
+            self.keyword.span(),
+            Some(self.ty.leftmost_token()),
+            shape.indent + printer.config.indent_width,
+            " ",
+        );
         multi_lined |= printer.print(&self.ty, shape).multi_lined;
         PrintInfo { multi_lined }
     }
@@ -5099,32 +5178,7 @@ impl FunctionArrow {
         continuation_indent: usize,
         printer: &mut Printer,
     ) {
-        let (_, arrow_trailing) = printer.trivia.get_for_range_split(self.span());
-        let next_leading = next_leftmost
-            .map(|range| printer.trivia.get_for_range_split(range).0)
-            .unwrap_or(&[]);
-        let mut printed_comment = false;
-        let mut continued_on_newline = false;
-
-        for trivia in arrow_trailing.iter().chain(next_leading) {
-            if !trivia.is_comment() {
-                continue;
-            }
-            if !continued_on_newline {
-                printer.print_spaces(1);
-            }
-            printer.print_trivia(trivia);
-            printed_comment = true;
-            continued_on_newline = trivia.single_line_len(printer.input).is_none();
-            if continued_on_newline {
-                printer.print_newline();
-                printer.print_spaces(continuation_indent);
-            }
-        }
-
-        if !printed_comment || !continued_on_newline {
-            printer.print_spaces(1);
-        }
+        printer.print_separator(self.span(), next_leftmost, continuation_indent, " ");
     }
 }
 
@@ -5287,7 +5341,7 @@ impl Printable for LambdaExpr {
 }
 
 /// The `with` options clause of a [`SpawnExpr`]: the keyword and its
-/// comma-separated expressions (in v1 a single `baml.spawn.options(...)`
+/// comma-separated expressions (each a `baml.spawn.Modifier` value
 /// call).
 pub type SpawnWithClause = (t::With, Vec<(Expression, Option<t::Comma>)>);
 
@@ -5529,7 +5583,7 @@ impl PrintMultiLine for SpawnExpr {
     /// opens right after it, closing at the outer indent.
     ///
     /// ```baml
-    /// spawn with baml.spawn.options(group = g) {
+    /// spawn with limit {
     ///     compute()
     /// }
     /// ```

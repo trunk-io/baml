@@ -138,18 +138,14 @@ pub(crate) fn display_instruction(
         Instruction::LoadGlobal(index) | Instruction::StoreGlobal(index) => {
             display_global_ref(*index, globals, objects, compile_time_globals)
         }
-        Instruction::Call { callee, .. }
-        | Instruction::CallWithRuntimeId { callee, .. }
-        | Instruction::SysOp(callee)
-        | Instruction::SysOpWithRuntimeId(callee) => {
+        Instruction::Call { callee, .. } | Instruction::SysOp(callee) => {
             display_global_ref(*callee, globals, objects, compile_time_globals)
         }
         Instruction::MakeGenericFunction { function, .. } => {
             display_global_ref(*function, globals, objects, compile_time_globals)
         }
         Instruction::MakeGenericFunctionFromValue { .. } => String::new(),
-        Instruction::VirtualCall { nargs, ntypeargs }
-        | Instruction::VirtualCallWithRuntimeId { nargs, ntypeargs } => {
+        Instruction::VirtualCall { nargs, ntypeargs } => {
             format!("nargs={nargs} ntypeargs={ntypeargs}")
         }
         Instruction::LoadVar(index)
@@ -178,6 +174,10 @@ pub(crate) fn display_instruction(
         }
         Instruction::Jump(offset)
         | Instruction::PopJumpIfFalse(offset)
+        | Instruction::PopJumpIfTrue(offset)
+        | Instruction::JumpIfFalseOrPop(offset)
+        | Instruction::JumpIfTrueOrPop(offset)
+        | Instruction::JumpIfNotNullOrPop(offset)
         | Instruction::JumpIfFalse(offset) => {
             format!("(to {})", instruction_ptr.wrapping_add_signed(*offset))
         }
@@ -241,12 +241,11 @@ pub(crate) fn display_instruction(
         | Instruction::Await
         | Instruction::AwaitAny
         | Instruction::CallIndirect
-        | Instruction::CallIndirectWithRuntimeId
+        | Instruction::SetCallTrace
         | Instruction::Throw
         | Instruction::Rethrow
         | Instruction::Discriminant
         | Instruction::TypeTag
-        | Instruction::RuntimeIsType
         | Instruction::IsType(_)
         | Instruction::ThrowIfPanic
         | Instruction::Unreachable
@@ -414,15 +413,17 @@ fn instruction_style(instruction: &Instruction) -> Style {
         | Instruction::UnaryOp(_) => Style::new().blue().bright(),
         Instruction::Jump(_)
         | Instruction::PopJumpIfFalse(_)
+        | Instruction::PopJumpIfTrue(_)
+        | Instruction::JumpIfFalseOrPop(_)
+        | Instruction::JumpIfTrueOrPop(_)
+        | Instruction::JumpIfNotNullOrPop(_)
         | Instruction::JumpIfFalse(_)
         | Instruction::JumpTable { .. }
         | Instruction::DenseTag(_) => Style::new().yellow(),
         Instruction::Call { .. }
-        | Instruction::CallWithRuntimeId { .. }
         | Instruction::CallIndirect
-        | Instruction::CallIndirectWithRuntimeId
-        | Instruction::VirtualCall { .. }
-        | Instruction::VirtualCallWithRuntimeId { .. } => Style::new().magenta(),
+        | Instruction::SetCallTrace
+        | Instruction::VirtualCall { .. } => Style::new().magenta(),
         Instruction::Return
         | Instruction::Pop(_)
         | Instruction::Copy(_)
@@ -433,14 +434,11 @@ fn instruction_style(instruction: &Instruction) -> Style {
         | Instruction::InitInstance(_)
         | Instruction::AllocVariant(_)
         | Instruction::AllocArray(_) => Style::new().cyan(),
-        Instruction::SysOp(_)
-        | Instruction::SysOpWithRuntimeId(_)
-        | Instruction::Spawn
-        | Instruction::Await
-        | Instruction::AwaitAny => Style::new().green().bright(),
+        Instruction::SysOp(_) | Instruction::Spawn | Instruction::Await | Instruction::AwaitAny => {
+            Style::new().green().bright()
+        }
         Instruction::Discriminant
         | Instruction::TypeTag
-        | Instruction::RuntimeIsType
         | Instruction::IsType(_)
         | Instruction::NarrowBind { .. }
         | Instruction::LoadType(_)
@@ -660,6 +658,10 @@ fn display_bytecode_textual(function: &Function) -> String {
         match instruction {
             Instruction::Jump(offset)
             | Instruction::PopJumpIfFalse(offset)
+            | Instruction::PopJumpIfTrue(offset)
+            | Instruction::JumpIfFalseOrPop(offset)
+            | Instruction::JumpIfTrueOrPop(offset)
+            | Instruction::JumpIfNotNullOrPop(offset)
             | Instruction::JumpIfFalse(offset) => {
                 let target = ip.wrapping_add_signed(*offset);
                 jump_targets.insert(target);
@@ -811,6 +813,23 @@ fn display_instruction_textual(
                 .unwrap_or_else(|| format!("?{target}"));
             format!("jump_if_false {label}")
         }
+        Instruction::PopJumpIfTrue(offset)
+        | Instruction::JumpIfFalseOrPop(offset)
+        | Instruction::JumpIfTrueOrPop(offset)
+        | Instruction::JumpIfNotNullOrPop(offset) => {
+            let name = match instruction {
+                Instruction::PopJumpIfTrue(_) => "pop_jump_if_true",
+                Instruction::JumpIfFalseOrPop(_) => "jump_if_false_or_pop",
+                Instruction::JumpIfTrueOrPop(_) => "jump_if_true_or_pop",
+                _ => "jump_if_not_null_or_pop",
+            };
+            let target = ip.wrapping_add_signed(*offset);
+            let label = label_map
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| format!("?{target}"));
+            format!("{name} {label}")
+        }
         Instruction::JumpTable(table_idx) => {
             let default_target =
                 ip.wrapping_add_signed(function.bytecode.jump_tables[*table_idx].default);
@@ -913,17 +932,16 @@ fn display_instruction_textual(
 
         // --- Calls ---
         Instruction::Call { .. } => format!("call {}", meta_str(&"")),
-        Instruction::CallWithRuntimeId { .. } => format!("call_with_runtime_id {}", meta_str(&"")),
+
         Instruction::CallIndirect => "call_indirect".to_string(),
-        Instruction::CallIndirectWithRuntimeId => "call_indirect_with_runtime_id".to_string(),
+        Instruction::SetCallTrace => "set_call_trace".to_string(),
+
         Instruction::VirtualCall { nargs, ntypeargs } => {
             format!("virtual_call nargs={nargs} ntypeargs={ntypeargs}")
         }
-        Instruction::VirtualCallWithRuntimeId { nargs, ntypeargs } => {
-            format!("virtual_call_with_runtime_id nargs={nargs} ntypeargs={ntypeargs}")
-        }
+
         Instruction::SysOp(_) => format!("sys_op {}", meta_str(&"")),
-        Instruction::SysOpWithRuntimeId(_) => format!("sys_op_with_runtime_id {}", meta_str(&"")),
+
         Instruction::Spawn => "spawn".to_string(),
         Instruction::Await => "await".to_string(),
         Instruction::AwaitAny => "await_any".to_string(),
@@ -935,7 +953,6 @@ fn display_instruction_textual(
         // --- Type introspection ---
         Instruction::Discriminant => "discriminant".to_string(),
         Instruction::TypeTag => "type_tag".to_string(),
-        Instruction::RuntimeIsType => "runtime_is_type".to_string(),
         Instruction::IsType(const_idx) => {
             let name = meta_str(const_idx);
             format!("is_type {name}")
@@ -1170,9 +1187,7 @@ fn display_expanded_metadata(ip: usize, instruction: &Instruction, function: &Fu
         | Instruction::InitField(_)
         | Instruction::InitSpread(_)
         | Instruction::Call { .. }
-        | Instruction::CallWithRuntimeId { .. }
         | Instruction::SysOp(_)
-        | Instruction::SysOpWithRuntimeId(_)
         | Instruction::AllocInstance { .. }
         | Instruction::InitInstance(_)
         | Instruction::AllocVariant(_) => meta
@@ -1182,6 +1197,10 @@ fn display_expanded_metadata(ip: usize, instruction: &Instruction, function: &Fu
         // Jumps: show absolute target address.
         Instruction::Jump(offset)
         | Instruction::PopJumpIfFalse(offset)
+        | Instruction::PopJumpIfTrue(offset)
+        | Instruction::JumpIfFalseOrPop(offset)
+        | Instruction::JumpIfTrueOrPop(offset)
+        | Instruction::JumpIfNotNullOrPop(offset)
         | Instruction::JumpIfFalse(offset) => {
             let target = ip.wrapping_add_signed(*offset);
             format!("(to {target})")
@@ -1260,11 +1279,10 @@ pub fn display_compact_bytecode(
             | OpCode::StoreArrayElement
             | OpCode::StoreMapElement
             | OpCode::CallIndirect
-            | OpCode::CallIndirectWithRuntimeId
+            | OpCode::SetCallTrace
             | OpCode::Discriminant
             | OpCode::TypeTag
             | OpCode::Truthy
-            | OpCode::RuntimeIsType
             | OpCode::ThrowIfPanic
             | OpCode::Unreachable
             | OpCode::MakeCell
@@ -1366,7 +1384,6 @@ pub fn display_compact_bytecode(
             | OpCode::InitInstance
             | OpCode::AllocVariant
             | OpCode::SysOp
-            | OpCode::SysOpWithRuntimeId
             | OpCode::IsType
             | OpCode::DenseTag
             | OpCode::LoadType
@@ -1383,7 +1400,13 @@ pub fn display_compact_bytecode(
             }
 
             // Jump i32 operand: show relative offset and resolved absolute target
-            OpCode::Jump | OpCode::PopJumpIfFalse | OpCode::JumpIfFalse => {
+            OpCode::Jump
+            | OpCode::PopJumpIfFalse
+            | OpCode::JumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::JumpIfFalseOrPop
+            | OpCode::JumpIfTrueOrPop
+            | OpCode::JumpIfNotNullOrPop => {
                 let offset_val = read_i32(code, &mut pc);
                 let target = (pc as i64 + offset_val as i64) as usize;
                 writeln!(f, "{offset_val:+}  (-> {target:04})")?;
@@ -1399,7 +1422,7 @@ pub fn display_compact_bytecode(
                 )?;
             }
 
-            OpCode::Call | OpCode::CallWithRuntimeId => {
+            OpCode::Call | OpCode::CallExactArgs => {
                 let callee = read_u32(code, &mut pc);
                 let ntypeargs = read_u16(code, &mut pc);
                 writeln!(f, "callee={callee}  ntypeargs={ntypeargs}")?;
@@ -1424,7 +1447,7 @@ pub fn display_compact_bytecode(
                 writeln!(f, "ntypeargs={ntypeargs}")?;
             }
 
-            OpCode::VirtualCall | OpCode::VirtualCallWithRuntimeId => {
+            OpCode::VirtualCall => {
                 let nargs = read_u16(code, &mut pc);
                 let ntypeargs = read_u16(code, &mut pc);
                 writeln!(f, "nargs={nargs} ntypeargs={ntypeargs}")?;

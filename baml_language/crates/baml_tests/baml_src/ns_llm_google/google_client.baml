@@ -557,7 +557,7 @@ function google_stream_decode() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let stream = ai.stream.from_spec<string | null, string>(
+            let stream = ai.stream.from_spec<string>(
                 GoogleEcho@spec("Say pong."),
                 client = cl,
             );
@@ -588,7 +588,7 @@ function _stream_failure_label(events: string[]) -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let stream = ai.stream.from_spec<string | null, string>(
+            let stream = ai.stream.from_spec<string>(
                 GoogleEcho@spec("Say pong."),
                 client = cl,
             );
@@ -906,7 +906,7 @@ function vertex_stream_decode() -> string {
                 api_key = "express-key",
                 base_url = mock.base_url(),
             );
-            let stream = ai.stream.from_spec<string | null, string>(
+            let stream = ai.stream.from_spec<string>(
                 GoogleEcho@spec("Say pong."),
                 client = cl,
             );
@@ -928,21 +928,21 @@ function vertex_stream_time_to_first_token_timeout_ms() -> string {
     root.llm_mock.mock_sse_serve(
         [root.llm_mock.sse_data(`{"candidates":[{"content":{"parts":[{"text":"pong"}]},"finishReason":"STOP"}]}`)],
         (mock: root.llm_mock.MockSseServer) -> {
-            // The corpus runs every leaf concurrently, so leave transport
-            // headroom while keeping the delayed first event past the TTFT limit.
+            // The mock holds the first event for 10s, so only the 20ms TTFT can
+            // end this call, however slow the machine is.
             let cl = google.VertexClient.new(
                 model = "gemini-2.5-flash",
                 api_key = "express-key",
                 base_url = mock.base_url(),
                 request_timeout_ms = 15000,
-                time_to_first_token_timeout_ms = 5000,
+                time_to_first_token_timeout_ms = 20,
             );
-            let stream = ai.stream.from_spec<string | null, string>(
+            let stream = ai.stream.from_spec<string>(
                 GoogleEcho@spec("Say pong."),
                 client = cl,
             );
             let outcome = stream.final() catch_all (e) {
-                let timeout: baml.errors.Timeout => "Timeout",
+                let timeout: baml.errors.Timeout => `Timeout:${timeout.duration_ms ?? -1}`,
                 _ => `other:${e.to_string()}`,
             };
             `${cl.time_to_first_token_timeout_ms ?? -1}|${outcome}`
@@ -952,7 +952,7 @@ function vertex_stream_time_to_first_token_timeout_ms() -> string {
 }
 
 test "vertex_stream_time_to_first_token_timeout_ms" {
-    assert.equal(vertex_stream_time_to_first_token_timeout_ms(), "5000|Timeout")
+    assert.equal(vertex_stream_time_to_first_token_timeout_ms(), "20|Timeout:20")
 }
 
 // ─── error taxonomy ──────────────────────────────────────────────────────────
@@ -1126,4 +1126,67 @@ testset "live" with testing.Sequential() {
             "live::vertex not registered: INTEG_TESTS_GOOGLE_APPLICATION_CREDENTIALS_CONTENT is unset",
         )
     }
+}
+
+// ─── journal content blocks: media in tool results and user turns ─────────────
+//
+// Gemini column of the lowering table (`_lower_block` in gemini.baml): every
+// media kind is Accepted at every position. A result's text is the
+// `functionResponse.response.result`; its media rides in
+// `functionResponse.parts`. Both backends lower the same way.
+
+function _google_media_input() -> ai.ModelTurnInput {
+    let spec = GoogleToolEcho@spec("Weather in NYC?");
+    ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: root.llm_mock.media_journal("google/gemini-2.5-flash", root.llm_mock.media_png()),
+        toolbox: spec.tools(),
+        output_type: spec.output_type(),
+    }
+}
+
+function _google_media_shape(body: json) -> string {
+    let results = ".contents[2].parts";
+    [
+        baml.json.path<string>(body, ".contents[1].parts[1].functionCall.name"),
+        baml.json.path<string>(body, `${results}[0].functionResponse.response.result`),
+        baml.json.path_or<string>(body, `${results}[0].functionResponse.parts[0].inlineData.data`, "absent"),
+        baml.json.path<string>(body, `${results}[1].functionResponse.name`),
+        baml.json.path<string>(body, `${results}[1].functionResponse.response.result`),
+        baml.json.path<string>(body, `${results}[1].functionResponse.parts[0].inlineData.mimeType`),
+        baml.json.path<string>(body, ".contents[3].role"),
+        baml.json.path<string>(body, ".contents[3].parts[0].text"),
+        baml.json.path<string>(body, ".contents[3].parts[1].inlineData.data"),
+        baml.json.path_or<string>(body, ".contents[4].role", "absent"),
+    ].join("|")
+}
+
+function google_journal_image_accepted() -> string {
+    let cl = google.GeminiClient.new(
+        model = "gemini-2.5-flash",
+        api_key = "test-key",
+        base_url = "https://example.test",
+    );
+    _google_media_shape(baml.json.parse(google.internal.render(cl, _google_media_input()).body))
+}
+
+test "google_journal_image_accepted" {
+    assert.equal(
+        google_journal_image_accepted(),
+        "capture|sunny in SF|absent|capture|captured:|image/png|user|Screenshot after the tool ran:|SGVsbG8=|absent",
+    )
+}
+
+function vertex_journal_image_accepted() -> string {
+    let cl = google.VertexClient.new(
+        model = "gemini-2.5-flash",
+        project_id = "my-project",
+        location = "us-central1",
+        api_key = "express-key",
+    );
+    _google_media_shape(baml.json.parse(google.internal.vertex_render(cl, _google_media_input()).body))
+}
+
+test "vertex_journal_image_accepted" {
+    assert.equal(vertex_journal_image_accepted(), google_journal_image_accepted())
 }

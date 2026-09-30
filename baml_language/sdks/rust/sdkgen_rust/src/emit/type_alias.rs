@@ -5,7 +5,7 @@
 //! are transparent — so no conversion impls are needed; the item exists
 //! to keep the user's named types on the SDK surface.
 
-use baml_codegen_types::{Name, TypeAlias};
+use baml_sdkgen_types::{Name, TypeAlias};
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -24,7 +24,7 @@ pub(crate) fn emit(
     alias: &TypeAlias,
     ctx: &TyCtx<'_>,
 ) -> Result<TokenStream, SkipWarning> {
-    let ident = idents::ident(name.bare_name());
+    let ident = idents::ident(name.name().as_str());
     let rhs = translate_ty::translate(&alias.resolves_to, ctx).map_err(|u| SkipWarning {
         fqn: name.to_string(),
         reason: format!(

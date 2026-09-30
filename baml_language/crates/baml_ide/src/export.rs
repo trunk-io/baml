@@ -21,8 +21,8 @@
 //! Impls are top-level records referenced by id from the items they attach
 //! to — a blanket impl (`implements<T> Concrete for T`) attaches to every
 //! item and must not be duplicated into each. The export set is explicit:
-//! synthetic items (`$stream` companions, `$new` constructors) are listed
-//! and flagged, never silently dropped.
+//! synthetic items (`@`-companions, auto-derived methods) are listed and
+//! flagged, never silently dropped.
 //!
 //! One document covers one package. References may cross packages — a field
 //! type's head, an attached impl declared downstream — and stay
@@ -51,15 +51,16 @@
 use std::fmt::{self, Write as _};
 
 use baml_base::{MediaKind, Name, SourceFile};
+use baml_compiler2_ast::ast::FunctionOrigin;
 use baml_compiler2_hir::{
     contributions::Definition,
+    item_data,
     loc::{ClassLoc, EnumLoc, FunctionLoc, ImplLoc, InterfaceLoc},
     namespace::NamespaceId,
-    package::PackageId,
+    package::{Spelling, spelling},
 };
-use baml_compiler2_ppir::item_data;
 use baml_type::{
-    Interface as InterfaceBound, ParamTy, PrimitiveType, QualifiedTypeName, RuntimeTy, Ty,
+    DeclName, Interface as InterfaceBound, ParamTy, PrimitiveType, QualifiedTypeName, RuntimeTy, Ty,
 };
 use serde::Serialize;
 use text_size::TextRange;
@@ -68,11 +69,11 @@ use text_size::TextRange;
 /// before reading anything else.
 pub const FORMAT_VERSION: u32 = 1;
 
-type Db = dyn baml_compiler2_ppir::Db;
+type Db = dyn baml_compiler2_hir::Db;
 
 // ── Type heads (rustdoc-style lossy impl attachment) ─────────────────────────
 //
-// An impl's `for` type may be generic (`implements<T extends Comparable>
+// An impl's `for` type may be generic (`implements<T extends baml.ops.Compare>
 // Sortable for T[]`), so attaching impls to a declaration cannot go through
 // the type checker's `impls_for_type` — that path *discharges bounds*, and
 // with no scope bounds registered for `T` it would silently drop every
@@ -118,16 +119,16 @@ fn container_qtn(name: &str) -> QualifiedTypeName {
 
 /// Extract a type's head constructor; `None` for un-headed types (unions,
 /// projections, sentinels), which no impl can attach to by head.
-fn ty_head(ty: &Ty) -> Option<TyHead> {
+fn ty_head(spelling: &Spelling, ty: &Ty) -> Option<TyHead> {
     match ty {
-        Ty::Int { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Int))),
-        Ty::Bigint { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Bigint))),
-        Ty::Float { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Float))),
-        Ty::String { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::String))),
-        Ty::Bool { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Bool))),
-        Ty::Null { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Null))),
-        Ty::Uint8Array { .. } => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Uint8Array))),
-        Ty::Media(kind, _) => match kind {
+        Ty::Int => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Int))),
+        Ty::Bigint => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Bigint))),
+        Ty::Float => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Float))),
+        Ty::String => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::String))),
+        Ty::Bool => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Bool))),
+        Ty::Null => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Null))),
+        Ty::Uint8Array => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Uint8Array))),
+        Ty::Media(kind) => match kind {
             MediaKind::Image => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Image))),
             MediaKind::Audio => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Audio))),
             MediaKind::Video => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::Video))),
@@ -135,30 +136,26 @@ fn ty_head(ty: &Ty) -> Option<TyHead> {
             // "Any media" has no single companion class.
             MediaKind::Generic => None,
         },
-        Ty::Literal(lit, _, _) => Some(TyHead::Nominal(primitive_qtn(
-            PrimitiveType::from_literal(lit),
-        ))),
+        Ty::Literal(lit, _) => Some(TyHead::Nominal(primitive_qtn(PrimitiveType::from_literal(
+            lit,
+        )))),
         // Companion classes (`baml.Int`, `baml.Array`, …) already carry the
         // canonical name, so nominal heads pass through unchanged.
-        Ty::Class(qtn, _, _) | Ty::Interface(qtn, _, _, _) | Ty::Enum(qtn, _) => {
-            Some(TyHead::Nominal(qtn.clone()))
+        Ty::Class(qtn, _) | Ty::Interface(qtn, _, _) | Ty::Enum(qtn) => {
+            Some(TyHead::Nominal(spelling.wire(qtn)))
         }
-        Ty::EnumVariant(qtn, _, _) => Some(TyHead::Nominal(qtn.clone())),
-        Ty::List(_, _) => Some(TyHead::Nominal(container_qtn("Array"))),
+        Ty::EnumVariant(qtn, _) => Some(TyHead::Nominal(spelling.wire(qtn))),
+        Ty::List(_) => Some(TyHead::Nominal(container_qtn("Array"))),
         Ty::Map { .. } => Some(TyHead::Nominal(container_qtn("Map"))),
         Ty::Function { .. } => Some(TyHead::Function),
-        Ty::Future(_, _, _) => Some(TyHead::Future),
+        Ty::Future(_, _) => Some(TyHead::Future),
         // Lossy by design: the alias head attaches without expansion.
-        Ty::TypeAlias(qtn, _) => Some(TyHead::Nominal(qtn.clone())),
-        Ty::TypeVar(_, _) => Some(TyHead::Blanket),
-        Ty::Union(_, _) => None,
+        Ty::TypeAlias(qtn) => Some(TyHead::Nominal(spelling.wire(qtn))),
+        Ty::TypeVar(_) => Some(TyHead::Blanket),
+        Ty::Union(_) => None,
         Ty::AssociatedTypeProjection { .. } => None,
-        Ty::RustType { .. }
-        | Ty::Type { .. }
-        | Ty::Resource { .. }
-        | Ty::PromptAst { .. }
-        | Ty::Void { .. } => None,
-        Ty::Unknown { .. } | Ty::Never { .. } | Ty::Error { .. } => None,
+        Ty::RustType | Ty::Type | Ty::Resource | Ty::PromptAst | Ty::Void => None,
+        Ty::Unknown | Ty::Never | Ty::Error => None,
     }
 }
 
@@ -183,7 +180,7 @@ fn impl_attaches(impl_head: &TyHead, decl_head: &TyHead) -> bool {
 // M:baml.time.Duration.abs          method
 // F:user.Point.x                    field
 // E:user.Color.Red                  enum variant
-// A:baml.Comparable.CompareError    associated type
+// A:baml.ops.Compare.Ordering       associated type
 // M:(int as baml.ops.Add<bigint>).add   method reached through an impl block
 // ```
 //
@@ -325,18 +322,14 @@ impl SymbolId {
             | Definition::Enum(_)
             | Definition::Interface(_)
             | Definition::TypeAlias(_) => IdKind::Type,
-            Definition::Function(_)
-            | Definition::TemplateString(_)
-            | Definition::Client(_)
-            | Definition::RetryPolicy(_)
-            | Definition::Let(_) => IdKind::Value,
+            Definition::Function(_) | Definition::Let(_) => IdKind::Value,
         };
         let name = definition_name(db, def);
         let pkg = baml_compiler2_hir::file_package::file_package(db, definition_file(db, def));
         Some(Self {
             kind,
             owner: Owner::Path {
-                package: pkg.package.to_string(),
+                package: spelling(db).of(pkg.root).to_string(),
                 namespace: pkg.namespace_path.iter().map(ToString::to_string).collect(),
                 name: name.to_string(),
             },
@@ -349,17 +342,18 @@ impl SymbolId {
     /// block ids, so the two can never disagree about what identifies an impl.
     fn impl_owner(db: &Db, imp: ImplLoc<'_>) -> Option<Owner> {
         let data = impl_facts(db, imp)?;
-        let mut interface = interface_qtn(db, data.interface).render_dotted(false);
+        let vp = baml_compiler2_hir_ty::render::Viewpoint::canonical(db);
+        let mut interface = vp.path(&interface_qtn(db, data.interface));
         if !data.interface_args.is_empty() {
             let args: Vec<String> = data
                 .interface_args
                 .iter()
-                .map(Ty::render_canonical)
+                .map(|ty| ty.render_with(&vp))
                 .collect();
             interface = format!("{interface}<{}>", args.join(", "));
         }
         Some(Owner::Impl {
-            for_ty: data.for_ty_pattern.render_canonical(),
+            for_ty: data.for_ty_pattern.render_with(&vp),
             interface,
         })
     }
@@ -376,7 +370,7 @@ impl SymbolId {
         Self {
             kind,
             owner: Owner::Path {
-                package: pkg.package.to_string(),
+                package: spelling(db).of(pkg.root).to_string(),
                 namespace: pkg.namespace_path.iter().map(ToString::to_string).collect(),
                 name: owner_name.to_string(),
             },
@@ -416,8 +410,8 @@ pub struct TyRef {
 }
 
 impl TyRef {
-    fn of(ty: &Ty) -> Self {
-        let head = match ty_head(ty) {
+    fn of(db: &Db, ty: &Ty) -> Self {
+        let head = match ty_head(spelling(db), ty) {
             Some(TyHead::Nominal(qtn)) => Some(
                 SymbolId {
                     kind: IdKind::Type,
@@ -433,7 +427,7 @@ impl TyRef {
             Some(TyHead::Function | TyHead::Future | TyHead::Blanket) | None => None,
         };
         Self {
-            display: ty.render_canonical(),
+            display: ty.render_with(&baml_compiler2_hir_ty::render::Viewpoint::canonical(db)),
             head,
             // `RuntimeTy` excludes exactly the compiler-sentinel axis
             // (`Error`/`Unknown`/`Infer`) while keeping symbolic
@@ -448,19 +442,21 @@ impl TyRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GenericExport {
     pub name: String,
-    /// Bound interfaces, rendered (`baml.Comparable`); listed, not proven.
+    /// Bound interfaces, rendered (`baml.ops.Compare`); listed, not proven.
     pub bounds: Vec<String>,
 }
 
-fn generic_export(param: &ParamTy, bounds: &[InterfaceBound]) -> GenericExport {
+fn generic_export(db: &Db, param: &ParamTy, bounds: &[InterfaceBound]) -> GenericExport {
+    let vp = baml_compiler2_hir_ty::render::Viewpoint::canonical(db);
     GenericExport {
         name: param.as_str().to_string(),
         bounds: bounds
             .iter()
             .map(|b| {
-                let mut s = b.name.render_dotted(false);
+                let mut s = vp.path(&b.name);
                 if !b.generics.is_empty() {
-                    let args: Vec<String> = b.generics.iter().map(Ty::render_canonical).collect();
+                    let args: Vec<String> =
+                        b.generics.iter().map(|ty| ty.render_with(&vp)).collect();
                     let _ = write!(s, "<{}>", args.join(", "));
                 }
                 s
@@ -515,7 +511,7 @@ pub struct FunctionExport {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docstring: Option<String>,
-    /// `true` for compiler-minted companions (`$`-named) and derives.
+    /// `true` for compiler-minted companions (`@`-named) and derives.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
     /// `true` when this entry is an interface default the impl inherited
@@ -593,8 +589,8 @@ pub struct AssocBindingExport {
 
 // ── Item records ─────────────────────────────────────────────────────────────
 
-/// The structural kind of an exported item, serialized exactly as the
-/// pre-rework surface layer spelled it.
+/// The structural kind of an exported item, in its wire spelling
+/// (`snake_case`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportItemKind {
@@ -603,9 +599,6 @@ pub enum ExportItemKind {
     Interface,
     TypeAlias,
     Function,
-    TemplateString,
-    Client,
-    RetryPolicy,
     Global,
 }
 
@@ -616,9 +609,6 @@ fn item_kind(def: Definition<'_>) -> ExportItemKind {
         Definition::Interface(_) => ExportItemKind::Interface,
         Definition::TypeAlias(_) => ExportItemKind::TypeAlias,
         Definition::Function(_) => ExportItemKind::Function,
-        Definition::TemplateString(_) => ExportItemKind::TemplateString,
-        Definition::Client(_) => ExportItemKind::Client,
-        Definition::RetryPolicy(_) => ExportItemKind::RetryPolicy,
         Definition::Let(_) => ExportItemKind::Global,
     }
 }
@@ -712,28 +702,28 @@ fn function_name(db: &Db, func: FunctionLoc<'_>) -> Name {
     item_data::function_data(db, func).name.clone()
 }
 
-fn interface_qtn(db: &Db, iface: InterfaceLoc<'_>) -> QualifiedTypeName {
+fn interface_qtn(db: &Db, iface: InterfaceLoc<'_>) -> DeclName {
     let pkg = baml_compiler2_hir::file_package::file_package(db, iface.file(db));
-    QualifiedTypeName::new(
-        pkg.package,
+    DeclName::in_root(
+        pkg.root,
         pkg.namespace_path,
         item_data::interface_data(db, iface).name.clone(),
     )
 }
 
-fn class_qtn(db: &Db, class: ClassLoc<'_>) -> QualifiedTypeName {
+fn class_qtn(db: &Db, class: ClassLoc<'_>) -> DeclName {
     let pkg = baml_compiler2_hir::file_package::file_package(db, class.file(db));
-    QualifiedTypeName::new(
-        pkg.package,
+    DeclName::in_root(
+        pkg.root,
         pkg.namespace_path,
         item_data::class_data(db, class).name.clone(),
     )
 }
 
-fn enum_qtn(db: &Db, enm: EnumLoc<'_>) -> QualifiedTypeName {
+fn enum_qtn(db: &Db, enm: EnumLoc<'_>) -> DeclName {
     let pkg = baml_compiler2_hir::file_package::file_package(db, enm.file(db));
-    QualifiedTypeName::new(
-        pkg.package,
+    DeclName::in_root(
+        pkg.root,
         pkg.namespace_path,
         item_data::enum_data(db, enm).name.clone(),
     )
@@ -746,9 +736,6 @@ fn definition_name(db: &Db, def: Definition<'_>) -> Name {
         Definition::Interface(loc) => item_data::interface_data(db, loc).name.clone(),
         Definition::TypeAlias(loc) => item_data::type_alias_data(db, loc).name.clone(),
         Definition::Function(loc) => item_data::function_data(db, loc).name.clone(),
-        Definition::TemplateString(loc) => item_data::template_string_data(db, loc).name.clone(),
-        Definition::Client(loc) => item_data::client_data(db, loc).name.clone(),
-        Definition::RetryPolicy(loc) => item_data::retry_policy_data(db, loc).name.clone(),
         Definition::Let(loc) => item_data::let_data(db, loc).name.clone(),
     }
 }
@@ -760,9 +747,6 @@ fn definition_file(db: &Db, def: Definition<'_>) -> SourceFile {
         Definition::Interface(loc) => loc.file(db),
         Definition::TypeAlias(loc) => loc.file(db),
         Definition::Function(loc) => loc.file(db),
-        Definition::TemplateString(loc) => loc.file(db),
-        Definition::Client(loc) => loc.file(db),
-        Definition::RetryPolicy(loc) => loc.file(db),
         Definition::Let(loc) => loc.file(db),
     }
 }
@@ -774,16 +758,12 @@ fn definition_span(db: &Db, def: Definition<'_>) -> TextRange {
         Definition::Interface(loc) => item_data::interface_source_map(db, loc).span,
         Definition::TypeAlias(loc) => item_data::type_alias_source_map(db, loc).span,
         Definition::Function(loc) => item_data::function_source_map(db, loc).span,
-        Definition::TemplateString(loc) => item_data::template_string_source_map(db, loc).span,
-        Definition::Client(loc) => item_data::client_source_map(db, loc).span,
-        Definition::RetryPolicy(loc) => item_data::retry_policy_source_map(db, loc).span,
         Definition::Let(loc) => item_data::let_source_map(db, loc).span,
     }
 }
 
-/// The leading `///` docstring, where the kind carries one. Template
-/// strings, clients, tests, retry policies, and globals carry none in the
-/// item data today.
+/// The leading `///` docstring, where the kind carries one. Globals carry
+/// none in the item data today.
 fn definition_docstring<'db>(db: &'db Db, def: Definition<'db>) -> Option<&'db str> {
     match def {
         Definition::Class(loc) => item_data::class_data(db, loc).docstring.as_deref(),
@@ -791,10 +771,7 @@ fn definition_docstring<'db>(db: &'db Db, def: Definition<'db>) -> Option<&'db s
         Definition::Interface(loc) => item_data::interface_data(db, loc).docstring.as_deref(),
         Definition::TypeAlias(loc) => item_data::type_alias_data(db, loc).docstring.as_deref(),
         Definition::Function(loc) => item_data::function_data(db, loc).docstring.as_deref(),
-        Definition::TemplateString(_)
-        | Definition::Client(_)
-        | Definition::RetryPolicy(_)
-        | Definition::Let(_) => None,
+        Definition::Let(_) => None,
     }
 }
 
@@ -875,20 +852,20 @@ fn plain_bounds(
 // ── Projection ───────────────────────────────────────────────────────────────
 
 /// Export one package's full surface.
-pub fn export_package<'db>(db: &'db Db, package: PackageId<'db>) -> PackageExport {
+pub fn export_package<'db>(db: &'db Db, package: baml_base::SourceRoot) -> PackageExport {
     let impl_index = ImplIndex::build(db);
 
     // Namespaces root-first sorted by path; items types-then-values sorted
     // by name within each namespace. (The final id sort makes the walk order
     // invisible in the artifact; it is kept for deterministic tie behavior.)
-    let items_index = baml_compiler2_ppir::package_items(db, package);
+    let items_index = baml_compiler2_hir::package::package_items(db, package);
     let mut ns_paths: Vec<&Vec<Name>> = items_index.namespaces.keys().collect();
     ns_paths.sort();
 
     let mut items = Vec::new();
     for path in ns_paths {
-        let ns = NamespaceId::new(db, package.name(db), path.clone());
-        let ns_items = baml_compiler2_ppir::namespace_items(db, ns);
+        let ns = NamespaceId::new(db, package, path.clone());
+        let ns_items = baml_compiler2_hir::namespace::namespace_items(db, ns);
         let mut named: Vec<(&Name, Definition<'db>)> = ns_items
             .types
             .iter()
@@ -910,12 +887,11 @@ pub fn export_package<'db>(db: &'db Db, package: PackageId<'db>) -> PackageExpor
     }
     items.sort_by(|a, b| a.id.cmp(&b.id));
 
-    let package_name = package.name(db);
     let mut impls: Vec<ImplExport> = impl_index
         .exports
         .into_iter()
         .filter(|(imp, _)| {
-            baml_compiler2_hir::file_package::file_package(db, imp.file(db)).package == package_name
+            baml_compiler2_hir::file_package::file_package(db, imp.file(db)).root == package
         })
         .map(|(_, export)| export)
         .collect();
@@ -923,7 +899,7 @@ pub fn export_package<'db>(db: &'db Db, package: PackageId<'db>) -> PackageExpor
 
     PackageExport {
         format_version: FORMAT_VERSION,
-        package: package_name.to_string(),
+        package: spelling(db).of(package).to_string(),
         items,
         impls,
     }
@@ -956,7 +932,7 @@ impl<'db> ImplIndex<'db> {
             .iter()
             .filter(|(imp, _)| {
                 impl_facts(db, *imp)
-                    .and_then(|data| ty_head(&data.for_ty_pattern))
+                    .and_then(|data| ty_head(spelling(db), &data.for_ty_pattern))
                     .is_some_and(|impl_head| impl_attaches(&impl_head, head))
             })
             .map(|(_, export)| export.id.clone())
@@ -982,6 +958,14 @@ fn source_export(db: &Db, file: SourceFile, span: TextRange) -> SourceExport {
         file: file.path(db).to_string_lossy().into_owned(),
         start: span.start().into(),
         end: span.end().into(),
+    }
+}
+
+/// Whether the compiler minted a function rather than a source declaring it.
+fn is_synthetic_origin(origin: FunctionOrigin) -> bool {
+    match origin {
+        FunctionOrigin::Companion | FunctionOrigin::AutoDerive => true,
+        FunctionOrigin::UserDefined | FunctionOrigin::Internal => false,
     }
 }
 
@@ -1033,12 +1017,12 @@ fn function_export(
         declared_by,
         name: name.to_string(),
         docstring: data.docstring.clone(),
-        synthetic: name.as_str().contains('$'),
+        synthetic: is_synthetic_origin(data.metadata.origin),
         from_default,
         signature: SignatureExport {
             generics: function_generics(db, function)
                 .iter()
-                .map(|(param, bounds)| generic_export(param, bounds))
+                .map(|(param, bounds)| generic_export(db, param, bounds))
                 .collect(),
             params: sig
                 .params
@@ -1048,12 +1032,15 @@ fn function_export(
                         .name
                         .as_ref()
                         .map_or_else(|| "_".to_string(), ToString::to_string),
-                    ty: TyRef::of(&p.ty),
+                    ty: TyRef::of(db, &p.ty),
                     optional: matches!(p.mode, baml_type::FunctionParamMode::Optional),
                 })
                 .collect(),
-            returns: TyRef::of(&sig.return_type),
-            throws: TyRef::of(&baml_compiler2_hir_ty::callable::callable_throws(db, function).0),
+            returns: TyRef::of(db, &sig.return_type),
+            throws: TyRef::of(
+                db,
+                &baml_compiler2_hir_ty::callable::callable_throws(db, function).0,
+            ),
         },
         source: source_export(db, function.file(db), source_map.span),
     }
@@ -1067,7 +1054,10 @@ fn class_field_export(db: &Db, class: ClassLoc<'_>, index: usize) -> FieldExport
             .to_string(),
         name: field.name.to_string(),
         docstring: field.docstring.clone(),
-        ty: TyRef::of(&baml_compiler2_hir_ty::lower::resolve_class_fields(db, class)[index].1),
+        ty: TyRef::of(
+            db,
+            &baml_compiler2_hir_ty::lower::resolve_class_fields(db, class)[index].1,
+        ),
     }
 }
 
@@ -1080,6 +1070,7 @@ fn interface_field_export(db: &Db, iface: InterfaceLoc<'_>, index: usize) -> Fie
         name: field.name.to_string(),
         docstring: field.docstring.clone(),
         ty: TyRef::of(
+            db,
             &baml_compiler2_hir_ty::interfaces::resolve_interface_fields(db, iface).fields[index].1,
         ),
     }
@@ -1116,7 +1107,7 @@ fn required_method_export(db: &Db, iface: InterfaceLoc<'_>, index: usize) -> Req
             generics: resolved
                 .generic_params
                 .iter()
-                .map(|(param, bounds)| generic_export(param, bounds))
+                .map(|(param, bounds)| generic_export(db, param, bounds))
                 .collect(),
             params: params
                 .iter()
@@ -1125,12 +1116,12 @@ fn required_method_export(db: &Db, iface: InterfaceLoc<'_>, index: usize) -> Req
                         .name
                         .as_ref()
                         .map_or_else(|| "_".to_string(), ToString::to_string),
-                    ty: TyRef::of(&p.ty),
+                    ty: TyRef::of(db, &p.ty),
                     optional: matches!(p.mode, baml_type::FunctionParamMode::Optional),
                 })
                 .collect(),
-            returns: TyRef::of(returns),
-            throws: TyRef::of(throws),
+            returns: TyRef::of(db, returns),
+            throws: TyRef::of(db, throws),
         },
     }
 }
@@ -1138,9 +1129,11 @@ fn required_method_export(db: &Db, iface: InterfaceLoc<'_>, index: usize) -> Req
 fn export_impl(db: &Db, imp: ImplLoc<'_>) -> Option<ImplExport> {
     let data = impl_facts(db, imp)?;
     let iface_qtn = interface_qtn(db, data.interface);
-    let pkg = baml_compiler2_hir::file_package::file_package(db, imp.file(db)).package;
+    let pkg = spelling(db)
+        .of(baml_compiler2_hir::file_package::file_package(db, imp.file(db)).root)
+        .clone();
 
-    let for_ty = TyRef::of(&data.for_ty_pattern);
+    let for_ty = TyRef::of(db, &data.for_ty_pattern);
     // Destructured from the one renderer rather than rebuilt here, so a
     // block's id and the ids of the methods it contributes can never disagree
     // about what identifies it.
@@ -1172,23 +1165,27 @@ fn export_impl(db: &Db, imp: ImplLoc<'_>) -> Option<ImplExport> {
     Some(ImplExport {
         id,
         docstring: block_data.docstring.clone(),
-        interface: iface_qtn.render_dotted(false),
+        interface: crate::render::canonical_path(db, &iface_qtn),
         interface_id: SymbolId::of_definition(db, Definition::Interface(data.interface))
             .map(|id| id.to_string())
             .unwrap_or_default(),
-        interface_args: data.interface_args.iter().map(TyRef::of).collect(),
+        interface_args: data
+            .interface_args
+            .iter()
+            .map(|ty| TyRef::of(db, ty))
+            .collect(),
         for_ty,
         generics: data
             .generic_params
             .iter()
-            .map(|(param, bounds)| generic_export(param, bounds))
+            .map(|(param, bounds)| generic_export(db, param, bounds))
             .collect(),
         assoc_bindings: data
             .associated_types
             .iter()
             .map(|(name, ty)| AssocBindingExport {
                 name: name.to_string(),
-                ty: TyRef::of(ty),
+                ty: TyRef::of(db, ty),
             })
             .collect(),
         methods,
@@ -1226,13 +1223,16 @@ fn export_item<'db>(
             ItemDetail::Class {
                 generics: class_generics(db, class)
                     .iter()
-                    .map(|(param, bounds)| generic_export(param, bounds))
+                    .map(|(param, bounds)| generic_export(db, param, bounds))
                     .collect(),
                 fields: (0..data.fields.len())
                     .map(|index| class_field_export(db, class, index))
                     .collect(),
                 methods,
-                impls: impl_index.ids_for_class_head(db, &TyHead::Nominal(class_qtn(db, class))),
+                impls: impl_index.ids_for_class_head(
+                    db,
+                    &TyHead::Nominal(spelling(db).wire(&class_qtn(db, class))),
+                ),
             }
         }
         Definition::Enum(enm) => {
@@ -1254,7 +1254,10 @@ fn export_item<'db>(
                         docstring: variant.docstring.clone(),
                     })
                     .collect(),
-                impls: impl_index.ids_for_class_head(db, &TyHead::Nominal(enum_qtn(db, enm))),
+                impls: impl_index.ids_for_class_head(
+                    db,
+                    &TyHead::Nominal(spelling(db).wire(&enum_qtn(db, enm))),
+                ),
             }
         }
         Definition::Interface(iface) => {
@@ -1268,7 +1271,7 @@ fn export_item<'db>(
             ItemDetail::Interface {
                 generics: interface_generics(db, iface)
                     .iter()
-                    .map(|(param, bounds)| generic_export(param, bounds))
+                    .map(|(param, bounds)| generic_export(db, param, bounds))
                     .collect(),
                 fields: (0..data.fields.len())
                     .map(|index| interface_field_export(db, iface, index))
@@ -1292,7 +1295,7 @@ fn export_item<'db>(
                                 iface,
                                 assoc.name.clone(),
                             )
-                            .map(|(ty, _diags)| TyRef::of(&ty)),
+                            .map(|(ty, _diags)| TyRef::of(db, &ty)),
                     })
                     .collect(),
                 required_methods: (0..data.required_methods.len())
@@ -1303,15 +1306,15 @@ fn export_item<'db>(
             }
         }
         Definition::TypeAlias(alias) => ItemDetail::TypeAlias {
-            resolved: TyRef::of(&baml_compiler2_hir_ty::lower::type_alias_value(db, alias)),
+            resolved: TyRef::of(
+                db,
+                &baml_compiler2_hir_ty::lower::type_alias_value(db, alias),
+            ),
         },
         Definition::Function(function) => ItemDetail::Function {
             signature: function_export(db, function, false, None).signature,
         },
-        Definition::TemplateString(_)
-        | Definition::Client(_)
-        | Definition::RetryPolicy(_)
-        | Definition::Let(_) => ItemDetail::Plain {},
+        Definition::Let(_) => ItemDetail::Plain {},
     };
 
     Some(ItemExport {
@@ -1320,9 +1323,17 @@ fn export_item<'db>(
         name: name.to_string(),
         namespace,
         docstring: definition_docstring(db, def).map(str::to_string),
-        // Reliable, not heuristic: `$` cannot appear in a user identifier,
-        // and every compiler-synthesized top-level item is `$`-named.
-        synthetic: name.as_str().contains('$'),
+        // Provenance, not spelling: only functions are ever synthesized.
+        synthetic: match def {
+            Definition::Function(function) => {
+                is_synthetic_origin(item_data::function_data(db, function).metadata.origin)
+            }
+            Definition::Class(_)
+            | Definition::Enum(_)
+            | Definition::Interface(_)
+            | Definition::TypeAlias(_)
+            | Definition::Let(_) => false,
+        },
         source: source_export(db, definition_file(db, def), definition_span(db, def)),
         detail,
     })
@@ -1340,8 +1351,10 @@ mod tests {
         db
     }
 
-    fn package<'db>(db: &'db ProjectDatabase, name: &str) -> PackageId<'db> {
-        PackageId::new(db, Name::new(name))
+    fn package(db: &ProjectDatabase, name: &str) -> baml_base::SourceRoot {
+        spelling(db)
+            .root(&Name::new(name))
+            .expect("package is installed")
     }
 
     /// The whole `assert` package, pretty-printed — small enough to review,
@@ -1470,8 +1483,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing item {id}"))
         };
 
-        // Cross-link: baml.Int's impl list includes the Comparable block,
-        // and that block's export carries `compare`.
+        // Cross-link: baml.Int's impl list includes the Compare block,
+        // and that block's export carries `cmp`.
         let int = find("T:baml.Int");
         let int_impls: Vec<&str> = int["impls"]
             .as_array()
@@ -1481,20 +1494,20 @@ mod tests {
             .collect();
         let comparable_impl = int_impls
             .iter()
-            .find(|id| id.contains("baml.Comparable for int"))
-            .unwrap_or_else(|| panic!("Int lists its Comparable impl: {int_impls:?}"));
+            .find(|id| id.contains("baml.ops.Compare for int"))
+            .unwrap_or_else(|| panic!("Int lists its Compare impl: {int_impls:?}"));
         let impls = json["impls"].as_array().unwrap();
         let block = impls
             .iter()
             .find(|imp| imp["id"] == **comparable_impl)
-            .expect("Comparable-for-int block is exported");
+            .expect("Compare-for-int block is exported");
         assert!(
             block["methods"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|m| m["name"] == "compare"),
-            "compare is listed"
+                .any(|m| m["name"] == "cmp"),
+            "cmp is listed"
         );
 
         // The generic Sortable impl attaches to Array with its symbolic
@@ -1514,21 +1527,18 @@ mod tests {
         );
 
         // Interface records list their implementors.
-        let comparable = find("T:baml.Comparable");
+        let comparable = find("T:baml.ops.Compare");
         assert!(
             comparable["implementors"].as_array().unwrap().len() >= 4,
-            "Comparable lists implementors"
+            "Compare lists implementors"
         );
         // Required-method signature: Self stays symbolic in the export.
         let required = comparable["required_methods"].as_array().unwrap();
-        let compare = required
+        let cmp = required
             .iter()
-            .find(|m| m["name"] == "compare")
-            .expect("Comparable::compare is required");
-        assert_eq!(
-            compare["signature"]["throws"]["display"],
-            "(Self as baml.Comparable).CompareError"
-        );
+            .find(|m| m["name"] == "cmp")
+            .expect("Compare::cmp is required");
+        assert_eq!(cmp["signature"]["params"][0]["ty"]["display"], "Self");
 
         // An interface exports the parameters it declares, and only those.
         // The in-scope view leads with the implicit `Self`, which belongs to
@@ -1552,21 +1562,14 @@ mod tests {
         );
         // Associated types are exported as members of the interface that
         // owns them.
-        let sortable = find("T:baml.Sortable");
+        let summable = find("T:baml.Summable");
         assert!(
-            sortable["assoc_types"]
+            summable["assoc_types"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|a| a["name"] == "SortError"),
-            "Sortable carries SortError"
-        );
-
-        // Synthetic companions are present and flagged, never dropped.
-        assert!(
-            items.iter().any(|item| item["synthetic"] == true
-                && item["id"].as_str().unwrap().contains("$stream")),
-            "synthetic $stream companions are listed and flagged"
+                .any(|a| a["name"] == "Sum"),
+            "Summable carries Sum"
         );
 
         // Docstrings survive.

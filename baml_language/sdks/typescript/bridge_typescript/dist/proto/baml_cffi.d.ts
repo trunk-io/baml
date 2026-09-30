@@ -66,6 +66,9 @@ export namespace baml_bridge {
 
                 /** InboundValue promptAstValue */
                 promptAstValue?: (baml_bridge.cffi.v1.IBamlValuePromptAst|null);
+
+                /** InboundValue jsNumberValue */
+                jsNumberValue?: (number|null);
             }
 
             /** Represents an InboundValue. */
@@ -125,8 +128,11 @@ export namespace baml_bridge {
                 /** InboundValue promptAstValue. */
                 public promptAstValue?: (baml_bridge.cffi.v1.IBamlValuePromptAst|null);
 
+                /** InboundValue jsNumberValue. */
+                public jsNumberValue?: (number|null);
+
                 /** InboundValue value. */
-                public value?: ("stringValue"|"intValue"|"floatValue"|"boolValue"|"listValue"|"mapValue"|"classValue"|"enumValue"|"handle"|"uint8arrayValue"|"bigintValue"|"tyValue"|"tyDefValue"|"mediaValue"|"promptAstValue");
+                public value?: ("stringValue"|"intValue"|"floatValue"|"boolValue"|"listValue"|"mapValue"|"classValue"|"enumValue"|"handle"|"uint8arrayValue"|"bigintValue"|"tyValue"|"tyDefValue"|"mediaValue"|"promptAstValue"|"jsNumberValue");
 
                 /**
                  * Creates a new InboundValue instance using the specified properties.
@@ -1069,7 +1075,6 @@ export namespace baml_bridge {
                 ADT_MEDIA_PDF = 9,
                 ADT_MEDIA_GENERIC = 10,
                 ADT_PROMPT_AST = 11,
-                ADT_COLLECTOR = 12,
                 ADT_TYPE = 13,
                 ADT_TAGGED_HEAP_HANDLE = 14,
                 HOST_VALUE_CALLABLE = 15,

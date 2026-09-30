@@ -28,8 +28,7 @@ use baml_compiler2_emit::{
     MountedPackageLinkError, OptLevel, emit_units, generate_project_bytecode_with_mounted_units,
     generate_project_bytecode_with_opt,
 };
-use baml_compiler2_hir::package::PackageId;
-use baml_compiler2_hir_ty::package_interface::{ExportedType, PackageInterface, package_interface};
+use baml_compiler2_hir_ty::package_interface::{ExportedType, PackageInterface, export_interface};
 use baml_db::{ProjectDatabase, collect_diagnostics, testing::assert_no_diagnostic_errors};
 use baml_tests::engine::{TestDbExt, run_compiled};
 use bex_engine::BexExternalValue;
@@ -156,17 +155,22 @@ fn library_db() -> ProjectDatabase {
 
 struct LibraryArtifacts {
     blob: Vec<u8>,
-    interface: PackageInterface,
+    interface: PackageInterface<baml_type::TypeName>,
     units: Vec<CompilationUnit>,
 }
 
 fn library_artifacts() -> LibraryArtifacts {
     let db = library_db();
     assert_no_diagnostic_errors(&db);
-    let interface = package_interface(&db, PackageId::new(&db, Name::new("app"))).clone();
+    let interface = export_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("app"))
+            .unwrap(),
+    );
     let blob = baml_artifact::encode(baml_artifact::ArtifactKind::PackageInterface, &interface)
         .expect("serialize app package interface");
-    let round_trip = baml_artifact::decode::<PackageInterface>(
+    let round_trip = baml_artifact::decode::<PackageInterface<baml_type::TypeName>>(
         baml_artifact::ArtifactKind::PackageInterface,
         &blob,
     )
@@ -175,12 +179,19 @@ fn library_artifacts() -> LibraryArtifacts {
         interface, round_trip,
         "interface blob must round-trip exactly"
     );
-    let units = emit_units(&db, OPT).expect("emit independent app units");
+    let units = emit_units(&db, package(&db), OPT).expect("emit independent app units");
     LibraryArtifacts {
         blob,
         interface,
         units,
     }
+}
+
+/// The workspace root the fixture builder added: the package whose program
+/// the test compiles.
+fn package(db: &ProjectDatabase) -> baml_db::SourceRoot {
+    db.workspace_root()
+        .unwrap_or_else(|| unreachable!("the fixture builder adds one workspace root"))
 }
 
 fn source_db(user: &str) -> ProjectDatabase {
@@ -192,8 +203,7 @@ fn source_db(user: &str) -> ProjectDatabase {
 fn blob_db(user: &str, blob: Vec<u8>) -> ProjectDatabase {
     let mut db = ProjectDatabase::new();
     db.workspace(std::path::Path::new(ROOT));
-    db.set_mounted_packages([("app".to_string(), blob)].into())
-        .unwrap();
+    db.mount("app", blob);
     db.file("main.baml", user);
     db
 }
@@ -201,13 +211,13 @@ fn blob_db(user: &str, blob: Vec<u8>) -> ProjectDatabase {
 fn compile_source(user: &str) -> Program {
     let db = source_db(user);
     assert_no_diagnostic_errors(&db);
-    generate_project_bytecode_with_opt(&db, OPT).expect("source-path compile")
+    generate_project_bytecode_with_opt(&db, package(&db), OPT).expect("source-path compile")
 }
 
 fn compile_blob(user: &str, artifacts: &LibraryArtifacts) -> Program {
     let db = blob_db(user, artifacts.blob.clone());
     assert_no_diagnostic_errors(&db);
-    generate_project_bytecode_with_mounted_units(&db, OPT, &artifacts.units)
+    generate_project_bytecode_with_mounted_units(&db, package(&db), OPT, &artifacts.units)
         .expect("blob-path compile and link")
 }
 
@@ -507,9 +517,9 @@ fn emitted_program_dependency_and_consumer_units_are_byte_identical() {
     let artifacts = library_artifacts();
     let source_db = source_db(ARTIFACT_USER);
     assert_no_diagnostic_errors(&source_db);
-    let source_program =
-        generate_project_bytecode_with_opt(&source_db, OPT).expect("source program");
-    let source_units = emit_units(&source_db, OPT).expect("source units");
+    let source_program = generate_project_bytecode_with_opt(&source_db, package(&source_db), OPT)
+        .expect("source program");
+    let source_units = emit_units(&source_db, package(&source_db), OPT).expect("source units");
 
     let blob_db = blob_db(ARTIFACT_USER, artifacts.blob.clone());
     assert_no_diagnostic_errors(&blob_db);
@@ -522,6 +532,7 @@ fn emitted_program_dependency_and_consumer_units_are_byte_identical() {
     let (blob_program, blob_units) =
         baml_compiler2_emit::generate_project_bytecode_with_mounted_units_artifacts(
             &blob_db,
+            package(&blob_db),
             OPT,
             &artifacts.units,
         )
@@ -590,7 +601,7 @@ fn exported_impl_method_preserves_synthetic_callback_effect_params() {
             implementation.interface.name.name().as_str() == "Applies"
                 && matches!(
                     &implementation.for_ty_pattern,
-                    baml_type::Ty::Class(qtn, _, _) if qtn.name().as_str() == "Runner"
+                    baml_type::Ty::Class(qtn, _) if qtn.name().as_str() == "Runner"
                 )
         })
         .expect("Runner implements Applies row");
@@ -612,8 +623,9 @@ fn mounted_unit_api_preserves_dependency_link_errors() {
     let mut duplicate_units = artifacts.units.clone();
     duplicate_units.push(unit(&artifacts.units, "<builtin>/app/lib.baml").clone());
     let db = blob_db("function main() -> int { 0 }", artifacts.blob);
-    let error = generate_project_bytecode_with_mounted_units(&db, OPT, &duplicate_units)
-        .expect_err("duplicate dependency export must fail before consumer emit");
+    let error =
+        generate_project_bytecode_with_mounted_units(&db, package(&db), OPT, &duplicate_units)
+            .expect_err("duplicate dependency export must fail before consumer emit");
     assert!(matches!(
         error,
         MountedPackageLinkError::DependencyLink(bex_vm_types::link::LinkError::DuplicateExport(_))
@@ -656,14 +668,53 @@ implement app.Tagged for Mine {
     assert!(overlap.related_info.is_empty());
 }
 
+/// A user impl for a mounted ALIAS overlaps a user impl for the alias's body
+/// in both lanes: the blob's alias rows are the only place a mounted
+/// package's aliases exist (link stubs carry none), and an alias coherence
+/// cannot expand fails open — the unifier's fallback verdict is "disjoint".
+#[test]
+fn alias_headed_overlap_is_e0132_in_both_lanes() {
+    const USER: &str = r#"
+interface Marker {
+    function mark(self) -> int throws never
+}
+
+implement Marker for app.Score {
+    function mark(self) -> int throws never {
+        1
+    }
+}
+
+implement Marker for int {
+    function mark(self) -> int throws never {
+        2
+    }
+}
+"#;
+    let codes = |db: &ProjectDatabase| -> Vec<String> {
+        collect_diagnostics(db)
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == baml_compiler_diagnostics::Severity::Error)
+            .map(|diagnostic| format!("{} {}", diagnostic.code(), diagnostic.message))
+            .collect()
+    };
+    let from_source = codes(&source_db(USER));
+    assert_eq!(from_source.len(), 1, "{from_source:?}");
+    assert!(from_source[0].starts_with("E0132 "), "{from_source:?}");
+    let from_blob = codes(&blob_db(USER, library_artifacts().blob));
+    assert_eq!(from_blob, from_source);
+}
+
 /// Two valid, independently checked mounted blobs cannot introduce a new
 /// blob-vs-blob overlap: the orphan rule requires either the interface or the
 /// receiver constructor to be local. Distinct packages therefore own distinct
 /// receiver constructors, while a package attempting to overlap a dependency's
 /// blanket impl is rejected by this same E0132 check before its blob is emitted.
 /// This makes user-vs-blob the only expressible load-time direction for valid
-/// mounted-package artifacts; artifact validation rejects malformed or
-/// tampered blobs.
+/// mounted-package artifacts. An artifact whose OWN rows overlap is not the
+/// export of a checked package; the mount boundary refuses only the
+/// degenerate identity-level duplicate (`ImportError::DuplicateImpl`), so a
+/// served root's rows are trusted to be what its own compile checked.
 #[test]
 fn blob_vs_blob_overlap_is_not_expressible_for_valid_artifacts() {
     // Keep the argument executable: the rich fixture's blanket impl is exported
@@ -672,7 +723,7 @@ fn blob_vs_blob_overlap_is_not_expressible_for_valid_artifacts() {
     let artifacts = library_artifacts();
     assert!(artifacts.interface.impls.iter().any(|implementation| {
         implementation.interface.name.name().as_str() == "Tagged"
-            && matches!(implementation.for_ty_pattern, baml_type::Ty::TypeVar(_, _))
+            && matches!(implementation.for_ty_pattern, baml_type::Ty::TypeVar(_))
     }));
     assert!(matches!(
         artifacts.interface.lookup_type(&[], &Name::new("Tagged")),
