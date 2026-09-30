@@ -2178,7 +2178,7 @@ jobs:
 
   size-gate-linux:
     name: "KILN: measure-baml-size (linux)"
-    runs-on: trunk-kiln-staging=${{ github.run_id }}-${{ github.run_attempt }}..size=small
+    runs-on: trunk-kiln-staging=${{ github.run_id }}-${{ github.run_attempt }}..size=medium
     needs: determine_changes
     if: needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary'
     timeout-minutes: 60
