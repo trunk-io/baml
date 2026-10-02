@@ -55,7 +55,7 @@
     "jest-junit": "^16.0.0",
     "jest-summary-reporter": "^0.0.2",
     "node-loader": "^2.1.0",
-    "postcss": "^8.5.3",
+    "postcss": "^8.5.23",
     "tailwindcss": "^3.4.1",
     "ts-jest": "^29.2.6",
     "ts-node": "^10.9.2",
