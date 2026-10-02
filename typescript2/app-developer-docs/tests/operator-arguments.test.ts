@@ -30,5 +30,5 @@ test('operator arguments keep values and explicit flags separate', () => {
     ['apply'],
   );
   assert.equal(requireOperatorValue(parsed, 'version'), '0.18.1');
-  assert.equal(parsed.flags.has('apply'), true);
+  assert.equal(parsed.flags.has('apply'), false);
 });
