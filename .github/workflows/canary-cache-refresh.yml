@@ -4,13 +4,6 @@ name: Canary cache refresh
 # explanation at the top of cargo-tests.reusable.yaml.
 
 on:
-  schedule:
-    # 13:00 UTC = 5am PST / 6am PDT. GHA cron is UTC-only and does
-    # not honor DST, so the local hour shifts by one across the
-    # spring/fall transitions.
-    - cron: '0 13 * * *'
-  # Hand-trigger for testing the purge + repopulate flow without
-  # waiting for the daily cron.
   workflow_dispatch: {}
 
 permissions:
