@@ -258,7 +258,7 @@
     "react-refresh": "0.17.0",
     "rimraf": "6.0.1",
     "tsup": "^8.0.0",
-    "vitest": "3.2.4"
+    "vitest": "4.1.11"
   },
   "preview": false
 }
