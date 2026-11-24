@@ -13,9 +13,9 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use baml_db::testing::compile_source;
+use baml_test_support::compile_source;
 use bex_vm::BexVm;
-use bex_vm_types::{HeapPtr, RootHaver, Value};
+use bex_vm_types::{ForwardRoots, HeapPtr, NothingCollected, RootHaverExt, Value};
 
 fn make_vm() -> BexVm {
     // The program contents don't matter — we only need a VM whose TLAB
@@ -38,7 +38,7 @@ fn forward_roots_invalidates_tlab() {
         "TLAB should hold a chunk after the first allocation"
     );
 
-    vm.forward_roots(&HashMap::new());
+    vm.forward_roots(&mut ForwardRoots::new(&HashMap::new(), &NothingCollected));
     assert!(
         !vm.tlab.is_valid(),
         "TLAB must be invalidated by forward_roots so the next alloc refills"
@@ -53,27 +53,27 @@ fn forward_roots_remaps_stack_object_pointers() {
     let new_ptr = vm.tlab.alloc_string("after_gc".to_string());
     let untouched_ptr = vm.tlab.alloc_string("stays_put".to_string());
 
-    vm.stack.0.push(Value::object(old_ptr));
-    vm.stack.0.push(Value::int(42));
-    vm.stack.0.push(Value::object(untouched_ptr));
+    vm.stack.try_push(Value::object(old_ptr)).unwrap();
+    vm.stack.try_push(Value::int(42)).unwrap();
+    vm.stack.try_push(Value::object(untouched_ptr)).unwrap();
 
     let mut forwarding: HashMap<HeapPtr, HeapPtr> = HashMap::new();
     forwarding.insert(old_ptr, new_ptr);
 
-    vm.forward_roots(&forwarding);
+    vm.forward_roots(&mut ForwardRoots::new(&forwarding, &NothingCollected));
 
     assert_eq!(
-        vm.stack.0[0],
+        vm.stack[bex_vm_types::StackIndex::from_raw(0)],
         Value::object(new_ptr),
         "stack slot 0 should have been rewritten to the forwarded pointer"
     );
     assert_eq!(
-        vm.stack.0[1],
+        vm.stack[bex_vm_types::StackIndex::from_raw(1)],
         Value::int(42),
         "non-object stack values must be left alone"
     );
     assert_eq!(
-        vm.stack.0[2],
+        vm.stack[bex_vm_types::StackIndex::from_raw(2)],
         Value::object(untouched_ptr),
         "pointers without a forwarding entry must be left alone"
     );

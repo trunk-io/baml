@@ -2,41 +2,107 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroU64,
     sync::{
         Arc, LazyLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use bex_project::{BexExternalAdt, BexExternalValue, Handle, MediaKind};
+use bex_project::{BexExternalAdt, BexExternalValue, ConcreteMediaKind, Handle};
 
 use crate::baml_bridge::cffi::BamlHandleType;
 
-/// Newtype wrapper around opaque `$rust_type` objects
-/// (`Arc<dyn Any + Send + Sync>`) stored as a handle.
-#[derive(Clone)]
-pub struct BexRustData(pub Arc<dyn std::any::Any + Send + Sync>);
+/// A host's reference to an engine object: a key the handle table minted.
+/// Never 0, which the wire and every host reserve for "no handle".
+///
+/// A `TableKey` is not a host-value key (`bex_project::HostKey`) and cannot be
+/// passed where one is expected; the one place a bare `u64` becomes either is
+/// the wire decoder, which decides by the handle's tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TableKey(NonZeroU64);
 
-impl std::fmt::Debug for BexRustData {
+impl TableKey {
+    /// A key as the C ABI or the wire carries it; `None` for the reserved 0.
+    pub const fn new(key: u64) -> Option<Self> {
+        match NonZeroU64::new(key) {
+            Some(key) => Some(Self(key)),
+            None => None,
+        }
+    }
+
+    /// The key as the C ABI and the wire carry it.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for TableKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BexRustData").finish()
+        self.0.fmt(f)
+    }
+}
+
+/// A typed, runtime-owned immutable callback/re-entry capability.
+#[derive(Clone)]
+pub struct InvocationStateHandle {
+    pub owner: Arc<dyn bex_project::Bex>,
+    pub state: bex_project::InheritedInvocationState,
+}
+
+impl std::fmt::Debug for InvocationStateHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvocationStateHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl bex_project::BexRustData for InvocationStateHandle {
+    fn measure(&self, _: &mut bex_project::Meter) {
+        // The engine owns everything this names.
+    }
+}
+
+#[derive(Clone)]
+pub struct TraceReservationHandle {
+    pub owner: Arc<dyn bex_project::Bex>,
+    pub reservation: Arc<bex_project::ReservedSpanData>,
+}
+
+impl std::fmt::Debug for TraceReservationHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceReservationHandle")
+            .field("reservation", &self.reservation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl bex_project::BexRustData for TraceReservationHandle {
+    fn measure(&self, meter: &mut bex_project::Meter) {
+        meter.shared(&self.reservation, |meter| self.reservation.measure(meter));
     }
 }
 
 /// Subset of `BexExternalValue` that can be held as a handle.
 /// Enforces at the type level that primitives/containers never enter the table.
 ///
-/// Note: `HOST_VALUE_CALLABLE` keys do NOT live in this table. They are
-/// bridge-side identifiers backed by a per-bridge `HostValueRegistry`.
-/// See `bex_external_types::host_value` for the inverted-direction
-/// lifetime model (Rust holds keys + Arc-with-Drop; bridge holds the
-/// underlying host object).
+/// Note: host-value keys (`HOST_VALUE_CALLABLE`, `HOST_VALUE_OPAQUE`) do NOT
+/// live in this table: they are the engine's references to host objects,
+/// typed `bex_project::HostKey` and indexed by `bex_external_types::host_value`
+/// (the dual of this table: the engine holds keys + Arc-with-Drop; the bridge
+/// holds the underlying host object).
 #[derive(Clone, Debug)]
 pub enum CffiHandleTableEntry {
     BexHeapHandle(Handle),
-    FunctionRef { global_index: usize },
-    Adt(BexExternalAdt),
-    RustData(BexRustData),
+    Adt(TableAdt),
+    InvocationState(InvocationStateHandle),
+    TraceReservation(TraceReservationHandle),
+    /// The engine's hold on a host value it sent the host
+    /// ([`HOST_VALUE_PIN`](BamlHandleType::HostValuePin)): the host releases
+    /// it with the result that carried the value, after it has read the
+    /// value's key, so the engine cannot give the key's references back
+    /// first. Never a value.
+    HostValuePin(Arc<bex_project::HostValueArc>),
 }
 
 pub struct CffiHandleTableOptions<'a> {
@@ -63,24 +129,116 @@ impl CffiHandleTableOptions<'_> {
     }
 }
 
+/// What a table row holds of the engine's ADTs: a payload a host holds by
+/// key (a media value, a rendered prompt's tree), a host body's cancel token,
+/// or a rooted engine object. A type never: it crosses as itself, a
+/// `ty_value`.
+#[derive(Clone, Debug)]
+pub enum TableAdt {
+    PromptAst(Arc<bex_project::PromptAst>),
+    Media(Arc<bex_project::MediaValue>),
+    /// A host body's `baml.spawn.CancelToken`, which a host holds as a
+    /// reference to a `CancelToken` and the issuing runtime builds when it
+    /// comes back.
+    CancelToken(bex_project::CancelTokenCapability),
+    TaggedHeapHandle {
+        kind: bex_project::TaggedHeapHandleKind,
+        ty: bex_project::AnnotationTy,
+        heap_handle: Handle,
+    },
+}
+
+impl TryFrom<BexExternalAdt> for TableAdt {
+    type Error = &'static str;
+
+    fn try_from(adt: BexExternalAdt) -> Result<Self, Self::Error> {
+        match adt {
+            BexExternalAdt::PromptAst(prompt) => Ok(Self::PromptAst(prompt)),
+            BexExternalAdt::Media(media) => Ok(Self::Media(media)),
+            BexExternalAdt::CancelToken(token) => Ok(Self::CancelToken(token)),
+            BexExternalAdt::TaggedHeapHandle {
+                kind,
+                ty,
+                heap_handle,
+            } => Ok(Self::TaggedHeapHandle {
+                kind,
+                ty,
+                heap_handle,
+            }),
+            BexExternalAdt::Type(_) | BexExternalAdt::WireType(_) => {
+                Err("a type crosses as itself, never as a handle")
+            }
+        }
+    }
+}
+
+impl From<TableAdt> for BexExternalAdt {
+    fn from(adt: TableAdt) -> Self {
+        match adt {
+            TableAdt::PromptAst(prompt) => Self::PromptAst(prompt),
+            TableAdt::Media(media) => Self::Media(media),
+            TableAdt::CancelToken(token) => Self::CancelToken(token),
+            TableAdt::TaggedHeapHandle {
+                kind,
+                ty,
+                heap_handle,
+            } => Self::TaggedHeapHandle {
+                kind,
+                ty,
+                heap_handle,
+            },
+        }
+    }
+}
+
 impl CffiHandleTableEntry {
+    /// The engine object this entry names, if it names one: a heap handle,
+    /// bare or tagged with the engine's proxy kind. Such an entry carries the
+    /// object's identity, so one object has one live key. A payload (media, a
+    /// prompt) or a capability carries none.
+    ///
+    /// A function value carries none either: it crosses as the type of the
+    /// slot it crosses through, and a host names its arguments by that type,
+    /// which the row keeps to bind them. One function in two slots (`(a, b)`
+    /// and `(b, a)`) is two rows.
+    fn identity(&self) -> Option<&Handle> {
+        match self {
+            Self::BexHeapHandle(handle) => Some(handle),
+            Self::Adt(TableAdt::TaggedHeapHandle {
+                kind, heap_handle, ..
+            }) => match kind {
+                bex_project::TaggedHeapHandleKind::Stream
+                | bex_project::TaggedHeapHandleKind::FunctionSpec
+                | bex_project::TaggedHeapHandleKind::RuntimeValue
+                | bex_project::TaggedHeapHandleKind::TraceControl(_) => Some(heap_handle),
+                bex_project::TaggedHeapHandleKind::Callable => None,
+            },
+            Self::Adt(TableAdt::PromptAst(_) | TableAdt::Media(_) | TableAdt::CancelToken(_))
+            | Self::InvocationState(_)
+            | Self::TraceReservation(_)
+            | Self::HostValuePin(_) => None,
+        }
+    }
+
     /// Map this value to its proto `BamlHandleType` tag.
     pub fn handle_type(&self) -> BamlHandleType {
         match self {
             Self::BexHeapHandle(_) => BamlHandleType::UntaggedBexHeap,
-            Self::FunctionRef { .. } => BamlHandleType::FunctionRef,
-            Self::RustData(_) => BamlHandleType::UntaggedRustData,
+            Self::InvocationState(_) => BamlHandleType::InvocationState,
+            Self::TraceReservation(_) => BamlHandleType::TraceReservation,
+            Self::HostValuePin(_) => BamlHandleType::HostValuePin,
             Self::Adt(adt) => match adt {
-                BexExternalAdt::Type(_) | BexExternalAdt::TypeDef(_) => BamlHandleType::AdtType,
-                BexExternalAdt::PromptAst(_) => BamlHandleType::AdtPromptAst,
-                BexExternalAdt::Media(media) => match media.kind {
-                    MediaKind::Image => BamlHandleType::AdtMediaImage,
-                    MediaKind::Audio => BamlHandleType::AdtMediaAudio,
-                    MediaKind::Video => BamlHandleType::AdtMediaVideo,
-                    MediaKind::Pdf => BamlHandleType::AdtMediaPdf,
-                    MediaKind::Generic => BamlHandleType::AdtMediaGeneric,
+                TableAdt::PromptAst(_) => BamlHandleType::AdtPromptAst,
+                // A host holds it as it holds any reference to a runtime
+                // value: the row, not the tag, says what it is.
+                TableAdt::CancelToken(_) => BamlHandleType::AdtRuntimeValue,
+                TableAdt::Media(media) => match media.kind {
+                    ConcreteMediaKind::Image => BamlHandleType::AdtMediaImage,
+                    ConcreteMediaKind::Audio => BamlHandleType::AdtMediaAudio,
+                    ConcreteMediaKind::Video => BamlHandleType::AdtMediaVideo,
+                    ConcreteMediaKind::Pdf => BamlHandleType::AdtMediaPdf,
                 },
-                BexExternalAdt::TaggedHeapHandle { kind, .. } => match kind {
+                TableAdt::TaggedHeapHandle { kind, .. } => match kind {
                     bex_project::TaggedHeapHandleKind::Callable => BamlHandleType::FunctionRef,
                     bex_project::TaggedHeapHandleKind::Stream => {
                         BamlHandleType::AdtTaggedHeapHandle
@@ -88,7 +246,8 @@ impl CffiHandleTableEntry {
                     bex_project::TaggedHeapHandleKind::FunctionSpec => {
                         BamlHandleType::AdtFunctionSpec
                     }
-                    bex_project::TaggedHeapHandleKind::RuntimeValue => {
+                    bex_project::TaggedHeapHandleKind::RuntimeValue
+                    | bex_project::TaggedHeapHandleKind::TraceControl(_) => {
                         BamlHandleType::AdtRuntimeValue
                     }
                 },
@@ -103,21 +262,18 @@ impl TryFrom<BexExternalValue> for CffiHandleTableEntry {
     fn try_from(value: BexExternalValue) -> Result<Self, Self::Error> {
         match value {
             BexExternalValue::Handle(h) => Ok(Self::BexHeapHandle(h)),
-            BexExternalValue::FunctionRef { global_index } => {
-                Ok(Self::FunctionRef { global_index })
-            }
-            BexExternalValue::Adt(a) => Ok(Self::Adt(a)),
-            BexExternalValue::RustData(arc) => Ok(Self::RustData(BexRustData(arc))),
-            // HostValue uses a separate per-bridge registry, not HANDLE_TABLE.
+            BexExternalValue::Adt(adt) => TableAdt::try_from(adt).map(Self::Adt),
+            // Host values use a separate per-bridge registry, not HANDLE_TABLE.
             BexExternalValue::HostValue(_)
+            | BexExternalValue::HostCallable { .. }
             | BexExternalValue::Null
             | BexExternalValue::Int(_)
             | BexExternalValue::Bigint(_)
             | BexExternalValue::Float(_)
-            | BexExternalValue::JsNumber(_)
             | BexExternalValue::Bool(_)
             | BexExternalValue::String(_)
             | BexExternalValue::Array { .. }
+            | BexExternalValue::Tuple { .. }
             | BexExternalValue::Map { .. }
             | BexExternalValue::Instance { .. }
             | BexExternalValue::Variant { .. }
@@ -129,15 +285,15 @@ impl TryFrom<BexExternalValue> for CffiHandleTableEntry {
     }
 }
 
-impl From<CffiHandleTableEntry> for BexExternalValue {
-    fn from(value: CffiHandleTableEntry) -> Self {
-        match value {
-            CffiHandleTableEntry::BexHeapHandle(h) => BexExternalValue::Handle(h),
-            CffiHandleTableEntry::FunctionRef { global_index } => {
-                BexExternalValue::FunctionRef { global_index }
-            }
-            CffiHandleTableEntry::Adt(a) => BexExternalValue::Adt(a),
-            CffiHandleTableEntry::RustData(BexRustData(arc)) => BexExternalValue::RustData(arc),
+impl CffiHandleTableEntry {
+    /// The value this entry holds, if it holds one. A capability (invocation
+    /// state, a trace reservation) is control-channel data
+    /// the bridge reads itself: it is never an application value.
+    pub fn value(&self) -> Option<BexExternalValue> {
+        match self {
+            Self::BexHeapHandle(handle) => Some(BexExternalValue::Handle(handle.clone())),
+            Self::Adt(adt) => Some(BexExternalValue::Adt(adt.clone().into())),
+            Self::InvocationState(_) | Self::TraceReservation(_) | Self::HostValuePin(_) => None,
         }
     }
 }
@@ -163,51 +319,69 @@ struct CffiHandleTableRow {
     refcount: u64,
 }
 
-/// Global handle table mapping opaque u64 keys to `Arc<CffiHandleTableEntry>`.
+/// Global handle table mapping [`TableKey`]s to `Arc<CffiHandleTableEntry>`.
 /// Single instance shared by all bridges.
 pub struct CffiHandleTable {
     next_key: AtomicU64,
     /// Lock order: `entries` before `heap_keys`, always.
-    entries: RwLock<HashMap<u64, CffiHandleTableRow>>,
-    /// Dedup index for the identity-bearing arm: one live cffi key per heap
+    entries: RwLock<HashMap<TableKey, CffiHandleTableRow>>,
+    /// Dedup index for the entries that name an engine object
+    /// ([`CffiHandleTableEntry::identity`]): one live cffi key per heap
     /// [`Handle`] (`Eq` = slab key + issuing heap), so a host-side key compare
-    /// answers object identity. `RustData`/`Adt` entries carry no identity and
-    /// never dedup.
-    heap_keys: RwLock<HashMap<Handle, u64>>,
+    /// answers object identity. Payload entries carry no identity and never
+    /// dedup.
+    heap_keys: RwLock<HashMap<Handle, TableKey>>,
 }
 
 impl CffiHandleTable {
     pub fn new() -> Self {
         Self {
-            next_key: AtomicU64::new(1), // start at 1; 0 = invalid
+            next_key: AtomicU64::new(1),
             entries: RwLock::new(HashMap::new()),
             heap_keys: RwLock::new(HashMap::new()),
         }
     }
 
+    /// A fresh key. The counter starts at 1 and never hands out 0, even if it
+    /// ever wrapped.
+    fn mint(&self) -> TableKey {
+        loop {
+            if let Some(key) = TableKey::new(self.next_key.fetch_add(1, Ordering::Relaxed)) {
+                return key;
+            }
+        }
+    }
+
     /// Insert a value and return its key, adding one ownership.
     ///
-    /// A `BexHeapHandle` naming an object that already has a live key returns
+    /// An entry naming an engine object that already has a live key returns
     /// that key (host-side `==` on keys is an identity compare); every other
     /// value gets a fresh key. Either way the caller now owes one release.
-    pub fn insert(&self, value: CffiHandleTableEntry) -> u64 {
+    pub fn insert(&self, value: CffiHandleTableEntry) -> TableKey {
         let mut entries = self
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let CffiHandleTableEntry::BexHeapHandle(handle) = &value {
+        if let Some(handle) = value.identity() {
             let mut heap_keys = self
                 .heap_keys
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(&key) = heap_keys.get(handle) {
-                entries
+                let row = entries
                     .get_mut(&key)
-                    .unwrap_or_else(|| unreachable!("heap_keys always names a live entry"))
-                    .refcount += 1;
+                    .unwrap_or_else(|| unreachable!("heap_keys always names a live entry"));
+                // An object crosses in one form, fixed by its kind and its
+                // class's crossing, so the key's entry is this one.
+                debug_assert_eq!(
+                    row.value.handle_type(),
+                    value.handle_type(),
+                    "one engine object crossed in two forms"
+                );
+                row.refcount += 1;
                 return key;
             }
-            let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+            let key = self.mint();
             heap_keys.insert(handle.clone(), key);
             entries.insert(
                 key,
@@ -218,7 +392,7 @@ impl CffiHandleTable {
             );
             return key;
         }
-        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let key = self.mint();
         entries.insert(
             key,
             CffiHandleTableRow {
@@ -232,27 +406,27 @@ impl CffiHandleTable {
     /// Clone a handle: adds one ownership and returns the key to release it
     /// through.
     ///
-    /// The identity-bearing arm keeps its key (a copy is another owner of the
-    /// same identity); identity-free values get a fresh key sharing the Arc,
-    /// preserving the historical "each wrapper holds its own key" shape.
-    pub fn clone_handle(&self, key: u64) -> Option<u64> {
+    /// An entry naming an engine object keeps its key (a copy is another owner
+    /// of the same identity); identity-free values get a fresh key sharing the
+    /// Arc, preserving the historical "each wrapper holds its own key" shape.
+    pub fn clone_handle(&self, key: TableKey) -> Option<TableKey> {
         let mut entries = self
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let row = entries.get_mut(&key)?;
-        if matches!(&*row.value, CffiHandleTableEntry::BexHeapHandle(_)) {
+        if row.value.identity().is_some() {
             row.refcount += 1;
             return Some(key);
         }
         let value = row.value.clone();
-        let new_key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let new_key = self.mint();
         entries.insert(new_key, CffiHandleTableRow { value, refcount: 1 });
         Some(new_key)
     }
 
     /// Resolve a key to its value (cheap Arc clone). Not an ownership change.
-    pub fn resolve(&self, key: u64) -> Option<Arc<CffiHandleTableEntry>> {
+    pub fn resolve(&self, key: TableKey) -> Option<Arc<CffiHandleTableEntry>> {
         self.entries
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -263,7 +437,7 @@ impl CffiHandleTable {
     /// Release one ownership of a key. Returns true if the key was live.
     /// The row (and its dedup index entry) is removed when the last
     /// ownership is released.
-    pub fn release(&self, key: u64) -> bool {
+    pub fn release(&self, key: TableKey) -> bool {
         let mut entries = self
             .entries
             .write()
@@ -276,7 +450,7 @@ impl CffiHandleTable {
             let row = entries
                 .remove(&key)
                 .unwrap_or_else(|| unreachable!("row was just read under the same write lock"));
-            if let CffiHandleTableEntry::BexHeapHandle(handle) = &*row.value {
+            if let Some(handle) = row.value.identity() {
                 self.heap_keys
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -290,7 +464,7 @@ impl CffiHandleTable {
     /// it still owes. Test instrumentation for the leak audits, which cannot
     /// see an imbalance on a shared key through [`Self::len`] alone (rows,
     /// not owners). `None` for a dead or unknown key.
-    pub fn refcount(&self, key: u64) -> Option<u64> {
+    pub fn refcount(&self, key: TableKey) -> Option<u64> {
         self.entries
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -315,7 +489,7 @@ impl CffiHandleTable {
     /// Atomically resolve and release one ownership — the inbound
     /// ownership-transfer lane (the host clones a key for the wire; decoding
     /// the wire consumes that clone). Returns None if the key was absent.
-    pub fn drain(&self, key: u64) -> Option<Arc<CffiHandleTableEntry>> {
+    pub fn drain(&self, key: TableKey) -> Option<Arc<CffiHandleTableEntry>> {
         let mut entries = self
             .entries
             .write()
@@ -325,7 +499,7 @@ impl CffiHandleTable {
         row.refcount -= 1;
         if row.refcount == 0 {
             entries.remove(&key);
-            if let CffiHandleTableEntry::BexHeapHandle(handle) = &*value {
+            if let Some(handle) = value.identity() {
                 self.heap_keys
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -347,36 +521,41 @@ pub static HANDLE_TABLE: LazyLock<CffiHandleTable> = LazyLock::new(CffiHandleTab
 
 #[cfg(test)]
 mod tests {
-    use bex_project::{BexExternalValue, HostValueArc, HostValueKind};
+    use bex_project::{BexExternalValue, HostValueArc, HostValueKind, MediaValue};
 
     use super::*;
     use crate::{baml_bridge::cffi::baml_outbound_value::Value as BamlValueVariant, value_encode};
 
-    fn make_function_ref() -> CffiHandleTableEntry {
-        CffiHandleTableEntry::FunctionRef { global_index: 42 }
+    /// Any engine row a test can mint without a heap: a media value.
+    fn media_row() -> CffiHandleTableEntry {
+        CffiHandleTableEntry::Adt(TableAdt::Media(MediaValue::from_url(
+            ConcreteMediaKind::Image,
+            "https://example.com/",
+            None,
+        )))
     }
 
     #[test]
     fn insert_and_resolve() {
         let table = CffiHandleTable::new();
-        let key = table.insert(make_function_ref());
+        let key = table.insert(media_row());
         let resolved = table.resolve(key).unwrap();
         assert!(matches!(
             &*resolved,
-            CffiHandleTableEntry::FunctionRef { global_index: 42 }
+            CffiHandleTableEntry::Adt(TableAdt::Media(_))
         ));
     }
 
     #[test]
     fn resolve_missing_returns_none() {
         let table = CffiHandleTable::new();
-        assert!(table.resolve(9999).is_none());
+        assert!(table.resolve(TableKey::new(9999).unwrap()).is_none());
     }
 
     #[test]
     fn clone_handle_produces_new_key() {
         let table = CffiHandleTable::new();
-        let key1 = table.insert(make_function_ref());
+        let key1 = table.insert(media_row());
         let key2 = table.clone_handle(key1).unwrap();
         assert_ne!(key1, key2);
         // Both resolve to something
@@ -387,7 +566,7 @@ mod tests {
     #[test]
     fn clone_handle_shares_same_arc() {
         let table = CffiHandleTable::new();
-        let key1 = table.insert(make_function_ref());
+        let key1 = table.insert(media_row());
         let key2 = table.clone_handle(key1).unwrap();
         let arc1 = table.resolve(key1).unwrap();
         let arc2 = table.resolve(key2).unwrap();
@@ -398,7 +577,7 @@ mod tests {
     #[test]
     fn release_original_clone_still_resolves() {
         let table = CffiHandleTable::new();
-        let key1 = table.insert(make_function_ref());
+        let key1 = table.insert(media_row());
         let key2 = table.clone_handle(key1).unwrap();
         assert!(table.release(key1));
         assert!(table.resolve(key1).is_none());
@@ -408,7 +587,7 @@ mod tests {
     #[test]
     fn release_both_clones() {
         let table = CffiHandleTable::new();
-        let key1 = table.insert(make_function_ref());
+        let key1 = table.insert(media_row());
         let key2 = table.clone_handle(key1).unwrap();
         assert!(table.release(key1));
         assert!(table.release(key2));
@@ -419,7 +598,7 @@ mod tests {
     #[test]
     fn double_release_returns_false() {
         let table = CffiHandleTable::new();
-        let key = table.insert(make_function_ref());
+        let key = table.insert(media_row());
         assert!(table.release(key));
         assert!(!table.release(key)); // second release returns false
     }
@@ -427,11 +606,11 @@ mod tests {
     #[test]
     fn drain_removes_entry() {
         let table = CffiHandleTable::new();
-        let key = table.insert(make_function_ref());
+        let key = table.insert(media_row());
         let drained = table.drain(key).expect("drain should return entry");
         assert!(matches!(
             &*drained,
-            CffiHandleTableEntry::FunctionRef { global_index: 42 }
+            CffiHandleTableEntry::Adt(TableAdt::Media(_))
         ));
         assert!(table.resolve(key).is_none());
         assert!(table.drain(key).is_none());
@@ -447,52 +626,42 @@ mod tests {
     }
 
     #[test]
-    fn try_from_accepts_function_ref() {
-        let val = BexExternalValue::FunctionRef { global_index: 7 };
-        let htv = CffiHandleTableEntry::try_from(val).unwrap();
-        assert!(matches!(
-            htv,
-            CffiHandleTableEntry::FunctionRef { global_index: 7 }
-        ));
-    }
-
-    #[test]
-    fn handle_type_function_ref() {
-        let htv = CffiHandleTableEntry::FunctionRef { global_index: 0 };
-        assert_eq!(htv.handle_type() as i32, BamlHandleType::FunctionRef as i32);
-    }
-
-    #[test]
     fn roundtrip_to_bex_external_value() {
-        let original = CffiHandleTableEntry::FunctionRef { global_index: 99 };
-        let bex: BexExternalValue = original.into();
+        let bex = media_row().value().expect("a media row holds a value");
         let back = CffiHandleTableEntry::try_from(bex).unwrap();
         assert!(matches!(
             back,
-            CffiHandleTableEntry::FunctionRef { global_index: 99 }
+            CffiHandleTableEntry::Adt(TableAdt::Media(_))
         ));
     }
 
     #[test]
     fn key_starts_at_one() {
         let table = CffiHandleTable::new();
-        let key = table.insert(make_function_ref());
-        assert_eq!(key, 1, "first key should be 1 (0 is reserved as invalid)");
+        let key = table.insert(media_row());
+        assert_eq!(
+            key.get(),
+            1,
+            "first key should be 1 (0 is reserved as invalid)"
+        );
     }
 
     #[test]
     fn keys_are_monotonically_increasing() {
         let table = CffiHandleTable::new();
-        let key1 = table.insert(make_function_ref());
-        let key2 = table.insert(make_function_ref());
-        let key3 = table.insert(make_function_ref());
+        let key1 = table.insert(media_row());
+        let key2 = table.insert(media_row());
+        let key3 = table.insert(media_row());
         assert!(key1 < key2);
         assert!(key2 < key3);
     }
 
     #[test]
     fn artifact_safe_encoding_does_not_insert_or_serialize_handle_table_key() {
-        let value = BexExternalValue::HostValue(HostValueArc::new(42, HostValueKind::Callable));
+        let value = BexExternalValue::HostValue(HostValueArc::new(
+            bex_project::HostKey::new(42).unwrap(),
+            HostValueKind::Callable,
+        ));
         let encoded = value_encode::artifact_safe_external_to_outbound(&value).unwrap();
 
         assert!(!matches!(
@@ -576,24 +745,73 @@ mod tests {
     #[test]
     fn identity_free_entries_never_dedup() {
         let table = CffiHandleTable::new();
-        let rust_data = BexRustData(Arc::new(42_u32));
-        let key1 = table.insert(CffiHandleTableEntry::RustData(rust_data.clone()));
-        let key2 = table.insert(CffiHandleTableEntry::RustData(rust_data));
-        assert_ne!(key1, key2, "RustData carries no identity");
+        let key1 = table.insert(media_row());
+        let key2 = table.insert(media_row());
+        assert_ne!(key1, key2, "a media payload carries no identity");
+        for key in [key1, key2] {
+            assert!(table.release(key));
+        }
+    }
 
-        // An ADT holding a heap handle is still identity-free at this layer.
+    /// A tagged heap handle names an engine object as a bare one does: one
+    /// object, one refcounted key, and a clone keeps it.
+    #[test]
+    fn tagged_heap_handle_dedups_to_one_refcounted_key() {
+        let table = CffiHandleTable::new();
         let handle = bex_project::Handle::new(7, stub_heap());
-        let adt = |h: &bex_project::Handle| {
-            CffiHandleTableEntry::Adt(bex_project::BexExternalAdt::TaggedHeapHandle {
+        let tagged = |h: &bex_project::Handle| {
+            CffiHandleTableEntry::Adt(TableAdt::TaggedHeapHandle {
                 kind: bex_project::TaggedHeapHandleKind::RuntimeValue,
-                ty: bex_project::RuntimeTy::int(),
+                ty: bex_project::AnnotationTy::int(),
                 heap_handle: h.clone(),
             })
         };
-        let key3 = table.insert(adt(&handle));
-        let key4 = table.insert(adt(&handle));
-        assert_ne!(key3, key4, "Adt entries never dedup");
-        for key in [key1, key2, key3, key4] {
+        let key1 = table.insert(tagged(&handle));
+        let key2 = table.insert(tagged(&handle));
+        assert_eq!(key1, key2, "one object, one key");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.clone_handle(key1), Some(key1));
+        let other = table.insert(tagged(&bex_project::Handle::new(8, stub_heap())));
+        assert_ne!(other, key1, "another object has its own key");
+
+        // Three owners of the shared key; the row lives until the last goes.
+        assert!(table.release(key1));
+        assert!(table.release(key1));
+        assert!(table.resolve(key1).is_some());
+        assert!(table.release(key1));
+        assert!(table.resolve(key1).is_none());
+        // The dedup index is cleaned at zero: a later crossing mints fresh.
+        let key3 = table.insert(tagged(&handle));
+        assert_ne!(key3, key1);
+        for key in [key3, other] {
+            assert!(table.release(key));
+        }
+    }
+
+    /// A function value crosses as the type of each slot it crosses through,
+    /// so each crossing keeps its own row: the second does not inherit the
+    /// first's parameter names.
+    #[test]
+    fn a_function_value_keeps_one_row_per_crossing() {
+        let table = CffiHandleTable::new();
+        let handle = bex_project::Handle::new(7, stub_heap());
+        let callable = |ty: bex_project::AnnotationTy| {
+            CffiHandleTableEntry::Adt(TableAdt::TaggedHeapHandle {
+                kind: bex_project::TaggedHeapHandleKind::Callable,
+                ty,
+                heap_handle: handle.clone(),
+            })
+        };
+        let first = table.insert(callable(bex_project::AnnotationTy::int()));
+        let second = table.insert(callable(bex_project::AnnotationTy::string()));
+        assert_ne!(first, second, "each crossing is its own row");
+        let ty_of = |key| match &*table.resolve(key).expect("live") {
+            CffiHandleTableEntry::Adt(TableAdt::TaggedHeapHandle { ty, .. }) => ty.clone(),
+            other => panic!("not a callable row: {:?}", other.handle_type()),
+        };
+        assert_eq!(ty_of(first), bex_project::AnnotationTy::int());
+        assert_eq!(ty_of(second), bex_project::AnnotationTy::string());
+        for key in [first, second] {
             assert!(table.release(key));
         }
     }

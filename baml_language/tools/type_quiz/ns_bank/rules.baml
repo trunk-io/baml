@@ -12,12 +12,15 @@ function gap(id: string) -> root.engine.SpecRef throws never {
 }
 
 /// A rule the spec states in one run of words.
-function rule(
-    name: string,
-    spec: root.engine.SpecRef,
-    quote: string,
-) -> root.engine.Rule throws never {
-    root.engine.Rule { name, spec, quote, more: [] }
+function rule(name: string, spec: root.engine.SpecRef, quote: string) -> root.engine.Rule
+    throws never
+{
+    root.engine.Rule {
+        name,
+        spec,
+        quote,
+        more: [],
+    }
 }
 
 /// A rule the spec states across separate runs of words: a sentence and the
@@ -30,7 +33,12 @@ function composite(
     quote: string,
     more: string[],
 ) -> root.engine.Rule throws never {
-    root.engine.Rule { name, spec, quote, more }
+    root.engine.Rule {
+        name,
+        spec,
+        quote,
+        more,
+    }
 }
 
 // ─── flow ────────────────────────────────────────────────────────────────────
@@ -120,7 +128,11 @@ function unknown_top_rule() -> root.engine.Rule throws never {
 }
 
 function identity_rule() -> root.engine.Rule throws never {
-    rule("subtyping/identity", section("BAML Subtyping Cases"), "identity: `T =: T` for all `T`")
+    rule(
+        "subtyping/identity",
+        section("BAML Subtyping Cases"),
+        "identity: `T =: T` for all `T`",
+    )
 }
 
 function union_member_rule() -> root.engine.Rule throws never {
@@ -140,7 +152,11 @@ function union_subset_rule() -> root.engine.Rule throws never {
 }
 
 function bool_is_true_or_false() -> root.engine.Rule throws never {
-    rule("subtyping/bool-is-true-or-false", section("BAML Subtyping Cases"), "`(true | false) == bool`")
+    rule(
+        "subtyping/bool-is-true-or-false",
+        section("BAML Subtyping Cases"),
+        "`(true | false) == bool`",
+    )
 }
 
 function enum_is_union_of_variants() -> root.engine.Rule throws never {
@@ -169,11 +185,19 @@ function unknown_absorbs() -> root.engine.Rule throws never {
 }
 
 function union_commutative() -> root.engine.Rule throws never {
-    rule("subtyping/union-commutative", section("Interface Coherence"), "unions (`|`) are commutative")
+    rule(
+        "subtyping/union-commutative",
+        section("Interface Coherence"),
+        "unions (`|`) are commutative",
+    )
 }
 
 function union_associative() -> root.engine.Rule throws never {
-    rule("subtyping/union-associative", section("Interface Coherence"), "unions (`|`) are associative")
+    rule(
+        "subtyping/union-associative",
+        section("Interface Coherence"),
+        "unions (`|`) are associative",
+    )
 }
 
 // ─── variance ────────────────────────────────────────────────────────────────
@@ -333,6 +357,15 @@ function unguarded_cycle_rejected() -> root.engine.Rule throws never {
     )
 }
 
+function guarded_cycle_legal() -> root.engine.Rule throws never {
+    composite(
+        "aliases/guarded-cycle-legal",
+        section("Productivity"),
+        "a cycle group needs at least one list/map edge",
+        ["so types like `A` above are legal"],
+    )
+}
+
 /// Every rule in the bank.
 function rules() -> root.engine.Rule[] throws never {
     [
@@ -365,6 +398,7 @@ function rules() -> root.engine.Rule[] throws never {
         partial_unfolding(),
         unguarded_member_vacuous(),
         unguarded_cycle_rejected(),
+        guarded_cycle_legal(),
         implementor_below_existential(),
         requires_widens_existential(),
         typevar_below_bound(),

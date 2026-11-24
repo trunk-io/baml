@@ -29,7 +29,6 @@ import {
 import {
   activeUnionVariant,
   defaultValueForSchema,
-  enumValue,
   enumVariantOf,
   isPlainObject,
   isRawJsonSchema,
@@ -290,21 +289,13 @@ const FieldInput: FC<FieldInputProps> = (props) => {
         </span>
       );
     case 'enumVariant':
-      return (
-        <EnumField {...props} enumName={schema.name} values={[schema.value]} />
-      );
+      return <EnumField {...props} values={[schema.value]} />;
     case 'ref': {
       // isRawJsonSchema handled dangling refs above, so this resolves.
       const resolved = resolveRef(schema.name, lookup);
       if (resolved === undefined) return <RawJsonField {...props} />;
       if (resolved.kind === 'enum') {
-        return (
-          <EnumField
-            {...props}
-            enumName={resolved.name}
-            values={resolved.values}
-          />
-        );
+        return <EnumField {...props} values={resolved.values} />;
       }
       if (resolved.kind === 'schema') {
         if (refPath.includes(schema.name)) {
@@ -318,18 +309,14 @@ const FieldInput: FC<FieldInputProps> = (props) => {
           />
         );
       }
-      return (
-        <ClassSection
-          {...props}
-          fields={resolved.fields}
-          typeName={resolved.name}
-        />
-      );
+      return <ClassSection {...props} fields={resolved.fields} />;
     }
     case 'list':
       return <ListField {...props} schema={schema} />;
     case 'map':
       return <MapField {...props} schema={schema} />;
+    case 'tuple':
+      return <TupleField {...props} schema={schema} />;
     case 'optional':
       return <OptionalField {...props} schema={schema} />;
     case 'union':
@@ -408,14 +395,16 @@ const BoolField: FC<FieldInputProps> = ({ value, onChange }) => (
   />
 );
 
-const EnumField: FC<
-  FieldInputProps & { enumName: string; values: string[] }
-> = ({ enumName, values, value, onChange }) => {
+const EnumField: FC<FieldInputProps & { values: string[] }> = ({
+  values,
+  value,
+  onChange,
+}) => {
   const current = enumVariantOf(value);
   if (values.length <= ENUM_TOGGLE_MAX) {
     return (
       <ToggleGroup
-        onValueChange={(v) => onChange(enumValue(enumName, v))}
+        onValueChange={(v) => onChange(v)}
         options={values.map((v) => ({ label: v, value: v }))}
         size="sm"
         value={current ?? ''}
@@ -428,7 +417,7 @@ const EnumField: FC<
         onChange={(e) => {
           // The empty value is the "select…" placeholder, not a variant.
           if (e.target.value === '') return;
-          onChange(enumValue(enumName, e.target.value));
+          onChange(e.target.value);
         }}
         value={current ?? ''}
       >
@@ -443,13 +432,17 @@ const EnumField: FC<
   );
 };
 
-const ClassSection: FC<
-  FieldInputProps & { typeName: string; fields: FieldSchemaField[] }
-> = ({ typeName, fields, schema, value, onChange, depth }) => {
+const ClassSection: FC<FieldInputProps & { fields: FieldSchemaField[] }> = ({
+  fields,
+  schema,
+  value,
+  onChange,
+  depth,
+}) => {
   const [open, setOpen] = useState(depth < AUTO_COLLAPSE_DEPTH);
   const obj = isPlainObject(value) ? value : {};
   const setField = (name: string, v: unknown) =>
-    onChange({ ...obj, $baml: { type: typeName }, [name]: v });
+    onChange({ ...obj, [name]: v });
   return (
     <Collapsible onOpenChange={setOpen} open={open}>
       <CollapsibleTrigger className="flex items-center gap-1 cursor-pointer text-xs text-vsc-description hover:text-foreground">
@@ -525,6 +518,39 @@ const ListField: FC<
   );
 };
 
+/** A fixed-arity tuple: one row per slot, labeled by position. Slots can be
+ *  neither added nor removed — the arity is part of the type. */
+const TupleField: FC<
+  FieldInputProps & { schema: Extract<FieldSchema, { type: 'tuple' }> }
+> = ({ schema, value, onChange, depth }) => {
+  const lookup = useContext(TypeLookupContext);
+  // A mismatched value never reaches here after reconciliation; seeding
+  // missing slots keeps every edit a full-arity array regardless.
+  const slots = schema.elements.map((element, i) =>
+    Array.isArray(value) && i < value.length
+      ? value[i]
+      : defaultValueForSchema(element, lookup),
+  );
+  return (
+    <div className="flex flex-col gap-1 border-l border-vsc-border ml-1.5 pl-2.5">
+      {schema.elements.map((element, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: A tuple slot is identified by its position.
+        <div className="flex flex-col gap-0.5" key={i}>
+          <FieldLabel name={String(i)} schema={element} />
+          <FieldInput
+            depth={depth + 1}
+            onChange={(v) =>
+              onChange(slots.map((cur, j) => (j === i ? v : cur)))
+            }
+            schema={element}
+            value={slots[i]}
+          />
+        </div>
+      ))}
+    </div>
+  );
+};
+
 /** Per-row key editor: commits a rename only when it wouldn't collide. */
 const MapKeyInput: FC<{
   mapKey: string;
@@ -556,10 +582,7 @@ const MapField: FC<
   FieldInputProps & { schema: Extract<FieldSchema, { type: 'map' }> }
 > = ({ schema, value, onChange, depth }) => {
   const lookup = useContext(TypeLookupContext);
-  const obj =
-    isPlainObject(value) && !('$baml' in value)
-      ? value
-      : ({} as Record<string, unknown>);
+  const obj = isPlainObject(value) ? value : ({} as Record<string, unknown>);
   const entries = Object.entries(obj);
   const rebuild = (
     mapped: (entry: [string, unknown], i: number) => [string, unknown] | null,

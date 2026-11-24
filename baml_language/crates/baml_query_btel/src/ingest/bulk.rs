@@ -10,21 +10,23 @@
 //! row is written once, in key order.
 use std::{borrow::Cow, collections::BTreeMap};
 
-use btel_reader::{
-    evidence::{self, ArgumentNames},
-    source_map::SourceMap,
-    timing::EpochStatus,
+use btel_core::{
+    reader::{
+        evidence::{self, ArgumentNames},
+        source_map::SourceMap,
+        timing::EpochStatus,
+    },
+    recording::v2::{self as proto, function_definition::Resolution, span_event::Event},
 };
-use btel_recorder::proto::{self, function_definition::Resolution, span_event::Event};
 use prost::Message as _;
 use rusqlite::{Transaction, params};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     NETWORK_COMPLETION_CONFLICT, NETWORK_INVALID, NETWORK_INVALID_DETAIL, NETWORK_SPAN_CONFLICT,
-    Totals, event_seq, id, network_invalid,
+    Totals, cas_id, event_seq, id, network_invalid,
     profile::{self, Counts, Part, PathFacts, Sysop},
-    quantity, sequence_i64, snapshot_id,
+    quantity, sequence_i64,
 };
 use crate::{Error, functions};
 
@@ -336,6 +338,7 @@ struct CallRow {
     type_args_cas: Option<[u8; 16]>,
     completed_sequence: Option<i64>,
     late: Option<bool>,
+    manual: Option<bool>,
     exited: Option<i64>,
     self_await: Option<i64>,
     outcome: Option<i64>,
@@ -401,10 +404,13 @@ pub(super) struct Bulk {
     calls: Table<u64, CallRow>,
     /// Futures' names, first one wins; rare next to threads.
     thread_names: FxHashMap<u64, String>,
+    /// The error a thread's first completion carried; rare next to threads.
+    thread_errors: FxHashMap<u64, [u8; 16]>,
     /// Sysop count and ticks per call path.
     sysops: BTreeMap<u32, (u128, u128)>,
-    /// `(sequence, position)` to one model turn's usage.
-    usage: BTreeMap<(u64, usize), proto::ModelUsage>,
+    /// The model usage a call's or thread's first completion carried, stored
+    /// on its row. Kept apart from the rows: almost none have any.
+    usage: BTreeMap<u64, Vec<crate::usage::ModelUsage>>,
     network_spans: FxHashMap<u64, NetworkRow>,
     network_events: Vec<EventRow>,
     /// The first header that names the process, and how it ended.
@@ -627,11 +633,6 @@ impl Bulk {
                 entry.1 = entry.1.saturating_add(u128::from(time.total_ticks));
             }
         }
-        if let Some(usage) = &file.usage {
-            for (position, entry) in usage.entries.iter().enumerate() {
-                self.usage.insert((sequence, position), entry.clone());
-            }
-        }
         if let Some(spans) = &file.spans {
             // Each network event's position among the file's.
             let mut network_events = 0_u32;
@@ -663,7 +664,16 @@ impl Bulk {
                             let outcome = i64::from(done.outcome);
                             let row = self.threads.row(section.thread_id);
                             match row.completion() {
-                                None => row.complete(completed, outcome, done.panicked),
+                                None => {
+                                    row.complete(completed, outcome, done.panicked);
+                                    if let Some(error) = &done.error_cas_id {
+                                        self.thread_errors.insert(section.thread_id, cas_id(error));
+                                    }
+                                    let usage = crate::usage::from_wire(&done.usage);
+                                    if !usage.is_empty() {
+                                        self.usage.insert(section.thread_id, usage);
+                                    }
+                                }
                                 Some(first) if first == (completed, outcome) => {}
                                 Some(_) => {
                                     row.set(THREAD_COMPLETION_CONFLICT, true);
@@ -686,10 +696,11 @@ impl Bulk {
                                 reentry: None,
                                 announced_sequence: Some(saturating_sequence(sequence)),
                                 entered: tick(entry.entered_at_ticks),
-                                inputs_cas: entry.inputs_cas_id.as_ref().map(snapshot_id),
-                                type_args_cas: entry.type_args_cas_id.as_ref().map(snapshot_id),
+                                inputs_cas: entry.inputs_cas_id.as_ref().map(cas_id),
+                                type_args_cas: entry.type_args_cas_id.as_ref().map(cas_id),
                                 completed_sequence: None,
                                 late: None,
+                                manual: Some(entry.manual),
                                 exited: None,
                                 self_await: None,
                                 outcome: None,
@@ -707,6 +718,7 @@ impl Bulk {
                                         && (row.announced_sequence.is_some()
                                             || row.thread != announced.thread
                                             || row.parent != announced.parent
+                                            || row.manual != announced.manual
                                             || row.path != announced.path
                                             || row.entered != announced.entered)
                                     {
@@ -740,7 +752,7 @@ impl Bulk {
                                 started: tick(entry.started_at_ticks),
                                 method: entry.method.clone(),
                                 url: entry.url.clone(),
-                                request_cas: entry.request_cas_id.as_ref().map(snapshot_id),
+                                request_cas: entry.request_cas_id.as_ref().map(cas_id),
                             };
                             let row = self.network_spans.entry(entry.id).or_default();
                             match &row.def {
@@ -766,7 +778,7 @@ impl Bulk {
                                 position: network_events,
                                 name: observed.name.clone(),
                                 at: tick(observed.at_ticks),
-                                payload_cas: observed.payload_cas_id.as_ref().map(snapshot_id),
+                                payload_cas: observed.payload_cas_id.as_ref().map(cas_id),
                             });
                             network_events += 1;
                         }
@@ -775,7 +787,7 @@ impl Bulk {
                                 completed: tick(done.completed_at_ticks),
                                 outcome: i64::from(done.outcome),
                                 panicked: done.panicked,
-                                error_cas: done.error_cas_id.as_ref().map(snapshot_id),
+                                error_cas: done.error_cas_id.as_ref().map(cas_id),
                             };
                             let row = self.network_spans.entry(done.span_id).or_default();
                             match row.done {
@@ -823,8 +835,14 @@ impl Bulk {
         let entered = tick(done.entered_at_ticks);
         let exited = tick(done.exited_at_ticks);
         let self_await = tick(done.self_await_ticks);
-        let value_cas = done.value_cas_id.as_ref().map(snapshot_id);
+        let value_cas = done.value_cas_id.as_ref().map(cas_id);
         let completed_sequence = Some(saturating_sequence(sequence));
+        // The first usage stored wins, as on the incremental path: a second
+        // completion is a conflict.
+        let usage = crate::usage::from_wire(&done.usage);
+        if !usage.is_empty() {
+            self.usage.entry(done.id).or_insert(usage);
+        }
         match self.calls.get_mut(&done.id) {
             None => {
                 self.calls.insert(
@@ -840,6 +858,7 @@ impl Bulk {
                         type_args_cas: None,
                         completed_sequence,
                         late: Some(late),
+                        manual: Some(done.completion_flags & 32 != 0),
                         exited,
                         self_await,
                         outcome: Some(outcome.code()),
@@ -855,6 +874,7 @@ impl Bulk {
                     && (row.completed_sequence.is_some()
                         || row.thread != thread
                         || row.parent != done.parent_id
+                        || row.manual != Some(done.completion_flags & 32 != 0)
                         || row.path != path
                         || (row.entered.is_some() && row.entered != entered))
                 {
@@ -863,6 +883,7 @@ impl Bulk {
                 row.reentry = Some(reentry);
                 row.completed_sequence = completed_sequence;
                 row.late = Some(late);
+                row.manual = Some(done.completion_flags & 32 != 0);
                 row.entered = row.entered.or(entered);
                 row.exited = exited;
                 row.self_await = self_await;
@@ -1013,7 +1034,7 @@ impl Bulk {
                 let utc = epoch
                     .utc
                     .as_ref()
-                    .and_then(btel_reader::timing::UtcAnchor::from_wire);
+                    .and_then(btel_core::reader::timing::UtcAnchor::from_wire);
                 row.def = Some(EpochDef {
                     domain: epoch.domain_id,
                     source: epoch.source,
@@ -1030,6 +1051,14 @@ impl Bulk {
     /// Write every row. A `complete` recording (its end applied) gets no
     /// more facts, so it is written folded, like `profile::fold` leaves it:
     /// its paths summed by node, and only the paths spans read.
+    /// The nodes whose usage `write` stores, for the totals.
+    pub(super) fn charged(&self) -> Vec<([u8; 8], Vec<crate::usage::ModelUsage>)> {
+        self.usage
+            .iter()
+            .map(|(node, usage)| (id(*node), usage.clone()))
+            .collect()
+    }
+
     pub(super) fn write(
         mut self,
         tx: &Transaction<'_>,
@@ -1070,7 +1099,6 @@ impl Bulk {
         self.network_events
             .sort_unstable_by_key(|event| (event.span, event.sequence, event.position));
         self.write_network_events(tx, rec)?;
-        self.write_usage(tx, rec)?;
         let mut insert = tx.prepare_cached(
             "INSERT INTO issue (rec, sequence, code, subject, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
@@ -1295,7 +1323,11 @@ impl Bulk {
                 let node = match parent_node {
                     Some(None) => None,
                     parent => self.node_name(def.callee).map(|name| {
-                        crate::functions::node_hash(parent.flatten(), &name, i64::from(def.edge))
+                        btel_core::reader::profile::node_hash(
+                            parent.flatten(),
+                            &name,
+                            i64::from(def.edge),
+                        )
                     }),
                 };
                 nodes.insert(path, node);
@@ -1354,31 +1386,6 @@ impl Bulk {
         )
     }
 
-    fn write_usage(&self, tx: &Transaction<'_>, rec: i64) -> Result<(), Error> {
-        let keys: Vec<(u64, usize)> = self.usage.keys().copied().collect();
-        let saturating = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
-        insert_rows(
-            tx,
-            "model_usage (rec, sequence, position, node_id, model, input_tokens, output_tokens,
-               cache_read_tokens, cache_write_tokens, reasoning_tokens)",
-            10,
-            &keys,
-            |b, key| {
-                let entry = &self.usage[&key];
-                b.bind(rec)?;
-                b.bind(saturating(key.0))?;
-                b.bind(i64::try_from(key.1).unwrap_or(i64::MAX))?;
-                b.bind(id(entry.node_id))?;
-                b.bind(&entry.model)?;
-                b.bind(saturating(entry.input_tokens))?;
-                b.bind(saturating(entry.output_tokens))?;
-                b.bind(entry.cache_read_tokens.map(saturating))?;
-                b.bind(entry.cache_write_tokens.map(saturating))?;
-                b.bind(entry.reasoning_tokens.map(saturating))
-            },
-        )
-    }
-
     fn write_functions(&self, tx: &Transaction<'_>, rec: i64) -> Result<(), Error> {
         let mut ids: Vec<u64> = self.functions.keys().copied().collect();
         ids.sort_unstable();
@@ -1388,8 +1395,8 @@ impl Bulk {
                kind_detail, origin, source_file, source_file_id, source_start, source_end,
                package, namespace, namespace_json, owner_type_key, parent_function_key,
                lambda_path, argument_names, parameter_count, metadata, source_map,
-               source_map_state, conflict)",
-            25,
+               source_map_state, model_invoke, conflict)",
+            26,
             &ids,
             |b, function_id| {
                 let row = &self.functions[&function_id];
@@ -1397,7 +1404,7 @@ impl Bulk {
                 b.bind(id(function_id))?;
                 b.bind(row.state)?;
                 let Some(meta) = &row.metadata else {
-                    b.nulls(21)?;
+                    b.nulls(22)?;
                     return b.bind(row.conflict);
                 };
                 let metadata = &meta.wire;
@@ -1426,6 +1433,7 @@ impl Bulk {
                 b.bind(&meta.encoded)?;
                 b.bind(&meta.map_blob)?;
                 b.bind(meta.map_state)?;
+                b.bind(metadata.model_invoke)?;
                 b.bind(row.conflict)
             },
         )?;
@@ -1506,8 +1514,8 @@ impl Bulk {
             tx,
             "thread (rec, thread_id, defined, parent_id, spawn_call_path_id, started_ticks,
                epoch_id, announced, ran_ticks, completed_ticks, outcome, panicked, name,
-               completion_conflict, conflict, entry_call_path_id)",
-            16,
+               completion_conflict, conflict, entry_call_path_id, usage, error_cas)",
+            18,
             &ids,
             |b, thread| {
                 let row = &self.threads[&thread];
@@ -1528,7 +1536,13 @@ impl Bulk {
                 b.bind(self.thread_names.get(&thread))?;
                 b.bind(row.has(THREAD_COMPLETION_CONFLICT))?;
                 b.bind(row.has(THREAD_CONFLICT))?;
-                b.bind((row.entry_path != 0).then(|| i64::from(row.entry_path)))
+                b.bind((row.entry_path != 0).then(|| i64::from(row.entry_path)))?;
+                b.bind(
+                    self.usage
+                        .get(&thread)
+                        .and_then(|u| crate::usage::to_json(u)),
+                )?;
+                b.bind(self.thread_errors.get(&thread).map(<[u8; 16]>::as_slice))
             },
         )
     }
@@ -1626,9 +1640,9 @@ impl Bulk {
             tx,
             "call (rec, call_id, thread_id, parent_id, call_path_id, reentry,
                announced_sequence, entered_ticks, inputs_cas, type_args_cas, completed_sequence,
-               late, exited_ticks, self_await_ticks, outcome, panicked, needs_announcement,
-               value_cas, conflict)",
-            19,
+               late, manual, exited_ticks, self_await_ticks, outcome, panicked, needs_announcement,
+               value_cas, usage, conflict)",
+            21,
             &ids,
             |b, call| {
                 let row = &self.calls[&call];
@@ -1644,12 +1658,14 @@ impl Bulk {
                 b.bind(row.type_args_cas.as_ref().map(<[u8; 16]>::as_slice))?;
                 b.bind(row.completed_sequence)?;
                 b.bind(row.late)?;
+                b.bind(row.manual)?;
                 b.bind(row.exited)?;
                 b.bind(row.self_await)?;
                 b.bind(row.outcome)?;
                 b.bind(row.panicked)?;
                 b.bind(row.needs_announcement)?;
                 b.bind(row.value_cas.as_ref().map(<[u8; 16]>::as_slice))?;
+                b.bind(self.usage.get(&call).and_then(|u| crate::usage::to_json(u)))?;
                 b.bind(row.conflict)
             },
         )

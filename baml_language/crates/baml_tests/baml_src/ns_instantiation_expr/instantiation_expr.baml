@@ -76,10 +76,10 @@ test "reflect_type_of_through_value" {
     assert.equal(describe_user_value_fn(), "instantiation_expr.User")
 }
 
-// Type-reifying native through a value: `baml.json.from_string<User>` decodes
+// Type-reifying native through a value: `baml.json.decode<User>` decodes
 // using T=User seeded from the value (previously a runtime crash under erasure).
 function from_string_value_fn() -> User {
-    let f = baml.json.from_string<User>;
+    let f = baml.json.decode<User>;
     f("{\"name\":\"Ada\"}")
 }
 
@@ -147,6 +147,38 @@ function bound_method_value() -> int {
 
 test "bound_method_value_runs" {
     assert.equal(bound_method_value(), 7)
+}
+
+// Two references to the same method on the same receiver are the same value
+// only at the same instantiation: `p.pick<int>` and `p.pick<string>` are
+// distinct specializations (TYPE_SYSTEM.md, "Generics on Functions").
+function bound_method_specializations_differ() -> bool[] {
+    let p = GenBox { v: 1 };
+    let q = GenBox { v: 1 };
+    [
+        p.pick<int> == p.pick<int>,
+        p.pick<int> == p.pick<string>,
+        p.pick<int> == q.pick<int>,
+    ]
+}
+
+test "bound_method_specializations_differ" {
+    assert.equal(bound_method_specializations_differ(), [true, false, false])
+}
+
+// A builtin's method referenced as a value carries its receiver's type
+// arguments into the native it runs: `xs.map` as a value produces a
+// `string[]`, exactly as the direct call `xs.map(f)` does, not an `unknown[]`
+// wearing a `string[]` static type.
+function builtin_method_value_keeps_its_element_type() -> bool {
+    let xs = [1, 2, 3];
+    let f: ((int) -> string throws never) -> string[] throws never = xs.map;
+    let ys: unknown = f((x: int) -> string { x.to_string() });
+    ys is string[]
+}
+
+test "builtin_method_value_keeps_its_element_type" {
+    assert.is_true(builtin_method_value_keeps_its_element_type())
 }
 
 // Companion: a (non-generic) lambda inside a generic function still reifies the

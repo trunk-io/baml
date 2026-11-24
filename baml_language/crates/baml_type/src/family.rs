@@ -29,9 +29,9 @@
 //! representation worth having (a name, an interned id, a heap handle) is
 //! cloneable, so this rules out nothing real.
 //!
-//! The semantic impls (`render_with`, `Display`, `validate_runtime`, the
-//! conversions, and the `lower_to_runtime` boundary)
-//! stay hand-written in `lib.rs`, `runtime_ty.rs`, and `realized_ty.rs`.
+//! The semantic impls (`render_with`, `Display`, the conversions, and the
+//! `lower_to_runtime` boundary) stay hand-written in `lib.rs`,
+//! `runtime_ty.rs`, and `realized_ty.rs`.
 
 use baml_type_macros::ty_family;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -172,8 +172,8 @@ ty_family! {
     /// The unified type representation for BAML, used from VIR through runtime.
     ///
     /// Contains both core runtime variants and compiler-only variants.
-    /// Runtime code should use `unreachable!()` for compiler-only variants.
-    /// Runtime code should call `validate_runtime()` to catch any that leak.
+    /// Runtime code holds a [`RuntimeTy`], which has none of the latter:
+    /// `lower_to_runtime` is the boundary that rejects them.
     ///
     #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
     #[borsh(use_discriminant = true)]
@@ -235,12 +235,8 @@ ty_family! {
         /// throw has error type `never`.
         #[axis(concrete)]
         Future(Box<Ty<N>>, Box<Ty<N>>) = 17,
-        /// Opaque Rust-managed state (`$rust_type` fields in builtin class stubs,
-        /// e.g. `Media._data`). A leaf concrete type with no inner structure.
-        ///
-        /// Renders as `$rust_type` (qualified name `baml.rust.RustType`).
-        #[axis(concrete)]
-        RustType = 18,
+        // reserved: 18 was `RustType`, the type of a field holding Rust-owned
+        // state, which a `@@rust_type` class holds instead.
         /// The `reflect.Type` metatype — a runtime value that wraps a `Ty`
         /// (reflection). A leaf concrete type.
         #[axis(concrete)]
@@ -260,9 +256,8 @@ ty_family! {
         #[axis(concrete)]
         PromptAst = 21,
 
-        /// Void type — the type of effectful expressions (was VIR `Unit`).
-        #[axis(special)]
-        Void = 22,
+        // reserved: 22 was `Void`, a second unit type beside `Null`. BAML has
+        // one unit type (`null`); `void` is a source spelling of it.
         // reserved = 23
         /// Only recursive aliases survive lower_ty; non-recursive are expanded.
         #[axis(special)]
@@ -305,8 +300,8 @@ ty_family! {
         #[axis(never)]
         Never = 28,
 
-        // --- Compiler-only sentinels: present during type checking, erased at
-        // the runtime boundary (`lower_to_runtime`). Each sits on its own axis
+        // --- Compiler-only sentinels: present during type checking, refused
+        // at the runtime boundary (`lower_to_runtime`). Each sits on its own axis
         // because the pipeline's stages admit them differently: `error` is
         // carried by every compiler-side member (a diagnosed failure is a
         // legitimate final answer), while `lower` exists only in `LoweringTy`
@@ -356,6 +351,8 @@ ty_family! {
         InferVar {
             var: crate::interned::InferVar,
         } = 37,
+        #[axis(concrete)]
+        Tuple(Box<[Ty<N>]>) = 38,
     }
 }
 
@@ -390,9 +387,41 @@ mod tests {
                     Box::new([Ty::Union(Box::new([Ty::Int, Ty::Null]))]),
                     Box::new([(Name::new("Item"), Ty::String)]),
                 )),
-                throws: Box::new(Ty::Void),
+                throws: Box::new(Ty::Never),
             }),
         }
+    }
+
+    /// A head carrying a lifetime, as the runtime's heap-branded head will: an
+    /// identity plus the epoch it was read in. Nothing along a conversion may
+    /// demand `N: 'static`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    struct Branded<'p>(u32, std::marker::PhantomData<&'p u8>);
+
+    fn brand<'p>(_epoch: &'p u8, id: u32) -> Branded<'p> {
+        Branded(id, std::marker::PhantomData)
+    }
+
+    #[test]
+    fn conversions_hold_at_a_head_carrying_a_lifetime() {
+        // A real, non-`'static` lifetime: every head borrows `epoch`.
+        let epoch = 0u8;
+        let t: Ty<Branded<'_>> = Ty::Map {
+            key: Box::new(Ty::Class(brand(&epoch, 7), Box::new([Ty::Int]))),
+            value: Box::new(Ty::List(Box::new(Ty::Enum(brand(&epoch, 9))))),
+        };
+
+        let rt = RuntimeTy::<Branded<'_>>::try_from(&t).unwrap();
+        let rz = RealizedTy::<Branded<'_>>::try_from(&t).unwrap();
+        assert_eq!(Ty::from(&rt), t);
+        assert_eq!(Ty::from(rt.clone()), t);
+        assert_eq!(rt.as_ty(), &t);
+        assert_eq!(rz.as_runtime_ty(), &rt);
+        assert_eq!(<&RealizedTy<Branded<'_>>>::try_from(&t), Ok(&rz));
+
+        let ct = ConcreteTy::<Branded<'_>>::try_from(&rt).unwrap();
+        assert_eq!(RuntimeTy::from(&ct), rt);
+        assert_eq!(Ty::from(&ct), t);
     }
 
     /// A stand-in for the interned/heap-anchored head the runtime will carry:
@@ -418,7 +447,7 @@ mod tests {
                     Box::new([Ty::Bool]),
                     Box::new([(Name::new("Item"), Ty::String)]),
                 )),
-                throws: Box::new(Ty::Void),
+                throws: Box::new(Ty::Never),
             }),
         };
 
@@ -479,7 +508,7 @@ mod tests {
                     // ...and through the tuple element of a binding list.
                     Box::new([(Name::new("Item"), Ty::Class(6, Box::new([])))]),
                 )),
-                throws: Box::new(Ty::Void),
+                throws: Box::new(Ty::Never),
             }),
         };
 
@@ -521,7 +550,7 @@ mod tests {
                     Some(Name::new("x")),
                     Ty::Class(1, Box::new([Ty::Enum(2)])),
                 )]),
-                ret: Box::new(Ty::Void),
+                ret: Box::new(Ty::Null),
                 throws: Box::new(Ty::Never),
             }),
             interface: Box::new(crate::Interface::new(
@@ -549,6 +578,63 @@ mod tests {
             _ => Ok(format!("h{head}")),
         });
         assert_eq!(rejected, Err(3));
+    }
+
+    /// The child walkers reach every nested type position once, including the
+    /// ones inside satellites, and `map_children` is the identity when `f` is.
+    /// A pass over a whole tree is `f` recursing: the structural match lives
+    /// in the macro, so no consumer re-lists the variants.
+    #[test]
+    fn child_walkers_reach_every_nested_type() {
+        let t: Interned = Ty::AssociatedTypeProjection {
+            base: Box::new(Ty::Function {
+                params: Box::new([FunctionParamTy::required(
+                    Some(Name::new("x")),
+                    Ty::Class(1, Box::new([Ty::Enum(2)])),
+                )]),
+                ret: Box::new(Ty::Null),
+                throws: Box::new(Ty::Never),
+            }),
+            interface: Box::new(crate::Interface::new(
+                3,
+                Box::new([Ty::TypeAlias(4)]),
+                Box::new([(Name::new("Item"), Ty::EnumVariant(5, Name::new("V")))]),
+            )),
+            member: Name::new("Out"),
+        };
+
+        // Direct children only: the projection's base, then the interface's
+        // generics and bindings; the function's own children are one level down.
+        let mut direct = Vec::new();
+        t.visit_children(&mut |child| direct.push(child.clone()));
+        assert_eq!(direct.len(), 3);
+        assert!(matches!(direct[0], Ty::Function { .. }));
+        assert_eq!(direct[1], Ty::TypeAlias(4));
+        assert_eq!(direct[2], Ty::EnumVariant(5, Name::new("V")));
+
+        assert_eq!(t.map_children(&mut Clone::clone), t);
+
+        // A whole-tree rewrite recurses through `f`.
+        fn never_to_unknown(ty: &Interned) -> Interned {
+            match ty {
+                Ty::Never => Ty::Unknown,
+                other => other.map_children(&mut never_to_unknown),
+            }
+        }
+        let rewritten = never_to_unknown(&t);
+        let Ty::AssociatedTypeProjection { base, .. } = &rewritten else {
+            panic!("shape changed");
+        };
+        let Ty::Function { params, throws, .. } = &**base else {
+            panic!("shape changed");
+        };
+        assert_eq!(**throws, Ty::Unknown);
+        assert_eq!(params[0].name, Some(Name::new("x")));
+
+        let mut none = Vec::new();
+        Ty::<u32>::Literal(crate::Literal::Int(1), crate::Freshness::Regular)
+            .visit_children(&mut |child| none.push(child.clone()));
+        assert!(none.is_empty());
     }
 
     /// A type variable nested inside a concrete container: representable in
@@ -694,7 +780,8 @@ mod tests {
     }
 
     /// Lock the Borsh wire format. Every family member uses the explicit master
-    /// discriminants, with slots 23, 31, and 32 reserved for removed variants.
+    /// discriminants, with the slots of removed variants (18, 22, 23, 29, 31,
+    /// 32, 35, 36) left reserved.
     /// `Infer`'s tag of 33 is what proves a removed variant leaves a gap rather
     /// than renumbering the tail.
     #[test]
@@ -702,6 +789,7 @@ mod tests {
         assert_eq!(tag::<Ty<TypeName>>(Ty::Int), 0);
         assert_eq!(tag::<Ty<TypeName>>(Ty::Media(MediaKind::Image)), 7);
         assert_eq!(tag::<Ty<TypeName>>(Ty::List(Box::new(Ty::Bool))), 13);
+        assert_eq!(tag::<Ty<TypeName>>(Ty::Type), 19);
         assert_eq!(tag::<LoweringTy<TypeName>>(LoweringTy::Infer), 33);
         assert_eq!(
             tag::<RuntimeTy<TypeName>>(RuntimeTy::TypeAlias(qtn("Alias"))),

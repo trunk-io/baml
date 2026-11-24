@@ -17,8 +17,9 @@ use crate::{
 /// A catchable BAML panic — maps 1:1 to a `baml.panics.*` class.
 ///
 /// These are user-visible runtime errors (division by zero, index out of
-/// bounds, etc.) that can be caught by `catch` handlers. The handler's
-/// `ThrowIfPanic` instruction filters which panics are caught vs rethrown.
+/// bounds, etc.) that can be caught by `catch` handlers. A panic is caught by
+/// an arm naming its type or by a `catch_all_panics` wildcard arm; other
+/// wildcard arms test for it and let it pass.
 #[derive(Debug, Error, PartialEq, Clone)]
 pub enum VmPanic {
     #[error("division by zero: {left:?} / {right:?}")]
@@ -222,12 +223,21 @@ pub enum VmInternalError {
     #[error("type error: expected {expected}, got {got}")]
     TypeError { expected: Type, got: Type },
 
-    /// A Rust type error during downcasting from an `Arc<dyn Any + Send + Sync>`.
+    /// A Rust type error during downcasting from an `Arc<dyn BexRustData>`.
     /// The message currently uses typeids which are not very human-readable.
     #[error("rust type error during downcasting: expected typeid {expected:?}, got typeid {got:?}")]
     RustTypeError {
         expected: ::core::any::TypeId,
         got: ::core::any::TypeId,
+    },
+
+    /// A `@@rust_type` instance holds a payload of another kind than its
+    /// class declares, which [`crate::RustInstance::fits`] rules out.
+    #[error("a `{class}` instance holds a {got:?} payload, not a {expected:?} one")]
+    RustPayloadMismatch {
+        class: &'static str,
+        expected: baml_base::RustPayloadKind,
+        got: baml_base::RustPayloadKind,
     },
 
     #[error("cannot apply binary operation: {left} {op} {right}")]
@@ -244,6 +254,10 @@ pub enum VmInternalError {
 
     #[error("missing native function: {name}")]
     MissingNativeFunction { name: String },
+    /// Schema-aligned parsing produced a value its target's declarations
+    /// cannot hold: the parse model and the heap disagree.
+    #[error("schema-aligned parsing produced a value its target cannot hold: {message}")]
+    SapValue { message: String },
 
     #[error("unexpected constant kind: expected a TyTemplate constant at this index")]
     UnexpectedConstantKind,
@@ -257,13 +271,12 @@ pub enum VmInternalError {
     #[error("StoreGlobal executed outside of $init (globals are frozen post-init)")]
     StoreGlobalAfterInit,
 
-    /// A native resource handle (SSE stream, WebSocket stream, …) did not
-    /// resolve in the registry that owns it. The sysop holds a live
-    /// `ResourceHandle` for the whole call and the registry entry is removed
-    /// only when the last handle drops, so a missing entry is a registry
-    /// invariant violation rather than anything user code can provoke.
-    #[error("resource handle {key} of kind `{kind}` did not resolve in its registry")]
-    UnresolvedResourceHandle { kind: &'static str, key: usize },
+    /// `$init` read a global whose initializer has not run yet. The compiler
+    /// orders initializers by their dependencies; a read it could not see (a
+    /// global reached through a virtual call or a function value) can still
+    /// run first. The engine names the global from `slot`.
+    #[error("global slot {} was read before its initializer ran", slot.raw())]
+    GlobalReadBeforeInit { slot: crate::GlobalIndex },
 
     /// A bridge-layer fault that prevented a host operation from
     /// proceeding — e.g. `external_to_outbound` could not serialize a
@@ -276,6 +289,34 @@ pub enum VmInternalError {
     #[error("bridge failure: {message}")]
     BridgeFailure { message: String },
 
+    /// A runtime operation threw a value outside the throws type its stdlib
+    /// declaration states. The program's `throws` clauses are a contract the
+    /// runtime keeps (a caller that sees `throws never` catches nothing), so
+    /// an operation whose error escapes its own declaration is the
+    /// operation's bug, never a catchable throw of an undeclared class.
+    /// `detail` is the membership refusal, which names the value's class.
+    #[error(
+        "operation `{operation}` threw a value outside its declared throws type `{declared}`: {detail}"
+    )]
+    UndeclaredThrow {
+        operation: String,
+        declared: String,
+        detail: String,
+    },
+
+    /// A runtime operation received an argument whose object is not what
+    /// its declared type guarantees: a wrong receiver kind, a `_inner`
+    /// payload that is not the runtime's, an artifact already consumed. The
+    /// compiler admitted the call against the declaration, so the value was
+    /// forged or corrupted; the operation's fault to report, never a
+    /// catchable `InvalidArgument` for the program to handle.
+    #[error("malformed argument: {message}")]
+    MalformedArgument { message: String },
+    /// A compiled function body (`Function::compiled_body`) violated
+    /// the contract the call path relies on, e.g. by yielding.
+    #[error("compiled body: {message}")]
+    CompiledBody { message: String },
+
     /// A `VirtualCall` found no `implements` rule for the receiver's runtime
     /// concrete type and the call's interface. The type checker only emits a
     /// virtual call once it has proved the receiver implements the interface,
@@ -285,6 +326,9 @@ pub enum VmInternalError {
     /// failure kinds.)
     #[error("virtual call could not resolve interface method `{method}`")]
     UnresolvedVirtualCall { method: String },
+
+    #[error("tuple of {arity} elements allocated at the type `{ty}`")]
+    TupleTypeMismatch { arity: usize, ty: String },
 
     /// An impl rule's `interface_head` does not point at an `Object::Interface`.
     /// The head is bound to the rule's interface declaration at load/graft, so
@@ -421,6 +465,12 @@ pub enum VmError {
     },
 }
 
+impl From<VmInternalError> for Box<VmError> {
+    fn from(error: VmInternalError) -> Self {
+        Box::new(VmError::from(error))
+    }
+}
+
 impl VmError {
     #[must_use]
     pub const fn thrown_fresh(value: Value) -> Self {
@@ -454,14 +504,6 @@ impl VmRustFnError {
         Self::Thrown {
             value,
             throw_kind: ThrowKind::Fresh,
-        }
-    }
-
-    #[must_use]
-    pub const fn thrown_rethrow(value: Value) -> Self {
-        Self::Thrown {
-            value,
-            throw_kind: ThrowKind::Rethrow,
         }
     }
 }

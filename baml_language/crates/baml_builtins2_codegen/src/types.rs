@@ -4,7 +4,19 @@ pub enum BuiltinPipeline {
     /// `$rust_function` — synchronous, runs inline in VM.
     Vm,
     /// `$rust_io_function` — asynchronous, dispatched via engine.
-    Io,
+    Io(IoCallers),
+}
+
+/// Who calls a `$rust_io_function`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoCallers {
+    /// Hosts as well as the running engine: `RuntimeIo` has a method for it.
+    Hosts,
+    /// Only the running engine (`//baml:runtime_only`): it takes state only
+    /// the runtime builds as an ordinary argument, which no `RuntimeIo`
+    /// method can stand for. Codegen requires the directive of exactly such
+    /// a builtin.
+    RuntimeOnly,
 }
 
 /// A single extracted `$rust_function` or `$rust_io_function` builtin.
@@ -14,9 +26,10 @@ pub struct NativeBuiltin {
     /// The declaring namespace (no package, no class): `"fs"` for
     /// `baml.fs.File.read`, `""` for a top-level class or item.
     /// Carried STRUCTURALLY from extraction — the `path` alone cannot be
-    /// split, because an impl-block class segment embeds the WRITTEN
-    /// interface target, which may itself be dotted
-    /// (`root.io.Read$for$File`).
+    /// split, because an impl-block class segment embeds the interface
+    /// target as the native key spells it — a written `root.` as the
+    /// package's fixed name — which may itself be dotted
+    /// (`baml.io.Read$for$File`).
     pub namespace: String,
     /// The full class segment (`Class` or `{iface}$for${Class}`) for a
     /// method; `None` for a free item. Same structural-carry rationale as
@@ -43,6 +56,8 @@ pub struct NativeBuiltin {
     /// `//baml:fallible` directive — for builtins that can raise a *panic*
     /// (e.g. `AllocFailure`) rather than a catchable `throws` error.
     pub fallible: bool,
+    /// Generate a lock-free receiver accessor twin.
+    pub local_twin: bool,
     /// Which pipeline this builtin belongs to.
     pub pipeline: BuiltinPipeline,
     /// The `throws` clause:
@@ -104,15 +119,32 @@ pub struct Receiver {
     /// (e.g. `"time"`, `"media"`, `""` for a root-level class). Used to build
     /// the `view::<ns>::<Class>` path when the receiver is passed as a view.
     pub namespace: String,
-    /// Whether the class is backed by `Object::Instance` with declared fields
-    /// (i.e. it has a generated `view::` struct). True for classes like
-    /// `time.Instant` / media classes; false for dedicated-variant types
-    /// (`Array`/`Map`/`String`/`Uint8Array`), opaque classes (`Future`), and
-    /// primitives — those keep a type-erased `&Value` receiver.
+    /// Whether the class has a generated `view::` struct: it is backed by
+    /// `Object::Instance` with declared fields (`time.Instant`, the media
+    /// classes) or by `Object::RustInstance` (a `@@rust_type` class). False for
+    /// dedicated-variant types (`Array`/`Map`/`String`/`Uint8Array`), opaque
+    /// classes (`Future`), and primitives — those keep a type-erased `&Value`
+    /// receiver.
     pub instance_backed: bool,
+    /// `@@rust_type`: the receiver is an `Object::RustInstance` of this kind.
+    pub rust_type: Option<baml_base::RustPayloadKind>,
     /// Generic type parameters of the class (e.g. `["T"]` for `Array<T>`).
     pub class_generics: Vec<String>,
     pub receiver_type: ReceiverType,
+    /// Whether the receiver may be one of the builtins the glue special-cases
+    /// by class name (the containers, `String`, the numeric companions, the
+    /// media classes). Those all live in the `baml` package, so a same-named
+    /// class of another package (`reflect.Array`, `reflect.Map`) is not one.
+    pub builtin: bool,
+}
+
+impl Receiver {
+    /// The class name builtin-receiver handling matches on: the class name
+    /// when the receiver may be a builtin ([`Self::builtin`]), else `""`,
+    /// which no builtin is called.
+    pub fn builtin_name(&self) -> &str {
+        if self.builtin { &self.class_name } else { "" }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,8 +188,30 @@ pub enum BamlType {
     Media(String),
     /// Some other named type (class reference, path type).
     Named(String),
-    /// A `$rust_type` field — opaque Rust-managed state.
-    RustType,
+    /// A stdlib enum, resolved from the path naming it.
+    Enum(NativeEnum),
+    /// A union that is not `T?` (`"start" | "end"`, `string | ScanOptions`,
+    /// `string | null | Default`), its members in declaration order. Wherever
+    /// no typed enum stands for it, it is erased.
+    Union(Vec<BamlType>),
+    /// A string literal member of a [`Self::Union`].
+    StringLiteral(String),
+}
+
+/// A stdlib enum a builtin's signature names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEnum {
+    /// Its dotted path: `ai.internal.OutputFormatDefault`.
+    pub path: String,
+    /// Its variants, in declaration order.
+    pub variants: Vec<String>,
+}
+
+impl NativeEnum {
+    /// Its bare name: `OutputFormatDefault`.
+    pub fn name(&self) -> &str {
+        self.path.rsplit('.').next().unwrap_or(&self.path)
+    }
 }
 
 /// A single field of a builtin class.
@@ -180,10 +234,28 @@ pub struct NativeClassDef {
     pub namespace_prefix: String,
     /// Generic type parameters (e.g. `["T"]` for `Array<T>`).
     pub generic_params: Vec<String>,
-    /// Fields in declaration order.
-    pub fields: Vec<NativeClassField>,
+    pub body: NativeClassBody,
     /// Virtual path of the `.baml` source file (e.g. `"<builtin>/baml/ns_fs/fs.baml"`).
     pub source_file: String,
+}
+
+/// What a builtin class holds: fields, or Rust-owned state in their place.
+#[derive(Debug, Clone)]
+pub enum NativeClassBody {
+    /// Fields in declaration order.
+    Fields(Vec<NativeClassField>),
+    /// `@@rust_type`: an `Object::RustInstance` whose payload is of this kind.
+    RustType(baml_base::RustPayloadKind),
+}
+
+impl NativeClassDef {
+    /// The fields, of which a `@@rust_type` class has none.
+    pub fn fields(&self) -> &[NativeClassField] {
+        match &self.body {
+            NativeClassBody::Fields(fields) => fields,
+            NativeClassBody::RustType(_) => &[],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +278,7 @@ mod tests {
                 vm_usage: super::VmUsage::None,
                 may_yield: false,
                 fallible: false,
+                local_twin: false,
                 pipeline: super::BuiltinPipeline::Vm,
                 throws: None,
                 source_file: String::new(),
@@ -219,8 +292,8 @@ mod tests {
             "BamlRandomRngForSystemRandomRandom"
         );
         assert_eq!(
-            variant("baml.fs.root.io.Read$for$File.read"),
-            "BamlFsRootIoReadForFileRead"
+            variant("baml.fs.baml.io.Read$for$File.read"),
+            "BamlFsBamlIoReadForFileRead"
         );
     }
 }

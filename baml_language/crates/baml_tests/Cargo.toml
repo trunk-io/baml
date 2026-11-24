@@ -19,8 +19,8 @@ baml_compiler2_hir_ty = { workspace = true }
 baml_compiler2_mir = { workspace = true }
 baml_compiler_diagnostics = { workspace = true }
 baml_db = { workspace = true }
+baml_test_support = { workspace = true }
 baml_type = { workspace = true }
-baml_version = { workspace = true }
 bex_engine = { workspace = true }
 bex_heap = { workspace = true }
 bex_project = { workspace = true }
@@ -36,24 +36,31 @@ similar = { workspace = true }
 text-size = { workspace = true }
 
 [build-dependencies]
-baml_db = { workspace = true }
-baml_version = { workspace = true }
 prettyplease = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = [ "arbitrary_precision", "preserve_order" ] }
 syn = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
 baml_builtins2 = { workspace = true }
+baml_builtins2_codegen = { workspace = true }
 baml_cli = { workspace = true }
 baml_compiler2_emit = { workspace = true }
+baml_db = { workspace = true, features = [ "rust_backend" ] }
+baml_env = { workspace = true }
+baml_exec = { workspace = true }
 baml_fmt = { workspace = true }
 baml_linker = { workspace = true }
 baml_linker_types = { workspace = true }
+baml_parser = { workspace = true }
+baml_syntax = { workspace = true }
 bex_events = { workspace = true }
 bex_external_types = { workspace = true }
+btel_clock = { workspace = true }
+btel_recorder = { workspace = true }
+btel_settings = { workspace = true }
 borsh = { workspace = true }
 darwin-kperf = { workspace = true }
 darwin-kperf-events = { workspace = true }
@@ -62,9 +69,10 @@ libc = { workspace = true }
 mimalloc = { workspace = true }
 num-bigint = { workspace = true }
 rayon = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = [ "arbitrary_precision", "preserve_order" ] }
+syn = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "net" ] }
+tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "net", "sync" ] }
 walkdir = { workspace = true }
 wiremock = { workspace = true }
 
@@ -78,6 +86,10 @@ harness = false
 
 [[bench]]
 name = "call_overhead"
+harness = false
+
+[[bench]]
+name = "telemetry_overhead"
 harness = false
 
 [[bench]]

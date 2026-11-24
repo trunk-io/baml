@@ -10,7 +10,6 @@
 //! addressed.
 
 use baml_base::{Name, SourceFile};
-use baml_compiler_syntax::SyntaxKind;
 use baml_compiler2_ast::Expr;
 use baml_compiler2_hir::{
     contributions::Definition,
@@ -21,6 +20,7 @@ use baml_compiler2_hir::{
     semantic_index::{BindingId, BindingKind, FileSemanticIndex},
 };
 use baml_compiler2_hir_ty::extern_loc::{DefinitionRef, ExternDefinition, extern_definition_named};
+use baml_syntax::token::{KindSet, TokenIdx, TokenKind};
 use text_size::{TextRange, TextSize};
 
 use crate::syntax;
@@ -52,11 +52,12 @@ pub enum SymbolTarget<'db> {
     Item(DefinitionRef<'db>),
     /// A local binding (let, parameter, pattern, or catch binding).
     Local {
-        /// The function whose body arena owns the binding.
-        func: FunctionLoc<'db>,
-        /// The enclosing `Function` scope (reference searches start here;
-        /// lambda scopes nest below it and share the body arena).
-        func_scope: FileScopeId,
+        /// The body whose arena owns the binding: a function's, or a global
+        /// variable's initializer.
+        owner: baml_compiler2_hir::body::BodyOwnerId<'db>,
+        /// The owner's scope (reference searches start here; lambda scopes
+        /// nest below it and share the body arena).
+        owner_scope: FileScopeId,
         binding: BindingId,
     },
     /// A class field, by position in the class's field list — a source
@@ -118,14 +119,17 @@ pub fn symbol_at(
     // A dispatching operator token (`+`, `<`, `[`) addresses the method the
     // operation invokes: the matching impl's override when the receiver's
     // static type pins one, else the `baml.ops` interface's declaration.
-    if let Some(target) = operator_target_at(db, file, offset, token.kind()) {
+    // `>=`, `>>` and `>>=` are `>` tokens and an `=` joined by adjacency: a
+    // cursor on their tail is on the operator that begins at the first.
+    let (operator_offset, operator_kind) = operator_head(&token, offset);
+    if let Some(target) = operator_target_at(db, file, operator_offset, operator_kind) {
         return Some(target);
     }
 
     // WORD tokens and keyword tokens may both be names in member position
     // (`obj.implements()`), so let the resolvers decide whether the text is
     // actually a symbol.
-    if token.kind() != SyntaxKind::WORD && !token.kind().is_keyword() {
+    if !token.is_ident() && !token.kind().is_keyword() {
         return None;
     }
 
@@ -166,6 +170,11 @@ pub fn symbol_at(
         return Some(target);
     }
 
+    // BUG: a token inside a qualified path (`Dog` in `root.Dog`,
+    // `Response` in `baml.http.Response`) is read here as the bare name
+    // first, so it lands on a same-named item of the reader's namespace
+    // when there is one; `qualified_item_at` should decide whenever the
+    // token has a path around it. `find_item_usages` shares the defect.
     match resolve_name_at(db, file, offset, &name) {
         ResolvedName::Item(def) | ResolvedName::Builtin(def) => {
             Some(SymbolTarget::Item(DeclRef::Source(def)))
@@ -185,7 +194,7 @@ fn qualified_item_at<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     file: SourceFile,
     offset: TextSize,
-    token: &baml_compiler_syntax::SyntaxToken,
+    token: &crate::syntax::TokenRef,
 ) -> Option<SymbolTarget<'db>> {
     let chain = crate::syntax::dotted_chain_to(token);
     if chain.len() < 2 {
@@ -201,19 +210,25 @@ fn qualified_item_at<'db>(
     }
 }
 
-/// A dotted name whose first segment is a package `file`'s package reaches,
-/// naming a declaration a SERVED package exports (`app.Widget`,
-/// `app.util.make`): the row's defining identity. `None` for anything the
-/// served lane does not export — a source package's items resolve through
+/// A dotted name whose first segment is a package `file`'s package reaches
+/// ([`baml_compiler2_hir::package::path_head`]), naming a declaration a
+/// SERVED package exports (`app.Widget`, `app.util.make`): the row's
+/// defining identity. `None` for anything the served lane does not export —
+/// a source package's items resolve through
 /// [`baml_compiler2_hir::resolve::resolve_path_at`].
 fn served_item_at<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     file: SourceFile,
     chain: &[Name],
 ) -> Option<SymbolTarget<'db>> {
-    let (package, path) = chain.split_first()?;
-    let (name, namespace) = path.split_last()?;
-    let root = baml_compiler2_hir::package::accessible_package(db, file.source_root(db), package)?;
+    let namespace = &baml_compiler2_hir::file_package::file_package(db, file).namespace_path;
+    let (baml_compiler2_hir::package::PathHead::Package(root)
+    | baml_compiler2_hir::package::PathHead::Lang(root)) =
+        baml_compiler2_hir::package::path_head(db, file.source_root(db), namespace, chain)
+    else {
+        return None;
+    };
+    let (name, namespace) = chain[1..].split_last()?;
     let definition = extern_definition_named(db, root, namespace, name)?;
     Some(SymbolTarget::Item(DeclRef::External(definition)))
 }
@@ -229,7 +244,7 @@ struct MemberPosition<'db> {
 /// One member-position claim: the owning function (and its body scope),
 /// the claiming expression, the claimed span, and the path segment index.
 type Claim<'db> = (
-    baml_compiler2_hir::loc::FunctionLoc<'db>,
+    baml_compiler2_hir::body::BodyOwnerId<'db>,
     baml_compiler2_hir::scope::ScopeId<'db>,
     baml_compiler2_ast::ExprId,
     TextRange,
@@ -260,27 +275,24 @@ fn member_position_at(
     // function: an llm function's companions alias the prompt span, and the
     // real interpolation expressions may live in any of the family.
     let mut claim: Option<Claim<'_>> = None;
-    let mut seen: Vec<baml_compiler2_hir::loc::FunctionLoc<'_>> = Vec::new();
+    let mut seen: Vec<baml_compiler2_hir::body::BodyOwnerId<'_>> = Vec::new();
     for scope_id in scope_candidates_at(db, file, index, offset) {
-        let Some(func_scope) = enclosing_function_scope(index, scope_id) else {
+        let Some(owner_scope) = enclosing_body_scope(index, scope_id) else {
             continue;
         };
-        let func_owner = index.scope_ids[func_scope.index() as usize];
-        let Some(item_data::ScopeOwner::Function(func_loc)) =
-            item_data::scope_owner(db, func_owner)
-        else {
+        let func_owner = index.scope_ids[owner_scope.index() as usize];
+        let Some(func_loc) = scope_body_owner(db, index, owner_scope) else {
             continue;
         };
         if seen.contains(&func_loc) {
             continue;
         }
         seen.push(func_loc);
-        let body = baml_compiler2_hir::body::function_body(db, func_loc);
-        let baml_compiler2_hir::body::FunctionBody::Expr(expr_body) = body.as_ref() else {
+        let body = baml_compiler2_hir::body::body(db, func_loc);
+        let Some(expr_body) = body.expr_body() else {
             continue;
         };
-        let Some(source_map) = baml_compiler2_hir::body::function_body_source_map(db, func_loc)
-        else {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(db, func_loc) else {
             continue;
         };
         let mut push_claim =
@@ -334,11 +346,9 @@ fn member_position_at(
     }
 
     let (func_loc, func_owner, expr_id, _, segment_idx) = claim?;
-    let body = baml_compiler2_hir::body::function_body(db, func_loc);
-    let baml_compiler2_hir::body::FunctionBody::Expr(expr_body) = body.as_ref() else {
-        return None;
-    };
-    let source_map = baml_compiler2_hir::body::function_body_source_map(db, func_loc)?;
+    let body = baml_compiler2_hir::body::body(db, func_loc);
+    let expr_body = body.expr_body()?;
+    let source_map = baml_compiler2_hir::body::body_source_map(db, func_loc)?;
     let inference = baml_compiler2_hir_ty::ide::infer_for_scope(db, func_owner);
     let target = match &expr_body.exprs[expr_id] {
         Expr::Object { .. } => constructor_field_at(db, offset, expr_body, &source_map, inference?),
@@ -347,11 +357,25 @@ fn member_position_at(
         | Expr::QualifiedPath { .. }
         | Expr::Path(_) => {
             let inference = inference?;
+            // The segment that names a global — the last of its (possibly
+            // namespace-qualified) root — is the global itself, as the checker
+            // resolved it; a qualifier before it is a namespace.
+            if let Some(idx) = segment_idx
+                && let Some(root) = inference.global_roots.get(&expr_id)
+                && idx < root.segments
+            {
+                return Some(MemberPosition {
+                    target: match root.binding {
+                        DeclRef::Source(binding) if idx + 1 == root.segments => Some(
+                            SymbolTarget::Item(DeclRef::Source(Definition::Let(binding))),
+                        ),
+                        _ => None,
+                    },
+                });
+            }
             let resolution = match segment_idx {
                 Some(idx) => inference
-                    .path_resolutions
-                    .get(&expr_id)
-                    .and_then(|path| path.segments.get(idx))
+                    .path_segment_at_written(expr_id, idx)
                     .and_then(|step| step.resolution.as_ref())
                     .or_else(|| inference.member_resolutions.get(&expr_id)),
                 None => inference.member_resolutions.get(&expr_id),
@@ -416,7 +440,7 @@ pub fn receiver_at_dot<'db>(
                 .get(usize::from(end)..usize::from(dot))
                 .is_some_and(|between| between.chars().all(|c| c.is_whitespace() || c == '?'))
     };
-    let mut seen: Vec<baml_compiler2_hir::loc::FunctionLoc<'db>> = Vec::new();
+    let mut seen: Vec<baml_compiler2_hir::body::BodyOwnerId<'db>> = Vec::new();
     // Innermost wins, the same contest `member_position_at` runs: a receiver
     // nested in an argument list claims over the call that encloses it.
     let mut best: Option<(
@@ -425,25 +449,22 @@ pub fn receiver_at_dot<'db>(
         TextRange,
     )> = None;
     for scope_id in scope_candidates_at(db, file, index, dot) {
-        let Some(func_scope) = enclosing_function_scope(index, scope_id) else {
+        let Some(owner_scope) = enclosing_body_scope(index, scope_id) else {
             continue;
         };
-        let func_owner = index.scope_ids[func_scope.index() as usize];
-        let Some(item_data::ScopeOwner::Function(func_loc)) =
-            item_data::scope_owner(db, func_owner)
-        else {
+        let func_owner = index.scope_ids[owner_scope.index() as usize];
+        let Some(func_loc) = scope_body_owner(db, index, owner_scope) else {
             continue;
         };
         if seen.contains(&func_loc) {
             continue;
         }
         seen.push(func_loc);
-        let body = baml_compiler2_hir::body::function_body(db, func_loc);
-        let baml_compiler2_hir::body::FunctionBody::Expr(expr_body) = body.as_ref() else {
+        let body = baml_compiler2_hir::body::body(db, func_loc);
+        let Some(expr_body) = body.expr_body() else {
             continue;
         };
-        let Some(source_map) = baml_compiler2_hir::body::function_body_source_map(db, func_loc)
-        else {
+        let Some(source_map) = baml_compiler2_hir::body::body_source_map(db, func_loc) else {
             continue;
         };
         let Some(inference) = baml_compiler2_hir_ty::ide::infer_for_scope(db, func_owner) else {
@@ -477,8 +498,7 @@ pub fn receiver_at_dot<'db>(
                     if !reaches(span.end()) {
                         return None;
                     }
-                    let resolved = inference.path_resolutions.get(&expr_id)?;
-                    let step = resolved.segments.get(segment_idx)?;
+                    let step = inference.path_segment_at_written(expr_id, segment_idx)?;
                     Some((step.ty.clone(), span))
                 }),
                 _ => None,
@@ -499,6 +519,154 @@ pub fn receiver_at_dot<'db>(
     // would answer "no members" for a dot that has plenty.
     best.filter(|(_, ty, _)| !matches!(ty, baml_type::Ty::Error))
         .map(|(owner, ty, _)| (owner, ty))
+}
+
+fn visit_bodies_at<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    file: SourceFile,
+    offset: TextSize,
+    mut visit: impl FnMut(
+        baml_compiler2_hir::body::BodyOwnerId<'db>,
+        &baml_compiler2_ast::ExprBody,
+        &baml_compiler2_ast::AstSourceMap,
+        &'db baml_compiler2_hir_ty::infer::InferenceResult<'db>,
+    ),
+) {
+    let index = baml_compiler2_hir::file_semantic_index(db, file);
+    let mut seen: Vec<baml_compiler2_hir::body::BodyOwnerId<'db>> = Vec::new();
+    for scope_id in scope_candidates_at(db, file, index, offset) {
+        let Some(owner_scope) = enclosing_body_scope(index, scope_id) else {
+            continue;
+        };
+        let Some(owner) = scope_body_owner(db, index, owner_scope) else {
+            continue;
+        };
+        if seen.contains(&owner) {
+            continue;
+        }
+        seen.push(owner);
+        let body = baml_compiler2_hir::body::body(db, owner);
+        let (Some(expr_body), Some(source_map), Some(inference)) = (
+            body.expr_body(),
+            baml_compiler2_hir::body::body_source_map(db, owner),
+            baml_compiler2_hir_ty::ide::infer_for_scope(
+                db,
+                index.scope_ids[owner_scope.index() as usize],
+            ),
+        ) else {
+            continue;
+        };
+        visit(owner, expr_body, &source_map, inference);
+    }
+}
+
+pub(crate) fn tuple_slots(
+    db: &dyn baml_compiler2_hir::Db,
+    ty: &baml_type::Ty,
+) -> Option<Vec<baml_type::Ty>> {
+    let mut ty = ty.clone();
+    for _ in 0..32 {
+        match ty {
+            baml_type::Ty::Tuple(elements) => return Some(elements.into_vec()),
+            baml_type::Ty::TypeAlias(ref name) => {
+                let alias = baml_compiler2_hir_ty::layout::alias_ref_of(db, name)?;
+                ty = baml_compiler2_hir_ty::layout::alias_value(db, alias).clone();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+pub struct TupleAccess {
+    pub access: String,
+    pub ty: baml_type::Ty,
+}
+
+pub fn tuple_access_at(
+    db: &dyn baml_compiler2_hir::Db,
+    file: SourceFile,
+    offset: TextSize,
+) -> Option<TupleAccess> {
+    let nullable = |ty: &baml_type::Ty| {
+        let mut ty = ty.clone();
+        for _ in 0..32 {
+            if let baml_type::Ty::TypeAlias(ref name) = ty {
+                let Some(alias) = baml_compiler2_hir_ty::layout::alias_ref_of(db, name) else {
+                    return false;
+                };
+                ty = baml_compiler2_hir_ty::layout::alias_value(db, alias).clone();
+            } else {
+                return ty.is_null() || ty.is_nullable_union();
+            }
+        }
+        false
+    };
+    let mut best: Option<(TextSize, TupleAccess)> = None;
+    visit_bodies_at(db, file, offset, |_, body, source_map, inference| {
+        for (id, expr) in body.exprs.iter() {
+            let (Expr::MemberAccess { member, .. } | Expr::OptionalMemberAccess { member, .. }) =
+                expr
+            else {
+                continue;
+            };
+            if member.as_str().parse::<u32>().is_err() {
+                continue;
+            }
+            let Some(span) = source_map.member_name_span(id) else {
+                continue;
+            };
+            // A chain may share one float-shaped token, so find the separator
+            // from this slot's own range rather than from the token range.
+            let before = &file.text(db)[..usize::from(span.start())];
+            let dot_start = before.trim_end().strip_suffix('.').map(|prefix| {
+                let prefix = prefix.strip_suffix('?').unwrap_or(prefix);
+                TextSize::of(prefix)
+            });
+            if !TextRange::new(dot_start.unwrap_or(span.start()), span.end()).contains(offset) {
+                continue;
+            }
+            let Some(ty) = inference
+                .type_of_expr
+                .get(&id)
+                .filter(|ty| !matches!(ty, baml_type::Ty::Error))
+            else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(len, _)| span.len() < *len) {
+                // Inference records the non-null payload at each link and
+                // adds null at the enclosing OptionalChain. Hover presents
+                // the selected access as an expression of its own.
+                let mut link = id;
+                let mut optional = false;
+                loop {
+                    match &body.exprs[link] {
+                        Expr::OptionalMemberAccess { base, .. }
+                        | Expr::OptionalIndex { base, .. }
+                        | Expr::OptionalCall { callee: base, .. } => {
+                            optional |= inference.type_of_expr.get(base).is_some_and(&nullable);
+                            link = *base;
+                        }
+                        Expr::MemberAccess { base, .. } | Expr::Index { base, .. } => link = *base,
+                        Expr::Call { callee, .. } => link = *callee,
+                        _ => break,
+                    }
+                }
+                best = Some((
+                    span.len(),
+                    TupleAccess {
+                        access: body.display_expr(id),
+                        ty: if optional {
+                            baml_type::Ty::optional(ty.clone())
+                        } else {
+                            ty.clone()
+                        },
+                    },
+                ));
+            }
+        }
+    });
+    best.map(|(_, access)| access)
 }
 
 /// The type declaration a qualifier path names, when it names one:
@@ -558,12 +726,12 @@ pub fn call_at(
     open_paren: TextSize,
 ) -> Option<CallPosition> {
     let index = baml_compiler2_hir::file_semantic_index(db, file);
-    let mut seen: Vec<baml_compiler2_hir::loc::FunctionLoc<'_>> = Vec::new();
+    let mut seen: Vec<baml_compiler2_hir::body::BodyOwnerId<'_>> = Vec::new();
     for scope_id in scope_candidates_at(db, file, index, open_paren) {
         let Some((body, source_map, inference)) = body_at(db, index, scope_id, &mut seen) else {
             continue;
         };
-        let baml_compiler2_hir::body::FunctionBody::Expr(expr_body) = body.as_ref() else {
+        let Some(expr_body) = body.expr_body() else {
             continue;
         };
         for expr in expr_body.exprs.values() {
@@ -601,13 +769,13 @@ pub fn object_literal_at<'db>(
     offset: TextSize,
 ) -> Option<ObjectLiteralPosition<'db>> {
     let index = baml_compiler2_hir::file_semantic_index(db, file);
-    let mut seen: Vec<baml_compiler2_hir::loc::FunctionLoc<'db>> = Vec::new();
+    let mut seen: Vec<baml_compiler2_hir::body::BodyOwnerId<'db>> = Vec::new();
     let mut best: Option<(ObjectLiteralPosition<'db>, TextRange)> = None;
     for scope_id in scope_candidates_at(db, file, index, offset) {
         let Some((body, source_map, inference)) = body_at(db, index, scope_id, &mut seen) else {
             continue;
         };
-        let baml_compiler2_hir::body::FunctionBody::Expr(expr_body) = body.as_ref() else {
+        let Some(expr_body) = body.expr_body() else {
             continue;
         };
         for (expr_id, expr) in expr_body.exprs.iter() {
@@ -650,24 +818,24 @@ fn body_at<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     index: &'db FileSemanticIndex<'db>,
     scope_id: FileScopeId,
-    seen: &mut Vec<baml_compiler2_hir::loc::FunctionLoc<'db>>,
+    seen: &mut Vec<baml_compiler2_hir::body::BodyOwnerId<'db>>,
 ) -> Option<(
-    std::sync::Arc<baml_compiler2_hir::body::FunctionBody>,
+    baml_compiler2_hir::body::OwnerBody,
     baml_compiler2_ast::AstSourceMap,
     &'db baml_compiler2_hir_ty::infer::InferenceResult<'db>,
 )> {
-    let func_scope = enclosing_function_scope(index, scope_id)?;
-    let func_owner = index.scope_ids[func_scope.index() as usize];
-    let item_data::ScopeOwner::Function(func_loc) = item_data::scope_owner(db, func_owner)? else {
-        return None;
-    };
-    if seen.contains(&func_loc) {
+    let owner_scope = enclosing_body_scope(index, scope_id)?;
+    let owner = scope_body_owner(db, index, owner_scope)?;
+    if seen.contains(&owner) {
         return None;
     }
-    seen.push(func_loc);
-    let body = baml_compiler2_hir::body::function_body(db, func_loc);
-    let source_map = baml_compiler2_hir::body::function_body_source_map(db, func_loc)?;
-    let inference = baml_compiler2_hir_ty::ide::infer_for_scope(db, func_owner)?;
+    seen.push(owner);
+    let body = baml_compiler2_hir::body::body(db, owner);
+    let source_map = baml_compiler2_hir::body::body_source_map(db, owner)?;
+    let inference = baml_compiler2_hir_ty::ide::infer_for_scope(
+        db,
+        index.scope_ids[owner_scope.index() as usize],
+    )?;
     Some((body, source_map, inference))
 }
 
@@ -718,17 +886,12 @@ fn local_in_scope<'db>(
 
     let binding = declaration.or_else(|| index.visible_binding_at(scope_id, offset, name))?;
 
-    let func_scope = enclosing_function_scope(index, scope_id)?;
-    // The recorded item↔scope link, not a span match: a span cannot tell a
-    // function from its companions (they share one declaration span).
-    let owner_scope = index.scope_ids[func_scope.index() as usize];
-    let item_data::ScopeOwner::Function(func) = item_data::scope_owner(db, owner_scope)? else {
-        return None;
-    };
+    let owner_scope = enclosing_body_scope(index, scope_id)?;
+    let owner = scope_body_owner(db, index, owner_scope)?;
 
     Some(SymbolTarget::Local {
-        func,
-        func_scope,
+        owner,
+        owner_scope,
         binding,
     })
 }
@@ -758,6 +921,41 @@ fn scope_candidates_at(
         }
     }
     out
+}
+
+/// The nearest enclosing scope that owns a body — a function's, or a
+/// global variable's initializer (inclusive walk from `scope_id`'s
+/// ancestors). Lambda scopes nest below it and share its arena.
+pub(crate) fn enclosing_body_scope(
+    index: &FileSemanticIndex<'_>,
+    scope_id: FileScopeId,
+) -> Option<FileScopeId> {
+    index
+        .ancestor_scopes(scope_id)
+        .into_iter()
+        .find(|ancestor_id| {
+            matches!(
+                index.scopes[ancestor_id.index() as usize].kind,
+                ScopeKind::Function | ScopeKind::Let
+            )
+        })
+}
+
+/// The body owner of `owner_scope` (as [`enclosing_body_scope`] returns it):
+/// a function, or a global variable. The recorded item↔scope link, not a
+/// span match — a span cannot tell a function from its companions (they
+/// share one declaration span).
+pub(crate) fn scope_body_owner<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    index: &FileSemanticIndex<'db>,
+    owner_scope: FileScopeId,
+) -> Option<baml_compiler2_hir::body::BodyOwnerId<'db>> {
+    use baml_compiler2_hir::body::BodyOwnerId;
+    match item_data::scope_owner(db, index.scope_ids[owner_scope.index() as usize])? {
+        item_data::ScopeOwner::Function(function) => Some(BodyOwnerId::Function(function)),
+        item_data::ScopeOwner::Let(binding) => Some(BodyOwnerId::Let(binding)),
+        _ => None,
+    }
 }
 
 /// The nearest enclosing `Function`-kind scope (inclusive walk from
@@ -833,19 +1031,14 @@ fn member_at<'db>(
         // to open interface scopes the way class bodies do; interface
         // *usages* (virtual member accesses) resolve fine through inference.
         _ => {
-            let func_scope = enclosing_function_scope(index, scope_id)?;
-            let func_owner = index.scope_ids[func_scope.index() as usize];
-            let item_data::ScopeOwner::Function(func_loc) = item_data::scope_owner(db, func_owner)?
-            else {
-                return None;
-            };
+            let owner_scope = enclosing_body_scope(index, scope_id)?;
+            let func_owner = index.scope_ids[owner_scope.index() as usize];
+            let owner = scope_body_owner(db, index, owner_scope)?;
 
             let inference = baml_compiler2_hir_ty::ide::infer_for_scope(db, func_owner)?;
-            let body = baml_compiler2_hir::body::function_body(db, func_loc);
-            let baml_compiler2_hir::body::FunctionBody::Expr(expr_body) = body.as_ref() else {
-                return None;
-            };
-            let source_map = baml_compiler2_hir::body::function_body_source_map(db, func_loc)?;
+            let body = baml_compiler2_hir::body::body(db, owner);
+            let expr_body = body.expr_body()?;
+            let source_map = baml_compiler2_hir::body::body_source_map(db, owner)?;
 
             member_access_at(db, offset, token_text, expr_body, &source_map, inference)
                 .or_else(|| constructor_field_at(db, offset, expr_body, &source_map, inference))
@@ -885,7 +1078,9 @@ pub(crate) fn template_position_at(
     ) -> bool {
         segments.iter().any(|segment| match segment {
             TemplateSegment::Text(_) => false,
-            TemplateSegment::Interp(expr) => hit(source_map.expr_span(*expr)),
+            TemplateSegment::Interp(expr) | TemplateSegment::Effect { block: expr, .. } => {
+                hit(source_map.expr_span(*expr))
+            }
             TemplateSegment::For {
                 binding,
                 collection,
@@ -1101,6 +1296,26 @@ fn llm_prompt_position_at(
     }
 }
 
+/// The first token of the adjacency-joined operator `token` is part of
+/// (`>=`, `>>`, `>>=`), with its offset; `token` itself when it begins one
+/// or is none.
+fn operator_head(token: &syntax::TokenRef, offset: TextSize) -> (TextSize, TokenKind) {
+    use baml_syntax::ops::{AnyOperator, OpTok};
+    let tokens = token.tree().tokens();
+    for back in 1..=2u32 {
+        let Some(start) = token.idx().0.checked_sub(back) else {
+            break;
+        };
+        let start = TokenIdx(start);
+        if let Some(op) = OpTok::<AnyOperator>::at(tokens, start)
+            && op.tokens().any(|t| t == token.idx())
+        {
+            return (tokens.range(start).start(), tokens.kind(start));
+        }
+    }
+    (offset, token.kind())
+}
+
 /// Cursor on a dispatching operator token: the method the operation
 /// invokes, from the compiler's own operator table (`hir_ty::ops`) and impl
 /// resolver. The receiver's *static* type picks the impl (`1 + 2` navigates
@@ -1111,46 +1326,44 @@ fn operator_target_at(
     db: &dyn baml_compiler2_hir::Db,
     file: SourceFile,
     offset: TextSize,
-    kind: SyntaxKind,
+    kind: TokenKind,
 ) -> Option<SymbolTarget<'_>> {
     use baml_compiler2_ast::Expr;
     use baml_compiler2_hir_ty::ops;
 
-    // Token kinds that can spell a dispatching operator. Everything else
-    // exits before any body walk. `<`/`>`/`[`/`]` are ambiguous with
-    // generics and array syntax; the enclosing-expression check below
-    // disambiguates (only an operator sits in an operator expression's gap).
-    if !matches!(
-        kind,
-        SyntaxKind::PLUS
-            | SyntaxKind::MINUS
-            | SyntaxKind::STAR
-            | SyntaxKind::SLASH
-            | SyntaxKind::PERCENT
-            | SyntaxKind::AND
-            | SyntaxKind::PIPE
-            | SyntaxKind::CARET
-            | SyntaxKind::LESS_LESS
-            | SyntaxKind::GREATER_GREATER
-            | SyntaxKind::EQUALS_EQUALS
-            | SyntaxKind::NOT_EQUALS
-            | SyntaxKind::LESS
-            | SyntaxKind::GREATER
-            | SyntaxKind::LESS_EQUALS
-            | SyntaxKind::GREATER_EQUALS
-            | SyntaxKind::PLUS_EQUALS
-            | SyntaxKind::MINUS_EQUALS
-            | SyntaxKind::STAR_EQUALS
-            | SyntaxKind::SLASH_EQUALS
-            | SyntaxKind::PERCENT_EQUALS
-            | SyntaxKind::AND_EQUALS
-            | SyntaxKind::PIPE_EQUALS
-            | SyntaxKind::CARET_EQUALS
-            | SyntaxKind::LESS_LESS_EQUALS
-            | SyntaxKind::GREATER_GREATER_EQUALS
-            | SyntaxKind::L_BRACKET
-            | SyntaxKind::R_BRACKET
-    ) {
+    // Token kinds that can begin a dispatching operator (`>>`, `>=` and
+    // `>>=` are `>` tokens joined by adjacency). Everything else exits before
+    // any body walk. `<`/`>`/`[`/`]` are ambiguous with generics and array
+    // syntax; the enclosing-expression check below disambiguates (only an
+    // operator sits in an operator expression's gap).
+    const OPERATOR_START: KindSet = KindSet::new(&[
+        TokenKind::Plus,
+        TokenKind::Minus,
+        TokenKind::Star,
+        TokenKind::Slash,
+        TokenKind::Percent,
+        TokenKind::And,
+        TokenKind::Pipe,
+        TokenKind::Caret,
+        TokenKind::LessLess,
+        TokenKind::EqualsEquals,
+        TokenKind::NotEquals,
+        TokenKind::Less,
+        TokenKind::Greater,
+        TokenKind::LessEquals,
+        TokenKind::PlusEquals,
+        TokenKind::MinusEquals,
+        TokenKind::StarEquals,
+        TokenKind::SlashEquals,
+        TokenKind::PercentEquals,
+        TokenKind::AndEquals,
+        TokenKind::PipeEquals,
+        TokenKind::CaretEquals,
+        TokenKind::LessLessEquals,
+        TokenKind::LBracket,
+        TokenKind::RBracket,
+    ]);
+    if !OPERATOR_START.contains(kind) {
         return None;
     }
 
@@ -1228,6 +1441,11 @@ fn operator_target_at(
 
     let (_, dispatch, lhs, rhs) = claim?;
     let inference = baml_compiler2_hir_ty::ide::infer_for_scope(db, func_owner)?;
+    if dispatch == ops::INDEX_DISPATCH
+        && tuple_slots(db, inference.type_of_expr.get(&lhs)?).is_some()
+    {
+        return None;
+    }
     let lhs_ty = baml_type::interned::Ty::from_plain(inference.type_of_expr.get(&lhs)?);
     let rhs_ty = rhs
         .and_then(|rhs| inference.type_of_expr.get(&rhs))
@@ -1380,9 +1598,7 @@ fn member_access_at<'db>(
     // uses the expression-level resolution.
     let resolution = if let Some(seg_idx) = path_seg_idx {
         inference
-            .path_resolutions
-            .get(&expr_id)
-            .and_then(|path| path.segments.get(seg_idx))
+            .path_segment_at_written(expr_id, seg_idx)
             .and_then(|step| step.resolution.as_ref())
             .or_else(|| inference.member_resolutions.get(&expr_id))
     } else {
@@ -1418,7 +1634,8 @@ pub(crate) fn member_resolution_target<'db>(
                     .iter()
                     .position(|f| f.name == *field)?,
                 DeclRef::External(class) => extern_class_row(db, *class)
-                    .fields
+                    .body
+                    .fields()
                     .iter()
                     .position(|(name, ..)| name == field)?,
             };
@@ -1459,7 +1676,9 @@ pub(crate) fn member_resolution_target<'db>(
             ..
         } => Some(SymbolTarget::Method { func: *func }),
         MemberResolution::Method {
-            callee: MethodCallee::Virtual { interface, method },
+            callee: MethodCallee::Virtual {
+                interface, method, ..
+            },
             ..
         } => {
             // Only the slot (interface + name) is known statically — and the
@@ -1533,7 +1752,8 @@ fn constructor_field_at<'db>(
                 .position(|f| f.name == field.name)?,
             DeclRef::External(class) => {
                 baml_compiler2_hir_ty::extern_loc::extern_class_row(db, class)
-                    .fields
+                    .body
+                    .fields()
                     .iter()
                     .position(|(name, _, _)| *name == field.name)?
             }
@@ -1574,8 +1794,8 @@ pub fn target_definition<'db>(
         }
         // A row has no `SourceFile` and no span in this database.
         SymbolTarget::Item(DeclRef::External(_)) => None,
-        SymbolTarget::Local { func, binding, .. } => {
-            let file = func.file(db);
+        SymbolTarget::Local { owner, binding, .. } => {
+            let file = owner.file(db);
             match binding.kind {
                 BindingKind::Local(idx) => {
                     let index = baml_compiler2_hir::file_semantic_index(db, file);
@@ -1587,12 +1807,16 @@ pub fn target_definition<'db>(
                     // NAME. Synthesized binds have no name token, and nothing
                     // in source can address one, so the pattern span is only
                     // ever reached for spans no cursor lands on.
-                    let range = baml_compiler2_hir::body::function_body_source_map(db, func)
+                    let range = baml_compiler2_hir::body::body_source_map(db, owner)
                         .and_then(|source_map| source_map.bind_name_span(local.bind_pattern))
                         .unwrap_or(local.name_range);
                     Some(Location { file, range })
                 }
                 BindingKind::Parameter(idx) => {
+                    // A global initializer declares no parameters of its own.
+                    let baml_compiler2_hir::body::BodyOwnerId::Function(func) = owner else {
+                        return None;
+                    };
                     let sig_map =
                         baml_compiler2_hir::signature::function_signature_source_map(db, func);
                     let range = sig_map.param_name_spans.get(idx).copied()?;

@@ -48,10 +48,12 @@ pub enum BamlValue<'s, 'v, 't, N: TypeIdent> {
     Null(BamlNull),
     Media(BamlMedia),
     Array(BamlArray<'s, 'v, 't, N>),
+    Tuple(BamlTuple<'s, 'v, 't, N>),
     Map(BamlMap<'s, 'v, 't, N>),
     Enum(BamlEnum<'t, N>),
     Class(BamlClass<'s, 'v, 't, N>),
     StreamState(BamlStreamState<'s, 'v, 't, N>),
+    Shaped(BamlShaped<'s, 'v, 't, N>),
 }
 
 #[derive(Clone, From)]
@@ -110,6 +112,13 @@ where
     pub value: Vec<BamlValueWithFlags<'s, 'v, 't, N>>,
 }
 #[derive(Debug, Clone)]
+pub struct BamlTuple<'s, 'v, 't, N: TypeIdent>
+where
+    's: 'v,
+{
+    pub value: Vec<BamlValueWithFlags<'s, 'v, 't, N>>,
+}
+#[derive(Debug, Clone)]
 pub struct BamlMap<'s, 'v, 't, N: TypeIdent>
 where
     's: 'v,
@@ -128,6 +137,16 @@ where
 {
     pub name: &'t N,
     pub value: IndexMap<&'t str, BamlValueWithFlags<'s, 'v, 't, N>>,
+}
+/// The shape value read for a [`crate::sap_model::ShapedTy`]: the host builds
+/// the value of `name` from `value`.
+#[derive(Debug, Clone)]
+pub struct BamlShaped<'s, 'v, 't, N: TypeIdent>
+where
+    's: 'v,
+{
+    pub name: &'t N,
+    pub value: Box<BamlValueWithFlags<'s, 'v, 't, N>>,
 }
 /// When we parse the value:
 /// - If the value is complete, we return `Complete(value)`.
@@ -165,10 +184,12 @@ impl<N: TypeIdent> serde::Serialize for BamlValue<'_, '_, '_, N> {
             BamlValue::Null(n) => n.serialize(serializer),
             BamlValue::Media(m) => m.serialize(serializer),
             BamlValue::Array(a) => a.serialize(serializer),
+            BamlValue::Tuple(t) => t.serialize(serializer),
             BamlValue::Map(m) => m.serialize(serializer),
             BamlValue::Enum(e) => e.serialize(serializer),
             BamlValue::Class(c) => c.serialize(serializer),
             BamlValue::StreamState(s) => s.serialize(serializer),
+            BamlValue::Shaped(s) => s.value.value.serialize(serializer),
         }
     }
 }
@@ -217,6 +238,17 @@ impl serde::Serialize for BamlMedia {
 }
 
 impl<N: TypeIdent> serde::Serialize for BamlArray<'_, '_, '_, N> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.value.len()))?;
+        for item in &self.value {
+            seq.serialize_element(&item.value)?;
+        }
+        seq.end()
+    }
+}
+
+impl<N: TypeIdent> serde::Serialize for BamlTuple<'_, '_, '_, N> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.value.len()))?;

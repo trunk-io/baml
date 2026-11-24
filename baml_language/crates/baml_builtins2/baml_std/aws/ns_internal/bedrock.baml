@@ -165,40 +165,60 @@ class ContentBlock {
     cachePoint: baml.json.json?,
 
     function of_text(text: string) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), text: text }
+        ContentBlock {
+            ..._empty_content_block(),
+            text: text,
+        }
     }
 
     function of_image(image: ImageBlock) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), image: image }
+        ContentBlock {
+            ..._empty_content_block(),
+            image: image,
+        }
     }
 
     function of_video(video: VideoBlock) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), video: video }
+        ContentBlock {
+            ..._empty_content_block(),
+            video: video,
+        }
     }
 
     function of_document(document: DocumentBlock) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), document: document }
+        ContentBlock {
+            ..._empty_content_block(),
+            document: document,
+        }
     }
 
     function of_audio(audio: AudioBlock) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), audio: audio }
+        ContentBlock {
+            ..._empty_content_block(),
+            audio: audio,
+        }
     }
 
     function of_tool_use(tool_use: ToolUseBlock) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), toolUse: tool_use }
+        ContentBlock {
+            ..._empty_content_block(),
+            toolUse: tool_use,
+        }
     }
 
     function of_tool_result(tool_result: ToolResultBlock) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), toolResult: tool_result }
-    }
-
-    function of_cache_point() -> ContentBlock {
-        ContentBlock.of_cache_delimiter(_default_cache_point())
+        ContentBlock {
+            ..._empty_content_block(),
+            toolResult: tool_result,
+        }
     }
 
     /// A `cachePoint` block carrying `args` exactly as the prompt wrote it.
     function of_cache_delimiter(args: baml.json.json) -> ContentBlock {
-        ContentBlock { ..._empty_content_block(), cachePoint: args }
+        ContentBlock {
+            ..._empty_content_block(),
+            cachePoint: args,
+        }
     }
 }
 
@@ -224,7 +244,10 @@ class SystemContentBlock {
     cachePoint: baml.json.json?,
 
     function of_text(text: string) -> SystemContentBlock {
-        SystemContentBlock { text: text, cachePoint: null }
+        SystemContentBlock {
+            text: text,
+            cachePoint: null,
+        }
     }
 
     function of_cache_point() -> SystemContentBlock {
@@ -233,7 +256,10 @@ class SystemContentBlock {
 
     /// A `cachePoint` block carrying `args` exactly as the prompt wrote it.
     function of_cache_delimiter(args: baml.json.json) -> SystemContentBlock {
-        SystemContentBlock { text: null, cachePoint: args }
+        SystemContentBlock {
+            text: null,
+            cachePoint: args,
+        }
     }
 }
 
@@ -284,11 +310,17 @@ class ToolEntry {
     cachePoint: CachePointBlock?,
 
     function of_spec(spec: ToolSpec) -> ToolEntry {
-        ToolEntry { toolSpec: spec, cachePoint: null }
+        ToolEntry {
+            toolSpec: spec,
+            cachePoint: null,
+        }
     }
 
     function of_cache_point() -> ToolEntry {
-        ToolEntry { toolSpec: null, cachePoint: CachePointBlock { type: "default" } }
+        ToolEntry {
+            toolSpec: null,
+            cachePoint: CachePointBlock { type: "default" },
+        }
     }
 }
 
@@ -328,7 +360,7 @@ class ConverseRequest {
 // ---------------------------------------------------------------------------
 // 3. Null pruning
 //
-// `baml.json.to_json` emits `"field": null` for an unset optional, but the
+// `baml.json.from` emits `"field": null` for an unset optional, but the
 // Converse endpoint expects absent members (the SDK serializer uses
 // `skip_serializing_if = Option::is_none` throughout,
 // `forks/aws-bedrock/src/lib.rs:269-276`), and an externally tagged union with
@@ -488,21 +520,30 @@ function _media_source(
     preview: bool = false,
 ) -> MediaSource {
     if let data: string = resolved.base64 {
-        return MediaSource { bytes: data, s3Location: null };
+        return MediaSource {
+            bytes: data,
+            s3Location: null,
+        };
     }
     if let url: string = resolved.url {
         if (url.starts_with("s3://")) {
-            return MediaSource { bytes: null, s3Location: S3Location { uri: url, bucketOwner: null } };
+            return MediaSource {
+                bytes: null,
+                s3Location: S3Location {
+                    uri: url,
+                    bucketOwner: null,
+                },
+            };
         }
         if (preview) {
             throw ai.errors.PreviewUnsupported {
                 provider: "aws-bedrock",
                 detail: `Bedrock request preview only supports s3:// ${kind} URLs; it cannot download ${url}`,
-            }
+            };
         }
-        throw _reject(`Bedrock requires s3:// URIs for ${kind} URLs, got: ${url}`)
+        throw _reject(`Bedrock requires s3:// URIs for ${kind} URLs, got: ${url}`);
     }
-    throw _reject(`Bedrock ${kind} content could not be resolved`)
+    throw _reject(`Bedrock ${kind} content could not be resolved`);
 }
 
 function _image_block(image: baml.media.Image, preview: bool = false) -> ContentBlock {
@@ -511,12 +552,10 @@ function _image_block(image: baml.media.Image, preview: bool = false) -> Content
     } else {
         ai.wire.resolve_media(image, !_is_s3_url(image.url()))
     };
-    ContentBlock.of_image(
-        ImageBlock {
-            format: _image_format(resolved.mime_type),
-            source: _media_source(resolved, "image", preview = preview),
-        },
-    )
+    ContentBlock.of_image(ImageBlock {
+        format: _image_format(resolved.mime_type),
+        source: _media_source(resolved, "image", preview = preview),
+    })
 }
 
 function _video_block(video: baml.media.Video, preview: bool = false) -> ContentBlock {
@@ -527,12 +566,10 @@ function _video_block(video: baml.media.Video, preview: bool = false) -> Content
     } else {
         ai.wire.resolve_media(video, false)
     };
-    ContentBlock.of_video(
-        VideoBlock {
-            format: _video_format(resolved.mime_type),
-            source: _media_source(resolved, "video", preview = preview),
-        },
-    )
+    ContentBlock.of_video(VideoBlock {
+        format: _video_format(resolved.mime_type),
+        source: _media_source(resolved, "video", preview = preview),
+    })
 }
 
 function _document_block(pdf: baml.media.Pdf, preview: bool = false) -> ContentBlock {
@@ -542,17 +579,17 @@ function _document_block(pdf: baml.media.Pdf, preview: bool = false) -> ContentB
         ai.wire.resolve_media(pdf, !_is_s3_url(pdf.url()))
     };
     if (resolved.mime_type != "application/pdf") {
-        throw _reject(`unsupported document format for Bedrock: ${resolved.mime_type}`)
+        throw _reject(
+            `unsupported document format for Bedrock: ${resolved.mime_type}`,
+        );
     }
-    ContentBlock.of_document(
-        DocumentBlock {
-            format: "pdf",
-            // Bedrock requires a name; the SDK path used this constant too
-            // (`build_request/bedrock.rs:323`).
-            name: "document",
-            source: _media_source(resolved, "document", preview = preview),
-        },
-    )
+    ContentBlock.of_document(DocumentBlock {
+        format: "pdf",
+        // Bedrock requires a name; the SDK path used this constant too
+        // (`build_request/bedrock.rs:323`).
+        name: "document",
+        source: _media_source(resolved, "document", preview = preview),
+    })
 }
 
 function _audio_block(audio: baml.media.Audio, preview: bool = false) -> ContentBlock {
@@ -564,12 +601,10 @@ function _audio_block(audio: baml.media.Audio, preview: bool = false) -> Content
     } else {
         ai.wire.resolve_media(audio, !_is_s3_url(audio.url()))
     };
-    ContentBlock.of_audio(
-        AudioBlock {
-            format: _audio_format(resolved.mime_type),
-            source: _media_source(resolved, "audio", preview = preview),
-        },
-    )
+    ContentBlock.of_audio(AudioBlock {
+        format: _audio_format(resolved.mime_type),
+        source: _media_source(resolved, "audio", preview = preview),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -629,9 +664,12 @@ function _lower_blocks(blocks: ai.content.Block[], preview: bool = false) -> Con
 
 /// (internal) System content is text-only; a media part in a system message is rejected
 /// rather than silently dropped (`build_request/bedrock.rs:174-176`).
-function _prompt_system(message: ai.PromptMessage) -> SystemContentBlock[] {
+function _prompt_system(
+    message: ai.PromptMessage,
+    default_cache_args: baml.json.json,
+) -> SystemContentBlock[] {
     let blocks: SystemContentBlock[] = [];
-    for (let part in ai.wire.prompt_parts(message)) {
+    for (let part in ai.wire.prompt_parts(message, default_cache_args = default_cache_args)) {
         match (part) {
             let text: string => {
                 // Blank text is dropped here too: Converse rejects an empty
@@ -643,14 +681,18 @@ function _prompt_system(message: ai.PromptMessage) -> SystemContentBlock[] {
             },
             let delimiter: ai.CacheDelimiter => {
                 if (
-                    _takes_cache_point(blocks.at(blocks.length() - 1)?.cachePoint, blocks.length(), delimiter)
+                    _takes_cache_point(
+                        blocks.at(blocks.length() - 1)?.cachePoint,
+                        blocks.length(),
+                        delimiter,
+                    )
                 ) {
                     blocks.push(SystemContentBlock.of_cache_delimiter(delimiter.args));
                 }
                 null
             },
             let media: ai.MediaPart => {
-                throw _reject("Bedrock system messages do not support media content")
+                throw _reject("Bedrock system messages do not support media content");
             },
         };
     }
@@ -665,9 +707,10 @@ function _prompt_system(message: ai.PromptMessage) -> SystemContentBlock[] {
 ///     and a `cachePoint` that leads a message is a ValidationException.
 ///   * The last block is already a `cachePoint`: two in a row mark the same
 ///     prefix, and each one counts against the four a request may carry.
-///   * `cache(null)`: there is no value to embed, and a null member is dropped
+///   * Null `args`: there is no value to embed, and a null member is dropped
 ///     from the body, which would leave an empty block behind.
-///     (`ai.wire.prompt_parts` already removes these; this is the backstop.)
+///     (`ai.wire.prompt_parts` has already given a `${cache()}` the client's
+///     default, or removed it when there is none; this is the backstop.)
 function _takes_cache_point(
     previous: baml.json.json?,
     lowered: int,
@@ -684,9 +727,13 @@ function _takes_cache_point(
 /// becomes a `cachePoint` block at the position it was written, with `args`
 /// embedded as written, and the text on either side of it is trimmed where it
 /// faces the checkpoint (`ai.wire.prompt_parts`).
-function _prompt_content(message: ai.PromptMessage, preview: bool = false) -> ContentBlock[] {
+function _prompt_content(
+    message: ai.PromptMessage,
+    default_cache_args: baml.json.json,
+    preview: bool = false,
+) -> ContentBlock[] {
     let content: ContentBlock[] = [];
-    for (let part in ai.wire.prompt_parts(message)) {
+    for (let part in ai.wire.prompt_parts(message, default_cache_args = default_cache_args)) {
         match (part) {
             let text: string => {
                 let block = ai.content.Text { text: text };
@@ -697,14 +744,22 @@ function _prompt_content(message: ai.PromptMessage, preview: bool = false) -> Co
             },
             let delimiter: ai.CacheDelimiter => {
                 if (
-                    _takes_cache_point(content.at(content.length() - 1)?.cachePoint, content.length(), delimiter)
+                    _takes_cache_point(
+                        content.at(content.length() - 1)?.cachePoint,
+                        content.length(),
+                        delimiter,
+                    )
                 ) {
                     content.push(ContentBlock.of_cache_delimiter(delimiter.args));
                 }
                 null
             },
             let media: ai.MediaPart => {
-                let block = ai.content.Media { media: media, provider_id: null, revised_prompt: null };
+                let block = ai.content.Media {
+                    media: media,
+                    provider_id: null,
+                    revised_prompt: null,
+                };
                 if let lowered: ContentBlock = _lower_block(block, preview = preview) {
                     content.push(lowered);
                 }
@@ -713,27 +768,6 @@ function _prompt_content(message: ai.PromptMessage, preview: bool = false) -> Co
         };
     }
     content
-}
-
-/// (internal) The per-message metadata key that requests a Bedrock prompt-caching
-/// checkpoint after the message's content.
-///
-/// The engine emits `{"cachePoint":{"type":"default"}}` whenever a message
-/// carries `cache_control` metadata
-/// (`engine/.../aws_client.rs:123-155`). BAML's neutral spelling of that is a
-/// `ai.PromptMessage.metadata` entry, and Bedrock's own name for the feature
-/// is a cache *point*, so the key is `cache_point` — any non-null value
-/// (`true` is the idiomatic one) turns the checkpoint on.
-///
-/// NOTE: `ai.internal.make_role` currently builds every role marker with empty
-/// metadata, so nothing populates this yet from the prompt DSL. Until that
-/// lands, use the client's `cache_system_prompt` / `cache_tools` options,
-/// which do not depend on per-message metadata.
-function _wants_cache_point(metadata: map<string, baml.json.json>) -> bool {
-    match (metadata.get("cache_point")) {
-        null => false,
-        _ => true,
-    }
 }
 
 /// (internal) The Converse conversation roles are `user` and `assistant` only. `system`
@@ -758,33 +792,37 @@ function _conversation_role(role: string) -> string {
 /// demoting would silently move authored instructions into the conversation.
 /// The native Anthropic client (`messages.baml:308-337`) merges for the same
 /// reason.
-function _lower_prompt(prompt: ai.Prompt, preview: bool = false) -> BedrockPrompt {
+function _lower_prompt(
+    prompt: ai.Prompt,
+    default_cache_args: baml.json.json,
+    preview: bool = false,
+) -> BedrockPrompt {
     let system: SystemContentBlock[] = [];
     let messages: Message[] = [];
     for (let message in prompt.messages()) {
         if (message.role == "system") {
-            for (let block in _prompt_system(message)) {
+            for (let block in _prompt_system(message, default_cache_args)) {
                 system.push(block);
-            }
-            if (_wants_cache_point(message.metadata)) {
-                system.push(SystemContentBlock.of_cache_point());
             }
             null
         } else {
-            let content = _prompt_content(message, preview = preview);
+            let content = _prompt_content(message, default_cache_args, preview = preview);
             // A message that lowered to nothing (all-whitespace text) is
             // dropped: `content: []` is a ValidationException, and a lone
             // `cachePoint` with nothing to cache is no better.
             if (content.length() > 0) {
-                if (_wants_cache_point(message.metadata)) {
-                    content.push(ContentBlock.of_cache_point());
-                }
-                messages.push(Message { role: _conversation_role(message.role), content: content });
+                messages.push(Message {
+                    role: _conversation_role(message.role),
+                    content: content,
+                });
             }
             null
         };
     }
-    BedrockPrompt { system: system, messages: messages }
+    BedrockPrompt {
+        system: system,
+        messages: messages,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +854,20 @@ function _supports_tool_result_status(model: string) -> bool {
     id.includes("anthropic.claude") || id.includes("amazon.nova")
 }
 
+/// (internal) Whether a `${cache()}` sends a `cachePoint` to this model. Converse
+/// accepts a checkpoint for Anthropic Claude and Amazon Nova, and answers 403
+/// ("You invoked an unsupported model or your request did not allow prompt
+/// caching") for the other families it serves — Llama, Mistral, DeepSeek and
+/// gpt-oss were checked. So the default is given only to what is known to
+/// take one, by the same substring test as `_supports_tool_result_status`. An
+/// unrecognized id (an application inference profile ARN, a custom model)
+/// gets none; its author writes `${cache({ "type": "default" })}`, which is
+/// always sent.
+function _supports_cache_point(model: string) -> bool {
+    let id = model.to_lower_case();
+    id.includes("anthropic.claude") || id.includes("amazon.nova")
+}
+
 /// (internal) Append one toolResult block, extending the trailing group when it is open.
 function _push_tool_result(
     pending: PendingMessage[],
@@ -831,7 +883,11 @@ function _push_tool_result(
     } else {
         "success"
     };
-    let block = ContentBlock.of_tool_result(ToolResultBlock { toolUseId: id, content: content, status: status });
+    let block = ContentBlock.of_tool_result(ToolResultBlock {
+        toolUseId: id,
+        content: content,
+        status: status,
+    });
     // `.at` is null on an empty list, which covers the no-messages case.
     if let last: PendingMessage = pending.at(pending.length() - 1) {
         if (last.tool_results) {
@@ -839,9 +895,13 @@ function _push_tool_result(
             return;
         }
     }
-    pending.push(
-        PendingMessage { message: Message { role: "user", content: [block] }, tool_results: true },
-    );
+    pending.push(PendingMessage {
+        message: Message {
+            role: "user",
+            content: [block],
+        },
+        tool_results: true,
+    });
 }
 
 /// (internal) `ai.RunStarted` / `ai.ToolRequested` / `ai.Usage` / `ai.FinalProduced` are
@@ -857,15 +917,13 @@ function _lower_journal(
             let user: ai.events.UserMessage => {
                 let content = _lower_blocks(user.content, preview = preview);
                 if (content.length() > 0) {
-                    if (_wants_cache_point(user.metadata)) {
-                        content.push(ContentBlock.of_cache_point());
-                    }
-                    pending.push(
-                        PendingMessage {
-                            message: Message { role: "user", content: content },
-                            tool_results: false,
+                    pending.push(PendingMessage {
+                        message: Message {
+                            role: "user",
+                            content: content,
                         },
-                    );
+                        tool_results: false,
+                    });
                 }
                 null
             },
@@ -880,15 +938,11 @@ function _lower_journal(
                             null
                         },
                         let use: ai.content.ToolUse => {
-                            content.push(
-                                ContentBlock.of_tool_use(
-                                    ToolUseBlock {
-                                        toolUseId: use.id,
-                                        name: use.name,
-                                        input: use.args,
-                                    },
-                                ),
-                            );
+                            content.push(ContentBlock.of_tool_use(ToolUseBlock {
+                                toolUseId: use.id,
+                                name: use.name,
+                                input: use.args,
+                            }));
                             null
                         },
                         // Dropped: Converse replays reasoning as
@@ -906,12 +960,13 @@ function _lower_journal(
                 // reasoning, so nothing upstream removes it. Mirrors the
                 // Anthropic client's guard in `_lower_journal`.
                 if (content.length() > 0) {
-                    pending.push(
-                        PendingMessage {
-                            message: Message { role: "assistant", content: content },
-                            tool_results: false,
+                    pending.push(PendingMessage {
+                        message: Message {
+                            role: "assistant",
+                            content: content,
                         },
-                    );
+                        tool_results: false,
+                    });
                 }
                 null
             },
@@ -929,7 +984,13 @@ function _lower_journal(
                 null
             },
             let failed: ai.events.ToolFailed => {
-                _push_tool_result(pending, failed.id, [ContentBlock.of_text(failed.message)], true, with_status);
+                _push_tool_result(
+                    pending,
+                    failed.id,
+                    [ContentBlock.of_text(failed.message)],
+                    true,
+                    with_status,
+                );
             },
             _ => null,
         };
@@ -950,9 +1011,21 @@ function _lower_journal(
 function _tool_choice(choice: string) -> ToolChoice {
     let empty: map<string, unknown> = {};
     match (choice) {
-        "auto" => ToolChoice { auto: empty, any: null, tool: null },
-        "any" | "required" => ToolChoice { auto: null, any: empty, tool: null },
-        _ => ToolChoice { auto: null, any: null, tool: SpecificToolChoice { name: choice } },
+        "auto" => ToolChoice {
+            auto: empty,
+            any: null,
+            tool: null,
+        },
+        "any" | "required" => ToolChoice {
+            auto: null,
+            any: empty,
+            tool: null,
+        },
+        _ => ToolChoice {
+            auto: null,
+            any: null,
+            tool: SpecificToolChoice { name: choice },
+        },
     }
 }
 
@@ -966,15 +1039,13 @@ function _tool_config(
     }
     let entries: ToolEntry[] = [];
     for (let tool in toolbox.list()) {
-        entries.push(
-            ToolEntry.of_spec(
-                ToolSpec {
-                    name: tool.name,
-                    description: tool.description,
-                    inputSchema: ToolInputSchema { json_schema: baml.json.to_json(tool.input_schema) },
-                },
-            ),
-        );
+        entries.push(ToolEntry.of_spec(ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            inputSchema: ToolInputSchema {
+                json_schema: baml.json.from(tool.input_schema),
+            },
+        }));
     }
     if (cache_tools) {
         entries.push(ToolEntry.of_cache_point());
@@ -986,7 +1057,10 @@ function _tool_config(
         null => null,
         let choice: string => _tool_choice(choice),
     };
-    ToolConfig { tools: entries, toolChoice: selection }
+    ToolConfig {
+        tools: entries,
+        toolChoice: selection,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,7 +1075,7 @@ function _inference_config(client: root.BedrockClient) -> InferenceConfig? {
         if (limit > 2147483647 || limit < 0) {
             throw _reject(
                 `max_tokens value ${limit} is out of the supported range (0..=2147483647)`,
-            )
+            );
         }
     }
     let stops: string[]? = match (client.stop_sequences) {
@@ -1043,11 +1117,17 @@ function _system_as_user(system: SystemContentBlock[]) -> Message {
         } else {
             // A system block is `text` or `cachePoint`; the checkpoint moves
             // with the content it followed, value intact.
-            content.push(ContentBlock { ..._empty_content_block(), cachePoint: block.cachePoint });
+            content.push(ContentBlock {
+                ..._empty_content_block(),
+                cachePoint: block.cachePoint,
+            });
             null
         };
     }
-    Message { role: "user", content: content }
+    Message {
+        role: "user",
+        content: content,
+    }
 }
 
 /// (internal) Converse requires strict user/assistant alternation, and several paths here
@@ -1073,7 +1153,10 @@ function _merge_adjacent_roles(messages: Message[]) -> Message[] {
                 continue;
             }
         }
-        out.push(Message { role: message.role, content: message.content.concat([]) });
+        out.push(Message {
+            role: message.role,
+            content: message.content.concat([]),
+        });
     }
     out
 }
@@ -1084,7 +1167,11 @@ function converse_request(
     input: ai.ModelTurnInput,
     preview: bool = false,
 ) -> ConverseRequest {
-    let prompt = _lower_prompt(input.prompt(ai.internal.build_output_format(input.output_type)), preview = preview);
+    let prompt = _lower_prompt(
+        (input.prompt)(ai.internal.build_output_format(input.output_type)),
+        client.default_cache_args(),
+        preview = preview,
+    );
     let system = prompt.system;
     if (client.cache_system_prompt && system.length() > 0) {
         system.push(SystemContentBlock.of_cache_point());
@@ -1092,7 +1179,7 @@ function converse_request(
     let messages = prompt.messages;
     let journal_messages = _lower_journal(
         ai.wire.degrade_tool_media(
-            ai.wire.sanitize_for_client(input.journal, client.id()),
+            ai.wire.sanitize_for_client(input.journal, "aws-bedrock", client.model),
             ["image", "pdf", "video"],
         ),
         _supports_tool_result_status(client.model),
@@ -1114,19 +1201,23 @@ function converse_request(
     //     synthesize the leading user turn the API insists on. Without this
     //     the request is a guaranteed ValidationException.
     let synthesized = messages.length() > 0 && leading_role != "user" && system.length() == 0;
-    let wire_messages = _merge_adjacent_roles(
-        if (folded) {
-            [_system_as_user(system)].concat(messages)
-        } else if (synthesized) {
-            [Message { role: "user", content: [ContentBlock.of_text("(continue)")] }].concat(
-                messages,
-            )
-        } else {
-            messages
-        },
-    );
+    let wire_messages = _merge_adjacent_roles(if (folded) {
+        [_system_as_user(system)].concat(messages)
+    } else if (synthesized) {
+        [
+            Message {
+                role: "user",
+                content: [ContentBlock.of_text("(continue)")],
+            },
+        ]
+        .concat(messages)
+    } else {
+        messages
+    });
     if (wire_messages.length() == 0) {
-        throw _reject("the rendered prompt and journal produced no message content")
+        throw _reject(
+            "the rendered prompt and journal produced no message content",
+        );
     }
     let wire_system: SystemContentBlock[]? = if (folded || system.length() == 0) {
         null
@@ -1163,35 +1254,28 @@ function converse_url(
     }
     // An explicit region wins outright and never touches the resolver — the
     // same short-circuit sys_llm had (`auth_request/bedrock.rs:164-166`), and
-    // it keeps URL construction free of io when the caller was explicit.
-    if let explicit: string = client.region {
-        return `https://bedrock-runtime.${explicit}.amazonaws.com${path}`;
+    // it keeps URL construction free of io when the caller was explicit. A
+    // region is not a secret, so a preview shows a configured one, as it does
+    // `endpoint_url`.
+    if let region: string = ai.wire.resolve_credential(client.region, null) {
+        return `https://bedrock-runtime.${region}.amazonaws.com${path}`;
     }
     if (preview) {
         return `https://bedrock-runtime.preview-region.amazonaws.com${path}`;
     }
-    // Reading the profile can fail on io; that is a configuration problem, not
-    // a transport one, so it stays a typed InvalidRequest rather than becoming
-    // an UnknownError at the `ai.Client` boundary.
-    let region = root.internal.resolve_region(null, client.profile) catch_all (e) {
-        _ => {
-            throw ai.errors.InvalidRequest {
-                provider: "aws-bedrock",
-                status_code: null,
-                detail: `AWS region resolution failed: ${e.to_string()}`,
-                raw_body: null,
-            }
-        },
-    };
+    // Discovery never fails: an unreadable profile is skipped, so a region
+    // that resolves nowhere is the error below.
+    let profile = ai.wire.resolve_credential(client.profile, null);
+    let region = root.internal.resolve_region(null, profile);
     if let resolved: string = region {
         return `https://bedrock-runtime.${resolved}.amazonaws.com${path}`;
     }
     throw ai.errors.InvalidRequest {
         provider: "aws-bedrock",
         status_code: null,
-        detail: "no AWS region: set the client's `region` option, AWS_REGION, AWS_DEFAULT_REGION, or a `region` key on the active profile (or set `endpoint_url` to bypass region resolution)",
+        detail: `no AWS region: set the client's \`region\` option, AWS_REGION, AWS_DEFAULT_REGION, or a \`region\` key on the active profile (or set \`endpoint_url\` to bypass region resolution)${_unset_location_note(client)}`,
         raw_body: null,
-    }
+    };
 }
 
 /// (internal) `base` with `extra` applied over it, header names lowercased so a user
@@ -1225,7 +1309,9 @@ function _apply_query(url: string, params: map<string, string>?) -> string {
         let query: map<string, string> => {
             let pairs: string[] = [];
             for (let name in query.keys()) {
-                pairs.push(`${encode_path_label(name)}=${encode_path_label(query.get(name) ?? "")}`);
+                pairs.push(
+                    `${encode_path_label(name)}=${encode_path_label(query.get(name) ?? "")}`,
+                );
             }
             if (pairs.length() == 0) {
                 url
@@ -1251,7 +1337,9 @@ function build_request(
     preview: bool = false,
     stream: bool = false,
 ) -> baml.http.Request {
-    let body = _prune_nulls(baml.json.to_json(converse_request(client, input, preview = preview)));
+    let body = _prune_nulls(
+        baml.json.from(converse_request(client, input, preview = preview)),
+    );
     let merged = ai.wire.merge_request_body(body, client.request_body);
     let accept = if (stream) {
         "application/vnd.amazon.eventstream"
@@ -1260,37 +1348,108 @@ function build_request(
     };
     baml.http.Request {
         method: "POST",
-        url: _apply_query(converse_url(client, preview = preview, stream = stream), client.query_params),
-        headers: _merge_headers({ "content-type": "application/json", "accept": accept }, client.headers),
+        url: _apply_query(
+            converse_url(client, preview = preview, stream = stream),
+            client.query_params,
+        ),
+        headers: _merge_headers(
+            { "content-type": "application/json", "accept": accept },
+            client.headers,
+        ),
         body: baml.json.stringify(merged),
+    }
+}
+
+/// (internal) A note naming a `region` or `profile` configured as `env.NAME`
+/// that read nothing, so resolution moved on to the environment's own.
+function _unset_location_note(client: root.BedrockClient) -> string {
+    ai.wire.unset_credentials_note({ "region": client.region, "profile": client.profile })
+}
+
+/// (internal) The static credential options, resolved, as the signer takes them.
+class StaticKeys {
+    access_key_id: string?,
+    secret_access_key: string?,
+    session_token: string?,
+}
+
+/// (internal) The static credentials to sign with.
+///
+/// They are one identity, so they are all-or-nothing: when any of
+/// `access_key_id`, `secret_access_key` and `session_token` reads a value, the
+/// key pair must both read one. Otherwise the request fails naming what is
+/// missing; it never falls through to the provider chain, which would sign as
+/// whatever identity the environment holds. When none reads a value (an unset
+/// `env.NAME`, or blank, counts as none), all are null and the provider chain
+/// runs, so `env.AWS_ACCESS_KEY_ID`-style options also work where the chain
+/// supplies credentials.
+function _static_keys(client: root.BedrockClient) -> StaticKeys {
+    let keys = StaticKeys {
+        access_key_id: ai.wire.resolve_credential(client.access_key_id, null),
+        secret_access_key: ai.wire.resolve_credential(client.secret_access_key, null),
+        session_token: ai.wire.resolve_credential(client.session_token, null),
+    };
+    let has_key = keys.access_key_id != null;
+    let has_secret = keys.secret_access_key != null;
+    if (has_key == has_secret && (has_key || keys.session_token == null)) {
+        return keys;
+    }
+    let missing: string[] = [];
+    if (!has_key) {
+        missing.push(_missing_option("access_key_id", client.access_key_id));
+    }
+    if (!has_secret) {
+        missing.push(
+            _missing_option("secret_access_key", client.secret_access_key),
+        );
+    }
+    throw ai.errors.InvalidRequest {
+        provider: "aws-bedrock",
+        status_code: null,
+        detail: `AWS static credentials are incomplete: ${missing.join(", ")}. Set access_key_id and secret_access_key together (and session_token for temporary credentials), or none of them to use the AWS provider chain.`,
+        raw_body: null,
+    };
+}
+
+/// (internal) How a static credential option that read nothing is named in the
+/// error: its variable when it is `env.NAME`, never a value.
+function _missing_option(name: string, option: ai.Credential?) -> string {
+    match (option) {
+        let named: baml.env.Ref => `${name} (env.${named.name} is unset or blank)`,
+        string => `${name} (blank)`,
+        null => `${name} (not set)`,
     }
 }
 
 /// SigV4-sign the request. This is the LAST mutation: the signature covers the
 /// method, URL, headers and body exactly as built above.
 function sign(client: root.BedrockClient, request: baml.http.Request) -> baml.http.Request {
-    root.internal.sign_request(
-        request,
-        root.internal.SignOptions {
-            region: client.region,
-            profile: client.profile,
-            access_key_id: client.access_key_id,
-            secret_access_key: client.secret_access_key,
-            session_token: client.session_token,
-            service: "bedrock",
-        },
-    ) catch_all (e) {
+    let keys = _static_keys(client);
+    root.internal.sign_request(request, root.internal.SignOptions {
+        region: ai.wire.resolve_credential(client.region, null),
+        profile: ai.wire.resolve_credential(client.profile, null),
+        access_key_id: keys.access_key_id,
+        secret_access_key: keys.secret_access_key,
+        session_token: keys.session_token,
+        service: "bedrock",
+    }) catch_all (e) {
         // Signing fails when no credentials resolve, or when the credential
         // chain's own IO fails. Nothing was sent, so the failure is retry-safe
         // — but it is emphatically not a NetworkFailure, and a blanket
         // `UnknownError` would lose that.
         _ => {
+            let message = match (e) {
+                let io: baml.errors.Io => io.message,
+                let access: baml.errors.AccessError => access.message,
+                // An `env.NAME` option whose value is not UTF-8.
+                let parse: baml.errors.ParseError => parse.message,
+            };
             throw ai.errors.InvalidRequest {
                 provider: "aws-bedrock",
                 status_code: null,
-                detail: `AWS SigV4 signing failed: ${e.to_string()}`,
+                detail: `AWS SigV4 signing failed: ${message}${_unset_location_note(client)}`,
                 raw_body: null,
-            }
+            };
         },
     }
 }
@@ -1300,7 +1459,7 @@ function sign(client: root.BedrockClient, request: baml.http.Request) -> baml.ht
 //
 // Every member is optional: Converse omits `usage` on some model families,
 // omits `output.message` on a guardrail intervention, and adds members over
-// time. A non-optional field here would be a `ParseFailed` waiting to happen
+// time. A non-optional field here would be an `InvalidResponse` waiting to happen
 // (PLAN §1.5).
 // ---------------------------------------------------------------------------
 
@@ -1367,13 +1526,8 @@ class ConverseResponse {
 /// could not assemble into a message) and `malformed_tool_use` (it emitted a
 /// tool call the service could not assemble into a `toolUse` block).
 ///
-/// Neither is a stop *reason* in the `ai.content.StopReason` sense — there is
-/// no answer to stop on — so `parse_response` throws `ai.errors.ParseFailed`
-/// with the whole response as `raw_output` instead of returning a turn. That
-/// is the honest identity (it IS a failure to produce parseable output), it is
-/// `RetrySafety.Safe` so a Retry policy re-asks, and it keeps the raw bytes
-/// for the caller. `MaxTokens` would falsely blame the token limit and
-/// `Refused` would falsely claim the model declined.
+/// Neither is a successful stop reason: the provider explicitly reported
+/// unusable generation. The response is delivered as ai.errors.ProviderError.
 function _is_malformed_stop(raw: string) -> bool {
     raw == "malformed_model_output" || raw == "malformed_tool_use"
 }
@@ -1411,18 +1565,24 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
     // a truncated or garbled "answer" (see `_is_malformed_stop`).
     if let raw: string = response.stopReason {
         if (_is_malformed_stop(raw)) {
-            throw ai.errors.ParseFailed {
+            throw ai.errors.ProviderError {
                 provider: "aws-bedrock",
-                raw_output: baml.json.stringify(baml.json.to_json(response)),
-            }
+                message: `the model could not produce a valid turn: ${raw}`,
+                error_type: raw,
+                error_code: null,
+                raw_body: baml.json.stringify(response),
+                status_code: null,
+            };
         }
     }
     let message = response.output?.message;
     if (message == null) {
-        throw ai.errors.ParseFailed {
+        throw ai.errors.InvalidResponse {
             provider: "aws-bedrock",
-            raw_output: baml.json.stringify(baml.json.to_json(response)),
-        }
+            message: "the Converse response is missing output.message",
+            raw_body: baml.json.stringify(response),
+            status_code: null,
+        };
     }
     let content: ai.content.ModelBlock[] = [];
     let blocks: ResponseContentBlock[] = message.content ?? [];
@@ -1432,13 +1592,11 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
             null
         } else if let use: ResponseToolUse = block.toolUse {
             let empty: map<string, unknown> = {};
-            content.push(
-                ai.content.ToolUse {
-                    id: use.toolUseId ?? "",
-                    name: use.name ?? "",
-                    args: use.input ?? empty,
-                },
-            );
+            content.push(ai.content.ToolUse {
+                id: use.toolUseId ?? "",
+                name: use.name ?? "",
+                args: use.input ?? empty,
+            });
             null
         } else if let reasoning: ReasoningContent = block.reasoningContent {
             if let summary: string = reasoning.reasoningText?.text {
@@ -1458,12 +1616,27 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
         let raw: string => stop_reason(raw),
     };
 
-    let usage: ai.events.Usage? = match (response.usage) {
+    ai.ModelTurn {
+        calls: [],
+        child_turns: [],
+        content: content,
+        stop_reason: stop,
+    }
+}
+
+/// A response's or stream metadata event's usage, null when it reported none.
+function converse_usage(usage: ConverseUsage?) -> ai.events.Usage? {
+    match (usage) {
         null => null,
         let reported: ConverseUsage => {
             ai.events.Usage {
-                input_tokens: reported.inputTokens ?? 0,
-                output_tokens: reported.outputTokens ?? 0,
+                // inputTokens excludes both cache counts.
+                input_tokens: ai.internal.total_input_tokens(
+                    reported.inputTokens,
+                    reported.cacheReadInputTokens,
+                    reported.cacheWriteInputTokens,
+                ),
+                output_tokens: reported.outputTokens,
                 cached_input_tokens: reported.cacheReadInputTokens,
                 // Converse reports no separate reasoning-token count; the
                 // thinking tokens are already inside outputTokens.
@@ -1473,9 +1646,7 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
                 uncached_input_tokens: reported.inputTokens,
             }
         },
-    };
-
-    ai.ModelTurn { calls: [], content: content, stop_reason: stop, usage: usage }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,12 +1659,19 @@ function invoke(client: root.BedrockClient, input: ai.ModelTurnInput) -> ai.Mode
     );
     let sent = ai.wire.send_as_with_wire<ConverseResponse>(
         request,
-        "aws-bedrock",
-        client.id(),
+        ai.events.ModelKey {
+            provider: client.provider(),
+            model: client.model,
+        },
         capture_wire = client.capture_wire,
     );
-    let turn = parse_response(sent.value);
-    ai.ModelTurn { ...turn, calls: [sent.call], model: client.model }
+    ai.internal.with_own_call(
+        parse_response(sent.value),
+        sent.call,
+        converse_usage(sent.value.usage),
+        client.model,
+        null,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,12 +1823,12 @@ type ConverseStreamEvent = MessageStartEvent
 /// this model does not know.
 function decode_stream_event(event_type: string, data: string) -> ConverseStreamEvent? {
     match (event_type) {
-        "messageStart" => baml.json.from_string<MessageStartEvent>(data),
-        "contentBlockStart" => baml.json.from_string<ContentBlockStartEvent>(data),
-        "contentBlockDelta" => baml.json.from_string<ContentBlockDeltaEvent>(data),
-        "contentBlockStop" => baml.json.from_string<ContentBlockStopEvent>(data),
-        "messageStop" => baml.json.from_string<MessageStopEvent>(data),
-        "metadata" => baml.json.from_string<ConverseStreamMetadataEvent>(data),
+        "messageStart" => baml.json.decode<MessageStartEvent>(data),
+        "contentBlockStart" => baml.json.decode<ContentBlockStartEvent>(data),
+        "contentBlockDelta" => baml.json.decode<ContentBlockDeltaEvent>(data),
+        "contentBlockStop" => baml.json.decode<ContentBlockStopEvent>(data),
+        "messageStop" => baml.json.decode<MessageStopEvent>(data),
+        "metadata" => baml.json.decode<ConverseStreamMetadataEvent>(data),
         _ => null,
     }
 }
@@ -1681,20 +1859,25 @@ class ServiceUnavailableException {
     message: string?,
 }
 
-/// (internal) The HTTP status Bedrock documents for each ConverseStream
-/// exception, so a mid-stream failure classifies (and retries) exactly like
-/// the same failure on `invoke`.
-function _stream_exception_status(exception_type: string) -> int {
-    match (exception_type) {
-        "throttlingException" => 429,
-        "serviceUnavailableException" => 503,
-        "internalServerException" => 500,
-        "modelStreamErrorException" => 424,
-        "modelTimeoutException" => 408,
-        "validationException" => 400,
-        "accessDeniedException" => 403,
-        "resourceNotFoundException" => 404,
-        _ => 500,
+// Exception frame metadata reports a provider failure, not an HTTP status.
+function _stream_provider_error(kind: string, data: string) -> ai.errors.Failure {
+    let body = baml.json.parse(data) catch_all (e) {
+        let parse => {
+            return ai.errors.InvalidResponse {
+                provider: "aws-bedrock",
+                message: parse.to_string(),
+                raw_body: data,
+                status_code: null,
+            };
+        },
+    };
+    ai.errors.ProviderError {
+        provider: "aws-bedrock",
+        message: baml.json.path_or<string>(body, ".message", kind),
+        error_type: kind,
+        error_code: null,
+        raw_body: data,
+        status_code: null,
     }
 }
 
@@ -1708,12 +1891,31 @@ function decode_stream_batch(batch: string) -> ai.stream.Event[] {
         let data = raw.data ?? "";
         if (name.starts_with("exception:")) {
             let exception_type = name.slice(10, name.length());
-            throw ai.errors.classify_http("aws-bedrock", _stream_exception_status(exception_type), data);
+            throw _stream_provider_error(exception_type, data);
         }
         if (name.starts_with("error:")) {
-            throw ai.errors.classify_http("aws-bedrock", 500, `${name.slice(6, name.length())}: ${data}`);
+            // Unmodeled error frames carry a plain-text :error-message header,
+            // unlike modeled exception frames with JSON payloads.
+            throw ai.errors.ProviderError {
+                provider: "aws-bedrock",
+                message: data,
+                error_type: name,
+                error_code: name.slice(6, name.length()),
+                raw_body: data,
+                status_code: null,
+            };
         }
-        match (decode_stream_event(name, data)) {
+        let decoded = decode_stream_event(name, data) catch_all (e) {
+            let parse => {
+                throw ai.errors.InvalidResponse {
+                    provider: "aws-bedrock",
+                    message: parse.to_string(),
+                    raw_body: data,
+                    status_code: null,
+                };
+            },
+        };
+        match (decoded) {
             let event: ContentBlockDeltaEvent => {
                 if let text: string = event.delta?.text {
                     out.push(ai.stream.TextDelta { text: text });
@@ -1729,26 +1931,27 @@ function decode_stream_batch(batch: string) -> ai.stream.Event[] {
             let event: MessageStopEvent => {
                 if let raw_stop: string = event.stopReason {
                     if (_is_malformed_stop(raw_stop)) {
-                        throw ai.errors.ParseFailed { provider: "aws-bedrock", raw_output: data }
+                        throw ai.errors.ProviderError {
+                            provider: "aws-bedrock",
+                            message: `the model could not produce a valid turn: ${raw_stop}`,
+                            error_type: raw_stop,
+                            error_code: null,
+                            raw_body: data,
+                            status_code: null,
+                        };
                     }
-                    out.push(
-                        ai.stream.TurnMeta {
-                            stop_reason: stop_reason(raw_stop),
-                            input_tokens: null,
-                            output_tokens: null,
-                        },
-                    );
+                    out.push(ai.stream.TurnMeta {
+                        stop_reason: stop_reason(raw_stop),
+                        usage: null,
+                    });
                 }
                 null
             },
             let event: ConverseStreamMetadataEvent => {
-                out.push(
-                    ai.stream.TurnMeta {
-                        stop_reason: null,
-                        input_tokens: event.usage?.inputTokens,
-                        output_tokens: event.usage?.outputTokens,
-                    },
-                );
+                out.push(ai.stream.TurnMeta {
+                    stop_reason: null,
+                    usage: converse_usage(event.usage),
+                });
                 out.push(ai.stream.TurnDone {});
                 null
             },
@@ -1766,31 +1969,7 @@ function decode_stream_batch(batch: string) -> ai.stream.Event[] {
 function _stream_open_failure(error: baml.errors.Io | baml.errors.Timeout) -> never {
     match (error) {
         let timeout: baml.errors.Timeout => throw timeout,
-        let io: baml.errors.Io => {
-            let prefix = "SSE request failed with status ";
-            let message = io.message;
-            if (message.starts_with(prefix)) {
-                let rest = message.slice(prefix.length(), message.length());
-                if let separator: int = rest.index_of(":") {
-                    let status = baml.Int.parse(rest.slice(0, separator)) catch_all (e) {
-                        _ => 0,
-                    };
-                    if (status > 0) {
-                        throw ai.errors.classify_http(
-                            "aws-bedrock",
-                            status,
-                            rest.slice(separator + 1, rest.length()).trim(),
-                        );
-                    }
-                }
-            }
-            throw ai.errors.NetworkFailure {
-                status_code: null,
-                provider: "aws-bedrock",
-                detail: `transport failed before a response arrived: ${message}`,
-                raw_body: null,
-            }
-        },
+        let io: baml.errors.Io => throw ai.wire.sse_failure("aws-bedrock", io),
     }
 }
 
@@ -1801,7 +1980,10 @@ function invoke_stream(
     input: ai.ModelTurnInput,
 ) -> ai.stream.TurnStream {
     let limits = ai.LlmTimeoutOptions._resolve(client.timeout);
-    let request = limits._apply(sign(client, build_request(client, input, preview = false, stream = true)));
+    let request = limits._apply(sign(
+        client,
+        build_request(client, input, preview = false, stream = true),
+    ));
     let started = baml.time.Instant.now();
     let sse = baml.http.send_sse(request) catch (e) {
         baml.errors.Io => _stream_open_failure(e),
@@ -1821,13 +2003,16 @@ function invoke_stream(
         timeout_options = limits,
         dispatched = started,
     );
-    let call = ai.events.LLMCall {
-        client_name: client.id(),
-        provider: "aws-bedrock",
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: client.provider(),
+            model: client.model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: null,
-            ttft_ms: null,
+            start_time: started,
+            duration: null,
+            ttft: null,
         },
         http_request: if (client.capture_wire) {
             baml.http.Request {
@@ -1839,17 +2024,15 @@ function invoke_stream(
         } else {
             null
         },
-        http_response: ai.events.HttpResponse { status: sse.status_code, headers: sse.headers, body: null },
-        usage: null,
-        selected: true,
-        sse_responses: if (client.capture_wire) {
-            []
-        } else {
-            null
+        http_response: ai.events.HttpResponse {
+            status: sse.status_code,
+            headers: sse.headers,
+            body: null,
         },
+        sse_responses: if (client.capture_wire) { [] } else { null },
     };
-    stream._calls = [call];
     stream._wire_call = call;
+    stream._requested_model = client.model;
     stream._call_started = started;
     stream._ttft_from = baml.time.Instant.now();
     stream._capture_sse = client.capture_wire;

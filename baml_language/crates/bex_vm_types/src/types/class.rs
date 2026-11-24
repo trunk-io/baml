@@ -1,21 +1,25 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use indexmap::IndexMap;
 
-use crate::{
-    AtomicValueSlot, CleanupLatch, HeapPtr, ObjectIndex, RuntimeTy, Value, types::TypeValue,
-};
+use crate::{HeapPtr, ObjectIndex, RuntimeTy, types::TypeValue};
 
 /// A field within a runtime class, carrying type and schema metadata.
+// Each bool is one flag attribute of the declaration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent flag per attribute the source can write; no combination is invalid"
+)]
 pub struct ClassField {
     pub name: String,
     /// Used by paths that don't care about parametric class type-args
     /// (codegen, `sys_ops` walking, output-format rendering).  For typed
-    /// runtime walking against an `Instance::class_type_args` binding, use
+    /// runtime walking against an instance's class type args, use
     /// `field_template` and call `substitute` on it instead.
     pub field_type: RuntimeTy,
     /// Field-type template with `TypeArgRef(N)` leaves for class-level
-    /// generic params (`N` indexes into `Instance::class_type_args`).
+    /// generic params (`N` indexes into the instance's class type args).
     ///
     /// Populated by emit using the enclosing class's `generic_params`.  For
     /// non-generic classes this is a fully-realized template (no `TypeArgRef`).
@@ -31,6 +35,20 @@ pub struct ClassField {
     /// `@stream.must_exist`: the field has no default, so its class has no
     /// partial parse until the field is present.
     pub must_exist: bool,
+    /// `@json.rename`: the field's JSON key, under every naming.
+    pub json_rename: Option<String>,
+    /// `@json.flatten`: the field holds every key no other field took, and
+    /// writes them next to the other fields.
+    pub json_flatten: bool,
+    /// `@json.fallback`: the field holds the whole object, and is all its
+    /// class writes.
+    pub json_fallback: bool,
+    /// `@@json.omit_nulls` on the class, and the field is optional: it is not
+    /// written while it holds `null`.
+    pub json_omit_null: bool,
+    /// `@trace.redact`: telemetry records a redaction in place of the field's
+    /// value.
+    pub redact: bool,
 
     /// The exact `type` operand a runtime-constructed field was built from, so
     /// reflection reads back the definitions it carried, not just its shape.
@@ -38,18 +56,43 @@ pub struct ClassField {
     pub runtime_type: Option<TypeValue>,
 }
 
+/// What a class's instances are made of.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub enum ClassBody {
+    /// BAML fields, with type and schema metadata: an instance is a cell
+    /// with one slot per field, read through
+    /// [`InstanceRef`](crate::InstanceRef).
+    Fields(Vec<ClassField>),
+    /// `@@rust_type("Kind")`: an instance is a
+    /// [`RustInstance`](super::RustInstance) holding the kind's payload, which
+    /// only the runtime builds.
+    RustType(baml_base::RustPayloadKind),
+}
+
+/// Why an instance of a class cannot be built from field values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unbuildable {
+    /// A `@@rust_type` class: its state is Rust's, which only the runtime
+    /// builds.
+    RustType(baml_base::RustPayloadKind),
+    /// A class with fields whose values are the runtime's own (a
+    /// `reflect.Package`): it crosses as `crossing`, never by its fields.
+    RuntimeOwned(baml_type::ClassCrossing),
+}
+
 /// Runtime class representation.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct Class {
-    /// How this declaration is named: package-qualified for a compiled class,
-    /// a bare item name for a runtime-created one. Display and boundary
-    /// spelling only — identity is `type_tag` and the declaration object
-    /// itself. Use `name.display_name()` for the display string (e.g.
-    /// "ai.PromptMessage" or "Person").
-    pub name: crate::DeclarationName,
+    /// Where this class is declared inside its package: its namespace path
+    /// and item name (a class minted through `reflect` has only the item
+    /// name). Its own coordinates, and all of its name it carries — see
+    /// [`Self::name`]. Never an identity: that is `type_tag` and the
+    /// declaration object itself.
+    pub path: super::LocalName,
 
-    /// Class fields with type and schema metadata.
-    pub fields: Vec<ClassField>,
+    /// What the class's instances are made of: BAML fields, or the Rust
+    /// state of a `@@rust_type` class.
+    pub body: ClassBody,
 
     /// Class-level description for LLM prompt schema rendering.
     pub description: Option<String>,
@@ -65,6 +108,15 @@ pub struct Class {
     /// the whole object is complete.
     pub stream_done: bool,
 
+    /// `@@trace.redact`: telemetry records a redaction in place of every
+    /// instance of the class.
+    pub redact: bool,
+
+    /// How the compiler decided an instance crosses the host boundary; a
+    /// class built through `reflect` is `Fields`. Read through
+    /// [`Self::crossing`], which every crossing in either direction asks.
+    pub declared_crossing: baml_type::ClassCrossing,
+
     /// This class's head identity: assigned by the linker (`CLASS_BASE +` the
     /// class's object index in the image) or, for a runtime-created class,
     /// minted fresh by the grafter; in a unit it holds the class's own object
@@ -72,11 +124,12 @@ pub struct Class {
     /// the identity a `TypeHead` referring to this class compares by.
     pub type_tag: baml_type::typetag::TypeTag,
 
-    /// BEP-042: `true` if this class defines a magic `cleanup(self) -> void`
-    /// finalizer. Set at emit time. The GC checks this bit to decide whether an
-    /// instance is finalizable — so the common case (no `cleanup`) is a single
-    /// flag read and never enters finalization.
-    pub has_cleanup: bool,
+    /// The class's finalizer (BEP-042), as its position in [`methods`](Self::methods),
+    /// or `None` for a class without one. The checker decides which method is
+    /// the finalizer; emit records where it placed that method. The position
+    /// is validated against the table at load (`Program::validate`), so reading
+    /// it needs no name and cannot miss.
+    pub cleanup: Option<usize>,
 
     /// Number of generic params the class itself declares (`GenericBox<T>` ⇒ 1,
     /// non-generic ⇒ 0). A method's `display_type_params` are De Bruijn-ordered
@@ -101,6 +154,11 @@ pub struct Class {
     /// export table names a method (`FnPath::Method`), and how a consumer
     /// binds one without a rendered spelling.
     pub methods: IndexMap<baml_type::Name, ClassMethodDef>,
+
+    /// The definition telemetry recorded for this class, made by the first
+    /// recorded capture that names it and dropped with the class.
+    #[borsh(skip)]
+    pub telemetry_definition: btel_types::DefinitionCell,
 }
 
 /// One inherent method of a [`Class`]: the pooled function on the wire, bound
@@ -118,89 +176,81 @@ pub struct ClassMethodDef {
     pub function_ptr: HeapPtr,
 }
 
-impl std::fmt::Display for Class {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<class {}>", self.name)
-    }
-}
-
-/// Runtime instance representation.
-#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
-pub struct Instance {
-    /// Pointer to the class object in the heap.
-    pub class: HeapPtr,
-
-    /// Resolved class-level type args at construction time.  Empty when the
-    /// class is non-generic.  De Bruijn-ordered to match
-    /// `enclosing_generic_params()`: index 0 = first class param, etc.
-    ///
-    /// Boxed (immutable after construction) rather than a `Vec` so `Instance`
-    /// stays within `Object`'s 64-byte budget once the `cleaned` latch is added
-    /// — matching the existing `Box<[RuntimeTy]>` convention for type-arg lists.
-    pub class_type_args: Box<[crate::RealizedTy]>,
-
-    /// Fields are accessed by index. No string lookups. Each slot is atomic so
-    /// racing field reads/writes across `spawn` fibers cannot become a Rust
-    /// data race.
-    pub fields: Vec<AtomicValueSlot>,
-
-    /// BEP-042 `cleanup` run-once latch. `false` for a fresh instance; flipped
-    /// `true` by the first `cleanup` invocation (explicit, `defer`, or the GC
-    /// finalizer). Only classes with a `cleanup` method ever read or write it;
-    /// for every other instance it is an inert `false`.
-    pub cleaned: CleanupLatch,
-}
-
-impl Instance {
-    pub fn new(
-        class: HeapPtr,
-        class_type_args: Box<[crate::RealizedTy]>,
-        fields: Vec<Value>,
-    ) -> Self {
-        Self {
-            class,
-            class_type_args,
-            fields: fields.into_iter().map(AtomicValueSlot::new).collect(),
-            cleaned: CleanupLatch::new(false),
+impl Class {
+    /// How an instance crosses the host boundary. A class with a dynamic
+    /// tag (declared at run time, through `reflect` or a runtime-compiled
+    /// package) crosses as an opaque reference whatever it declares: no host
+    /// has its declaration to build or read one by.
+    #[must_use]
+    pub fn crossing(&self) -> baml_type::ClassCrossing {
+        if self.type_tag.is_dynamic() {
+            baml_type::ClassCrossing::Opaque
+        } else {
+            self.declared_crossing
         }
     }
 
-    #[inline]
-    pub fn field_len(&self) -> usize {
-        self.fields.len()
+    /// The fields an instance is built from, or why none can be: the one
+    /// question every structural builder (decoding, parsing, reflection,
+    /// defaults) asks. A class built by reflection declares `Fields` and is
+    /// buildable whatever its dynamic tag makes [`Self::crossing`] say.
+    pub fn buildable_fields(&self) -> Result<&[ClassField], Unbuildable> {
+        match &self.body {
+            ClassBody::RustType(kind) => Err(Unbuildable::RustType(*kind)),
+            ClassBody::Fields(_) if self.declared_crossing.runtime_owned() => {
+                Err(Unbuildable::RuntimeOwned(self.declared_crossing))
+            }
+            ClassBody::Fields(fields) => Ok(fields),
+        }
     }
 
-    #[inline]
-    pub fn try_load_field(&self, idx: usize) -> Option<Value> {
-        self.fields.get(idx).map(AtomicValueSlot::load)
+    /// The fields the class declares, for describing it (reflection,
+    /// telemetry, display): none for a `@@rust_type` class. Code that builds
+    /// an instance asks [`Self::buildable_fields`] instead, which refuses one.
+    pub fn declared_fields(&self) -> &[ClassField] {
+        match &self.body {
+            ClassBody::Fields(fields) => fields,
+            ClassBody::RustType(_) => &[],
+        }
     }
 
-    #[inline]
-    pub fn load_field(&self, idx: usize) -> Value {
-        self.fields[idx].load()
+    /// The fields of a class whose instances are field-backed cells. Only
+    /// such an instance's own class is asked, and only a `Fields` class has
+    /// them: every builder goes through [`Self::buildable_fields`] or
+    /// is the runtime building a class it declared with fields.
+    #[track_caller]
+    pub fn instance_fields(&self) -> &[ClassField] {
+        match &self.body {
+            ClassBody::Fields(fields) => fields,
+            ClassBody::RustType(kind) => panic!(
+                "`{}` is a `@@rust_type(\"{}\")` class, which has no `Instance`s",
+                self.path,
+                kind.spelling().unwrap_or("Foreign"),
+            ),
+        }
     }
 
-    #[inline]
-    pub fn try_store_field(&self, idx: usize, value: Value) -> Result<(), usize> {
-        let Some(field) = self.fields.get(idx) else {
-            return Err(self.fields.len());
-        };
-        field.store(value);
-        Ok(())
+    /// How this class is named: its path under its package's display name
+    /// for a class a package declares (`ai.PromptMessage`), the bare path for
+    /// one no package owns (`Person`). Display and boundary spelling only —
+    /// see [`declaration_name`](super::declaration_name).
+    #[must_use]
+    pub fn name(&self) -> crate::DeclarationName {
+        self.owner.name_of(&self.path)
     }
 
-    #[inline]
-    pub fn store_field(&self, idx: usize, value: Value) {
-        self.fields[idx].store(value);
-    }
-
-    pub fn field_values(&self) -> impl Iterator<Item = Value> + '_ {
-        self.fields.iter().map(AtomicValueSlot::load)
+    /// This class's finalizer, if it declares one: the method at the recorded
+    /// position of its method table. The class is the identity here — nothing
+    /// renders a name to find the function.
+    #[must_use]
+    pub fn cleanup(&self) -> Option<HeapPtr> {
+        self.cleanup
+            .map(|position| self.methods[position].function_ptr)
     }
 }
 
-impl std::fmt::Display for Instance {
+impl std::fmt::Display for Class {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<instance of {:p}>", self.class.as_ptr())
+        write!(f, "<class {}>", self.name())
     }
 }

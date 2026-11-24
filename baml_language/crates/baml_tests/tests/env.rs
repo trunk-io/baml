@@ -97,7 +97,7 @@ async fn env_sugar_is_a_late_bound_ref() {
     function main() -> string {
         load_const "BAML_TEST_SUGAR_REF_VAR"
         call baml.env.ref
-        load_field .name
+        load_field_local .name
         return
     }
     "#);
@@ -138,7 +138,7 @@ async fn runtime_constructed_openai_client_defaults_api_key_from_env() {
                     prompt: spec.prompt_template,
                     journal: ai.Journal { log: [] },
                     toolbox: ai.tools.Toolbox.new([]),
-                    output_type: reflect.Type.of<string>(),
+                    output_type: string.type(),
                 };
                 openai.internal.render(
                     openai.ResponsesClient.new(model = "gpt-4o"),
@@ -172,7 +172,7 @@ async fn anthropic_clients_default_api_key_from_env_at_runtime() {
                     prompt: spec.prompt_template,
                     journal: ai.Journal { log: [] },
                     toolbox: ai.tools.Toolbox.new([]),
-                    output_type: reflect.Type.of<string>(),
+                    output_type: string.type(),
                 };
                 let runtime = anthropic.internal._request(
                     anthropic.Client.new(model = "claude-sonnet-4-20250514"),
@@ -186,4 +186,55 @@ async fn anthropic_clients_default_api_key_from_env_at_runtime() {
     let headers = result_headers(output.result);
     let expected = BexExternalValue::String("sk-ant-from-env".into());
     assert_eq!(headers.get("runtime"), Some(&expected));
+}
+
+// ─── HTTP proxy variables ─────────────────────────────────────────────────────
+
+/// The runtime shares HTTP clients across requests, and reqwest reads the
+/// proxy variables when it builds one. Setting or clearing a proxy between
+/// requests must still apply to the next request.
+#[tokio::test]
+async fn http_proxy_change_applies_to_next_request() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+
+    async fn answering(body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+    let origin = answering("origin").await;
+    // A plain-HTTP proxy receives the request itself; this one answers it.
+    let proxy = answering("proxy").await;
+    let program = format!(
+        r#"function main() -> string {{ baml.http.fetch("{}/").text() }}"#,
+        origin.uri()
+    );
+    let body = |text: &str| BexExternalValue::String(text.to_string().into());
+
+    // Start from no proxy configuration: an inherited HTTP_PROXY or ALL_PROXY
+    // would send the first request elsewhere, an inherited NO_PROXY covering
+    // 127.0.0.1 would bypass the proxy, and REQUEST_METHOD makes reqwest
+    // ignore HTTP_PROXY. nextest runs each test in its own process, so
+    // nothing is restored.
+    unsafe {
+        for var in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+    assert_eq!(baml_test!(&program).result, Ok(body("origin")));
+    unsafe { std::env::set_var("HTTP_PROXY", proxy.uri()) };
+    assert_eq!(baml_test!(&program).result, Ok(body("proxy")));
+    unsafe { std::env::remove_var("HTTP_PROXY") };
+    assert_eq!(baml_test!(&program).result, Ok(body("origin")));
 }

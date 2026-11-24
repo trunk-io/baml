@@ -1,121 +1,71 @@
-// `baml auth` — a human email login via WorkOS CLI Auth (`baml auth login`).
-//
-// This replaces the earlier agent-registration (auth.md) design: identity
-// for feedback is now PostHog-first (see `feedback_command.rs`) — anonymous
-// reporters get a locally generated PostHog distinct id, and logging in
-// exists to attach a verified email to that id. `baml auth login` runs the
-// OAuth 2.0 device authorization grant (RFC 8628): show a one-time code,
-// the user confirms it in a browser, the CLI polls for tokens. On success,
-// if an anonymous distinct id exists, a PostHog `$identify` event merges the
-// anonymous person into the identified one — retroactively attributing all
-// previously sent feedback.
-//
-// Credentials live in `~/.baml/creds.json` (0600). The PostHog distinct id
-// survives logout so anonymous continuity is never lost.
+//! Boundary device login for the CLI. Identity sessions use the shared native
+//! client.
 
 use std::{
-    path::PathBuf,
+    io::{self, Write},
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-// WorkOS client id: baked in at build time from BAML_WORKOS_CLIENT_ID (set
-// by release CI), overridable at runtime by the same variable. A public
-// OAuth identifier, not a secret — but environment-specific, so it doesn't
-// belong in source.
-const BUILD_CLIENT_ID: Option<&str> = option_env!("BAML_WORKOS_CLIENT_ID");
-const DEFAULT_API_DOMAIN: &str = "https://api.workos.com";
+use crate::{
+    ExitCode,
+    output::{Command, CommandContext, Outcome, Report, Style, run_command},
+    recordings::CloudScope,
+};
 
-/// Hard cap on how long the device-authorization poll loop waits for the
-/// user to confirm.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Per-request cap so a black-holed network fails a login step instead of
-/// stalling it indefinitely.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-
-/// A blocking HTTP client with [`REQUEST_TIMEOUT`] applied.
-pub(crate) fn http_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        // Falls back to default settings only if the builder ever fails,
-        // which requires a broken TLS backend; a login attempt should still
-        // proceed rather than abort here.
-        .unwrap_or_default()
-}
-
-fn env_or(var: &str, default: &str) -> String {
-    std::env::var(var)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// WorkOS API domain: hosts the CLI Auth device-authorization endpoints.
-fn api_domain() -> String {
-    env_or("BAML_WORKOS_API_DOMAIN", DEFAULT_API_DOMAIN)
-}
-
-/// Resolves the WorkOS client id from the runtime environment or the
-/// build-time default. Blank values are treated as unset (CI expands a
-/// missing repo variable to an empty string).
-///
-/// Errors:
-/// - When neither source provides a non-blank value.
-fn client_id() -> Result<String> {
-    std::env::var("BAML_WORKOS_CLIENT_ID")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            BUILD_CLIENT_ID
-                .filter(|v| !v.trim().is_empty())
-                .map(str::to_string)
-        })
-        .context(
-            "This build has no WorkOS environment configured. Set \
-             BAML_WORKOS_CLIENT_ID (release builds bake it in at compile time).",
-        )
-}
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuthCommands {
     #[command(about = "Log in to Boundary with your email")]
     Login(LoginArgs),
-    #[command(about = "Show the current identity")]
-    Whoami(WhoamiArgs),
-    #[command(about = "Log out (keeps your anonymous feedback id)")]
+    #[command(about = "Verify authentication and show the selected project")]
+    Status(StatusArgs),
+    #[command(about = "Log out")]
     Logout(LogoutArgs),
     #[command(about = "Print a valid access token", hide = true)]
     Token(TokenArgs),
 }
 
 impl AuthCommands {
-    pub fn run(&self) -> Result<crate::ExitCode> {
+    pub fn run(&self, cx: &CommandContext, scope: &CloudScope) -> Result<ExitCode> {
         match self {
-            AuthCommands::Login(args) => args.run(),
-            AuthCommands::Whoami(args) => args.run(),
-            AuthCommands::Logout(args) => args.run(),
-            AuthCommands::Token(args) => args.run(),
+            AuthCommands::Login(args) => Self::run_one(args, cx),
+            AuthCommands::Status(_) => Self::run_one(&Status { scope }, cx),
+            AuthCommands::Logout(args) => Self::run_one(args, cx),
+            AuthCommands::Token(args) => Self::run_one(args, cx),
         }
+    }
+
+    /// Runs one auth command, reporting transport failures as actionable
+    /// Boundary diagnostics.
+    pub fn run_one<C: Command>(command: &C, cx: &CommandContext) -> Result<ExitCode> {
+        run_command(command, cx).map_err(|error| match error.downcast::<bcs_api::Error>() {
+            Ok(source) => bcs_api::diagnostics::Context {
+                endpoint: crate::cloud_config::login_endpoint(cx.project_dir.as_deref()).ok(),
+                source: bcs_api::diagnostics::CredentialSource::Configured,
+                operation: bcs_api::diagnostics::Operation::Authentication,
+            }
+            .report(source, bcs_api::diagnostics::Outcome::AuthenticationFailed)
+            .into(),
+            Err(error) => error,
+        })
     }
 }
 
-/// `baml auth login` — device-code email login.
+/// `baml cloud auth login`: device-code email login.
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
   Log in using a browser:
-    baml auth login
+    baml cloud auth login
 
   Print the verification URL instead:
-    baml auth login --no-open")]
+    baml cloud auth login --no-open")]
 pub(crate) struct LoginArgs {
     /// Print the verification URL instead of opening a browser.
     #[arg(long)]
@@ -123,23 +73,25 @@ pub(crate) struct LoginArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(after_long_help = "Examples:\n  Show the current identity:\n    baml auth whoami")]
-pub(crate) struct WhoamiArgs {}
+#[command(
+    after_long_help = "Examples:\n  Verify authentication and show the selected project:\n    baml cloud auth status"
+)]
+pub(crate) struct StatusArgs {}
 
 #[derive(Args, Debug)]
-#[command(after_long_help = "Examples:\n  Log out:\n    baml auth logout")]
+#[command(after_long_help = "Examples:\n  Log out:\n    baml cloud auth logout")]
 pub(crate) struct LogoutArgs {}
 
 #[derive(Args, Debug)]
 pub(crate) struct TokenArgs {}
 
-impl LoginArgs {
-    /// Runs `baml auth login`.
+impl Command for LoginArgs {
+    type Output = ();
+
+    /// Runs `baml cloud auth login`.
     ///
-    /// Device-code login via WorkOS CLI Auth, then — when an anonymous
-    /// PostHog distinct id exists — sends a `$identify` event so all
-    /// feedback previously reported anonymously is merged into the now
-    /// identified person.
+    /// Device-code login via the Boundary gateway. The persistent credential
+    /// goes to protected storage; temporary access stays in this process.
     ///
     /// Returns:
     /// - `ExitCode::Success` once credentials are persisted.
@@ -147,495 +99,319 @@ impl LoginArgs {
     /// Errors:
     /// - When authorization can't be started, the user denies the login,
     ///   the code expires, or [`LOGIN_TIMEOUT`] elapses.
-    pub fn run(&self) -> Result<crate::ExitCode> {
+    fn run(&self, cx: &CommandContext) -> Result<Outcome<()>> {
         let reporter = crate::reporter::Reporter::new();
-        let mut existing = Credentials::read()?.unwrap_or_default();
+        let project_dir = cx.project_dir.as_deref();
+        // Check protected storage before asking the user to approve a login.
+        let endpoint = crate::cloud_config::login_endpoint(project_dir)?;
+        let existing = bcs_api::store(&endpoint).read()?;
         // Only skip the flow when the stored session can still produce a
         // token; a session that can't refresh falls through to a fresh
         // login instead of dead-ending against "already logged in".
-        if let Some(email) = existing.user_email.clone() {
-            if existing.access_token().is_ok() {
-                existing.write()?;
-                reporter.status("Login", format!("already logged in as {email}"));
-                return Ok(crate::ExitCode::Success);
+        if let Some(email) = existing.map(|stored| stored.caller.email) {
+            match boundary_session(project_dir) {
+                Ok(session) => {
+                    reporter.status(
+                        "Login",
+                        format!("already logged in as {}", session.caller.email),
+                    );
+                    return Ok(Outcome::ok(()));
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<bcs_api::Error>()
+                        .is_some_and(|failure| {
+                            failure.status() == Some(reqwest::StatusCode::UNAUTHORIZED)
+                        }) =>
+                {
+                    reporter.status(
+                        "Login",
+                        format!("the session for {email} was revoked; logging in again"),
+                    );
+                }
+                Err(error) => return Err(error.context("Could not check existing Boundary login")),
             }
-            reporter.status(
-                "Login",
-                format!("the session for {email} has expired; logging in again"),
-            );
         }
-        let creds = device_login(self.no_open, existing)?;
-        match creds.user_email.as_deref() {
-            Some(email) => reporter.finish("Login", format!("logged in as {email}")),
-            None => reporter.finish("Login", "logged in"),
-        }
-        Ok(crate::ExitCode::Success)
+        let email = device_login(self.no_open, project_dir)?;
+        reporter.finish("Login", format!("logged in as {email}"));
+        Ok(Outcome::ok(()))
     }
 }
 
-/// Runs the device authorization flow and persists the resulting session,
-/// preserving (and identifying) any anonymous PostHog distinct id carried in
-/// `existing`.
+/// Runs the device authorization flow, persists the resulting session and
+/// returns the caller's email.
 ///
-/// Parameters:
-/// - `no_open`: Print the verification URL instead of opening a browser.
-/// - `existing`: Prior credential state; the PostHog distinct id (if any)
-///   survives into the new session.
-///
-/// Returns:
-/// - The persisted, logged-in credentials.
-///
-/// Errors:
-/// - When authorization can't be started or the poll ends in denial,
-///   expiry, or timeout.
-pub(crate) fn device_login(no_open: bool, existing: Credentials) -> Result<Credentials> {
+/// Errors when authorization can't be started or the poll ends in denial,
+/// expiry, or timeout.
+fn device_login(no_open: bool, project_dir: Option<&Path>) -> Result<String> {
+    use bcs_api::{Client, LoginPoll, StoredSession};
     let reporter = crate::reporter::Reporter::new();
-    let client_id = client_id()?;
-    let device: DeviceAuthResponse = post_form(
-        &format!("{}/user_management/authorize/device", api_domain()),
-        &[("client_id", client_id.as_str())],
-    )
-    .context("Failed to start device authorization")?;
-
+    let endpoint = crate::cloud_config::login_endpoint(project_dir)?;
+    let store = bcs_api::store(&endpoint);
+    let client = Client::new(endpoint)?;
+    let device = client.start().context("Failed to start Boundary login")?;
     reporter.status(
         "Login",
-        format!("first, copy your one-time code: {}", device.user_code),
+        format!("copy your one-time code: {}", device.user_code),
     );
-    let open_uri = device
-        .verification_uri_complete
-        .as_deref()
-        .unwrap_or(&device.verification_uri);
-    if no_open {
-        reporter.status(
-            "Login",
-            format!("then log in at: {}", device.verification_uri),
-        );
-    } else {
-        reporter.status("Login", "then confirm the login in your browser...");
-        if webbrowser::open(open_uri).is_err() {
-            reporter.status(
-                "Login",
-                format!(
-                    "could not open a browser; log in at: {}",
-                    device.verification_uri
-                ),
-            );
-        }
+    if no_open || webbrowser::open(&device.verification_uri).is_err() {
+        reporter.status("Login", format!("confirm at: {}", device.verification_uri));
     }
-    reporter.status(
-        "Waiting",
-        format!(
-            "for confirmation (times out in {} minutes, ctrl-c to cancel)",
-            LOGIN_TIMEOUT.as_secs() / 60
-        ),
-    );
-
-    let tokens = poll_token_endpoint(
-        &format!("{}/user_management/authenticate", api_domain()),
-        &[
-            ("grant_type", DEVICE_GRANT_TYPE),
-            ("client_id", &client_id),
-            ("device_code", &device.device_code),
-        ],
-        device.interval,
-    )?;
-
-    let user = tokens.user.as_ref();
-    let creds = Credentials {
-        // Seed the distinct id when missing so the `$identify` below always
-        // merges: one PostHog person per machine whether feedback happens
-        // before or after the first login.
-        posthog_distinct_id: existing
-            .posthog_distinct_id
-            .clone()
-            .or_else(|| Some(uuid::Uuid::new_v4().to_string())),
-        user_id: user.and_then(|u| u.id.clone()),
-        user_email: user.and_then(|u| u.email.clone()),
-        access_token: Some(tokens.access_token),
-        expires_at: tokens.expires_in.map(|s| now_unix() + s),
-        refresh_token: tokens.refresh_token,
-    };
-    creds.write()?;
-
-    // Retroactive attribution: merge the anonymous person (all feedback sent
-    // before login) into the identified one. Best-effort — a failed identify
-    // never fails the login; the next one retries the merge.
-    crate::feedback_command::identify(&creds);
-
-    Ok(creds)
-}
-
-impl WhoamiArgs {
-    #[allow(clippy::print_stdout)]
-    pub fn run(&self) -> Result<crate::ExitCode> {
-        match Credentials::read()? {
-            Some(creds) if creds.user_email.is_some() => {
-                println!(
-                    "logged in as {}",
-                    creds.user_email.as_deref().unwrap_or("<unknown>")
-                );
-                Ok(crate::ExitCode::Success)
-            }
-            Some(creds) if creds.posthog_distinct_id.is_some() => {
-                println!(
-                    "anonymous (feedback id {}); run `baml auth login` to attach your email",
-                    creds.posthog_distinct_id.as_deref().unwrap_or("<unknown>")
-                );
-                Ok(crate::ExitCode::Success)
-            }
-            _ => {
-                println!("not logged in");
-                Ok(crate::ExitCode::Other)
-            }
-        }
-    }
-}
-
-impl LogoutArgs {
-    /// Removes the login session. The PostHog distinct id is preserved so
-    /// anonymous feedback continuity — and a future re-login's retroactive
-    /// attribution — still work.
-    pub fn run(&self) -> Result<crate::ExitCode> {
-        let reporter = crate::reporter::Reporter::new();
-        match Credentials::read()? {
-            None => reporter.status("Logout", "not logged in"),
-            Some(creds) if creds.user_email.is_none() && creds.access_token.is_none() => {
-                reporter.status("Logout", "not logged in");
-            }
-            Some(creds) => {
-                let anonymous = Credentials {
-                    posthog_distinct_id: creds.posthog_distinct_id,
-                    ..Credentials::default()
-                };
-                anonymous.write()?;
-                reporter.status("Logout", "logged out");
-            }
-        }
-        Ok(crate::ExitCode::Success)
-    }
-}
-
-impl TokenArgs {
-    #[allow(clippy::print_stdout)]
-    pub fn run(&self) -> Result<crate::ExitCode> {
-        let reporter = crate::reporter::Reporter::new();
-        let mut creds = match Credentials::read()? {
-            Some(creds) => creds,
-            None => return Ok(reporter.fatal("not logged in; run `baml auth login`")),
-        };
-        // The token itself is this command's data output (stdout); auth
-        // failures are fatal diagnostics.
-        match creds.access_token() {
-            Ok(token) => println!("{token}"),
-            Err(e) => return Ok(reporter.fatal(e)),
-        }
-        creds.write()?;
-        Ok(crate::ExitCode::Success)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Device authorization
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct DeviceAuthResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    verification_uri_complete: Option<String>,
-    /// Suggested polling interval in seconds.
-    interval: Option<u64>,
-}
-
-/// Polls a token endpoint until the pending grant resolves.
-///
-/// Speaks the RFC 8628 error vocabulary: `authorization_pending` sleeps the
-/// current interval, `slow_down` widens it by five seconds, and
-/// `access_denied` / `expired_token` are terminal.
-///
-/// Errors:
-/// - When the user denies the login, the code expires, an unrecognized
-///   error is returned, or [`LOGIN_TIMEOUT`] elapses.
-fn poll_token_endpoint(
-    endpoint: &str,
-    form: &[(&str, &str)],
-    server_interval: Option<u64>,
-) -> Result<TokenResponse> {
-    let client = http_client();
+    reporter.status("Waiting", "for browser confirmation (ctrl-c to cancel)");
     let deadline = std::time::Instant::now() + LOGIN_TIMEOUT;
-    let mut interval = server_interval
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_POLL_INTERVAL);
+    let mut interval = Duration::from_secs(u64::from(device.interval_seconds.max(1)));
     loop {
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "Timed out after {} minutes waiting for the login to be confirmed.",
-                LOGIN_TIMEOUT.as_secs() / 60
-            );
+        if now_unix() >= device.expires_at || std::time::Instant::now() >= deadline {
+            return Err(bcs_api::Error::LoginExpired.into());
         }
-        let resp = client
-            .post(endpoint)
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(encode_form(form))
-            .send()
-            .context("Failed to reach the auth server")?;
-        let status = resp.status();
-        let value: serde_json::Value = resp
-            .json()
-            .context("Failed to parse token endpoint response")?;
-
-        if status.is_success() {
-            return serde_json::from_value(value).context("Failed to parse token response");
-        }
-
-        let error = value.get("error").and_then(|e| e.as_str()).unwrap_or("");
-        match error {
-            "authorization_pending" => std::thread::sleep(interval),
-            "slow_down" => {
-                interval += Duration::from_secs(5);
-                std::thread::sleep(interval);
+        std::thread::sleep(
+            interval.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+        match client.poll(&device.device_code)? {
+            LoginPoll::Pending { interval_seconds } => {
+                interval = Duration::from_secs(u64::from(interval_seconds.max(1)))
             }
-            "access_denied" => anyhow::bail!("Login was denied in the browser."),
-            "expired_token" => anyhow::bail!(
-                "the confirmation code expired before it was used; run `baml auth login` again"
-            ),
-            _ => anyhow::bail!("Auth server returned {status}: {value}"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Request plumbing
-// ---------------------------------------------------------------------------
-
-/// WorkOS authenticate response. Field presence varies by grant, so
-/// everything but `access_token` is optional.
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
-    user: Option<TokenUser>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenUser {
-    id: Option<String>,
-    email: Option<String>,
-}
-
-/// POSTs a form-encoded body and deserializes a successful JSON response.
-///
-/// Errors:
-/// - On network failure, a non-success status (the response body is
-///   included in the error), or a body that fails to deserialize as `T`.
-fn post_form<T: serde::de::DeserializeOwned>(url: &str, form: &[(&str, &str)]) -> Result<T> {
-    let client = http_client();
-    let resp = client
-        .post(url)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(encode_form(form))
-        .send()
-        .context("Failed to reach the auth server")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("Auth server returned {status}: {body}");
-    }
-    resp.json().context("Failed to parse auth server response")
-}
-
-fn encode_form(form: &[(&str, &str)]) -> String {
-    form.iter()
-        .map(|(k, v)| format!("{k}={}", form_urlencode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// Percent-encodes a form value.
-///
-/// RFC 3986 unreserved characters pass through; every other byte is
-/// `%XX`-encoded.
-fn form_urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
+            LoginPoll::Denied => return Err(bcs_api::Error::LoginDenied.into()),
+            LoginPoll::Expired => return Err(bcs_api::Error::LoginExpired.into()),
+            LoginPoll::Approved { session } => {
+                store.write(&StoredSession::from(&session))?;
+                return Ok(session.caller.email);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
-    out
 }
 
-// ---------------------------------------------------------------------------
-// Credential storage: ~/.baml/creds.json
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub(crate) struct Credentials {
-    /// The PostHog distinct id used for feedback events. Generated locally
-    /// on first anonymous feedback; survives logout so continuity and
-    /// later retroactive attribution keep working.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub posthog_distinct_id: Option<String>,
-    /// WorkOS user id, once logged in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
-    /// Verified email, once logged in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_email: Option<String>,
-    /// Cached WorkOS access token (absent while anonymous).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    access_token: Option<String>,
-    /// Unix seconds; absent means unknown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expires_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refresh_token: Option<String>,
+/// `baml cloud auth status` with the cloud scope it was invoked under.
+struct Status<'a> {
+    scope: &'a CloudScope,
 }
 
-/// Writes a file readable only by the owner (0600 on unix; other
-/// platforms fall back to default permissions). Shared by every store
-/// that persists identity data (`creds.json`, `feedback.json`).
-pub(crate) fn write_owner_only(path: &std::path::Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::{
-            io::Write as _,
-            os::unix::fs::{OpenOptionsExt, PermissionsExt},
+impl Command for Status<'_> {
+    type Output = AuthenticationStatus;
+
+    fn run(&self, cx: &CommandContext) -> Result<Outcome<AuthenticationStatus>> {
+        use bcs_api::diagnostics::{
+            Context as DiagnosticContext, CredentialSource, Operation, Outcome as Failure,
         };
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(content.as_bytes())
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        let root = crate::project_load::find_project_root_from(cx.project_dir.as_deref())?;
+        let boundary = match root.as_deref() {
+            Some(root) => crate::cloud_config::Boundary::read(root)?,
+            None => crate::cloud_config::Boundary::default(),
+        };
+        let endpoint = boundary.endpoint()?;
+        let diagnostic = |source| DiagnosticContext {
+            endpoint: Some(endpoint.clone()),
+            source,
+            operation: Operation::Authentication,
+        };
+        let login_context = diagnostic(CredentialSource::SavedLogin);
+        let report_login = |error| login_context.report(error, Failure::AuthenticationFailed);
+        let api_key = baml_env::string_var("BOUNDARY_API_KEY")?
+            .filter(|key| key != bcs_api::credentials::LOCAL_API_KEY)
+            .map(bcs_api::Secret::new);
+        let project = match (
+            &self.scope.project,
+            baml_env::string_var("BOUNDARY_PROJECT")?,
+        ) {
+            (Some(project), _) => format!("{project} (--project)"),
+            (None, Some(project)) => format!("{project} (BOUNDARY_PROJECT)"),
+            (None, None) => match boundary.project {
+                Some(project) => format!("{project} (baml.toml)"),
+                None if root.is_some() => "Not configured (baml.toml)".into(),
+                None => "Not selected (outside a BAML project)".into(),
+            },
+        };
+        let client = bcs_api::Client::new(endpoint.clone()).map_err(report_login)?;
+        if let Some(key) = &api_key {
+            client.verify_api_key(key).map_err(|error| {
+                diagnostic(CredentialSource::ApiKey).report(error, Failure::AuthenticationFailed)
+            })?;
+        }
+        // Verify the active API key independently of the optional saved login.
+        // A broken saved login remains fatal when it is the only credential.
+        let login = (|| -> std::result::Result<Option<String>, bcs_api::Error> {
+            let store = bcs_api::store(&endpoint);
+            let Some(stored) = store.read()? else {
+                return Ok(None);
+            };
+            let session = client.refresh(&stored)?;
+            store.write(&bcs_api::StoredSession::from(&session))?;
+            Ok(Some(session.caller.email))
+        })();
+        let user = match login {
+            Ok(user) => user,
+            Err(error) if api_key.is_some() => {
+                crate::reporter::Reporter::new().warning(format!(
+                    "Could not verify your saved Boundary login. BOUNDARY_API_KEY is verified.\n\n{error}"
+                ));
+                None
+            }
+            Err(error) => return Err(report_login(error).into()),
+        };
+        let authenticated = user.is_some() || api_key.is_some();
+        let status = AuthenticationStatus {
+            user,
+            api_key: api_key.is_some(),
+            project,
+            endpoint: endpoint.as_str().to_owned(),
+        };
+        Ok(Outcome::new(
+            status,
+            if authenticated {
+                ExitCode::Success
+            } else {
+                ExitCode::Failure
+            },
+        ))
     }
-    #[cfg(not(unix))]
-    std::fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
 }
 
-fn creds_path() -> Result<PathBuf> {
-    Ok(baml_release::baml_home().join("creds.json"))
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthenticationStatus {
+    /// The verified saved login, if any.
+    user: Option<String>,
+    /// Whether a verified `BOUNDARY_API_KEY` is in effect.
+    api_key: bool,
+    /// The selected cloud project and where the selection came from.
+    project: String,
+    endpoint: String,
 }
 
-pub(crate) fn now_unix() -> u64 {
+impl Report for AuthenticationStatus {
+    fn text(&self, out: &mut dyn Write, _style: &Style) -> io::Result<()> {
+        match &self.user {
+            Some(email) => writeln!(out, "User: {email} (verified)")?,
+            None => writeln!(out, "User: Not logged in")?,
+        }
+        if self.api_key {
+            let label = if self.user.is_some() {
+                "Credential overridden by"
+            } else {
+                "Credential"
+            };
+            writeln!(out, "{label}: BOUNDARY_API_KEY (verified)")?;
+        }
+        writeln!(out, "Project: {}", self.project)?;
+        if self.endpoint != bcs_api::auth::DEFAULT_API_URL {
+            writeln!(out, "Endpoint: {}", self.endpoint)?;
+        }
+        Ok(())
+    }
+}
+
+impl Command for LogoutArgs {
+    type Output = ();
+
+    fn run(&self, cx: &CommandContext) -> Result<Outcome<()>> {
+        use bcs_api::Client;
+        let reporter = crate::reporter::Reporter::new();
+        let endpoint = crate::cloud_config::login_endpoint(cx.project_dir.as_deref())?;
+        let store = bcs_api::store(&endpoint);
+        let revocation = match store.read() {
+            Ok(Some(stored)) => {
+                Some(Client::new(endpoint).and_then(|client| client.logout(&stored)))
+            }
+            Ok(None) => None,
+            // Malformed local state must remain removable through logout. Without
+            // a readable session we cannot confirm server-side revocation.
+            Err(error @ bcs_api::Error::InvalidStoredLogin { .. }) => Some(Err(error)),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(revocation) = revocation {
+            store.clear()?;
+            reporter.status("Logout", "local login removed");
+            if let Err(error) = revocation {
+                reporter.warning(format!(
+                    "Boundary could not confirm server-side logout.\nThe saved credential was removed from this machine, but the server session may still be active.\n\n{error}"
+                ));
+            }
+        } else {
+            reporter.status("Logout", "not logged in");
+        }
+        Ok(Outcome::ok(()))
+    }
+}
+
+/// A valid access token.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct Token(String);
+
+impl Report for Token {
+    fn text(&self, out: &mut dyn Write, _style: &Style) -> io::Result<()> {
+        writeln!(out, "{}", self.0)
+    }
+}
+
+impl Command for TokenArgs {
+    type Output = Token;
+
+    fn run(&self, cx: &CommandContext) -> Result<Outcome<Token>> {
+        let session = boundary_session(cx.project_dir.as_deref())?;
+        Ok(Outcome::ok(Token(session.access_token.expose().to_owned())))
+    }
+}
+
+fn boundary_session(project_dir: Option<&Path>) -> Result<bcs_api::Session> {
+    use bcs_api::{Client, StoredSession};
+    let endpoint = crate::cloud_config::login_endpoint(project_dir)?;
+    let store = bcs_api::store(&endpoint);
+    let stored = store
+        .read()?
+        .context("not logged in; run `baml cloud auth login`")?;
+    let session = Client::new(endpoint)?.refresh(&stored)?;
+    store.write(&StoredSession::from(&session))?;
+    Ok(session)
+}
+
+fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-impl Credentials {
-    /// Reads stored credentials from `~/.baml/creds.json`.
-    ///
-    /// Returns:
-    /// - `Ok(None)` when no credentials file exists — a normal state, not
-    ///   an error.
-    ///
-    /// Errors:
-    /// - When the file exists but cannot be read or parsed.
-    pub fn read() -> Result<Option<Self>> {
-        let path = creds_path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let creds = serde_json::from_str(&content)
-            .with_context(|| format!("Malformed credentials in {}", path.display()))?;
-        Ok(Some(creds))
-    }
-
-    /// Persists credentials to `~/.baml/creds.json` with owner-only access.
-    ///
-    /// On Unix the file is created with mode 0600 before any bytes are
-    /// written; there is never a window where the contents are readable by
-    /// other users.
-    pub fn write(&self) -> Result<()> {
-        let path = creds_path()?;
-        write_owner_only(&path, &serde_json::to_string_pretty(self)?)
-    }
-
-    /// Returns a valid access token, refreshing via the OAuth refresh-token
-    /// grant when near expiry. Callers persist afterwards if they want the
-    /// refreshed state kept.
-    ///
-    /// Errors:
-    /// - When not logged in, or the session is expired and cannot be
-    ///   refreshed.
-    pub fn access_token(&mut self) -> Result<&str> {
-        if self.access_token.is_none() {
-            anyhow::bail!("not logged in; run `baml auth login`");
-        }
-        let expired = match self.expires_at {
-            Some(at) => at <= now_unix() + 30,
-            // Unknown expiry: refresh when we can, rather than trusting a
-            // token we can't validate.
-            None => self.refresh_token.is_some(),
-        };
-        if expired {
-            let refresh = self
-                .refresh_token
-                .as_deref()
-                .context("session expired; run `baml auth login` again")?;
-            let tokens: TokenResponse = post_form(
-                &format!("{}/user_management/authenticate", api_domain()),
-                &[
-                    ("grant_type", "refresh_token"),
-                    ("client_id", &client_id()?),
-                    ("refresh_token", refresh),
-                ],
-            )
-            .context("failed to refresh session; run `baml auth login` again")?;
-            self.access_token = Some(tokens.access_token);
-            self.expires_at = tokens.expires_in.map(|s| now_unix() + s);
-            if tokens.refresh_token.is_some() {
-                self.refresh_token = tokens.refresh_token;
-            }
-        }
-        Ok(self.access_token.as_deref().expect("checked above"))
-    }
-}
-
 #[cfg(test)]
-mod tests {
+mod status_tests {
     use super::*;
 
     #[test]
-    fn form_urlencode_passes_unreserved_and_escapes_the_rest() {
-        assert_eq!(form_urlencode("abc-XYZ_0.9~"), "abc-XYZ_0.9~");
-        assert_eq!(
-            form_urlencode("urn:ietf:params:oauth:grant-type:device_code"),
-            "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
-        );
-    }
-
-    #[test]
-    fn credentials_serialize_roundtrip_and_skip_absent_fields() {
-        let creds = Credentials {
-            posthog_distinct_id: Some("ph-uuid".into()),
-            ..Credentials::default()
-        };
-        let json = serde_json::to_string(&creds).unwrap();
-        assert!(json.contains("ph-uuid"), "{json}");
-        assert!(
-            !json.contains("access_token"),
-            "absent fields skipped: {json}"
-        );
-        let back: Credentials = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.posthog_distinct_id.as_deref(), Some("ph-uuid"));
-        assert!(back.user_email.is_none());
+    fn status_has_exact_output_for_each_credential_source() {
+        for (user, api_key, expected) in [
+            (
+                Some("alice@acme.com"),
+                true,
+                r#"User: alice@acme.com (verified)
+Credential overridden by: BOUNDARY_API_KEY (verified)
+Project: acme/app (baml.toml)"#,
+            ),
+            (
+                Some("alice@acme.com"),
+                false,
+                r#"User: alice@acme.com (verified)
+Project: acme/app (baml.toml)"#,
+            ),
+            (
+                None,
+                true,
+                r#"User: Not logged in
+Credential: BOUNDARY_API_KEY (verified)
+Project: acme/app (baml.toml)"#,
+            ),
+            (
+                None,
+                false,
+                r#"User: Not logged in
+Project: acme/app (baml.toml)"#,
+            ),
+        ] {
+            let status = AuthenticationStatus {
+                user: user.map(str::to_owned),
+                api_key,
+                project: "acme/app (baml.toml)".into(),
+                endpoint: bcs_api::auth::DEFAULT_API_URL.to_owned(),
+            };
+            assert_eq!(crate::output::text_of(&status).trim_end(), expected);
+        }
     }
 }

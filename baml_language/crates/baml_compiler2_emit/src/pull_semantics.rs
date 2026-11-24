@@ -29,13 +29,21 @@ pub(crate) enum LocalPullAction<'db> {
 /// `'db` is the lifetime of the MIR the sink traverses (the inlined rvalues a
 /// [`LocalPullAction::Inline`] hands back are clones out of that MIR).
 pub(crate) trait PullSink<'db> {
+    fn trace_hook_settings(&mut self, with_settings: bool) -> Result<(), Self::Error>;
     type Error;
 
     fn pull_constant(&mut self, constant: &Constant<'db>) -> Result<(), Self::Error>;
     fn pull_local(&mut self, local: Local) -> Result<LocalPullAction<'db>, Self::Error>;
 
-    fn load_field(&mut self, field: usize, name: &str) -> Result<(), Self::Error>;
-    fn load_index(&mut self, kind: IndexKind) -> Result<(), Self::Error>;
+    /// Load a field of `base`, the instance place the field applies to.
+    fn load_field(&mut self, field: usize, name: &str, base: &Place) -> Result<(), Self::Error>;
+    /// Load an element of `base`, the container place the index applies to.
+    fn load_index(
+        &mut self,
+        kind: IndexKind,
+        base: &Place,
+        index: Local,
+    ) -> Result<(), Self::Error>;
 
     /// Complete a binary operation after its operands have been pulled. Typed
     /// code generators can use the operands to select a specialized opcode.
@@ -46,8 +54,13 @@ pub(crate) trait PullSink<'db> {
         right: &Operand<'db>,
     ) -> Result<(), Self::Error>;
     fn unary_op(&mut self, op: UnaryOp) -> Result<(), Self::Error>;
+    /// Complete `x == null` (or `x != null` when `negate`) after `x` alone
+    /// has been pulled: `null` is a constant with nothing to evaluate.
+    fn null_test(&mut self, negate: bool) -> Result<(), Self::Error>;
+    fn concat_strings(&mut self, len: usize) -> Result<(), Self::Error>;
 
     fn alloc_array(&mut self, element_ty: &TyTemplate, len: usize) -> Result<(), Self::Error>;
+    fn alloc_tuple(&mut self, tuple_ty: &TyTemplate, len: usize) -> Result<(), Self::Error>;
     fn alloc_uint8array(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
     fn alloc_map(
         &mut self,
@@ -82,7 +95,11 @@ pub(crate) trait PullSink<'db> {
     /// Emits `Instruction::LoadType(const_idx)` in the bytecode emitter.
     fn load_type(&mut self, template: &TyTemplate) -> Result<(), Self::Error>;
     /// Reify the package statically selected at this call site.
-    fn load_current_package(&mut self, package: &str) -> Result<(), Self::Error>;
+    fn load_current_package(&mut self) -> Result<(), Self::Error>;
+    /// Pop a bound (an `Object::Type` of the interface constraint) and a type
+    /// value, push whether the type satisfies the bound
+    /// (`Rvalue::SatisfiesBound`).
+    fn satisfies_bound(&mut self) -> Result<(), Self::Error>;
     fn make_closure(&mut self, lambda_idx: usize, capture_count: usize) -> Result<(), Self::Error>;
 
     /// Same as `make_closure` but with an additional `ntypeargs` count for
@@ -141,8 +158,15 @@ pub(crate) trait PullSink<'db> {
 
 /// Stack-effect callbacks for statement/terminator helpers.
 pub(crate) trait StackEffectSink<'db>: PullSink<'db> {
-    fn store_field_value(&mut self, field: usize, name: &str) -> Result<(), Self::Error>;
-    fn store_index_value(&mut self, kind: IndexKind) -> Result<(), Self::Error>;
+    /// Store a field of `base`, the instance place the field applies to.
+    fn store_field_value(
+        &mut self,
+        field: usize,
+        name: &str,
+        base: &Place,
+    ) -> Result<(), Self::Error>;
+    /// Store an element of `base`, the container place the index applies to.
+    fn store_index_value(&mut self, kind: IndexKind, base: &Place) -> Result<(), Self::Error>;
     fn pop_values(&mut self, n: usize) -> Result<(), Self::Error>;
 }
 
@@ -203,24 +227,27 @@ pub(crate) fn local_store_behavior(class: LocalClassification) -> LocalStoreBeha
 /// Returns `Ok(true)` when `destination` is a projection and was handled here.
 /// Returns `Ok(false)` for `Place::Local(_)` and `Place::Deref(_)`, which the
 /// caller stores to a slot or through a cell.
+/// `pull_rvalue` uses the backend's full rvalue evaluator, including forms
+/// that need special materialization or conservative stack-carry handling.
 pub(crate) fn walk_projection_store<'db, S: StackEffectSink<'db>>(
     sink: &mut S,
     destination: &Place,
     value: &Rvalue<'db>,
+    mut pull_rvalue: impl FnMut(&mut S, &Rvalue<'db>) -> Result<(), S::Error>,
 ) -> Result<bool, S::Error> {
     match destination {
         Place::Field { base, field } => {
             let name = sink.resolve_field_name(base, *field);
             walk_place_pull(sink, base)?;
-            walk_rvalue_pull(sink, value)?;
-            sink.store_field_value(*field, &name)?;
+            pull_rvalue(sink, value)?;
+            sink.store_field_value(*field, &name, base)?;
             Ok(true)
         }
         Place::Index { base, index, kind } => {
             walk_place_pull(sink, base)?;
             walk_place_pull(sink, &Place::Local(*index))?;
-            walk_rvalue_pull(sink, value)?;
-            sink.store_index_value(*kind)?;
+            pull_rvalue(sink, value)?;
+            sink.store_index_value(*kind, base)?;
             Ok(true)
         }
         Place::Local(_) | Place::Deref(_) => Ok(false),
@@ -364,12 +391,14 @@ pub(crate) fn walk_place_pull<'db, S: PullSink<'db>>(
         Place::Field { base, field } => {
             let name = sink.resolve_field_name(base, *field);
             walk_place_pull(sink, base)?;
-            sink.load_field(*field, &name)
+            sink.load_field(*field, &name, base)
         }
         Place::Index { base, index, kind } => {
             walk_place_pull(sink, base)?;
-            walk_place_pull(sink, &Place::Local(*index))?;
-            sink.load_index(*kind)
+            if *kind != IndexKind::Tuple {
+                walk_place_pull(sink, &Place::Local(*index))?;
+            }
+            sink.load_index(*kind, base, *index)
         }
     }
 }
@@ -380,8 +409,13 @@ pub(crate) fn walk_rvalue_pull<'db, S: PullSink<'db>>(
     rvalue: &Rvalue<'db>,
 ) -> Result<(), S::Error> {
     match rvalue {
+        Rvalue::TraceHookSettings { with_settings } => sink.trace_hook_settings(*with_settings),
         Rvalue::Use(operand) => walk_operand_pull(sink, operand),
         Rvalue::BinaryOp { op, left, right } => {
+            if let Some((tested, negate)) = rvalue.null_test() {
+                walk_operand_pull(sink, tested)?;
+                return sink.null_test(negate);
+            }
             walk_operand_pull(sink, left)?;
             walk_operand_pull(sink, right)?;
             sink.binary_op(*op, left, right)
@@ -389,6 +423,12 @@ pub(crate) fn walk_rvalue_pull<'db, S: PullSink<'db>>(
         Rvalue::UnaryOp { op, operand } => {
             walk_operand_pull(sink, operand)?;
             sink.unary_op(*op)
+        }
+        Rvalue::ConcatStrings(parts) => {
+            for part in parts {
+                walk_operand_pull(sink, part)?;
+            }
+            sink.concat_strings(parts.len())
         }
         Rvalue::Array(element_ty, elements) => {
             for element in elements {
@@ -444,6 +484,15 @@ pub(crate) fn walk_rvalue_pull<'db, S: PullSink<'db>>(
                 }
                 sink.init_class_instance(*class, ntypeargs, fields.len())
             }
+            AggregateKind::Tuple { element_templates } => {
+                for field in fields {
+                    walk_operand_pull(sink, field)?;
+                }
+                sink.alloc_tuple(
+                    &TyTemplate::Tuple(element_templates.clone().into()),
+                    fields.len(),
+                )
+            }
         },
         Rvalue::Discriminant(place) => {
             walk_place_pull(sink, place)?;
@@ -461,6 +510,13 @@ pub(crate) fn walk_rvalue_pull<'db, S: PullSink<'db>>(
         Rvalue::IsTypeTag { operand, tag } => {
             walk_operand_pull(sink, operand)?;
             sink.is_type_tag(*tag)
+        }
+        // The bound is a constraint, loaded the way a virtual call loads the
+        // interface it dispatches through.
+        Rvalue::SatisfiesBound { ty, bound } => {
+            walk_operand_pull(sink, ty)?;
+            sink.load_type(&bound.to_template())?;
+            sink.satisfies_bound()
         }
         Rvalue::MakeClosure {
             lambda_idx,
@@ -517,6 +573,6 @@ pub(crate) fn walk_rvalue_pull<'db, S: PullSink<'db>>(
             sink.make_generic_function_from_value(type_arg_templates.len())
         }
         Rvalue::LoadType(template) => sink.load_type(template),
-        Rvalue::CurrentPackage(package) => sink.load_current_package(package),
+        Rvalue::CurrentPackage => sink.load_current_package(),
     }
 }

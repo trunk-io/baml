@@ -57,12 +57,14 @@ class Instant {
     /// # Examples
     ///
     /// ```baml
-    /// let start = Instant.now();
+    /// let start = baml.time.Instant.now();
     /// let response = baml.http.fetch("https://example.com");
     /// let duration = start.elapsed();
     /// ```
     function elapsed(self) -> Duration throws never {
-        Duration { _nanoseconds: Instant.now()._nanoseconds - self._nanoseconds }
+        Duration {
+            _nanoseconds: Instant.now()._nanoseconds - self._nanoseconds,
+        }
     }
 
     /// Parses a timestamp string into an `Instant`.
@@ -92,7 +94,7 @@ class Instant {
         $rust_function
     }
 
-    implements baml.ToString {
+    implements root.ToString {
         /// Serializes `self` to a [RFC 3339](https://datatracker.ietf.org/doc/html/rfc3339)
         /// and [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601)-compatible
         /// timestamp string.
@@ -137,7 +139,7 @@ class Instant {
     function _to_string_impl(self) -> string throws root.errors.InvalidArgument {
         $rust_function
     }
-    implements baml.FromJson {
+    implements root.FromJson {
         /// Decodes an `Instant` from a JSON string, accepting exactly what
         /// `Instant.parse` accepts.
         ///
@@ -145,22 +147,48 @@ class Instant {
         ///
         /// - `baml.json.DecodeError` if the value is not a string, or is a
         ///   string `Instant.parse` rejects.
-        function from_json(j: baml.json.json) -> Self throws baml.json.DecodeError {
+        function from_json(j: root.json.json) -> Self throws root.json.DecodeError {
             match (j) {
                 string => {
                     Instant.parse(j) catch (_) {
                         root.errors.ParseError { message } => {
-                            throw baml.json.DecodeError { message: message, path: "" }
+                            throw root.json.DecodeError {
+                                message: message,
+                                path: "",
+                            };
                         },
                     }
                 },
                 _ => {
-                    throw baml.json.DecodeError { message: "Expected timestamp string", path: "" }
+                    throw root.json.DecodeError {
+                        message: "Expected timestamp string",
+                        path: "",
+                    };
                 },
             }
         }
     }
-    implements baml.ToJson {
+    implements root.FromLlmOutput {
+        type Shape = string;
+
+        /// Builds an `Instant` from a timestamp a model wrote, accepting exactly what
+        /// `Instant.parse` accepts.
+        ///
+        /// # Throws
+        ///
+        /// - `baml.json.DecodeError` if `Instant.parse` rejects the string.
+        function from_llm_output(shape: string) -> Self throws root.json.DecodeError {
+            Instant.parse(shape) catch (_) {
+                root.errors.ParseError { message } => {
+                    throw root.json.DecodeError {
+                        message: message,
+                        path: "",
+                    };
+                },
+            }
+        }
+    }
+    implements root.ToJson {
         /// Encodes `self` as the same UTC RFC 3339 string `to_string` produces.
         ///
         /// # Throws
@@ -169,14 +197,14 @@ class Instant {
         ///   four-digit range. The same failure panics in `to_string`: a
         ///   serializer is called with a caller standing by to react, so it
         ///   gets the error channel.
-        function to_json(self) -> baml.json.json throws baml.json.SerializationError {
+        function to_json(self) -> root.json.json throws root.json.SerializationError {
             self._to_string_impl() catch (_) {
                 root.errors.InvalidArgument { message } => {
-                    throw baml.json.SerializationError {
+                    throw root.json.SerializationError {
                         message: message,
                         path: "",
                         reason: "unserializable",
-                    }
+                    };
                 },
             }
         }
@@ -204,7 +232,9 @@ class Instant {
     /// change the result. Use `self - other` instead when the sign — i.e. the
     /// direction — matters.
     function abs_diff(self, other: Instant) -> Duration throws never {
-        Duration { _nanoseconds: (self._nanoseconds - other._nanoseconds).abs() }
+        Duration {
+            _nanoseconds: (self._nanoseconds - other._nanoseconds).abs(),
+        }
     }
 
     /// The `Instant` `ns` nanoseconds after the UNIX epoch.
@@ -213,17 +243,23 @@ class Instant {
     }
     /// The `Instant` `us` microseconds after the UNIX epoch.
     function from_timestamp_microseconds(us: bigint) -> Instant throws never {
-        Instant { _nanoseconds: us * 1000 }
+        Instant {
+            _nanoseconds: us * 1000,
+        }
     }
     /// The `Instant` `ms` milliseconds after the UNIX epoch. This is the unit
     /// most JSON and JavaScript timestamps arrive in.
     function from_timestamp_milliseconds(ms: bigint) -> Instant throws never {
-        Instant { _nanoseconds: ms * 1000000 }
+        Instant {
+            _nanoseconds: ms * 1000000,
+        }
     }
     /// The `Instant` `s` seconds after the UNIX epoch. This is the unit a POSIX
     /// `time_t` arrives in.
     function from_timestamp_seconds(s: bigint) -> Instant throws never {
-        Instant { _nanoseconds: s * 1000000000 }
+        Instant {
+            _nanoseconds: s * 1000000000,
+        }
     }
 
     /// The number of nanoseconds since the UNIX epoch. Exact: this is the
@@ -249,10 +285,12 @@ class Instant {
     function epoch() -> Instant throws never {
         Instant { _nanoseconds: 0n }
     }
+
+    @@description("An RFC 3339 timestamp, for example 2026-01-01T00:00:00Z")
 }
 
 implement root.ops.Add<Duration> for Instant {
-    type Output = Instant
+    type Output = Instant;
     /// The point in time `other` after `self`.
     ///
     /// Pure absolute-time arithmetic: no timezone or calendar is consulted, so
@@ -260,30 +298,30 @@ implement root.ops.Add<Duration> for Instant {
     /// exact.
     function add(self, other: Duration) -> Instant {
         Instant {
-            _nanoseconds: self._nanoseconds + other._nanoseconds
+            _nanoseconds: self._nanoseconds + other._nanoseconds,
         }
     }
 }
 
 implement root.ops.Subtract<Duration> for Instant {
-    type Output = Instant
+    type Output = Instant;
     /// The point in time `other` before `self`. The inverse of
     /// `Instant + Duration`.
     function sub(self, other: Duration) -> Instant {
         Instant {
-            _nanoseconds: self._nanoseconds - other._nanoseconds
+            _nanoseconds: self._nanoseconds - other._nanoseconds,
         }
     }
 }
 
 implement root.ops.Subtract<Instant> for Instant {
-    type Output = Duration
+    type Output = Duration;
     /// The signed gap from `other` to `self`: positive when `self` is the later
     /// of the two, negative when it is the earlier. Use `abs_diff` when only
     /// the magnitude matters.
     function sub(self, other: Instant) -> Duration {
         Duration {
-            _nanoseconds: self._nanoseconds - other._nanoseconds
+            _nanoseconds: self._nanoseconds - other._nanoseconds,
         }
     }
 }

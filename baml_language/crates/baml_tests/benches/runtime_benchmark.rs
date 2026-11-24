@@ -3,19 +3,20 @@
 //! Run with: cargo bench --bench runtime_benchmark
 //!
 //! Every bench in this file is auto-generated from the cross-language speedtest
-//! corpus under `tools/speedtest/workloads/*.md` (see `build.rs`:
+//! corpus under `tools/speedtest/workloads/` (see `build.rs`:
 //! `generate_speedtest_benches`). There are intentionally no hand-written
-//! benches here — to add or change one, edit a workload `.md` so the speedtest
-//! harness and CodSpeed stay in sync from a single source of truth.
+//! benches here — to add or change one, edit a workload's `main.baml` so the speedtest
+//! harness and these benches stay in sync from a single source of truth.
 //!
 //! Each generated bench measures *pure VM execution*: the BAML source is
 //! compiled and the tokio runtime is built ONCE, outside the measured region
 //! (see `bench_vm_main`), so only the cost of calling `main()` is timed.
+#![allow(clippy::disallowed_methods)]
 
 use std::{path::Path, sync::Arc};
 
 use baml_compiler2_emit::OptLevel;
-use baml_db::{ProjectDatabase, compile_program};
+use baml_db::{CheckedWorld, ProjectDatabase};
 use baml_tests::engine::TestDbExt;
 use bex_engine::{BexEngine, FunctionCallContextBuilder};
 use divan::{Bencher, black_box};
@@ -26,15 +27,11 @@ fn main() {
         eprintln!("Skipping runtime_benchmark in debug/test profile.");
         return;
     }
-    // Adaptive sampling by default: bound each bench to ~2s of wall time rather
-    // than walltime mode's fixed 100 samples/bench. divan then runs as many
-    // samples as fit the budget — ~100 for cheap benches (full statistical
-    // power), down to 1 for the heavy O(n²)/1M-iter workloads (whose run-to-run
-    // variance is already tiny). Without this the suite blows past CI's 30-min
-    // timeout: compute::bubble_sort_5k alone is ~14s/sample on the codspeed
-    // runner, so 100 samples ≈ 23min for ONE bench. CI overrides the budget via
-    // the DIVAN_MAX_TIME env var (see ci.yaml); we only set a default when the
-    // caller hasn't, so `cargo bench`/`cargo codspeed run` are adaptive too.
+    // Adaptive sampling by default: bound each bench to ~2s of wall time. divan
+    // then runs as many samples as fit the budget — ~100 for cheap benches
+    // (full statistical power), down to 1 for the heavy O(n²)/1M-iter workloads
+    // (whose run-to-run variance is already tiny). We only set a default when
+    // the caller hasn't set DIVAN_MAX_TIME.
     if std::env::var_os("DIVAN_MAX_TIME").is_none() {
         // SAFETY: single-threaded here at the very top of main, before divan
         // reads its args/env. No other thread can observe the environment.
@@ -53,8 +50,10 @@ fn compile_source(source: &str) -> (ProjectDatabase, BexEngine) {
     let mut db = ProjectDatabase::new();
     let package = db.workspace(Path::new("."));
     db.file("bench.baml", source);
-    let bytecode =
-        compile_program(&db, package, OptLevel::Two).expect("benchmark compilation failed");
+    let bytecode = CheckedWorld::collect(&db, package)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("benchmark compilation failed");
     let engine = BexEngine::new(bytecode, Arc::new(sys_native::SysOps::native()), vec![])
         .expect("benchmark engine creation failed");
     (db, engine)

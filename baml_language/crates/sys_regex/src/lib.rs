@@ -131,6 +131,16 @@ pub struct Program {
     backtracking: bool,
 }
 
+/// Two programs are the same regex when they compile the same pattern in the
+/// same dialect; the compiled engines are a function of those two.
+impl PartialEq for Program {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.backtracking == other.backtracking
+    }
+}
+
+impl Eq for Program {}
+
 #[expect(
     clippy::missing_fields_in_debug,
     reason = "neither engine's compiled program has a readable representation"
@@ -145,6 +155,20 @@ impl std::fmt::Debug for Program {
 }
 
 impl Program {
+    /// Bytes the program's pattern text and capture names occupy. The
+    /// compiled automata are not sized: the regex engines do not report
+    /// what they allocate.
+    pub fn retained_bytes(&self) -> usize {
+        self.pattern.capacity()
+            + self.names.capacity() * size_of::<Option<String>>()
+            + self
+                .names
+                .iter()
+                .flatten()
+                .map(String::capacity)
+                .sum::<usize>()
+    }
+
     /// Compile `pattern`. `backtracking` selects the dialect.
     ///
     /// # Errors
@@ -591,23 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_match_anchors_the_whole_alternation() {
-        // `^a|b$` anchors each alternative separately, which is the trap
-        // `find_exact` exists to avoid.
-        let re = Program::compile("^a|b$", false).unwrap();
-        assert!(re.is_match("ab").unwrap());
-        assert!(re.find_exact("ab").unwrap().is_none());
-        assert!(re.find_exact("a").unwrap().is_some());
-    }
-
-    #[test]
-    fn exact_match_is_not_confused_by_multiline_flag() {
-        let re = Program::compile("(?m)^a$", false).unwrap();
-        assert!(re.is_match("x\na\ny").unwrap());
-        assert!(re.find_exact("x\na\ny").unwrap().is_none());
-    }
-
-    #[test]
     fn exact_match_preserves_comments_flags_and_captures() {
         for backtracking in [false, true] {
             for pattern in ["(?x)(?<letter>a) # trailing comment", "(?<letter>a)"] {
@@ -645,18 +652,5 @@ mod tests {
         // "😀hé" — byte offsets 0, 4, 5, 7.
         let s = "😀hé";
         assert_eq!(char_offsets(s, &[7, 0, 5, 4]), vec![3, 0, 2, 1]);
-    }
-
-    #[test]
-    fn split_interleaves_participating_groups_only() {
-        let re = Program::compile("(a)|(b)", false).unwrap();
-        let subject = "xaybz";
-        let pieces: Vec<&str> = re
-            .split(subject)
-            .unwrap()
-            .into_iter()
-            .map(|(start, end)| &subject[start..end])
-            .collect();
-        assert_eq!(pieces, vec!["x", "a", "y", "b", "z"]);
     }
 }

@@ -13,13 +13,14 @@ use std::sync::Arc;
 
 use baml_base::SourceRoot;
 use baml_compiler_diagnostics::Severity;
-use baml_compiler2_emit::{LoweringError, emit_package};
-use baml_compiler2_hir::package::{spelling, spelling_within, world_roots};
+use baml_compiler2_emit::emit_package;
+use baml_compiler2_hir::package::world_roots;
+use baml_compiler2_hir_ty::render::Viewpoint;
 use baml_db::{
-    CompileProgramError, OptLevel, ProjectDatabase, SourceRootKind, SourceRootSpec, compile_program,
+    CheckedWorld, CompileProgramError, OptLevel, ProjectDatabase, SourceRootKind, SourceRootSpec,
 };
 use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder};
-use bex_vm_types::{Object, Program};
+use bex_vm_types::Program;
 use sys_native::SysOpsExt;
 
 /// A database with the stdlib and two unnamed workspace roots, each with
@@ -43,20 +44,6 @@ fn two_workspaces(first: &str, second: &str) -> (ProjectDatabase, SourceRoot, So
     (db, a, b)
 }
 
-/// The class objects named `name` in `program`, as `(display name, type tag)`.
-fn classes_named(program: &Program, name: &str) -> Vec<(String, bex_vm_types::type_tags::TypeTag)> {
-    program
-        .objects
-        .iter()
-        .filter_map(|object| match object {
-            Object::Class(class) if class.name.item_name().as_str() == name => {
-                Some((class.name.display_name().to_string(), class.type_tag))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 /// Every object of `program`, serialized — objects carry no equality of
 /// their own, so byte identity is the comparison.
 fn object_bytes(program: &Program) -> Vec<Vec<u8>> {
@@ -67,17 +54,12 @@ fn object_bytes(program: &Program) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// The user-defined function names in `program`.
+/// The user-defined function names in `program`, rendered under the label of
+/// the package holding each.
 fn function_names(program: &Program) -> Vec<String> {
-    program
-        .objects
-        .iter()
-        .filter_map(|object| match object {
-            Object::Function(function) if function.name.starts_with("user.") => {
-                Some(function.name.clone())
-            }
-            _ => None,
-        })
+    (0..program.objects.len())
+        .filter_map(|index| program.function_name(bex_vm_types::ObjectIndex::from_raw(index)))
+        .filter(|name| name.starts_with("user."))
         .collect()
 }
 
@@ -105,12 +87,10 @@ async fn run_main(program: Program) -> BexExternalValue {
 #[test]
 fn each_workspace_root_is_its_own_world() {
     let (db, a, b) = two_workspaces("class Point { x int }\n", "class Point { y string }\n");
-    // Both roots spell themselves by the default; database-wide that is a
-    // shared spelling, but neither program holds the other root.
-    assert_eq!(spelling(&db).of(a), spelling(&db).of(b));
-    assert!(!spelling(&db).collisions().is_empty());
-    assert!(spelling_within(&db, a).collisions().is_empty());
-    assert!(spelling_within(&db, b).collisions().is_empty());
+    // Both roots are labelled by the stand-in — a label is not an identity
+    // — and neither program holds the other root.
+    let viewpoint = Viewpoint::canonical(&db);
+    assert_eq!(viewpoint.display_package(a), viewpoint.display_package(b));
     assert!(world_roots(&db, a).contains(&a) && !world_roots(&db, a).contains(&b));
     assert!(world_roots(&db, b).contains(&b) && !world_roots(&db, b).contains(&a));
     // Each world is the stdlib plus the one root, in table order.
@@ -126,11 +106,17 @@ fn each_workspace_root_is_its_own_world() {
 #[test]
 fn same_named_declarations_in_two_roots_emit_as_two_programs() {
     let (db, a, b) = two_workspaces("class Point { x int }\n", "class Point { y string }\n");
-    let program_a = compile_program(&db, a, OptLevel::Two).expect("root a emits alone");
-    let program_b = compile_program(&db, b, OptLevel::Two).expect("root b emits alone");
+    let program_a = CheckedWorld::collect(&db, a)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("root a emits alone");
+    let program_b = CheckedWorld::collect(&db, b)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("root b emits alone");
     // Exactly one `Point` per program, the workspace's own.
-    let points_a = classes_named(&program_a, "Point");
-    let points_b = classes_named(&program_b, "Point");
+    let points_a = baml_tests::engine::classes_named(&program_a, "Point");
+    let points_b = baml_tests::engine::classes_named(&program_b, "Point");
     let [(name_a, tag_a)] = points_a.as_slice() else {
         panic!("program a holds one Point: {points_a:?}");
     };
@@ -150,8 +136,14 @@ async fn each_program_runs_its_own_root() {
         "function main() -> int throws never { 1 }\nfunction only_a() -> int throws never { 10 }\n",
         "function main() -> int throws never { 2 }\nfunction only_b() -> int throws never { 20 }\n",
     );
-    let program_a = compile_program(&db, a, OptLevel::Two).expect("root a emits");
-    let program_b = compile_program(&db, b, OptLevel::Two).expect("root b emits");
+    let program_a = CheckedWorld::collect(&db, a)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("root a emits");
+    let program_b = CheckedWorld::collect(&db, b)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("root b emits");
     assert_eq!(
         function_names(&program_a),
         vec!["user.main".to_string(), "user.only_a".to_string()]
@@ -171,12 +163,10 @@ fn one_roots_errors_do_not_block_another() {
         "function main() -> int throws never { \"not an int\" }\n",
     );
     assert!(db.get_bytecode(a).is_ok(), "root a is clean and builds");
-    let Err(CompileProgramError::Emit(LoweringError::ProjectHasErrors { error_count })) =
-        db.get_bytecode(b)
-    else {
+    let Err(CompileProgramError::WorldHasErrors(refused)) = db.get_bytecode(b) else {
         panic!("root b has a type error and must not build");
     };
-    assert_eq!(error_count, 1);
+    assert_eq!(refused.errors().len(), 1);
     // The error is reported against b's file only.
     let errors: Vec<_> = baml_db::collect_compiler2_diagnostics(&db)
         .into_iter()
@@ -218,8 +208,14 @@ fn every_world_shares_the_stdlib_prefix() {
         })
         .sum();
     assert!(stdlib_objects > 0);
-    let program_a = compile_program(&db, a, OptLevel::Two).expect("root a emits");
-    let program_b = compile_program(&db, b, OptLevel::Two).expect("root b emits");
+    let program_a = CheckedWorld::collect(&db, a)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("root a emits");
+    let program_b = CheckedWorld::collect(&db, b)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("root b emits");
     assert_eq!(
         object_bytes(&program_a)[..stdlib_objects],
         object_bytes(&program_b)[..stdlib_objects],

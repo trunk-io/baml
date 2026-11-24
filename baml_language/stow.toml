@@ -46,7 +46,7 @@ ignore_crates = ["sdk_test_*"]
 # Graph visualization settings
 # Run: cargo stow --graph /tmp/deps.svg
 [graph]
-external_deps = ["serde_json", "tokio", "clap", "anyhow", "salsa", "rowan", "reqwest"]
+external_deps = ["serde_json", "tokio", "clap", "anyhow", "salsa", "reqwest"]
 
 # Implied dependencies: if a crate depends on both the key and a value,
 # the edge to the value is hidden (it's visually implied by the key).
@@ -81,14 +81,24 @@ allowed_crates = [
 regular_deps_only = true
 reason = "Use thiserror for proper error types in library crates."
 
+# Only the test harness imports these helpers as a regular dependency. Other
+# consumers share the embedded stdlib through dev-dependencies.
+[[dependency_rules]]
+pattern = "baml_test_support"
+allowed_crates = ["baml_tests"]
+regular_deps_only = true
+reason = "Precompiled stdlib test helpers belong in dev-dependencies."
+
 # baml namespace configuration
 [[namespaces]]
 name = "baml"
 # `fmt` is the formatter, `baml_fmt`, and its browser build, `baml_fmt_wasm`.
-approved_prefixes = ["compiler", "builtins", "builtins2", "compiler2", "type", "query", "fmt"]
+# `syntax` is the typed syntax tree (`baml_syntax`, `baml_syntax_macros`) and
+# `parser` the lexer+parser that builds it; both are foundational, like `baml_type`.
+approved_prefixes = ["compiler", "builtins", "builtins2", "compiler2", "type", "query", "fmt", "syntax", "parser"]
 # The type provider crate: `hir_ty` is one name (rust-analyzer's crate of
 # the same shape), not a prefix + word.
-approved_suffixes = ["artifact", "compiler2_hir_ty"]
+approved_suffixes = ["artifact", "compiler2_hir_ty", "project_root", "test_support"]
 test_crate_exceptions = ["baml_tests"]
 embed_crates = ["bex_project"]
 # The Rust SDK runtime crate keeps the `bridge_rust` folder (mirroring
@@ -136,16 +146,17 @@ reason = "baml_* crates should not depend on bex_* crates (baml_query_btel: non-
 # `baml_linker_types` carries the compilation-unit wire format over the
 # runtime's object types, and `baml_linker` folds units into a `Program`:
 # both sit on the compiler's output side, beside emit. Keep both
-# `bex_vm_types` allowlists in sync.
+# `bex_vm_types` allowlists in sync. The test-support crate also returns the
+# compiler's Program data, without importing the engine or VM implementation.
 [[namespaces.dependency_rules]]
 pattern.select = "bex_vm_types"
-allowed_crates = ["baml_compiler_emit", "baml_compiler2_emit", "baml_linker", "baml_linker_types", "baml_db", "baml_cli", "baml_exec", "baml_pack_host"]
+allowed_crates = ["baml_compiler_emit", "baml_compiler2_emit", "baml_compiler2_rust", "baml_linker", "baml_linker_types", "baml_db", "baml_cli", "baml_exec", "baml_pack_host", "baml_test_support"]
 regular_deps_only = true
 reason = "Only the compiler's output side (emit, the linker crates, baml_db) should depend on bex_vm_types (pure data layer)."
 
 [[namespaces.dependency_rules]]
 pattern.select = "bex_vm_types"
-allowed_crates = ["baml_compiler_emit", "baml_compiler2_emit", "baml_linker", "baml_linker_types", "baml_db", "baml_cli", "baml_exec", "baml_pack_host", "baml_query_btel"]
+allowed_crates = ["baml_compiler_emit", "baml_compiler2_emit", "baml_compiler2_rust", "baml_linker", "baml_linker_types", "baml_db", "baml_cli", "baml_exec", "baml_pack_host", "baml_query_btel", "baml_test_support"]
 reason = "Only the compiler's output side (emit, the linker crates, baml_db) should depend on bex_vm_types (pure data layer; baml_query_btel: non-production dev/build dependencies only)."
 
 
@@ -178,6 +189,10 @@ link_crates = ["baml_type", "sys_types"]
 # transport, processing, and publication crates will join this family later.
 [[namespaces]]
 name = "btel"
+
+# Boundary Cloud Service API contracts and clients.
+[[namespaces]]
+name = "bcs"
 
 # lsp namespace configuration
 [[namespaces]]

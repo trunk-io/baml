@@ -9,16 +9,17 @@ use std::{
     fmt,
 };
 
-use baml_base::MediaKind;
-use baml_sdkgen_types::{Name, Symbol, SymbolPool};
+use baml_base::ConcreteMediaKind;
+use baml_sdkgen_types::{ClassCrossing, Name, Symbol, SymbolPool};
 
 use crate::{
     packages::GoPackages,
-    rendering::is_protected_go_identifier,
-    types::{GoFunctionKey, GoFunctionParamMode, GoLiteral, GoTy, GoTypeProjection, GoUnionKey},
+    rendering::{ReferenceWrapperMethod, is_protected_go_identifier},
+    types::{
+        GoCallbackReturn, GoCallbackThrows, GoFunctionKey, GoFunctionParamMode, GoLiteral,
+        GoTupleKey, GoTy, GoTypeProjection, GoUnionKey,
+    },
 };
-
-const AI_PROMPT_FQN: &str = "ai.Prompt";
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct BamlFqn {
@@ -89,6 +90,7 @@ pub(crate) enum BamlWireName {
     Key(baml_base::Name),
     /// Synthesized Go-only declarations have no independent BAML wire name.
     StructuralUnion,
+    StructuralTuple,
     StructuralCallback,
 }
 
@@ -99,6 +101,7 @@ impl fmt::Display for BamlWireName {
             Self::Method { owner, method } => write!(f, "{owner}.{method}"),
             Self::Key(name) => write!(f, "{name}"),
             Self::StructuralUnion => f.write_str("<structural union>"),
+            Self::StructuralTuple => f.write_str("<structural tuple>"),
             Self::StructuralCallback => f.write_str("<structural callback>"),
         }
     }
@@ -256,16 +259,37 @@ enum NameScope {
 }
 
 impl NameScope {
+    /// `wrapper_method` is set for an instance method of an opaque class,
+    /// which renders on a reference wrapper whose own methods it must not take.
     fn escape_reserved(
         &self,
         mut candidate: GoIdent,
         generated_package_aliases: &BTreeSet<String>,
+        wrapper_method: bool,
     ) -> GoIdent {
         while (matches!(self, Self::Function(_))
             && (is_protected_go_identifier(candidate.name.as_ref())
                 || generated_package_aliases.contains(candidate.name.as_ref())))
             || (matches!(self, Self::Class(_))
                 && is_protected_go_identifier(candidate.name.as_ref()))
+            || (wrapper_method
+                && ReferenceWrapperMethod::ALL
+                    .iter()
+                    .any(|method| method.as_str() == candidate.name.as_ref()))
+            || (matches!(self, Self::Package(name) if name.as_str() == "user")
+                && matches!(
+                    candidate.name.as_ref(),
+                    "BamlOptions"
+                        | "WithOptions"
+                        | "CallOption"
+                        | "Invoke"
+                        | "Target"
+                        | "Arguments"
+                        | "TypeBindings"
+                        | "Value"
+                        | "NamedTarget"
+                        | "FunctionTarget"
+                ))
         {
             candidate = candidate.with_trailing_underscore();
         }
@@ -307,6 +331,7 @@ impl GoScope {
 pub(crate) struct GoNames {
     allocations: HashMap<NameRequest, GoName>,
     unions: BTreeMap<(baml_base::Name, GoUnionKey), GoUnionNames>,
+    tuples: BTreeMap<(baml_base::Name, GoTupleKey), GoName>,
     callback_options: BTreeMap<(baml_base::Name, GoFunctionKey), GoCallbackOptionNames>,
 }
 
@@ -573,13 +598,42 @@ impl GoNames {
             .iter()
             .map(|package| package.go_name().as_str().to_string())
             .collect();
+        // The class that crosses as a prompt is the runtime's `Prompt`, so it
+        // keeps its own name even where another declaration's collides.
+        let canonical_classes = pool
+            .iter()
+            .filter_map(|(name, symbol)| match symbol {
+                Symbol::Class(class) if class.crossing == ClassCrossing::Prompt => {
+                    Some(BamlFqn::symbol(name))
+                }
+                Symbol::Class(_) | Symbol::Enum(_) | Symbol::Function(_) | Symbol::TypeAlias(_) => {
+                    None
+                }
+            })
+            .collect();
+        // An opaque class renders as a reference wrapper, whose own methods
+        // its instance methods must not take.
+        let reference_classes = pool
+            .iter()
+            .filter_map(|(name, symbol)| match symbol {
+                Symbol::Class(class) if class.crossing == ClassCrossing::Opaque => {
+                    Some(BamlFqn::symbol(name))
+                }
+                Symbol::Class(_) | Symbol::Enum(_) | Symbol::Function(_) | Symbol::TypeAlias(_) => {
+                    None
+                }
+            })
+            .collect();
         let mut names = Self::allocate(
             requests,
             |request| packages.get(request.fqn.symbol.package()).go_name().clone(),
             &generated_package_aliases,
             &wire_overrides,
+            &canonical_classes,
+            &reference_classes,
         );
         names.allocate_unions(packages, projection);
+        names.allocate_tuples(packages, projection);
         names.allocate_callback_options(packages, projection);
         names
     }
@@ -613,6 +667,12 @@ impl GoNames {
             .expect("typed union name was not registered during allocation")
     }
 
+    pub(crate) fn tuple(&self, package: &baml_base::Name, key: &GoTupleKey) -> &GoName {
+        self.tuples
+            .get(&(package.clone(), key.clone()))
+            .expect("tuple name was not registered during allocation")
+    }
+
     pub(crate) fn callback_options(
         &self,
         package: &baml_base::Name,
@@ -630,6 +690,8 @@ impl GoNames {
             |_| package.clone(),
             &BTreeSet::default(),
             &HashMap::new(),
+            &BTreeSet::default(),
+            &BTreeSet::default(),
         )
     }
 
@@ -644,6 +706,8 @@ impl GoNames {
             |_| package.clone(),
             &BTreeSet::default(),
             wire_overrides,
+            &BTreeSet::default(),
+            &BTreeSet::default(),
         )
     }
 
@@ -652,13 +716,18 @@ impl GoNames {
         package_for: impl Fn(&NameRequest) -> GoPackageName,
         generated_package_aliases: &BTreeSet<String>,
         wire_overrides: &HashMap<NameRequest, BamlWireName>,
+        canonical_classes: &BTreeSet<BamlFqn>,
+        reference_classes: &BTreeSet<BamlFqn>,
     ) -> Self {
         let mut groups = BTreeMap::<NameScope, BTreeMap<GoIdent, Vec<NameRequest>>>::new();
         for request in requests {
             let scope = request.scope();
+            let wrapper_method = matches!(request.kind, GoNameKind::Method)
+                && matches!(&scope, NameScope::Class(class) if reference_classes.contains(class));
             let base = scope.escape_reserved(
                 project_base(package_for(&request), &request),
                 generated_package_aliases,
+                wrapper_method,
             );
             groups
                 .entry(scope)
@@ -676,7 +745,7 @@ impl GoNames {
                 let collides = requests.len() > 1;
                 for request in requests {
                     let canonical_runtime_prompt = matches!(request.kind, GoNameKind::Class)
-                        && request.fqn.symbol.to_string() == AI_PROMPT_FQN;
+                        && canonical_classes.contains(&request.fqn);
                     let candidate = if collides && !canonical_runtime_prompt {
                         base.with_suffix(&short_hash(request))
                     } else {
@@ -699,6 +768,7 @@ impl GoNames {
         Self {
             allocations,
             unions: BTreeMap::new(),
+            tuples: BTreeMap::new(),
             callback_options: BTreeMap::new(),
         }
     }
@@ -827,6 +897,47 @@ impl GoNames {
         }
     }
 
+    fn allocate_tuples(&mut self, packages: &GoPackages, projection: &GoTypeProjection<'_>) {
+        let mut used = BTreeMap::<GoPackageName, BTreeSet<Box<str>>>::new();
+        for name in self.allocations.values() {
+            used.entry(name.canonical.package.clone())
+                .or_default()
+                .insert(name.canonical.name.clone());
+        }
+        for names in self.unions.values() {
+            let package_used = used
+                .entry(names.type_name.canonical.package.clone())
+                .or_default();
+            package_used.insert(names.type_name.canonical.name.clone());
+            package_used.insert(names.variant_name.canonical.name.clone());
+            package_used.insert(names.kind_name.canonical.name.clone());
+            for arm in names.arms.values() {
+                package_used.insert(arm.wrapper.canonical.name.clone());
+                package_used.insert(arm.constructor.canonical.name.clone());
+                package_used.insert(arm.kind_constant.canonical.name.clone());
+            }
+        }
+
+        for package in packages.iter() {
+            let package_name = package.go_name().clone();
+            for key in projection.typed_tuples_in(package.baml_name()) {
+                let mut base = tuple_type_component(key, self);
+                let package_used = used.entry(package_name.clone()).or_default();
+                while is_protected_go_identifier(&base) || package_used.contains(base.as_str()) {
+                    base.push('_');
+                }
+                package_used.insert(base.clone().into());
+                self.tuples.insert(
+                    (package.baml_name().clone(), key.clone()),
+                    GoName {
+                        canonical: GoIdent::new(package_name.clone(), base),
+                        wire: BamlWireName::StructuralTuple,
+                    },
+                );
+            }
+        }
+    }
+
     fn allocate_callback_options(
         &mut self,
         packages: &GoPackages,
@@ -849,6 +960,11 @@ impl GoNames {
                 package_used.insert(arm.constructor.canonical.name.clone());
                 package_used.insert(arm.kind_constant.canonical.name.clone());
             }
+        }
+        for name in self.tuples.values() {
+            used.entry(name.canonical.package.clone())
+                .or_default()
+                .insert(name.canonical.name.clone());
         }
 
         for package in packages.iter() {
@@ -923,6 +1039,14 @@ fn callback_options_component(key: &GoFunctionKey, names: &GoNames) -> String {
     base
 }
 
+fn tuple_type_component(key: &GoTupleKey, names: &GoNames) -> String {
+    let mut component = format!("Tuple{}_", key.slots().len());
+    for slot in key.slots() {
+        component.push_str(&union_type_component(slot, names));
+    }
+    component
+}
+
 fn union_type_component(ty: &GoTy, names: &GoNames) -> String {
     match ty {
         GoTy::String => "String".into(),
@@ -935,14 +1059,26 @@ fn union_type_component(ty: &GoTy, names: &GoNames) -> String {
         GoTy::Media(kind) => media_component(*kind).to_string(),
         GoTy::Json => "Json".into(),
         GoTy::ReflectedType => "Type".into(),
-        GoTy::RustType => "RustType".into(),
+        GoTy::HostValue => "HostValue".into(),
         GoTy::FunctionSpec { output } => {
             format!("FunctionSpec{}", union_type_component(output, names))
         }
         GoTy::Stream { value } => format!("Stream{}", union_type_component(value, names)),
         GoTy::TypeVar(name) => format!("TypeVar{}", name.as_str()),
         GoTy::Literal(literal) => literal_component(literal),
-        GoTy::Class(name, arguments) => {
+        // A reference-crossing class keeps the component its declaration
+        // names, so a union's Go name does not depend on how it crosses.
+        GoTy::Prompt(name) => names
+            .project(
+                &BamlFqn::symbol(name),
+                GoNameKind::Class,
+                GoVisibility::Exported,
+            )
+            .canonical
+            .name
+            .to_string(),
+        // An opaque class too, with its arguments as a class has them.
+        GoTy::Class(name, arguments) | GoTy::Opaque(name, arguments) => {
             let mut component = names
                 .project(
                     &BamlFqn::symbol(name),
@@ -991,6 +1127,7 @@ fn union_type_component(ty: &GoTy, names: &GoNames) -> String {
             .map(|member| union_type_component(member, names))
             .collect::<Vec<_>>()
             .join("Or"),
+        GoTy::Tuple(key) => tuple_type_component(key, names),
         GoTy::Function(_) => "Function".into(),
         GoTy::Unsupported => "Unsupported".into(),
     }
@@ -1008,7 +1145,7 @@ fn disambiguated_union_component(ty: &GoTy, base: &str) -> String {
         GoTy::Media(kind) => format!("Primitive{}", media_component(*kind)),
         GoTy::Json => "StdlibJson".into(),
         GoTy::ReflectedType => "PrimitiveType".into(),
-        GoTy::RustType => "PrimitiveRustType".into(),
+        GoTy::HostValue => "PrimitiveHostValue".into(),
         GoTy::TypeVar(_) => {
             let mut hash = StableFnv::new();
             hash_go_ty(&mut hash, ty);
@@ -1046,7 +1183,7 @@ fn hash_go_ty(hash: &mut StableFnv, ty: &GoTy) {
         }
         GoTy::Json => hash.byte(18),
         GoTy::ReflectedType => hash.byte(19),
-        GoTy::RustType => hash.byte(20),
+        GoTy::HostValue => hash.byte(20),
         GoTy::FunctionSpec { output } => {
             hash.byte(23);
             hash_go_ty(hash, output);
@@ -1063,12 +1200,20 @@ fn hash_go_ty(hash: &mut StableFnv, ty: &GoTy) {
             hash.byte(7);
             hash.component(&literal_component(literal));
         }
-        GoTy::Class(name, arguments) => {
+        // An opaque class is hashed as the class it is, so its identity does
+        // not depend on how it crosses.
+        GoTy::Class(name, arguments) | GoTy::Opaque(name, arguments) => {
             hash.byte(8);
             hash.component(&nominal_type_hash(name, GoNameKind::Class));
             for argument in arguments {
                 hash_go_ty(hash, argument);
             }
+        }
+        // Hashed as the class it is, so its identity does not depend on how
+        // it crosses.
+        GoTy::Prompt(name) => {
+            hash.byte(8);
+            hash.component(&nominal_type_hash(name, GoNameKind::Class));
         }
         GoTy::Enum(name) => {
             hash.byte(9);
@@ -1105,6 +1250,13 @@ fn hash_go_ty(hash: &mut StableFnv, ty: &GoTy) {
                 hash_go_ty(hash, member);
             }
         }
+        GoTy::Tuple(key) => {
+            hash.byte(25);
+            hash.usize(key.slots().len());
+            for slot in key.slots() {
+                hash_go_ty(hash, slot);
+            }
+        }
         GoTy::Unsupported => hash.byte(16),
         GoTy::Function(key) => {
             hash.byte(17);
@@ -1118,22 +1270,37 @@ fn hash_go_ty(hash: &mut StableFnv, ty: &GoTy) {
                 }
                 hash_go_ty(hash, param.ty());
             }
-            hash.byte(u8::from(key.ret().is_some()));
-            if let Some(ret) = key.ret() {
-                hash_go_ty(hash, ret);
+            match key.returns() {
+                GoCallbackReturn::Null => hash.byte(0),
+                GoCallbackReturn::Value(ret) => {
+                    hash.byte(1);
+                    hash_go_ty(hash, ret);
+                }
+                GoCallbackReturn::Never => hash.byte(2),
             }
-            hash.byte(u8::from(key.throws()));
+            match key.throws() {
+                GoCallbackThrows::Never => hash.byte(0),
+                GoCallbackThrows::HostCallable => hash.byte(1),
+                GoCallbackThrows::Open => hash.byte(2),
+                GoCallbackThrows::Values {
+                    thrown,
+                    host_callable,
+                } => {
+                    hash.byte(3);
+                    hash.byte(u8::from(*host_callable));
+                    hash_go_ty(hash, thrown);
+                }
+            }
         }
     }
 }
 
-fn media_component(kind: MediaKind) -> &'static str {
+fn media_component(kind: ConcreteMediaKind) -> &'static str {
     match kind {
-        MediaKind::Image => "Image",
-        MediaKind::Audio => "Audio",
-        MediaKind::Video => "Video",
-        MediaKind::Pdf => "Pdf",
-        MediaKind::Generic => "Media",
+        ConcreteMediaKind::Image => "Image",
+        ConcreteMediaKind::Audio => "Audio",
+        ConcreteMediaKind::Video => "Video",
+        ConcreteMediaKind::Pdf => "Pdf",
     }
 }
 

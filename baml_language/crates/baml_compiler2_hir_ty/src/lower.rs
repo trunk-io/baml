@@ -15,19 +15,16 @@
 //! for `T | null`; enum variants read as literal types via the
 //! path-resolution fallback; generic arity is enforced by truncate/pad-with-
 //! `Error`; `baml.future.Future<V, E>` lowers to the dedicated `Future`
-//! kind. Diagnostics are not emitted yet (S17); every failure lowers to the
-//! `Error` sentinel.
-//!
-//! Not yet mirrored (later slices): free-impl method frames (their
-//! bodies as inference roots), map-key validation and other diagnostics
-//! (S17).
+//! kind. Every failure lowers to the `Error` sentinel and records its
+//! diagnostic in the context's sink; a sink-less lowering re-reads only
+//! what a checked world already reported on.
 
 use baml_base::LangRoots;
 use baml_compiler2_hir::{
     contributions::Definition,
     item_data::MethodOwner,
     loc::{ClassLoc, FunctionLoc, InterfaceLoc, TypeAliasLoc},
-    package::{accessible_package, is_served_from_interface},
+    package::{PathHead, is_served_from_interface},
     type_ref::{TypeRefId, TypeRefKind, TypeRefStore},
 };
 use baml_type::{
@@ -63,8 +60,7 @@ pub enum LoweringDiagKind {
         /// "Did you mean" candidates, each a fully qualified `root...` path.
         suggestions: Box<[Name]>,
     },
-    /// A map key type provably outside the string domain (B-267's
-    /// contract; `checked_map_key` lowers it to the Error sentinel).
+    /// A map key type without a `baml.Hash` implementation.
     InvalidMapKey { key: baml_type::Ty },
     /// A type error already in the shared vocabulary (projection
     /// determination, existential completeness), carried through the
@@ -94,9 +90,13 @@ pub enum NoInferReason {
     /// part of it may be inferred: the only body to infer from is a default
     /// that binds no implementor (`TYPE_SYSTEM.md` Functions rule 1).
     InterfaceSignature,
-    /// The right-hand side of a `type T = …` binding. It fills `T`'s frame
-    /// slot when the statement runs, from the written type alone.
+    /// An `extends` bound of a `let type T extends I = …` binding: the
+    /// statement checks it at run time, from the written type alone.
     TypeBinding,
+    /// The subject of an associated-type projection (`(Box<_> as I).Item`):
+    /// which interface declares the member is decided from the subject, so
+    /// the subject cannot be left for inference.
+    ProjectionBase,
 }
 
 /// Whether the types a [`LowerCtx`] lowers may contain an inference hole.
@@ -126,14 +126,18 @@ pub enum HolePolicy {
 /// a projection qualifier - pins only what it writes. (TIR's third
 /// variant, `ConstructorHead`, has no counterpart here: `hir_ty`'s
 /// construction road types heads through `infer_object`, not this path.)
+/// How many "did you mean" candidates an unresolved path reports: a
+/// message, not a listing of the package.
+const MAX_SUGGESTIONS: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypePosition {
     Existential,
     ConstraintHead,
     /// The outer function contract supplied to the exact
-    /// `reflect.Package.get_function<F>` method. It is otherwise an
-    /// existential; only an omitted OUTER `throws` differs, becoming the
-    /// runtime wildcard instead of E0151 + `never` recovery.
+    /// `reflect.Package.get_function<F>` or `find_function<F>` method. It is
+    /// otherwise an existential; only an omitted OUTER `throws` differs,
+    /// becoming the runtime wildcard instead of E0151 + `never` recovery.
     ExtractionContract,
 }
 
@@ -293,6 +297,12 @@ impl<'db> LowerCtx<'db> {
         self
     }
 
+    /// Bound one more rigid parameter: a body's `let type T extends I = …`
+    /// binding, which enters the env where its statement runs.
+    pub(crate) fn add_bounds(&mut self, param: ParamTy, bounds: Vec<baml_type::Interface>) {
+        self.bounds.insert(param, bounds);
+    }
+
     /// Forbid inference holes in everything this context lowers. See
     /// [`HolePolicy`].
     #[must_use]
@@ -343,29 +353,8 @@ impl<'db> LowerCtx<'db> {
         ty
     }
 
-    /// Lower one body-owned type through a lexical rigid-parameter overlay.
-    /// The declaration frame on this context remains immutable and reusable;
-    /// diagnostics produced by the short-lived fork are merged back into this
-    /// context's sink.
-    pub fn lower_type_ref_with_overlay(
-        &self,
-        store: &TypeRefStore,
-        id: TypeRefId,
-        position: TypePosition,
-        overlay: &[ParamTy],
-    ) -> LoweringTy {
-        if overlay.is_empty() {
-            return self.lower_type_ref_at(store, id, position);
-        }
-        let fork = self.fork_with_overlay(overlay);
-        let ty = fork.lower_type_ref_at(store, id, position);
-        self.merge_fork_diagnostics(&fork);
-        ty
-    }
-
-    /// Diagnostic-producing counterpart to
-    /// [`Self::lower_type_ref_with_overlay`]. The returned diagnostics are
-    /// scoped to `store` and this call only.
+    /// Lower a type ref through the overlay and report its diagnostics. The
+    /// returned diagnostics are scoped to `store` and this call only.
     pub fn lower_type_ref_with_overlay_and_diagnostics(
         &self,
         store: &TypeRefStore,
@@ -383,14 +372,15 @@ impl<'db> LowerCtx<'db> {
     /// [`Self::lower_type_path`] through the same body-local overlay.
     pub fn lower_type_path_with_overlay(
         &self,
+        head: PathHead,
         segments: &[Name],
         overlay: &[ParamTy],
     ) -> LoweringTy {
         if overlay.is_empty() {
-            return self.lower_type_path(segments);
+            return self.lower_type_path(head, segments);
         }
         let fork = self.fork_with_overlay(overlay);
-        let ty = fork.lower_type_path(segments);
+        let ty = fork.lower_type_path(head, segments);
         self.merge_fork_diagnostics(&fork);
         ty
     }
@@ -447,12 +437,10 @@ impl<'db> LowerCtx<'db> {
             TypeRefKind::Bool => LoweringTy::bool(),
             TypeRefKind::Null => LoweringTy::null(),
             TypeRefKind::Never => LoweringTy::never(),
-            TypeRefKind::Void => LoweringTy::void(),
             TypeRefKind::Uint8Array => LoweringTy::Uint8Array,
             TypeRefKind::Media { kind } => LoweringTy::Media(*kind),
             TypeRefKind::Unknown => LoweringTy::Unknown,
             TypeRefKind::Type => LoweringTy::Type,
-            TypeRefKind::Rust => LoweringTy::RustType,
             TypeRefKind::Optional { inner } => {
                 LoweringTy::optional(self.lower_type_ref(store, *inner))
             }
@@ -465,6 +453,12 @@ impl<'db> LowerCtx<'db> {
                 variants
                     .iter()
                     .map(|variant| self.lower_type_ref(store, *variant)),
+            ),
+            TypeRefKind::Tuple { elements } => LoweringTy::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.lower_type_ref(store, *element))
+                    .collect(),
             ),
             TypeRefKind::Literal { value } => {
                 LoweringTy::Literal(value.clone(), Freshness::Regular)
@@ -509,7 +503,7 @@ impl<'db> LowerCtx<'db> {
                     .into(),
             },
             TypeRefKind::Path {
-                segments,
+                path,
                 generic_args,
                 associated_type_bindings,
             } => {
@@ -521,7 +515,8 @@ impl<'db> LowerCtx<'db> {
                     .iter()
                     .map(|binding| (binding.name.clone(), self.lower_type_ref(store, binding.ty)))
                     .collect();
-                self.lower_path(segments, args, bindings, position)
+                let head = self.type_path_head(path.origin(), path);
+                self.lower_path(head, path, args, bindings, position)
             }
             // A projection node: `T.Output` / `(T as I).Output`. The
             // qualifying interface is the written one, or determined from
@@ -574,14 +569,10 @@ impl<'db> LowerCtx<'db> {
                         self.record_type_errors(lowered.diagnostics);
                         lowered.ty.as_lowering_ty().clone()
                     }
-                    // BUG: a hole-based projection (`(Box<_> as I).Item` in a
-                    // `let` annotation) errors silently — matching the
-                    // pre-split `Determination::InvalidBase` path, which also
-                    // pushed no diagnostic. The unsolved-inference diagnostics
-                    // thread owes this case a real error; today the only
-                    // hole-position diagnostics are the signature/expression
-                    // rejections.
-                    _ => LoweringTy::error(),
+                    _ => {
+                        self.record_no_infer(NoInferReason::ProjectionBase);
+                        LoweringTy::error()
+                    }
                 }
             }
             // `_` lowers to the hole node WHERE THE POSITION CAN FILL IT
@@ -599,9 +590,8 @@ impl<'db> LowerCtx<'db> {
                     LoweringTy::error()
                 }
             },
-            // `Missing` is an omitted annotation (a signature must be
-            // explicit; the diagnostic arrives with S17), `Error` was
-            // already diagnosed at parse time.
+            // `Missing` is an omitted annotation and `Error` an unparsable
+            // one: the parse reported both.
             TypeRefKind::Error | TypeRefKind::Missing => LoweringTy::error(),
         }
     }
@@ -617,8 +607,8 @@ impl<'db> LowerCtx<'db> {
     /// an interface-named prefix reaches the caller's projection-base
     /// rejection intact instead of tripping the existential completeness
     /// check first.
-    fn probe_projection_prefix(&self, prefix: &[Name]) -> Option<LoweringTy> {
-        let resolved = self.resolve_type(prefix);
+    fn probe_projection_prefix(&self, head: PathHead, prefix: &[Name]) -> Option<LoweringTy> {
+        let resolved = self.resolve_type(head, prefix);
         if matches!(
             resolved,
             Some(ResolvedTypeDefinition::Source(Definition::Enum(_)))
@@ -630,7 +620,13 @@ impl<'db> LowerCtx<'db> {
             return None;
         }
         let saved = self.diags.as_ref().map(|d| d.borrow().len());
-        let ty = self.lower_path(prefix, Vec::new(), Vec::new(), TypePosition::ConstraintHead);
+        let ty = self.lower_path(
+            head,
+            prefix,
+            Vec::new(),
+            Vec::new(),
+            TypePosition::ConstraintHead,
+        );
         let clean = match (&self.diags, saved) {
             (Some(diags), Some(saved)) => {
                 let mut diags = diags.borrow_mut();
@@ -664,7 +660,7 @@ impl<'db> LowerCtx<'db> {
 
     /// The interface a bare projection (`T.Output`) resolves through: for
     /// a type-var base, the UNIQUE bound in its conjunction whose
-    /// interface declares `member` (0 or ambiguity is Error - S17's
+    /// interface declares `member` (none, or several, is `Error` with its
     /// diagnostic); for an interface-existential base, itself.
     fn projection_interface_for(
         &self,
@@ -756,26 +752,14 @@ impl<'db> LowerCtx<'db> {
         }
     }
 
-    /// Map keys are strings by the language's contract: the VM's backing
-    /// store assumes it, map literals cannot spell a non-string key, and
-    /// `baml.Map`'s docstring states it (B-267). A key type not provably
-    /// a subtype of `string` is diagnosed (E0067) - INCLUDING a type
-    /// variable: no bound can prove one string-denoting, so `map<K, V>`
-    /// could be instantiated at a non-string key (TIR's fail-closed
-    /// rule; the stdlib's own `Map<K, V>` never writes a `map<K, V>`
-    /// annotation). Inference holes and error recovery stay untouched.
+    /// Inference holes are checked after solving; written keys must prove
+    /// `Hash` through their structural implementation or the enclosing bounds.
     fn checked_map_key(&self, key: LoweringTy) -> LoweringTy {
-        if key.contains_hole() || key.contains_error() {
+        if self.diags.is_none() || key.contains_hole() || key.contains_error() {
             return key;
         }
-        let facts = crate::facts::Facts::new(self.db);
-        let string = baml_type::Ty::String;
-        // Past the gate the key is hole-free, so the reject fold is a pure
-        // narrowing; the judgment stays in the plain vocabulary.
-        if !baml_type::normalize::is_subtype(&reject_holes(&key), &string, &facts) {
-            // Diagnose but keep the WRITTEN key (TIR's shape): the
-            // diagnostic is the enforcement, and downstream surfaces
-            // (codegen schemas, renders) still see what the user wrote.
+        let facts = crate::facts::Facts::with_bounds(self.db, self.plain_bounds_env());
+        if !crate::interfaces::map_key_is_hashable(self.db, &facts, &reject_holes(&key)) {
             if let (Some(diags), Some(type_ref)) = (&self.diags, self.current_ref.get()) {
                 diags.borrow_mut().push(LoweringDiag {
                     type_ref,
@@ -792,9 +776,12 @@ impl<'db> LowerCtx<'db> {
 
     /// Lowers a resolved (or fallback-resolved) type path. Mirrors TIR's
     /// `lower_path` dispatch and its failure fallbacks: in-scope type var,
-    /// then enum-variant reading, then `Error`.
+    /// then enum-variant reading, then `Error`. `head` is HIR's reading of
+    /// the first segment ([`PathHead`]); a lexical type name (a generic
+    /// parameter, `Self`) shadows it, as a binding shadows it in a body.
     fn lower_path(
         &self,
+        head: PathHead,
         segments: &[Name],
         args: Vec<LoweringTy>,
         bindings: Vec<(Name, LoweringTy)>,
@@ -803,27 +790,35 @@ impl<'db> LowerCtx<'db> {
         let short = segments.last().expect("type paths are never empty");
 
         // Lexical generic names (including a body-local overlay appended to
-        // the frame) shadow nominal type definitions. A multi-segment path
-        // rooted in such a name is an associated projection, never a package
-        // or namespace path with the same spelling. Associated types are NOT
-        // in the frame and have no bare spelling: a reference must be written
-        // `Self.X` (the projection road below), so a bare associated-type
-        // name falls through to ordinary resolution and diagnoses unresolved.
-        let generic_head = self
-            .generic_params
-            .iter()
-            .rev()
-            .find(|param| param.name() == &segments[0]);
+        // the frame) shadow nominal type definitions, as in Rust: a path
+        // rooted in such a name is a projection off the type variable,
+        // whatever follows — never a package or namespace path with the same
+        // spelling, and never a generic instantiation (a projection takes no
+        // arguments; written ones are an arity error). Associated types are
+        // NOT in the frame and have no bare spelling: a reference must be
+        // written `Self.X` (the projection road below), so a bare
+        // associated-type name falls through to ordinary resolution and
+        // diagnoses unresolved. Nothing shadows a package the compiler named
+        // by identity.
+        let generic_head = match head {
+            PathHead::Lang(_) => None,
+            PathHead::Package(_) | PathHead::Plain => self
+                .generic_params
+                .iter()
+                .rev()
+                .find(|param| param.name() == &segments[0]),
+        };
         if segments.len() == 1
             && let Some(param) = generic_head
         {
             return LoweringTy::TypeVar(param.clone());
         }
         if segments.len() > 1
-            && args.is_empty()
-            && bindings.is_empty()
             && let Some(param) = generic_head
         {
+            if !args.is_empty() || !bindings.is_empty() {
+                self.record_arity(short, args.len() + bindings.len(), 0);
+            }
             let mut ty = LoweringTy::TypeVar(param.clone());
             for member in &segments[1..] {
                 if let Some(interface) = self.projection_interface_for(&ty, member) {
@@ -835,9 +830,9 @@ impl<'db> LowerCtx<'db> {
                     continue;
                 }
                 // A chained projection over a hole-carrying prefix cannot
-                // determine; poison silently (same contract as the inner
-                // projection arm).
+                // determine (same contract as the inner projection arm).
                 let Ok(ty_plain) = baml_type::Ty::try_from(&ty) else {
+                    self.record_no_infer(NoInferReason::ProjectionBase);
                     return LoweringTy::error();
                 };
                 let lowered = crate::interfaces::lower_projection(
@@ -857,7 +852,7 @@ impl<'db> LowerCtx<'db> {
             return ty;
         }
 
-        if let Some(def) = self.resolve_type(segments) {
+        if let Some(def) = self.resolve_type(head, segments) {
             return match def {
                 ResolvedTypeDefinition::Source(def) => {
                     self.lower_definition(def, short, args, bindings, position)
@@ -868,11 +863,10 @@ impl<'db> LowerCtx<'db> {
             };
         }
 
-        // Fallback 1: a single segment naming an in-scope generic param
-        // (inner frames shadow outer: search in reverse).
-        // Fallback 1b: bare `Self` under a concrete impl owner (r-a's
-        // resolver-provided self type). Interface frames never reach
-        // here - their `Self` is a param, caught by fallback 1.
+        // Fallback 1: bare `Self` under a concrete impl owner (r-a's
+        // resolver-provided self type). A lexical generic name was read
+        // above, before any item; interface frames never reach here -
+        // their `Self` is a param.
         if segments.len() == 1
             && segments[0].as_str() == "Self"
             && let Some(self_ty) = &self.self_ty
@@ -884,7 +878,7 @@ impl<'db> LowerCtx<'db> {
         if segments.len() >= 2
             && args.is_empty()
             && bindings.is_empty()
-            && let Some(enum_def) = self.resolve_type(&segments[..segments.len() - 1])
+            && let Some(enum_def) = self.resolve_type(head, &segments[..segments.len() - 1])
         {
             let enum_qtn = match enum_def {
                 ResolvedTypeDefinition::Source(Definition::Enum(enum_loc)) => {
@@ -951,6 +945,7 @@ impl<'db> LowerCtx<'db> {
                         continue;
                     }
                     let Ok(ty_plain) = baml_type::Ty::try_from(&ty) else {
+                        self.record_no_infer(NoInferReason::ProjectionBase);
                         return LoweringTy::error();
                     };
                     let lowered = crate::interfaces::lower_projection(
@@ -975,12 +970,14 @@ impl<'db> LowerCtx<'db> {
             // enum variants had first refusal. Probed with the sink
             // muted so an unresolvable prefix falls through to the
             // ordinary unresolved-path report below.
-            if let Some(head) = self.probe_projection_prefix(&segments[..segments.len() - 1]) {
+            if let Some(prefix_ty) =
+                self.probe_projection_prefix(head, &segments[..segments.len() - 1])
+            {
                 let member = segments.last().expect("checked len > 1");
                 // A hole-carrying prefix cannot host a member projection;
                 // degrade to `Error` inside the prefix (the ordinary
                 // determination failure diagnostics still apply).
-                let head_plain = reject_holes(&head);
+                let head_plain = reject_holes(&prefix_ty);
                 if let Some(iface_qtn) = crate::interfaces::interface_base_without_member_pin(
                     self.db,
                     &head_plain,
@@ -1022,37 +1019,102 @@ impl<'db> LowerCtx<'db> {
                 },
             });
         }
+        if let Some(package) = self.package_shadowed_by_item(head, segments) {
+            self.record_type_errors(vec![crate::diagnostics::TirTypeError::ItemShadowsPackage {
+                name: package,
+            }]);
+        }
         LoweringTy::error()
     }
 
-    /// "Did you mean" candidates for an unresolved SINGLE-SEGMENT type
-    /// name: every namespace that declares the bare name, spelled as its
-    /// fully qualified `root...` path (TIR's `type_suggestions`).
+    /// "Did you mean" candidates for an unresolved type path: every
+    /// namespace of this package that declares the item and whose path ends
+    /// with the namespaces written, spelled as its fully qualified `root...`
+    /// path. For a bare name that is every namespace declaring it; for
+    /// `sub.Item` it is the `root.….sub.Item` the path would have to be
+    /// written as.
     pub(crate) fn type_suggestions(&self, segments: &[Name]) -> Box<[Name]> {
-        if segments.len() != 1 {
+        self.qualified_suggestions(segments, |items, item| items.types.contains_key(item))
+    }
+
+    /// [`Self::type_suggestions`] for an unresolved QUALIFIED value path
+    /// (`sub.make`): the `root.….sub.make` it would have to be written as.
+    /// A path whose item no namespace declares may name a member of a type
+    /// instead (`sub.Kind.A`, `sub.Cls.make`): then the longest prefix that
+    /// is a type path is suggested, with the members written after it. A
+    /// bare name gets none — a misspelled local is the likelier mistake, and
+    /// listing every namespace that declares the name would bury it.
+    pub(crate) fn value_suggestions(&self, segments: &[Name]) -> Box<[Name]> {
+        if segments.len() < 2 {
             return Box::new([]);
         }
-        let item = &segments[0];
-        let mut suggestions: Vec<String> = Vec::new();
-        for (ns_path, ns_items) in &self.package_items.namespaces {
-            if ns_items.types.contains_key(item) {
-                if ns_path.is_empty() {
-                    suggestions.push(format!("root.{item}"));
-                } else {
-                    let ns_str = ns_path
-                        .iter()
-                        .map(smol_str::SmolStr::as_str)
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    suggestions.push(format!("root.{ns_str}.{item}"));
-                }
-            }
+        let direct =
+            self.qualified_suggestions(segments, |items, item| items.values.contains_key(item));
+        if !direct.is_empty() {
+            return direct;
         }
-        suggestions.sort();
-        suggestions
+        (2..segments.len())
+            .rev()
+            .map(|split| segments.split_at(split))
+            .find_map(|(type_path, members)| {
+                let types = self.type_suggestions(type_path);
+                (!types.is_empty()).then(|| {
+                    types
+                        .iter()
+                        .map(|ty| {
+                            Name::new(
+                                std::iter::once(ty.as_str())
+                                    .chain(members.iter().map(Name::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                            )
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// The fully qualified `root.…` path of every namespace of this package
+    /// that `declares` the path's item and whose own path ends with the
+    /// namespaces written — the first [`MAX_SUGGESTIONS`] of them. The
+    /// namespace the path would have named had it been read relative to the
+    /// writer's (the reading this language does not have) comes first; the
+    /// rest are sorted.
+    fn qualified_suggestions(
+        &self,
+        segments: &[Name],
+        declares: impl Fn(&baml_compiler2_hir::namespace::NamespaceItems<'db>, &Name) -> bool,
+    ) -> Box<[Name]> {
+        let Some((item, written_ns)) = segments.split_last() else {
+            return Box::new([]);
+        };
+        let relative: Vec<&Name> = self.ns_context.iter().chain(written_ns).collect();
+        let mut candidates: Vec<(bool, &[Name])> = self
+            .package_items
+            .namespaces
             .iter()
-            .map(String::as_str)
-            .map(Name::new)
+            .filter(|(ns_path, ns_items)| ns_path.ends_with(written_ns) && declares(ns_items, item))
+            .map(|(ns_path, _)| {
+                (
+                    !ns_path.iter().eq(relative.iter().copied()),
+                    ns_path.as_slice(),
+                )
+            })
+            .collect();
+        candidates.sort();
+        candidates.truncate(MAX_SUGGESTIONS);
+        candidates
+            .into_iter()
+            .map(|(_, ns_path)| {
+                Name::new(
+                    std::iter::once("root")
+                        .chain(ns_path.iter().map(Name::as_str))
+                        .chain(std::iter::once(item.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            })
             .collect()
     }
 
@@ -1346,143 +1408,181 @@ impl<'db> LowerCtx<'db> {
         }
     }
 
-    /// The package this context's package spells as `name` (itself, or a
-    /// declared dependency) — see `hir::package::accessible_package`.
-    pub(crate) fn accessible_package(&self, name: &Name) -> Option<baml_base::SourceRoot> {
-        accessible_package(self.db, self.package_items.root, name)
+    /// HIR's reading of a WRITTEN type path's first segment
+    /// ([`baml_compiler2_hir::package::path_head`]), for the paths that have
+    /// no recorded head: pattern classes, paths the checker spells itself.
+    pub fn path_head(&self, segments: &[Name]) -> PathHead {
+        baml_compiler2_hir::package::path_head(
+            self.db,
+            self.package_items.root,
+            &self.ns_context,
+            segments,
+        )
     }
 
-    /// TIR's `resolve_type_in`, mirrored: (1) namespace-relative in the
-    /// current package (no outward walk); (2) `root.`-absolute or
-    /// package-prefixed.
-    pub(crate) fn resolve_type(&self, segments: &[Name]) -> Option<ResolvedTypeDefinition<'db>> {
-        let (item, seg_ns) = segments.split_last().expect("type paths are never empty");
+    /// The lexical generic parameter named `name`, innermost frame first:
+    /// the names that shadow every item in a type position.
+    pub(crate) fn lexical_generic(&self, name: &Name) -> Option<&ParamTy> {
+        self.generic_params
+            .iter()
+            .rev()
+            .find(|param| param.name() == name)
+    }
 
-        let relative_ns: Vec<Name> = if self.ns_context.is_empty() {
-            seg_ns.to_vec()
+    /// The package `segments` would have started at, had an item of this
+    /// namespace not claimed its head: `Some` exactly when `head` is plain
+    /// for that reason. The item is what the path reads; the package is
+    /// unreachable by that name from here (`TYPE_SYSTEM.md` § Declarations,
+    /// Packages, and Names) — what a diagnostic about the path should say.
+    pub(crate) fn package_shadowed_by_item(
+        &self,
+        head: PathHead,
+        segments: &[Name],
+    ) -> Option<Name> {
+        match (head, segments) {
+            (PathHead::Plain, [first, _, ..])
+                if baml_compiler2_hir::namespace::namespace_declares(
+                    self.db,
+                    self.package_items.root,
+                    &self.ns_context,
+                    first,
+                ) && baml_compiler2_hir::package::path_package(
+                    self.db,
+                    self.package_items.root,
+                    first,
+                )
+                .is_some() =>
+            {
+                Some(first.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// HIR's reading of a type path's first segment as `origin` says it was
+    /// written ([`baml_compiler2_hir::package::path_head_for`]): annotations
+    /// and constructor heads carry their origin with them.
+    pub fn type_path_head(&self, origin: baml_base::PathOrigin, segments: &[Name]) -> PathHead {
+        baml_compiler2_hir::package::path_head_for(
+            self.db,
+            self.package_items.root,
+            &self.ns_context,
+            origin,
+            segments,
+        )
+    }
+
+    /// The items of a source-served package this context can read: its own
+    /// (the context's table) or another's.
+    fn source_items(
+        &self,
+        package: baml_base::SourceRoot,
+    ) -> &'db baml_compiler2_hir::package::PackageItems<'db> {
+        if package == self.package_items.root {
+            self.package_items
         } else {
-            self.ns_context.iter().chain(seg_ns).cloned().collect()
-        };
-        if let Some(def) = self.package_items.lookup_type(&relative_ns, item) {
-            return Some(ResolvedTypeDefinition::Source(def));
+            baml_compiler2_hir::package::package_items(self.db, package)
         }
+    }
 
-        if segments.len() >= 2 {
-            let prefix_ns = &segments[1..segments.len() - 1];
-            if segments[0].as_str() == "root" {
-                if let Some(def) = self.package_items.lookup_type(prefix_ns, item) {
-                    return Some(ResolvedTypeDefinition::Source(def));
-                }
-            } else if let Some(package) = self.accessible_package(&segments[0]) {
-                // A served dependency answers from its interface ONLY: it
-                // has no files (`definition_of`).
-                if is_served_from_interface(self.db, package) {
-                    if let Some(exported) = crate::package_interface::exported_type_row(
-                        self.db, package, prefix_ns, item,
-                    ) {
-                        return Some(ResolvedTypeDefinition::Exported(Box::new(exported.clone())));
-                    }
-                } else if let Some(def) =
-                    baml_compiler2_hir::package::package_items(self.db, package)
-                        .lookup_type(prefix_ns, item)
-                {
-                    return Some(ResolvedTypeDefinition::Source(def));
-                }
-            }
-        }
-
-        // `json` is the sole builtin namespace shorthand. After ordinary
-        // local/package lookup fails, reinterpret `json.*` under `baml`.
-        if segments.first().is_some_and(|root| root.as_str() == "json")
-            && let Some(baml) = self.accessible_package(&Name::new("baml"))
+    /// The type `segments` names, read from `head`, when the WHOLE path is
+    /// the item's own path. There are two ways to name an item, and no third:
+    /// (1) its bare name, from the namespace that declares it;
+    /// (2) its fully qualified path — `root.<namespaces>.<Item>` in this
+    /// package, `<edge>.<namespaces>.<Item>` in one it reaches — which is
+    /// what a [`PathHead::Package`] head reads.
+    ///
+    /// `Cart.empty` starts at a local item and continues with a member of
+    /// it, so it is not an item path and is not answered here: the caller
+    /// resolves the item (`Cart`, a one-segment prefix under the same head)
+    /// and reads the rest as members. A plain head is never read as a
+    /// NAMESPACE relative to the current one: `sub.Item` does not reach a
+    /// child namespace `sub`.
+    ///
+    /// A package and an own item spelled alike (`#4543`, pinned by
+    /// `ns_reflect_shadowing`): the item claims the head
+    /// ([`baml_compiler2_hir::package::path_head`]), so the path arrives
+    /// `Plain` and the caller reads its one-segment prefix as the bare name. A `Lang`
+    /// head — a package the compiler named by identity — has no such
+    /// fallback: nothing in scope is read for it.
+    pub(crate) fn resolve_type(
+        &self,
+        head: PathHead,
+        segments: &[Name],
+    ) -> Option<ResolvedTypeDefinition<'db>> {
+        if let PathHead::Package(package) | PathHead::Lang(package) = head
+            && let Some((item, namespace)) = segments[1..].split_last()
         {
-            let namespace = &segments[..segments.len() - 1];
-            // Served `baml` (the precompiled stdlib of a runtime compile)
-            // answers from its interface, exactly as the package-prefixed
-            // spelling above and the value shorthand do.
-            if is_served_from_interface(self.db, baml) {
-                return crate::package_interface::exported_type_row(self.db, baml, namespace, item)
-                    .map(|exported| ResolvedTypeDefinition::Exported(Box::new(exported.clone())));
-            }
-            let baml_items = baml_compiler2_hir::package::package_items(self.db, baml);
-            let visible = self.package_items.root == baml
-                || crate::package_interface::package_interface(self.db, baml)
-                    .lookup_type(namespace, item)
-                    .is_some();
-            if visible && let Some(def) = baml_items.lookup_type(namespace, item) {
+            // A served dependency answers from its interface ONLY: it has
+            // no files (`definition_of`).
+            if is_served_from_interface(self.db, package) {
+                if let Some(exported) =
+                    crate::package_interface::exported_type_row(self.db, package, namespace, item)
+                {
+                    return Some(ResolvedTypeDefinition::Exported(Box::new(exported.clone())));
+                }
+            } else if let Some(def) = self.source_items(package).lookup_type(namespace, item) {
                 return Some(ResolvedTypeDefinition::Source(def));
             }
+        }
+
+        if let PathHead::Package(_) | PathHead::Plain = head
+            && let [item] = segments
+            && let Some(def) = self.package_items.lookup_type(&self.ns_context, item)
+        {
+            return Some(ResolvedTypeDefinition::Source(def));
         }
 
         None
     }
 
-    /// Value-namespace resolution, mirroring `LowerCtx::resolve_type`'s
-    /// algorithm over `lookup_value` (functions, clients, lets).
+    /// Value-namespace resolution, mirroring `resolve_type`'s
+    /// algorithm over `lookup_value` (functions, clients, lets): a bare name
+    /// in the current namespace, or a fully qualified path read from `head`.
     /// TIR's value-path ladder, mirrored, with ONE answer per lane: a
     /// source-served package's definition, or a served package's exported
-    /// function by its identity. A served dependency answers from its
-    /// interface ONLY — it has no files (`definition_of`) — which is also
-    /// why a served package's non-function value resolves to nothing: the
-    /// interface exports functions and types.
+    /// function or top-level binding by its identity. A served dependency
+    /// answers from its interface ONLY — it has no files (`definition_of`).
     pub fn resolve_value(
         &self,
+        head: PathHead,
         segments: &[Name],
     ) -> Option<crate::package_interface::ResolvedValue<'db>> {
         use crate::package_interface::ResolvedValue;
-        let (item, seg_ns) = segments.split_last()?;
-        let relative_ns: Vec<Name> = if self.ns_context.is_empty() {
-            seg_ns.to_vec()
-        } else {
-            self.ns_context.iter().chain(seg_ns).cloned().collect()
-        };
-        if let Some(def) = self.package_items.lookup_value(&relative_ns, item) {
-            return Some(ResolvedValue::Source(def));
-        }
-        if segments.len() >= 2 {
-            let prefix_ns = &segments[1..segments.len() - 1];
-            if segments[0].as_str() == "root" {
-                if let Some(def) = self.package_items.lookup_value(prefix_ns, item) {
-                    return Some(ResolvedValue::Source(def));
-                }
-            } else if let Some(package) = self.accessible_package(&segments[0]) {
-                if is_served_from_interface(self.db, package) {
-                    return crate::extern_loc::mounted_function_named(
-                        self.db, package, prefix_ns, item,
-                    )
-                    .map(ResolvedValue::External);
-                }
-                if let Some(def) = baml_compiler2_hir::package::package_items(self.db, package)
-                    .lookup_value(prefix_ns, item)
-                {
-                    return Some(ResolvedValue::Source(def));
-                }
-            }
-        }
-        // The sole builtin namespace shorthand: `json.x` reads `baml.json.x`.
-        if segments.first().is_some_and(|root| root.as_str() == "json")
-            && let Some(baml) = self.accessible_package(&Name::new("baml"))
+        if let PathHead::Package(package) | PathHead::Lang(package) = head
+            && let Some((item, namespace)) = segments[1..].split_last()
         {
-            let namespace = &segments[..segments.len() - 1];
-            if is_served_from_interface(self.db, baml) {
-                return crate::extern_loc::mounted_function_named(self.db, baml, namespace, item)
-                    .map(ResolvedValue::External);
-            }
-            let baml_items = baml_compiler2_hir::package::package_items(self.db, baml);
-            let visible = self.package_items.root == baml
-                || crate::package_interface::package_interface(self.db, baml)
-                    .lookup_function(namespace, item)
-                    .is_some();
-            if visible && let Some(def) = baml_items.lookup_value(namespace, item) {
+            if is_served_from_interface(self.db, package) {
+                if let Some(function) =
+                    crate::extern_loc::mounted_function_named(self.db, package, namespace, item)
+                {
+                    return Some(ResolvedValue::External(function));
+                }
+                if let Some(binding) =
+                    crate::extern_loc::mounted_let_named(self.db, package, namespace, item)
+                {
+                    return Some(ResolvedValue::ExternalLet(binding));
+                }
+            } else if let Some(def) = self.source_items(package).lookup_value(namespace, item) {
                 return Some(ResolvedValue::Source(def));
             }
+        }
+        if let PathHead::Package(_) | PathHead::Plain = head
+            && let [item] = segments
+            && let Some(def) = self.package_items.lookup_value(&self.ns_context, item)
+        {
+            return Some(ResolvedValue::Source(def));
         }
         None
     }
 
     /// Type-namespace resolution, exposed for constructor and member typing.
-    pub fn resolve_type_definition(&self, segments: &[Name]) -> Option<Definition<'db>> {
-        match self.resolve_type(segments) {
+    pub fn resolve_type_definition(
+        &self,
+        head: PathHead,
+        segments: &[Name],
+    ) -> Option<Definition<'db>> {
+        match self.resolve_type(head, segments) {
             Some(ResolvedTypeDefinition::Source(def)) => Some(def),
             _ => None,
         }
@@ -1490,9 +1590,10 @@ impl<'db> LowerCtx<'db> {
 
     pub fn resolve_exported_type_definition(
         &self,
+        head: PathHead,
         segments: &[Name],
     ) -> Option<Box<crate::package_interface::ExportedType>> {
-        match self.resolve_type(segments) {
+        match self.resolve_type(head, segments) {
             Some(ResolvedTypeDefinition::Exported(exported)) => Some(exported),
             _ => None,
         }
@@ -1502,8 +1603,14 @@ impl<'db> LowerCtx<'db> {
     /// `Type.from_json`), resolved exactly as a written annotation path -
     /// classes, enums, aliases, and in-scope generic params - with no
     /// written args or bindings.
-    pub fn lower_type_path(&self, segments: &[Name]) -> LoweringTy {
-        self.lower_path(segments, Vec::new(), Vec::new(), TypePosition::Existential)
+    pub fn lower_type_path(&self, head: PathHead, segments: &[Name]) -> LoweringTy {
+        self.lower_path(
+            head,
+            segments,
+            Vec::new(),
+            Vec::new(),
+            TypePosition::Existential,
+        )
     }
 
     /// `LowerCtx::qualify`, exposed for constructor typing.
@@ -1538,8 +1645,35 @@ pub fn substitute_params(ty: &baml_type::interned::Ty, args: &[baml_type::intern
     )
 }
 
-/// Generic-arity recovery without diagnostics (S17): extras truncated,
-/// missing padded with `Error`.
+/// [`substitute_params`] for one arm of a union `Self`. `args` binds `Self`
+/// (slot 0) to the union and `arm_args` binds it to the arm. A bare `Self`
+/// is the union, but an associated-type projection is taken over the arm:
+/// the value's own impl binds it, and the arms of one union can bind it
+/// differently.
+pub(crate) fn substitute_params_through_arm(
+    ty: &baml_type::interned::Ty,
+    args: &[baml_type::interned::Ty],
+    arm_args: &[baml_type::interned::Ty],
+) -> Ty {
+    use baml_type::interned::TypeFlags;
+    if !ty.flags().contains(TypeFlags::HAS_TYPEVAR) {
+        return ty.clone();
+    }
+    match ty.kind() {
+        InferTy::AssociatedTypeProjection { .. } => substitute_params(ty, arm_args),
+        InferTy::TypeVar(param) if args.get(param.index() as usize).is_some() => {
+            args[param.index() as usize].clone()
+        }
+        kind => Ty::intern(
+            kind.map_children(|child| substitute_params_through_arm(child, args, arm_args)),
+        ),
+    }
+}
+
+/// Generic-arity recovery: extras truncated, missing padded with
+/// `Error`. The arity report is `record_arity`'s, made before this runs;
+/// a sink-less re-lowering (MIR, emit) only sees signatures the checked
+/// world already reported on.
 fn enforce_arity(args: &mut Vec<LoweringTy>, expected: usize) {
     args.truncate(expected);
     while args.len() < expected {
@@ -1761,92 +1895,72 @@ pub fn interface_declared_params<'db>(
     interface_frame(db, interface)[1..=data.generic_params.len()].to_vec()
 }
 
-/// The root generic frame for an impl block: the enclosing class's frame
-/// for an in-class `implements`, the block's own declared generics for a
-/// free `implements ... for T`.
+/// The root generic frame for an impl block: its declared generics (an
+/// in-body block carries its class's).
 pub fn impl_frame<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     block: baml_compiler2_hir::loc::ImplLoc<'db>,
 ) -> Vec<ParamTy> {
     let data = baml_compiler2_hir::item_data::impl_block_data(db, block);
-    match &data.subject {
-        baml_compiler2_hir::item_data::ImplSubjectData::InClass { class, .. } => {
-            class_generic_frame(db, *class)
-        }
-        baml_compiler2_hir::item_data::ImplSubjectData::Free { generics, .. } => {
-            let mut frame = Vec::new();
-            ParamTy::extend_frame(
-                &mut frame,
-                &generics
-                    .iter()
-                    .map(|param| param.name.clone())
-                    .collect::<Vec<_>>(),
-            );
-            frame
-        }
-    }
+    let mut frame = Vec::new();
+    ParamTy::extend_frame(
+        &mut frame,
+        &data
+            .generics
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>(),
+    );
+    frame
 }
 
-/// The type an impl block is FOR — what `Self` denotes inside it: the
-/// enclosing class's self type for an in-body block, the lowered for-target
-/// for a free one. Together with [`impl_frame`] and [`impl_generic_bounds`]
-/// this is the UNIFORM impl surface: the in-body-vs-free distinction is
-/// HIR's business, and downstream consumers (emit's rule baking, MIR's
-/// display names) see only the type.
+/// The type an impl block is FOR — what `Self` denotes inside it: the lowered
+/// for-target (an in-body block's is its class applied to the class's
+/// generics). Together with [`impl_frame`] and [`impl_generic_bounds`] this
+/// is the UNIFORM impl surface downstream consumers (emit's rule baking,
+/// MIR's display names) see.
 pub fn impl_self_ty<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     block: baml_compiler2_hir::loc::ImplLoc<'db>,
 ) -> baml_type::Ty {
     let data = baml_compiler2_hir::item_data::impl_block_data(db, block);
-    match &data.subject {
-        baml_compiler2_hir::item_data::ImplSubjectData::InClass { class, .. } => {
-            class_self_ty(db, *class)
-        }
-        baml_compiler2_hir::item_data::ImplSubjectData::Free { for_target, .. } => reject_holes(
-            &lower_ctx_for_file(db, block.file(db))
-                .with_frame(impl_frame(db, block))
-                .with_bounds(impl_generic_bounds(db, block))
-                .lower_type_ref(&data.type_refs, *for_target),
-        ),
-    }
+    reject_holes(
+        &lower_ctx_for_file(db, block.file(db))
+            .with_frame(impl_frame(db, block))
+            .with_bounds(impl_generic_bounds(db, block))
+            .lower_type_ref(&data.type_refs, data.for_target),
+    )
 }
 
-/// A free impl block's declared generic bounds (`implements<T extends I>
-/// ... for T`), conjunctive per param - the impl-scope param env. In-class
-/// impls carry the CLASS's bounds instead (`class_generic_bounds`).
+/// An impl block's declared generic bounds (`implements<T extends I> ... for
+/// T`), conjunctive per param — the impl-scope param env.
 pub fn impl_generic_bounds<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     block: baml_compiler2_hir::loc::ImplLoc<'db>,
 ) -> FxHashMap<ParamTy, Vec<baml_type::Interface>> {
     let data = baml_compiler2_hir::item_data::impl_block_data(db, block);
-    match &data.subject {
-        baml_compiler2_hir::item_data::ImplSubjectData::InClass { class, .. } => {
-            class_generic_bounds(db, *class)
-        }
-        baml_compiler2_hir::item_data::ImplSubjectData::Free { generics, .. } => {
-            let frame = impl_frame(db, block);
-            let ctx = lower_ctx_for_file(db, block.file(db)).with_frame(frame.clone());
-            let mut out = FxHashMap::default();
-            for (param, param_data) in frame.iter().zip(generics.iter()) {
-                let bounds: Vec<_> = param_data
-                    .bounds
-                    .iter()
-                    .filter_map(|&type_ref| {
-                        reject_holes(&ctx.lower_type_ref_at(
-                            &data.type_refs,
-                            type_ref,
-                            TypePosition::ConstraintHead,
-                        ))
-                        .as_interface()
-                    })
-                    .collect();
-                if !bounds.is_empty() {
-                    out.insert(param.clone(), bounds);
-                }
-            }
-            out
+    let generics = &data.generics;
+    let frame = impl_frame(db, block);
+    let ctx = lower_ctx_for_file(db, block.file(db)).with_frame(frame.clone());
+    let mut out = FxHashMap::default();
+    for (param, param_data) in frame.iter().zip(generics.iter()) {
+        let bounds: Vec<_> = param_data
+            .bounds
+            .iter()
+            .filter_map(|&type_ref| {
+                reject_holes(&ctx.lower_type_ref_at(
+                    &data.type_refs,
+                    type_ref,
+                    TypePosition::ConstraintHead,
+                ))
+                .as_interface()
+            })
+            .collect();
+        if !bounds.is_empty() {
+            out.insert(param.clone(), bounds);
         }
     }
+    out
 }
 
 /// The qualified name of a definition as its own file's package and
@@ -1941,7 +2055,7 @@ pub struct SignatureParam {
 /// hole node uniformly; this is the signature-side policy fold that rejects
 /// survivors, producing the FINALIZED type (the inference side instead
 /// instantiates holes as fresh vars). Every hole becomes the `Error`
-/// sentinel — its rejection diagnostic is the position's own (S17 / E0147),
+/// sentinel — its rejection diagnostic is the position's own (E0147),
 /// not this fold's — with the closed spine around it preserved.
 pub fn reject_holes(ty: &LoweringTy) -> baml_type::Ty {
     baml_type::Ty::try_from(ty).unwrap_or_else(|_| fill_holes_as_errors(ty))
@@ -1963,6 +2077,7 @@ fn fill_holes_as_errors(ty: &LoweringTy) -> baml_type::Ty {
             value: Box::new(fill_holes_as_errors(value)),
         },
         LoweringTy::Union(members) => baml_type::Ty::Union(fill_all(members)),
+        LoweringTy::Tuple(elements) => baml_type::Ty::Tuple(fill_all(elements)),
         LoweringTy::Class(name, args) => baml_type::Ty::Class(name.clone(), fill_all(args)),
         LoweringTy::Interface(name, args, assoc) => baml_type::Ty::Interface(
             name.clone(),
@@ -2085,39 +2200,26 @@ pub fn function_generic_bounds<'db>(
         Some(MethodOwner::Impl(impl_loc)) => {
             // The owner prefix's declared bounds, conjunctive per param,
             // keyed by the frame-prefix identities this function's frame
-            // starts with: the block's own generics for a free impl
-            // (`implements<T extends I> ...`), the enclosing CLASS's
-            // generics for an in-class block (`impl_frame` is the class
-            // frame there, so the identities coincide).
+            // starts with: the block's declared generics (an in-body block
+            // carries its class's).
             let impl_data = baml_compiler2_hir::item_data::impl_block_data(db, impl_loc);
-            match &impl_data.subject {
-                baml_compiler2_hir::item_data::ImplSubjectData::InClass { class, .. } => {
-                    let class_data = baml_compiler2_hir::item_data::class_data(db, *class);
-                    out.extend(class_generic_bounds(db, *class));
-                    for _ in 0..class_data.generic_params.len() {
-                        frame_iter.next();
-                    }
-                }
-                baml_compiler2_hir::item_data::ImplSubjectData::Free { generics, .. } => {
-                    for param_data in generics {
-                        let Some(param) = frame_iter.next() else {
-                            break;
-                        };
-                        let bounds: Vec<_> = param_data
-                            .bounds
-                            .iter()
-                            .filter_map(|&type_ref| {
-                                as_ref(&ctx.lower_type_ref_at(
-                                    &impl_data.type_refs,
-                                    type_ref,
-                                    TypePosition::ConstraintHead,
-                                ))
-                            })
-                            .collect();
-                        if !bounds.is_empty() {
-                            out.insert(param.clone(), bounds);
-                        }
-                    }
+            for param_data in &impl_data.generics {
+                let Some(param) = frame_iter.next() else {
+                    break;
+                };
+                let bounds: Vec<_> = param_data
+                    .bounds
+                    .iter()
+                    .filter_map(|&type_ref| {
+                        as_ref(&ctx.lower_type_ref_at(
+                            &impl_data.type_refs,
+                            type_ref,
+                            TypePosition::ConstraintHead,
+                        ))
+                    })
+                    .collect();
+                if !bounds.is_empty() {
+                    out.insert(param.clone(), bounds);
                 }
             }
         }
@@ -2225,23 +2327,6 @@ pub fn interface_qualified_name<'db>(
     )
 }
 
-// SAFETY: PartialEq-driven overwrite, the CallableThrows precedent.
-#[allow(unsafe_code)]
-unsafe impl salsa::Update for FunctionSignature {
-    #[allow(unsafe_code)]
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        unsafe {
-            let changed = *old_pointer != new_value;
-            if changed {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            changed
-        }
-    }
-}
-
 /// Whether `function`'s signature is an interface's dispatch contract - the
 /// positions where inference holes are forbidden and the `throws` contract
 /// must be taken from the signature alone, never from a (default) body.
@@ -2264,23 +2349,25 @@ pub(crate) fn signature_is_interface_contract<'db>(
 }
 
 fn function_signature_cycle_initial<'db>(
-    _db: &'db dyn baml_compiler2_hir::Db,
+    db: &'db dyn baml_compiler2_hir::Db,
     _id: salsa::Id,
-    _function: FunctionLoc<'db>,
+    function: FunctionLoc<'db>,
 ) -> FunctionSignatureResult {
     // The fixpoint seed for the signature/throws/inference cycle (an
     // omitted or partial throws clause reads `callable_throws`, which
-    // runs `infer_body`, which reads the signature): a degenerate empty
-    // signature; iteration converges to the real one.
-    FunctionSignatureResult {
-        signature: FunctionSignature {
-            generic_params: Vec::new(),
-            params: Vec::new(),
-            ret: baml_type::Ty::error(),
-            throws: baml_type::Ty::never(),
-        },
-        diagnostics: Box::new([]),
-    }
+    // runs `infer_body`, which reads the signature). Only the throws type
+    // depends on the body, so only it is seeded - at the throw set's
+    // bottom, `never` - and the first iteration infers the body against
+    // the real parameters and return type.
+    lower_function_signature(db, function, ThrowsSource::Seed)
+}
+
+/// Where a signature's throws type comes from: the written clause and,
+/// for an open one, the body fixpoint - or the fixpoint's seed.
+#[derive(Clone, Copy)]
+enum ThrowsSource {
+    Lowered,
+    Seed,
 }
 
 /// The concrete `Self` a method's OWNER provides - the class's self
@@ -2414,6 +2501,9 @@ pub fn lowering_diag_error(kind: &LoweringDiagKind) -> crate::diagnostics::TirTy
         LoweringDiagKind::HoleNotAllowed {
             reason: NoInferReason::InterfaceSignature | NoInferReason::TypeBinding,
         } => TirTypeError::CannotInferType,
+        LoweringDiagKind::HoleNotAllowed {
+            reason: NoInferReason::ProjectionBase,
+        } => TirTypeError::WildcardInProjectionSubject,
     }
 }
 
@@ -2562,7 +2652,77 @@ pub fn signature_lowering_diagnostics<'db>(
             }
         }
     }
+    for error in method_generic_shadowing(db, function, &func_data.generic_params) {
+        out.push((source_map.name_span, error));
+    }
     out
+}
+
+/// A method's own generic parameter may not reuse the name of a generic
+/// parameter of its owner - the enclosing class, interface, or `implements`
+/// block. Shadowing would make one spelling name two frame slots, so it is
+/// rejected (as rustc's E0403 does) rather than resolved. An associated type
+/// is not a frame slot and has no bare spelling (it is always `Self.X`), so
+/// an own generic sharing its name shadows nothing.
+fn method_generic_shadowing<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    function: FunctionLoc<'db>,
+    own: &[baml_compiler2_hir::item_data::GenericParamData],
+) -> Vec<crate::diagnostics::TirTypeError> {
+    use crate::diagnostics::{ShadowedParamOwner, TirTypeError};
+    let Some(owner) = baml_compiler2_hir::item_data::method_owner(db, function) else {
+        return Vec::new();
+    };
+    let shadowed = |names: &[&Name], param: &Name| names.contains(&param);
+    match owner {
+        MethodOwner::Class(class_loc) => {
+            let data = baml_compiler2_hir::item_data::class_data(db, class_loc);
+            let names: Vec<&Name> = data.generic_params.iter().map(|g| &g.name).collect();
+            own.iter()
+                .filter(|param| shadowed(&names, &param.name))
+                .map(|param| TirTypeError::TypeParamShadowed {
+                    param_name: param.name.clone(),
+                    type_name: data.name.clone(),
+                    owner: ShadowedParamOwner::Class,
+                })
+                .collect()
+        }
+        MethodOwner::Interface(interface_loc) => {
+            let data = baml_compiler2_hir::item_data::interface_data(db, interface_loc);
+            let names: Vec<&Name> = data.generic_params.iter().map(|g| &g.name).collect();
+            own.iter()
+                .filter(|param| shadowed(&names, &param.name))
+                .map(|param| TirTypeError::TypeParamShadowed {
+                    param_name: param.name.clone(),
+                    type_name: data.name.clone(),
+                    owner: ShadowedParamOwner::Interface,
+                })
+                .collect()
+        }
+        MethodOwner::Impl(impl_loc) => {
+            // An in-class `implements` block's frame IS the class's, so the
+            // shadowed parameter is the class's own and is named as such;
+            // a free block's frame is the block's.
+            let in_class = baml_compiler2_hir::item_data::impl_enclosing_class(db, impl_loc);
+            let frame = impl_frame(db, impl_loc);
+            let names: Vec<&Name> = frame.iter().map(ParamTy::name).collect();
+            own.iter()
+                .filter(|param| shadowed(&names, &param.name))
+                .map(|param| match in_class {
+                    Some(class) => TirTypeError::TypeParamShadowed {
+                        param_name: param.name.clone(),
+                        type_name: baml_compiler2_hir::item_data::class_data(db, class)
+                            .name
+                            .clone(),
+                        owner: ShadowedParamOwner::Class,
+                    },
+                    None => TirTypeError::TypeParamShadowedImplParam {
+                        param_name: param.name.clone(),
+                    },
+                })
+                .collect()
+        }
+    }
 }
 
 /// An explicit associated binding written on a generic bound (`P extends
@@ -2696,7 +2856,7 @@ pub fn class_lowering_diagnostics<'db>(
         .with_bounds(class_generic_bounds(db, class));
     let mut out = Vec::new();
     // Field annotations: every written field type re-lowers with the sink
-    // (unresolved names, wrong arg counts - the pre-S17 structural walk)
+    // (unresolved names, wrong arg counts)
     // and is judged for generic-argument well-formedness.
     let scope_env = class_generic_bounds(db, class);
     for field in &data.fields {
@@ -2718,6 +2878,61 @@ pub fn class_lowering_diagnostics<'db>(
         );
     }
     out
+}
+
+fn file_root(
+    db: &dyn baml_compiler2_hir::Db,
+    file: baml_base::SourceFile,
+) -> baml_base::SourceRoot {
+    baml_compiler2_hir::file_package::file_package(db, file).root
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeclCycles {
+    pub invalid_aliases: Vec<DeclName>,
+    pub class_cycles: Vec<Vec<DeclName>>,
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn package_decl_cycles(
+    db: &dyn baml_compiler2_hir::Db,
+    root: baml_base::SourceRoot,
+) -> DeclCycles {
+    let mut aliases = std::collections::HashMap::new();
+    let mut class_fields = std::collections::HashMap::new();
+    for ns in baml_compiler2_hir::package::package_items(db, root)
+        .namespaces
+        .values()
+    {
+        for (name, def) in &ns.types {
+            match def {
+                Definition::TypeAlias(loc) => {
+                    aliases.insert(qualify_def(db, *def, name), type_alias_value(db, *loc));
+                }
+                Definition::Class(loc) => {
+                    let fields = resolve_class_fields(db, *loc)
+                        .iter()
+                        .map(|(n, ty, _)| (n.clone(), ty.clone()))
+                        .collect::<Vec<_>>();
+                    class_fields.insert(qualify_def(db, *def, name), fields);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut invalid_aliases: Vec<DeclName> =
+        baml_type::decl_cycles::find_invalid_alias_cycles(&aliases)
+            .into_iter()
+            .collect();
+    invalid_aliases.sort();
+    let class_cycles = baml_type::decl_cycles::find_invalid_class_cycles(&class_fields, &aliases)
+        .into_iter()
+        .map(|cycle| cycle.members)
+        .collect();
+    DeclCycles {
+        invalid_aliases,
+        class_cycles,
+    }
 }
 
 /// The check layer's INTERFACE-declaration diagnostic walk: requires
@@ -2977,6 +3192,49 @@ pub fn resolve_class_fields<'db>(
         .collect()
 }
 
+/// The declared type of a top-level `let`: its written `: T`, or `None` for
+/// an unannotated binding, whose type is its initializer's.
+///
+/// Lowered in the file's namespace with an empty generic frame — a global is
+/// not generic — so every reader (the initializer's own check, each use site,
+/// the package interface) agrees on one type without inferring the
+/// initializer. That independence is what lets an annotated global break a
+/// cycle through its own initializer. Holes were refused at AST lowering.
+#[salsa::tracked(returns(ref))]
+pub fn let_declared_type<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    binding: baml_compiler2_hir::loc::LetLoc<'db>,
+) -> Option<baml_type::Ty> {
+    let data = baml_compiler2_hir::item_data::let_data(db, binding);
+    let annotation = data.annotation?;
+    let ctx = lower_ctx_for_file(db, binding.file(db));
+    Some(reject_holes(
+        &ctx.lower_type_ref(&data.type_refs, annotation),
+    ))
+}
+
+/// The check layer's walk over a global's annotation: the written type
+/// re-lowered with the sink (unresolved names, wrong arg counts) and judged
+/// for generic-argument well-formedness, exactly as a type alias's body is.
+pub fn let_lowering_diagnostics<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    binding: baml_compiler2_hir::loc::LetLoc<'db>,
+) -> Vec<(text_size::TextRange, crate::diagnostics::TirTypeError)> {
+    let data = baml_compiler2_hir::item_data::let_data(db, binding);
+    let Some(annotation) = data.annotation else {
+        return Vec::new();
+    };
+    let ctx = lower_ctx_for_file(db, binding.file(db));
+    let (lowered, diagnostics) = ctx.lower_type_ref_with_diagnostics(&data.type_refs, annotation);
+    let source_map = baml_compiler2_hir::item_data::let_source_map(db, binding);
+    let mut out = Vec::new();
+    extend_lowering_diagnostics(&mut out, &source_map.type_refs, diagnostics);
+    for error in crate::interfaces::type_generic_bound_errors(db, &FxHashMap::default(), &lowered) {
+        out.push((source_map.type_refs.span(annotation), error));
+    }
+    out
+}
+
 /// The check layer's TYPE-ALIAS diagnostic walk: the alias body re-lowered
 /// with the sink (unresolved names, wrong arg counts).
 pub fn type_alias_lowering_diagnostics<'db>(
@@ -2999,6 +3257,19 @@ pub fn type_alias_lowering_diagnostics<'db>(
     for error in crate::interfaces::type_generic_bound_errors(db, &FxHashMap::default(), &lowered) {
         out.push((source_map.type_refs.span(value), error));
     }
+    let head = qualify_def(db, Definition::TypeAlias(alias), &data.name);
+    if package_decl_cycles(db, file_root(db, alias.file(db)))
+        .invalid_aliases
+        .binary_search(&head)
+        .is_ok()
+    {
+        out.push((
+            source_map.name_span,
+            crate::diagnostics::TirTypeError::AliasCycle {
+                name: data.name.clone(),
+            },
+        ));
+    }
     out
 }
 
@@ -3017,28 +3288,81 @@ pub fn function_signature_with_diagnostics<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     function: FunctionLoc<'db>,
 ) -> FunctionSignatureResult {
+    lower_function_signature(db, function, ThrowsSource::Lowered)
+}
+
+/// A function's written `throws` clause, read in its signature's
+/// environment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeclaredThrows {
+    /// No clause: `throws _`, the body's inferred effect alone.
+    Omitted,
+    /// A clause with a `_` member (spec Functions rule 3): the members it
+    /// names, and beside them the body's inferred remainder.
+    Partial { named: baml_type::Ty },
+    /// A clause with no `_` member: exactly what it names.
+    Closed(baml_type::Ty),
+}
+
+/// The written `throws` clause, lowered once in the signature's environment
+/// (frame, bounds, `Self`, impl target): the one reading the signature, the
+/// effect query, and the body's own throw-site check share. It reads no
+/// body, so it stands outside their fixpoint. An interface contract's clause
+/// is the signature's own, lowered under the contract's hole policy.
+#[salsa::tracked(returns(ref))]
+pub fn declared_throws<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    function: FunctionLoc<'db>,
+) -> DeclaredThrows {
+    let data = baml_compiler2_hir::item_data::elaborated_function_data(db, function);
+    let Some(throws) = data.throws else {
+        return DeclaredThrows::Omitted;
+    };
+    let lowered = signature_lower_ctx(db, function).lower_type_ref(&data.type_refs, throws);
+    let (named, open) = throws_clause_parts(&lowered);
+    if open {
+        DeclaredThrows::Partial { named }
+    } else {
+        DeclaredThrows::Closed(reject_holes(&lowered))
+    }
+}
+
+/// The context a function's signature lowers in: its frame and bounds, the
+/// owner's concrete `Self` (r-a's resolver-provided self type) and impl
+/// target. Interface owners provide no `Self` - theirs is the frame's
+/// universal slot 0, resolved as a param.
+fn signature_lower_ctx<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    function: FunctionLoc<'db>,
+) -> LowerCtx<'db> {
+    let frame = function_generic_frame(db, function);
+    let impl_target = owner_impl_target(db, function, &frame);
+    lower_ctx_for_file(db, function.file(db))
+        .with_frame(frame)
+        .with_bounds(function_generic_bounds(db, function))
+        .with_self_ty(owner_self_ty(db, function))
+        .with_impl_target(impl_target)
+}
+
+fn lower_function_signature<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    function: FunctionLoc<'db>,
+    throws_source: ThrowsSource,
+) -> FunctionSignatureResult {
     let data = baml_compiler2_hir::item_data::elaborated_function_data(db, function);
     let frame = function_generic_frame(db, function);
-    let bounds = function_generic_bounds(db, function);
-    // The owner's concrete `Self` (r-a's resolver-provided self type)
-    // serves BOTH jobs at once: written `Self` in any signature
-    // position resolves through the ctx, and an unannotated `self`
-    // receiver (elaboration leaves its slot `Missing`) takes it
-    // directly. Interface owners provide none - their `Self` is the
-    // frame's universal slot 0, resolved as a param.
+    // The owner's concrete `Self` serves BOTH jobs at once: written `Self`
+    // in any signature position resolves through the ctx, and an
+    // unannotated `self` receiver (elaboration leaves its slot `Missing`)
+    // takes it directly.
     let concrete_self = owner_self_ty(db, function);
-    let impl_target = owner_impl_target(db, function, &frame);
     let owner = baml_compiler2_hir::item_data::method_owner(db, function);
     // An interface method's signature is a dispatch contract, so NO part of
     // it may be inferred - there is no body to infer from that binds any
     // implementor. The context enforces that at each hole; generated
     // declarations are exempt, as they are from the diagnostic.
     let interface_owner = signature_is_interface_contract(db, function);
-    let ctx = lower_ctx_for_file(db, function.file(db))
-        .with_frame(frame.clone())
-        .with_bounds(bounds)
-        .with_self_ty(concrete_self.clone())
-        .with_impl_target(impl_target);
+    let ctx = signature_lower_ctx(db, function);
     let ctx = if interface_owner {
         ctx.with_holes_forbidden(NoInferReason::InterfaceSignature)
     } else {
@@ -3085,6 +3409,10 @@ pub fn function_signature_with_diagnostics<'db>(
     // or wholly omitted = one bare hole) fills from the body's inferred
     // effect; a closed clause is taken verbatim.
     let mut diagnostics = Vec::new();
+    let body_throws = |db: &'db dyn baml_compiler2_hir::Db| match throws_source {
+        ThrowsSource::Lowered => crate::callable::callable_throws(db, function).0,
+        ThrowsSource::Seed => baml_type::Ty::never(),
+    };
     let throws = match (data.throws, interface_owner) {
         (Some(throws), true) => {
             let (lowered, diags) = ctx.lower_type_ref_with_diagnostics(&data.type_refs, throws);
@@ -3100,19 +3428,14 @@ pub fn function_signature_with_diagnostics<'db>(
             diagnostics.push(SignatureDiag::MissingThrows);
             baml_type::Ty::error()
         }
-        (Some(throws), false) => {
-            let lowered = ctx.lower_type_ref(&data.type_refs, throws);
-            if throws_clause_parts(&lowered).1 {
-                // Open: the named members join the body-inferred remainder
-                // (what `callable_throws` computes through the body run).
-                crate::callable::callable_throws(db, function).0
-            } else {
-                reject_holes(&lowered)
-            }
-        }
-        // Omitted = `throws _`: entirely body-inferred, fixpoint over
-        // mutual recursion (S12's callable_throws).
-        (None, false) => crate::callable::callable_throws(db, function).0,
+        // A closed clause is taken verbatim; a partial or omitted one
+        // (`throws _`) fills from the body's inferred effect - what
+        // `callable_throws` computes through the body run, a fixpoint over
+        // mutual recursion.
+        (_, false) => match declared_throws(db, function) {
+            DeclaredThrows::Closed(declared) => declared.clone(),
+            DeclaredThrows::Partial { .. } | DeclaredThrows::Omitted => body_throws(db),
+        },
     };
     FunctionSignatureResult {
         signature: FunctionSignature {
@@ -3125,21 +3448,17 @@ pub fn function_signature_with_diagnostics<'db>(
     }
 }
 
-/// A class's field types, lowered in the class's own generic frame.
+/// A class's field types: [`resolve_class_fields`] without the attributes.
+/// One lowering - in the class's frame AND its bounds, so a field typed by
+/// a projection on a class parameter (`v T.Out` under `T extends HasOut`)
+/// resolves its declaring interface here exactly as it does for emit.
 pub fn class_field_types<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     class: ClassLoc<'db>,
 ) -> Vec<(Name, baml_type::Ty)> {
-    let data = baml_compiler2_hir::item_data::class_data(db, class);
-    let ctx = lower_ctx_for_file(db, class.file(db)).with_frame(class_generic_frame(db, class));
-    data.fields
+    resolve_class_fields(db, class)
         .iter()
-        .map(|field| {
-            (
-                field.name.clone(),
-                reject_holes(&ctx.lower_type_ref(&data.type_refs, field.type_ref)),
-            )
-        })
+        .map(|(name, ty, _)| (name.clone(), ty.clone()))
         .collect()
 }
 
@@ -3156,27 +3475,10 @@ pub fn type_alias_value<'db>(
 }
 
 /// One associated type's bound or default, lowered once in the interface
-/// frame. Wrapped for the manual `salsa::Update` impl (the
+/// frame. Wrapped for the manual `salsa::SalsaValue` impl (the
 /// `CallableThrows` precedent).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssocTypeLowering(pub Option<baml_type::Ty>);
-
-// SAFETY: PartialEq-driven overwrite, the CallableThrows precedent.
-#[allow(unsafe_code)]
-unsafe impl salsa::Update for AssocTypeLowering {
-    #[allow(unsafe_code)]
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        unsafe {
-            let changed = *old_pointer != new_value;
-            if changed {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            changed
-        }
-    }
-}
 
 /// The DEFAULT of associated type `member` on `interface` (`type member =
 /// ...`), lowered ONCE in the interface frame with `Self` symbolic (frame
@@ -3250,7 +3552,7 @@ fn lower_assoc_type_ref<'db>(
 /// declares the named types AND opens the remainder to inference. The
 /// hole is only meaningful as a top-level member; nested holes stay
 /// ruling-4 rejections through `reject_holes` on the named part.
-pub fn throws_clause_parts(ty: &LoweringTy) -> (baml_type::Ty, bool) {
+fn throws_clause_parts(ty: &LoweringTy) -> (baml_type::Ty, bool) {
     let members: Vec<&LoweringTy> = match ty {
         LoweringTy::Union(members) => members.iter().collect(),
         _ => vec![ty],

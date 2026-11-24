@@ -3,16 +3,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use bex_engine::{BexEngine, BexExternalValue as External, EngineError, TelemetryRecording};
 use bex_vm_types::Program;
 use btel_recorder::{CompletionFlags, RecordingConfig, proto};
-use btel_snapshot::{
-    Builder, Limits, Snapshot, SnapshotObject, SnapshotPool, SnapshotValue as Value,
-};
+use btel_snapshot::{Builder, Carried, Limits, Snapshot, SnapshotPool, SnapshotValue as Value};
 use sys_native::SysOpsExt;
 
-fn capture_id(id: &proto::SnapshotId) -> btel_snapshot::SnapshotId {
+fn capture_id(id: &proto::CasId) -> btel_snapshot::CasId {
     let mut digest = [0; 16];
     digest[..8].copy_from_slice(&id.low.to_le_bytes());
     digest[8..].copy_from_slice(&id.high.to_le_bytes());
-    btel_snapshot::SnapshotId::from_bytes(digest)
+    btel_snapshot::CasId::from_bytes(digest)
 }
 
 struct Recording {
@@ -84,10 +82,13 @@ impl Recording {
         let mut threads = HashMap::new();
         if let Some(path) = engine.telemetry_recording_directory() {
             assert_eq!(engine.telemetry_result(), Some(Ok(())));
-            let files = btel_file::read_directory(path).unwrap().files;
+            let files = btel_core::recording::read_directory(path).unwrap().files;
             engine.shutdown().await;
             assert_eq!(
-                btel_file::read_directory(path).unwrap().files.len(),
+                btel_core::recording::read_directory(path)
+                    .unwrap()
+                    .files
+                    .len(),
                 files.len()
             );
             for file in files {
@@ -144,31 +145,43 @@ impl Recording {
         };
         for (_, entry, done) in &recording.spans {
             for id in entry.inputs_cas_id.iter().chain(done.value_cas_id.iter()) {
-                recording.blob(id);
+                recording.blobs(capture_id(id));
             }
         }
         (result, recording)
     }
 
-    fn blob(&self, id: &proto::SnapshotId) -> Vec<u8> {
-        let id = capture_id(id);
-        let path = btel_file::cas_path(&self.directory.path().join("cas"), id);
+    /// One blob from the recording's CAS, decoded and checked against its ID.
+    fn blob(&self, id: btel_snapshot::CasId) -> (Vec<u8>, btel_core::cas::DecodedBlob) {
+        let path = btel_core::cas::cas_path(&self.directory.path().join("cas"), id);
         let bytes = std::fs::read(path).unwrap();
         let decoded =
-            btel_snapshot::decode_blob(&bytes, &btel_snapshot::DecodeLimits::default()).unwrap();
+            btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default()).unwrap();
         assert_eq!(decoded.id, id);
-        bytes
+        (bytes, decoded)
+    }
+
+    /// A capture's blobs as the recording's CAS holds them: the root and every
+    /// blob it reaches, each of which must be there.
+    fn blobs(&self, root: btel_snapshot::CasId) -> Blobs {
+        let mut blobs = HashMap::new();
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            if blobs.contains_key(&id) {
+                continue;
+            }
+            let (_, decoded) = self.blob(id);
+            pending.extend(decoded.children.iter().copied());
+            blobs.insert(id, decoded);
+        }
+        Blobs { root, blobs }
     }
 
     /// A failure captures the `baml.errors.Context` a handler would bind: its
     /// `error` is the thrown value `expected` holds.
     #[track_caller]
-    fn assert_error_capture(
-        &self,
-        actual: Option<&proto::SnapshotId>,
-        expected: Option<&Snapshot>,
-    ) {
-        use btel_snapshot::{DecodeLimits, DecodedObject, DecodedRoot, DecodedValue, decode_blob};
+    fn assert_error_capture(&self, actual: Option<&proto::CasId>, expected: Option<&Snapshot>) {
+        use btel_core::cas::{DecodedObject, DecodedRoot, DecodedValue};
         let (actual, expected) = match (actual, expected) {
             (None, None) => return,
             (Some(actual), Some(expected)) => (actual, expected),
@@ -178,39 +191,43 @@ impl Recording {
                 expected.is_some()
             ),
         };
-        let context = decode_blob(&self.blob(actual), &DecodeLimits::default()).unwrap();
-        let DecodedRoot::Value(DecodedValue::Object(root)) = context.root else {
+        let actual = self.blobs(capture_id(actual));
+        let context = actual.root();
+        let DecodedRoot::Value(DecodedValue::Object(root)) = context.blob.root else {
             panic!("expected a captured context object");
         };
-        let DecodedObject::Instance { fields, .. } = context.object(root) else {
+        let DecodedObject::Instance { fields, .. } = context.blob.object(root) else {
             panic!("expected a baml.errors.Context instance");
         };
-        let mut bytes = Vec::new();
-        expected.write_blob(&mut bytes).unwrap();
-        let expected = decode_blob(&bytes, &DecodeLimits::default()).unwrap();
-        let DecodedRoot::Value(value) = &expected.root else {
+        let expected = Blobs::of(expected);
+        let expected = expected.root();
+        let DecodedRoot::Value(value) = &expected.blob.root else {
             panic!("expected a captured value");
         };
         assert_eq!(fields[0].0.as_ref(), "error");
         assert!(
-            same_value(&context, &fields[0].1, &expected, value),
+            same_value(context, &fields[0].1, expected, value),
             "error {:?} differs from {value:?}",
             fields[0].1
         );
     }
 
+    /// The recording holds every blob of `expected`, byte for byte.
     #[track_caller]
-    fn assert_capture(&self, actual: Option<&proto::SnapshotId>, expected: Option<&Snapshot>) {
+    fn assert_capture(&self, actual: Option<&proto::CasId>, expected: Option<&Snapshot>) {
         match (actual, expected) {
             (None, None) => {}
             (Some(actual), Some(expected)) => {
-                if capture_id(actual) != expected.id() {
+                if capture_id(actual) != expected.root_id() {
                     // Not the value itself: a failure's context around it.
                     return self.assert_error_capture(Some(actual), Some(expected));
                 }
-                let mut expected_bytes = Vec::new();
-                expected.write_blob(&mut expected_bytes).unwrap();
-                assert_eq!(self.blob(actual), expected_bytes);
+                let mut scratch = btel_snapshot::BlobScratch::default();
+                for blob in expected.blobs() {
+                    let mut expected_bytes = Vec::new();
+                    blob.write(&mut scratch, &mut expected_bytes).unwrap();
+                    assert_eq!(self.blob(blob.id()).0, expected_bytes);
+                }
             }
             _ => panic!(
                 "capture presence differs: actual={}, expected={}",
@@ -221,39 +238,322 @@ impl Recording {
     }
 }
 
-/// Structural equality across two snapshots: object IDs are local to each.
-fn same_value(
-    a: &btel_snapshot::DecodedSnapshot,
-    x: &btel_snapshot::DecodedValue,
-    b: &btel_snapshot::DecodedSnapshot,
-    y: &btel_snapshot::DecodedValue,
-) -> bool {
-    use btel_snapshot::{DecodedObject, DecodedValue};
-    match (x, y) {
-        // NaN is its own bits, not equal to itself.
-        (DecodedValue::Float(x), DecodedValue::Float(y)) => x.to_bits() == y.to_bits(),
-        (DecodedValue::Object(x), DecodedValue::Object(y)) => match (a.object(*x), b.object(*y)) {
-            (DecodedObject::List { items: x, .. }, DecodedObject::List { items: y, .. }) => {
-                x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_value(a, x, b, y))
-            }
-            (
-                DecodedObject::Map { entries: x, .. } | DecodedObject::Instance { fields: x, .. },
-                DecodedObject::Map { entries: y, .. } | DecodedObject::Instance { fields: y, .. },
-            ) => {
-                x.len() == y.len()
-                    && x.iter()
-                        .zip(y)
-                        .all(|((kx, x), (ky, y))| kx == ky && same_value(a, x, b, y))
-            }
-            (DecodedObject::Cell(x), DecodedObject::Cell(y)) => same_value(a, x, b, y),
-            (x, y) => x == y,
-        },
-        (x, y) => x == y,
+/// A capture's blobs by ID.
+struct Blobs {
+    root: btel_snapshot::CasId,
+    blobs: HashMap<btel_snapshot::CasId, btel_core::cas::DecodedBlob>,
+}
+
+impl Blobs {
+    /// Every blob of a capture this test built.
+    fn of(snapshot: &Snapshot) -> Self {
+        let mut scratch = btel_snapshot::BlobScratch::default();
+        let blobs = snapshot
+            .blobs()
+            .map(|blob| {
+                let mut bytes = Vec::new();
+                blob.write(&mut scratch, &mut bytes).unwrap();
+                let decoded =
+                    btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default())
+                        .unwrap();
+                (blob.id(), decoded)
+            })
+            .collect();
+        Self {
+            root: snapshot.root_id(),
+            blobs,
+        }
+    }
+
+    fn root(&self) -> Side<'_> {
+        Side {
+            blobs: self,
+            blob: &self.blobs[&self.root],
+        }
     }
 }
 
+/// A capture, and the blob of it a value is read in.
+#[derive(Clone, Copy)]
+struct Side<'a> {
+    blobs: &'a Blobs,
+    blob: &'a btel_core::cas::DecodedBlob,
+}
+
+impl<'a> Side<'a> {
+    /// Media content, read from the child blob that stores it there.
+    fn content(self, payload: &'a btel_core::cas::MediaPayload) -> &'a str {
+        use btel_core::cas::{DecodedRoot, DecodedValue as V, MediaPayload};
+        match payload {
+            MediaPayload::Inline(text) => text,
+            MediaPayload::External { child, text_len } => {
+                let blob = &self.blobs.blobs[&self.blob.child(*child)];
+                let DecodedRoot::Value(V::String(text)) = &blob.root else {
+                    panic!("media content is a string");
+                };
+                assert_eq!(text.len() as u64, *text_len);
+                text
+            }
+        }
+    }
+
+    /// What `value` names, and the blob it is read in: a reference into a
+    /// child blob is followed there.
+    fn resolve(self, value: &btel_core::cas::DecodedValue) -> (Self, btel_core::cas::DecodedValue) {
+        use btel_core::cas::{DecodedRoot, DecodedValue as V};
+        match value {
+            V::External(child) => {
+                let blob = &self.blobs.blobs[&self.blob.child(*child)];
+                let DecodedRoot::Value(root) = &blob.root else {
+                    panic!("a child blob's root is a value");
+                };
+                (Side { blob, ..self }, root.clone())
+            }
+            V::ExternalNode { child, node } => {
+                let blob = &self.blobs.blobs[&self.blob.child(*child)];
+                (Side { blob, ..self }, V::Object(*node))
+            }
+            V::Null
+            | V::OmittedArg
+            | V::Bool(_)
+            | V::Int(_)
+            | V::Float(_)
+            | V::String(_)
+            | V::Bigint(_)
+            | V::Type(_)
+            | V::Truncated(_)
+            | V::Object(_)
+            | V::Enum { .. }
+            | V::Redacted(_) => (self, value.clone()),
+        }
+    }
+}
+
+/// Structural equality across two captures: object numbers are local to each
+/// blob, and a reference into a child blob compares as what it names.
+fn same_value(
+    a: Side<'_>,
+    x: &btel_core::cas::DecodedValue,
+    b: Side<'_>,
+    y: &btel_core::cas::DecodedValue,
+) -> bool {
+    use btel_core::cas::DecodedValue as V;
+    let (a, x) = a.resolve(x);
+    let (b, y) = b.resolve(y);
+    match (&x, &y) {
+        (V::External(_) | V::ExternalNode { .. }, _)
+        | (_, V::External(_) | V::ExternalNode { .. }) => {
+            unreachable!("a blob's root value is stored in it")
+        }
+        (V::Null, V::Null) | (V::OmittedArg, V::OmittedArg) => true,
+        (V::Bool(x), V::Bool(y)) => x == y,
+        (V::Int(x), V::Int(y)) => x == y,
+        // NaN is its own bits, not equal to itself.
+        (V::Float(x), V::Float(y)) => x.to_bits() == y.to_bits(),
+        (V::String(x), V::String(y)) => x == y,
+        (V::Bigint(x), V::Bigint(y)) => x == y,
+        (V::Type(x), V::Type(y)) => x == y,
+        (V::Truncated(x), V::Truncated(y)) => x == y,
+        // The same record, not a comparison of what was withheld.
+        (V::Redacted(x), V::Redacted(y)) => x == y,
+        (V::Object(x), V::Object(y)) => same_object(a, a.blob.object(*x), b, b.blob.object(*y)),
+        (
+            V::Enum {
+                declaration: x,
+                variant: variant_x,
+                name: name_x,
+            },
+            V::Enum {
+                declaration: y,
+                variant: variant_y,
+                name: name_y,
+            },
+        ) => {
+            variant_x == variant_y
+                && name_x == name_y
+                && same_object(a, a.blob.object(*x), b, b.blob.object(*y))
+        }
+        (
+            V::Null
+            | V::OmittedArg
+            | V::Bool(_)
+            | V::Int(_)
+            | V::Float(_)
+            | V::String(_)
+            | V::Bigint(_)
+            | V::Type(_)
+            | V::Truncated(_)
+            | V::Object(_)
+            | V::Enum { .. }
+            | V::Redacted(_),
+            _,
+        ) => false,
+    }
+}
+
+fn same_object(
+    a: Side<'_>,
+    x: &btel_core::cas::DecodedObject,
+    b: Side<'_>,
+    y: &btel_core::cas::DecodedObject,
+) -> bool {
+    use btel_core::cas::{DecodedObject as O, Fields};
+    let same_fields = |x: &Fields, y: &Fields| {
+        x.len() == y.len()
+            && x.iter()
+                .zip(y)
+                .all(|((key_x, x), (key_y, y))| key_x == key_y && same_value(a, x, b, y))
+    };
+    match (x, y) {
+        (
+            O::List {
+                element_type: type_x,
+                items: x,
+                original_len: len_x,
+            },
+            O::List {
+                element_type: type_y,
+                items: y,
+                original_len: len_y,
+            },
+        ) => {
+            type_x == type_y
+                && len_x == len_y
+                && x.len() == y.len()
+                && x.iter().zip(y).all(|(x, y)| same_value(a, x, b, y))
+        }
+        (
+            O::Tuple {
+                element_types: types_x,
+                items: x,
+                original_len: len_x,
+            },
+            O::Tuple {
+                element_types: types_y,
+                items: y,
+                original_len: len_y,
+            },
+        ) => {
+            types_x == types_y
+                && len_x == len_y
+                && x.len() == y.len()
+                && x.iter().zip(y).all(|(x, y)| same_value(a, x, b, y))
+        }
+        (
+            O::Map {
+                key_type: key_x,
+                value_type: value_x,
+                entries: x,
+                original_len: len_x,
+            },
+            O::Map {
+                key_type: key_y,
+                value_type: value_y,
+                entries: y,
+                original_len: len_y,
+            },
+        ) => {
+            key_x == key_y
+                && value_x == value_y
+                && len_x == len_y
+                && x.len() == y.len()
+                && x.iter().zip(y).all(|((key_x, x), (key_y, y))| {
+                    same_value(a, key_x, b, key_y) && same_value(a, x, b, y)
+                })
+        }
+        (
+            O::Instance {
+                type_arguments: arguments_x,
+                declaration: declaration_x,
+                fields: x,
+                original_len: len_x,
+            },
+            O::Instance {
+                type_arguments: arguments_y,
+                declaration: declaration_y,
+                fields: y,
+                original_len: len_y,
+            },
+        ) => {
+            arguments_x == arguments_y
+                && len_x == len_y
+                && same_object(
+                    a,
+                    a.blob.object(*declaration_x),
+                    b,
+                    b.blob.object(*declaration_y),
+                )
+                && same_fields(x, y)
+        }
+        (O::Cell(x), O::Cell(y)) => same_value(a, x, b, y),
+        (O::Media(x), O::Media(y)) => same_media(a, x, b, y),
+        // Objects without references compare as they are.
+        (O::Uint8Array { .. }, O::Uint8Array { .. })
+        | (O::Declaration { .. }, O::Declaration { .. })
+        | (O::NonSnapshotable, O::NonSnapshotable)
+        | (O::Descriptive { .. }, O::Descriptive { .. })
+        | (O::Truncated(_), O::Truncated(_)) => x == y,
+        (
+            O::Uint8Array { .. }
+            | O::List { .. }
+            | O::Tuple { .. }
+            | O::Map { .. }
+            | O::Instance { .. }
+            | O::Declaration { .. }
+            | O::Cell(_)
+            | O::NonSnapshotable
+            | O::Descriptive { .. }
+            | O::Media(_)
+            | O::Truncated(_),
+            _,
+        ) => false,
+    }
+}
+
+/// Media compares by kind, MIME type, source and content, wherever each side
+/// stores its content.
+fn same_media(
+    left: Side<'_>,
+    x: &btel_core::cas::DecodedMedia,
+    right: Side<'_>,
+    y: &btel_core::cas::DecodedMedia,
+) -> bool {
+    use btel_core::cas::{DecodedMediaSource as S, MediaPayload};
+    let content = |x: Option<&MediaPayload>, y: Option<&MediaPayload>| match (x, y) {
+        (Some(x), Some(y)) => left.content(x) == right.content(y),
+        (None, None) => true,
+        (Some(_) | None, _) => false,
+    };
+    x.kind == y.kind
+        && x.mime_type == y.mime_type
+        && match (&x.source, &y.source) {
+            (
+                S::Url {
+                    url: source,
+                    data: loaded,
+                },
+                S::Url {
+                    url: other,
+                    data: other_loaded,
+                },
+            )
+            | (
+                S::File {
+                    path: source,
+                    data: loaded,
+                },
+                S::File {
+                    path: other,
+                    data: other_loaded,
+                },
+            ) => source == other && content(loaded.as_ref(), other_loaded.as_ref()),
+            (S::Base64 { data }, S::Base64 { data: other }) => content(Some(data), Some(other)),
+            (S::Url { .. } | S::File { .. } | S::Base64 { .. }, _) => false,
+        }
+}
+
 fn snapshot(args: bool, values: &[External]) -> Snapshot {
-    let pool = SnapshotPool::new(1, Limits::default());
+    let pool = SnapshotPool::unbounded(Limits::default());
     let mut builder = pool.try_acquire().unwrap();
     let roots: Vec<_> = values
         .iter()
@@ -263,16 +563,13 @@ fn snapshot(args: bool, values: &[External]) -> Snapshot {
 }
 
 fn finish(mut builder: Builder, args: bool, roots: &[Value]) -> Snapshot {
+    let mut shaper = btel_snapshot::Shaper::default();
     if args {
-        let start = builder.value_start();
-        for root in roots {
-            builder.push_value(*root);
-        }
-        let slots = builder.value_range(start);
-        builder.finish_args(roots.len(), slots)
+        let root = builder.arguments(roots.iter(), |_, root| *root);
+        builder.finish(root, &mut shaper)
     } else {
         assert_eq!(roots.len(), 1);
-        builder.finish_value(roots[0])
+        builder.finish(roots[0], &mut shaper)
     }
 }
 
@@ -282,24 +579,11 @@ fn scalar(builder: &mut Builder, value: &External) -> Value {
         External::Bool(value) => Value::Bool(*value),
         External::Int(value) => Value::Int(*value),
         External::Float(value) => Value::Float(*value),
-        External::String(value) => Value::String(builder.string(value).unwrap()),
-        External::Bigint(value) => Value::Bigint(builder.bigint(&Arc::new(value.clone())).unwrap()),
+        External::String(value) => builder.leaves().string_value(value),
+        External::Bigint(value) => builder.leaves().bigint(&Arc::new(value.clone())),
         External::Uint8Array(value) => {
-            let object = builder.reserve_object().unwrap();
-            let data = builder.copy_bytes(value);
-            builder.set_object(
-                object,
-                SnapshotObject::Bytes {
-                    data,
-                    original_len: value.len(),
-                },
-            );
-            Value::Object(object)
-        }
-        External::RustData(_) => {
-            let object = builder.reserve_object().unwrap();
-            builder.set_object(object, SnapshotObject::NonSnapshotableValue {});
-            Value::Object(object)
+            let bytes = builder.bytes(value);
+            Value::Object(builder.leaves().object(bytes).unwrap())
         }
         _ => panic!("expected a scalar fixture value"),
     }
@@ -345,9 +629,11 @@ async fn capture_flags(program: &Program) {
                             (inputs == Some(true)).then_some(&args),
                         );
                         if fail {
+                            // A span records the error it ends with unless
+                            // the call declined it with `error = false`.
                             recording.assert_error_capture(
                                 done.value_cas_id.as_ref(),
-                                (error == Some(true)).then_some(&returned),
+                                (error != Some(false)).then_some(&returned),
                             );
                         } else {
                             recording.assert_capture(
@@ -360,11 +646,71 @@ async fn capture_flags(program: &Program) {
                                 .unwrap()
                                 .outcome(),
                             if fail {
-                                btel_types::InvocationOutcome::Errored
+                                proto::InvocationOutcome::Errored
                             } else {
-                                btel_types::InvocationOutcome::Ok
+                                proto::InvocationOutcome::Ok
                             },
                         );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `trace.span`, as a declaration hook and at a call site, records inputs,
+/// output and error; `trace.empty_span` records none of them.
+async fn span_defaults(program: &Program) {
+    for empty in [false, true] {
+        for fail in [false, true] {
+            let value = text("hook defaults");
+            let (result, recording) = Recording::run(
+                program,
+                "matrix_hook_defaults",
+                vec![value.clone(), External::Bool(empty), External::Bool(fail)],
+            )
+            .await;
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(recording.spans.len(), 1);
+            let (_, entry, done) = &recording.spans[0];
+            let args = snapshot(true, &[value.clone(), External::Bool(fail)]);
+            recording.assert_capture(entry.inputs_cas_id.as_ref(), (!empty).then_some(&args));
+            let returned = snapshot(false, std::slice::from_ref(&value));
+            let expected = (!empty).then_some(&returned);
+            if fail {
+                recording.assert_error_capture(done.value_cas_id.as_ref(), expected);
+            } else {
+                recording.assert_capture(done.value_cas_id.as_ref(), expected);
+            }
+        }
+        for chained in [false, true] {
+            for reserved in [false, true] {
+                for fail in [false, true] {
+                    let value = text("span defaults");
+                    let (result, recording) = Recording::run(
+                        program,
+                        "matrix_span_defaults",
+                        vec![
+                            value.clone(),
+                            External::Bool(empty),
+                            External::Bool(chained),
+                            External::Bool(reserved),
+                            External::Bool(fail),
+                        ],
+                    )
+                    .await;
+                    assert_eq!(result.is_err(), fail);
+                    assert_eq!(recording.spans.len(), 1);
+                    let (_, entry, done) = &recording.spans[0];
+                    let args = snapshot(true, std::slice::from_ref(&value));
+                    recording
+                        .assert_capture(entry.inputs_cas_id.as_ref(), (!empty).then_some(&args));
+                    let returned = snapshot(false, std::slice::from_ref(&value));
+                    let expected = (!empty).then_some(&returned);
+                    if fail {
+                        recording.assert_error_capture(done.value_cas_id.as_ref(), expected);
+                    } else {
+                        recording.assert_capture(done.value_cas_id.as_ref(), expected);
                     }
                 }
             }
@@ -426,183 +772,132 @@ async fn scalar_values(program: &Program) {
     }
 }
 
+/// The class `program` declares whose display name ends with `name`, beside
+/// the name a loaded instance's declaration answers with. A pooled class
+/// carries only its path; the package tables say which package declares it,
+/// and so what it is called.
+fn class_named<'p>(
+    program: &'p Program,
+    name: &str,
+) -> (&'p bex_vm_types::Class, bex_vm_types::DeclarationName) {
+    program
+        .packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .classes
+                .iter()
+                .map(move |(path, object)| (path.under(&package.name), *object))
+        })
+        .find(|(qualified, _)| qualified.display_name().ends_with(name))
+        .map(|(qualified, object)| {
+            let bex_vm_types::Object::Class(class) = &program.objects[object] else {
+                panic!("the class table names a class");
+            };
+            (&**class, bex_vm_types::DeclarationName::Declared(qualified))
+        })
+        .unwrap_or_else(|| panic!("the program declares a class named `{name}`"))
+}
+
+/// [`class_named`], for an enum.
+fn enum_named<'p>(
+    program: &'p Program,
+    name: &str,
+) -> (&'p bex_vm_types::Enum, bex_vm_types::DeclarationName) {
+    program
+        .packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .enums
+                .iter()
+                .map(move |(path, object)| (path.under(&package.name), *object))
+        })
+        .find(|(qualified, _)| qualified.display_name().ends_with(name))
+        .map(|(qualified, object)| {
+            let bex_vm_types::Object::Enum(enm) = &program.objects[object] else {
+                panic!("the enum table names an enum");
+            };
+            (&**enm, bex_vm_types::DeclarationName::Declared(qualified))
+        })
+        .unwrap_or_else(|| panic!("the program declares an enum named `{name}`"))
+}
+
 fn graph_snapshot(program: &Program, scenario: &str, args: bool, value: i64) -> Snapshot {
     use baml_type::RealizedTy;
-    use bex_vm_types::Object;
-    use btel_snapshot::Range;
 
-    let pool = SnapshotPool::new(1, Limits::default());
+    let pool = SnapshotPool::unbounded(Limits::default());
     let mut b = pool.try_acquire().unwrap();
-    let object = b.reserve_object().unwrap();
+    let field =
+        |_: &mut btel_snapshot::Leaves<'_>, (key, value): (&str, Value)| (key.into(), value);
     let root = match scenario {
         "cycle" | "node" => {
-            let class = program
-                .objects
-                .0
-                .iter()
-                .find_map(|object| match object {
-                    Object::Class(class) if class.name.display_name().ends_with("MatrixNode") => {
-                        Some(class)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            let declaration = b.reserve_object().unwrap();
-            b.set_object(
-                declaration,
-                SnapshotObject::Declaration {
-                    name: class.name.clone(),
-                    tag: class.type_tag,
-                    is_enum: false,
-                },
-            );
-            let start = b.entry_start();
-            b.entry(&"value".into(), Value::Int(value));
-            b.entry(
-                &"next".into(),
-                if scenario == "cycle" {
-                    Value::Object(object)
-                } else {
-                    Value::Null
-                },
-            );
-            let fields = b.entry_range(start);
-            b.set_object(
-                object,
-                SnapshotObject::Instance {
-                    type_arguments: Range::empty(),
-                    declaration,
-                    fields,
-                    original_len: 2,
-                },
-            );
-            Value::Object(object)
+            let (class, class_name) = class_named(program, "MatrixNode");
+            let definition = recorded(program, class.type_tag);
+            let definition = b.leaves().define(&definition, &mut Carried::default());
+            let named = b.declaration(&class_name, class.type_tag, false, Some(definition));
+            let declaration = b.leaves().object(named).unwrap();
+            let slot = b.leaves().reserve().unwrap();
+            let object = Value::Object(slot.id());
+            let next = if scenario == "cycle" {
+                object
+            } else {
+                Value::Null
+            };
+            let fields = [("value", Value::Int(value)), ("next", next)];
+            let instance = b.instance(declaration, [], fields.into_iter(), field);
+            b.fill(slot, instance);
+            object
         }
         "enum" => {
-            let enm = program
-                .objects
-                .0
-                .iter()
-                .find_map(|object| match object {
-                    Object::Enum(enm) if enm.name.display_name().ends_with("MatrixChoice") => {
-                        Some(enm)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            b.set_object(
-                object,
-                SnapshotObject::Declaration {
-                    name: enm.name.clone(),
-                    tag: enm.type_tag,
-                    is_enum: true,
-                },
-            );
+            let (enm, enum_name) = enum_named(program, "MatrixChoice");
+            let definition = recorded(program, enm.type_tag);
+            let definition = b.leaves().define(&definition, &mut Carried::default());
+            let named = b.declaration(&enum_name, enm.type_tag, true, Some(definition));
             Value::Enum {
-                declaration: object,
+                declaration: b.leaves().object(named).unwrap(),
                 variant: 1,
-                name: b.string(&"Second".into()).unwrap(),
+                name: b.leaves().label(&"Second".into()).unwrap(),
             }
         }
         "aliases" => {
-            let shared = b.reserve_object().unwrap();
-            let outer_type = b.push_type(RealizedTy::List(Box::new(RealizedTy::Int)));
-            let inner_type = b.push_type(RealizedTy::Int);
-            let start = b.value_start();
-            b.push_value(Value::Object(shared));
-            b.push_value(Value::Object(shared));
-            let items = b.value_range(start);
-            b.set_object(
-                object,
-                SnapshotObject::List {
-                    element_type: outer_type,
-                    items,
-                    original_len: 2,
-                },
-            );
-            let start = b.value_start();
-            b.push_value(Value::Int(1));
-            b.push_value(Value::Int(2));
-            let items = b.value_range(start);
-            b.set_object(
-                shared,
-                SnapshotObject::List {
-                    element_type: inner_type,
-                    items,
-                    original_len: 2,
-                },
-            );
-            Value::Object(object)
+            let outer_type = b.leaves().ty(RealizedTy::List(Box::new(RealizedTy::Int)));
+            let inner_type = b.leaves().ty(RealizedTy::Int);
+            let shared = b.list(inner_type, [1, 2].into_iter(), |_, n| Value::Int(n));
+            let shared = Value::Object(b.leaves().object(shared).unwrap());
+            let outer = b.list(outer_type, [shared, shared].into_iter(), |_, item| item);
+            Value::Object(b.leaves().object(outer).unwrap())
         }
         "empty_array" => {
-            let element_type = b.push_type(RealizedTy::Int);
-            b.set_object(
-                object,
-                SnapshotObject::List {
-                    element_type,
-                    items: Range::empty(),
-                    original_len: 0,
-                },
-            );
-            Value::Object(object)
+            let element_type = b.leaves().ty(RealizedTy::Int);
+            let empty = b.list(element_type, std::iter::empty(), |_, item| item);
+            Value::Object(b.leaves().object(empty).unwrap())
         }
         "generic" => {
-            let class = program
-                .objects
-                .0
-                .iter()
-                .find_map(|object| match object {
-                    Object::Class(class) if class.name.display_name().ends_with("MatrixBox") => {
-                        Some(class)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            let declaration = b.reserve_object().unwrap();
-            b.set_object(
-                declaration,
-                SnapshotObject::Declaration {
-                    name: class.name.clone(),
-                    tag: class.type_tag,
-                    is_enum: false,
-                },
-            );
-            let start = b.type_start();
-            b.push_type(RealizedTy::Int);
-            let type_arguments = b.type_range(start);
-            let start = b.entry_start();
-            b.entry(&"value".into(), Value::Int(7));
-            let fields = b.entry_range(start);
-            b.set_object(
-                object,
-                SnapshotObject::Instance {
-                    type_arguments,
-                    declaration,
-                    fields,
-                    original_len: 1,
-                },
-            );
-            Value::Object(object)
+            let (class, class_name) = class_named(program, "MatrixBox");
+            let definition = recorded(program, class.type_tag);
+            let definition = b.leaves().define(&definition, &mut Carried::default());
+            let named = b.declaration(&class_name, class.type_tag, false, Some(definition));
+            let declaration = b.leaves().object(named).unwrap();
+            let fields = [("value", Value::Int(7))];
+            let instance = b.instance(declaration, [RealizedTy::Int], fields.into_iter(), field);
+            Value::Object(b.leaves().object(instance).unwrap())
         }
         "map" => {
-            let key_type = b.push_type(RealizedTy::String);
-            let value_type = b.push_type(RealizedTy::Int);
-            let start = b.entry_start();
-            if value != 0 {
-                b.entry(&"first".into(), Value::Int(1));
-                b.entry(&"second".into(), Value::Int(2));
-            }
-            let entries = b.entry_range(start);
-            b.set_object(
-                object,
-                SnapshotObject::Map {
-                    key_type,
-                    value_type,
-                    entries,
-                    original_len: if value == 0 { 0 } else { 2 },
-                },
+            let key_type = b.leaves().ty(RealizedTy::String);
+            let value_type = b.leaves().ty(RealizedTy::Int);
+            let entries: &[(&str, Value)] = if value == 0 {
+                &[]
+            } else {
+                &[("first", Value::Int(1)), ("second", Value::Int(2))]
+            };
+            let map = b.map(
+                key_type,
+                value_type,
+                entries.iter().copied(),
+                |leaves, (key, value)| (leaves.string_value(&key.into()), value),
             );
-            Value::Object(object)
+            Value::Object(b.leaves().object(map).unwrap())
         }
         _ => unreachable!(),
     };
@@ -610,7 +905,7 @@ fn graph_snapshot(program: &Program, scenario: &str, args: bool, value: i64) -> 
 }
 
 async fn arguments_and_graphs(program: &Program) {
-    let pool = SnapshotPool::new(1, Limits::default());
+    let pool = SnapshotPool::unbounded(Limits::default());
     let omitted = finish(pool.try_acquire().unwrap(), true, &[Value::OmittedArg]);
     for (function, expected_args, expected_result) in [
         ("matrix_omitted", omitted, text("default")),
@@ -644,7 +939,7 @@ async fn arguments_and_graphs(program: &Program) {
             CompletionFlags::from_wire(done.completion_flags, false)
                 .unwrap()
                 .outcome(),
-            btel_types::InvocationOutcome::Ok
+            proto::InvocationOutcome::Ok
         );
     }
     for (scenario, function, arguments, before, after) in [
@@ -672,6 +967,77 @@ async fn arguments_and_graphs(program: &Program) {
             done.value_cas_id.as_ref(),
             Some(&graph_snapshot(program, scenario, false, after)),
         );
+    }
+}
+
+async fn typed_map_keys() {
+    use btel_core::cas::{DecodedObject as O, DecodedRoot, DecodedValue as V};
+
+    let program = baml_test_support::compile_source(include_str!(
+        "../../../baml_tests/baml_src/ns_trace_capture/map_keys.baml"
+    ));
+    for scenario in [
+        "int", "bool", "float", "null", "bigint", "enum", "array", "class",
+    ] {
+        let (result, recording) =
+            Recording::run(&program, "map_keys_capture", vec![text(scenario)]).await;
+        assert_eq!(result.unwrap(), External::Int(1), "{scenario}");
+        assert_eq!(recording.spans.len(), 1, "{scenario}");
+        let (_, entry, done) = &recording.spans[0];
+        let inputs = recording.blobs(capture_id(entry.inputs_cas_id.as_ref().unwrap()));
+        let output = recording.blobs(capture_id(done.value_cas_id.as_ref().unwrap()));
+        let DecodedRoot::FunctionArgs { slots, .. } = &inputs.root().blob.root else {
+            panic!("expected captured arguments");
+        };
+        let DecodedRoot::Value(value) = &output.root().blob.root else {
+            panic!("expected captured output");
+        };
+        assert_eq!(slots.len(), 1);
+        assert!(same_value(inputs.root(), &slots[0], output.root(), value));
+        let (side, value) = output.root().resolve(value);
+        let V::Object(id) = value else {
+            panic!("expected captured map");
+        };
+        let O::Map {
+            entries,
+            original_len,
+            ..
+        } = side.blob.object(id)
+        else {
+            panic!("expected captured map for {scenario}");
+        };
+        assert_eq!(*original_len, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, V::String(scenario.into()));
+        let (side, key) = side.resolve(&entries[0].0);
+        match (scenario, key) {
+            ("int", V::Int(7)) | ("bool", V::Bool(true)) | ("null", V::Null) => {}
+            ("float", V::Float(value)) => assert_eq!(value.to_bits(), 1.5_f64.to_bits()),
+            ("bigint", V::Bigint(value)) => assert_eq!(value.to_string(), "9007199254740993"),
+            ("enum", V::Enum { variant, name, .. }) => {
+                assert_eq!(variant, 0);
+                assert_eq!(&*name, "First");
+            }
+            ("array", V::Object(id)) => {
+                let O::List {
+                    items,
+                    original_len,
+                    ..
+                } = side.blob.object(id)
+                else {
+                    panic!("expected array key");
+                };
+                assert_eq!(*original_len, 2);
+                assert_eq!(items, &[V::Int(1), V::Int(2)]);
+            }
+            ("class", V::Object(id)) => {
+                let O::Instance { fields, .. } = side.blob.object(id) else {
+                    panic!("expected class key");
+                };
+                assert_eq!(fields, &vec![("id".into(), V::Int(7))]);
+            }
+            (_, key) => panic!("unexpected {scenario} key: {key:?}"),
+        }
     }
 }
 
@@ -713,7 +1079,7 @@ async fn call_structure(program: &Program) {
                 entry
                     .inputs_cas_id
                     .as_ref()
-                    .is_some_and(|id| capture_id(id) == child_args.id())
+                    .is_some_and(|id| capture_id(id) == child_args.root_id())
             })
             .unwrap();
         recording.assert_capture(child.1.inputs_cas_id.as_ref(), Some(&child_args));
@@ -762,7 +1128,7 @@ async fn call_structure(program: &Program) {
                 .find(|(_, _, done)| {
                     done.value_cas_id
                         .as_ref()
-                        .is_some_and(|id| capture_id(id) == expected.id())
+                        .is_some_and(|id| capture_id(id) == expected.root_id())
                 })
                 .unwrap();
             recording.assert_capture(
@@ -774,6 +1140,134 @@ async fn call_structure(program: &Program) {
     }
 }
 
+/// The definition the engine records for the declaration `tag` names in
+/// `program`, which a capture naming it carries: the declaration as the
+/// engine copies it. A field names the declaration itself, as member 0, or
+/// one that does not name it back.
+/// The name a loaded declaration with `tag` answers with: its path under the
+/// package whose tables declare it.
+fn declared_name(
+    program: &Program,
+    tag: baml_type::typetag::TypeTag,
+) -> bex_vm_types::DeclarationName {
+    program
+        .packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .classes
+                .iter()
+                .chain(package.enums.iter())
+                .map(move |(path, object)| (path.under(&package.name), *object))
+        })
+        .find(|(_, object)| match &program.objects[*object] {
+            bex_vm_types::Object::Class(class) => class.type_tag == tag,
+            bex_vm_types::Object::Enum(enm) => enm.type_tag == tag,
+            _ => false,
+        })
+        .map(|(qualified, _)| bex_vm_types::DeclarationName::Declared(qualified))
+        .unwrap_or_else(|| panic!("no declared class or enum with tag {tag:?}"))
+}
+
+fn recorded(program: &Program, tag: baml_type::typetag::TypeTag) -> btel_types::Definition {
+    use bex_vm_types::Object;
+    use btel_snapshot::definition::{self, Declaration, Field, Head, Meta, Variant};
+
+    let meta = |description: &Option<String>,
+                alias: &Option<String>,
+                docstring: &Option<String>,
+                other: &indexmap::IndexMap<String, String>| Meta {
+        description: description.clone(),
+        alias: alias.clone(),
+        docstring: docstring.clone(),
+        attributes: other
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    };
+    let declaration = |tag| {
+        program
+            .objects
+            .0
+            .iter()
+            .find(|object| match object {
+                Object::Class(class) => class.type_tag == tag,
+                Object::Enum(enm) => enm.type_tag == tag,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no declaration with tag {tag:?}"))
+    };
+    // The definitions its fields name, other than its own, made first.
+    let mut named: Vec<(baml_type::typetag::TypeTag, btel_types::Definition)> = Vec::new();
+    if let Object::Class(class) = declaration(tag) {
+        for field in class.declared_fields() {
+            field.field_template.visit_heads(&mut |head| {
+                if head.tag() != tag && !named.iter().any(|(seen, _)| *seen == head.tag()) {
+                    named.push((head.tag(), recorded(program, head.tag())));
+                }
+            });
+        }
+    }
+    let declared = match declaration(tag) {
+        Object::Class(class) => Declaration::Class(definition::Class {
+            name: declared_name(program, tag),
+            type_params: u32::try_from(class.generic_param_count).unwrap(),
+            meta: meta(
+                &class.description,
+                &class.alias,
+                &class.docstring,
+                &class.other,
+            ),
+            stream_done: class.stream_done,
+            fields: class
+                .declared_fields()
+                .iter()
+                .map(|field| Field {
+                    name: field.name.clone(),
+                    ty: field.field_template.map_heads(&mut |head| {
+                        if head.tag() == tag {
+                            return Head::Member(0);
+                        }
+                        let name = declared_name(program, head.tag());
+                        let (_, definition) =
+                            named.iter().find(|(seen, _)| *seen == head.tag()).unwrap();
+                        Head::Defined(name, definition)
+                    }),
+                    meta: meta(
+                        &field.description,
+                        &field.alias,
+                        &field.docstring,
+                        &field.other,
+                    ),
+                    skip: field.skip,
+                    stream_done: field.stream_done,
+                    must_exist: field.must_exist,
+                })
+                .collect(),
+        }),
+        Object::Enum(enm) => Declaration::Enum(definition::Enum {
+            name: declared_name(program, tag),
+            meta: meta(&enm.description, &enm.alias, &enm.docstring, &enm.other),
+            variants: enm
+                .variants
+                .iter()
+                .map(|variant| Variant {
+                    name: variant.name.clone(),
+                    meta: meta(
+                        &variant.description,
+                        &variant.alias,
+                        &variant.docstring,
+                        &variant.other,
+                    ),
+                    skip: variant.skip,
+                })
+                .collect(),
+        }),
+        _ => unreachable!(),
+    };
+    definition::group(&[declared]).remove(0)
+}
+
 fn one_field_instance(
     program: &Program,
     name: &str,
@@ -781,46 +1275,44 @@ fn one_field_instance(
     args: bool,
     additional_args: &[External],
 ) -> Snapshot {
-    let class = program
-        .objects
-        .0
-        .iter()
-        .find_map(|object| match object {
-            bex_vm_types::Object::Class(class) if class.name.display_name().ends_with(name) => {
-                Some(class)
-            }
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(class.fields.len(), 1);
-    let pool = SnapshotPool::new(1, Limits::default());
+    let (class, class_name) = class_named(program, name);
+    assert_eq!(class.instance_fields().len(), 1);
+    let pool = SnapshotPool::unbounded(Limits::default());
     let mut b = pool.try_acquire().unwrap();
-    let object = b.reserve_object().unwrap();
-    let declaration = b.reserve_object().unwrap();
-    b.set_object(
-        declaration,
-        SnapshotObject::Declaration {
-            name: class.name.clone(),
-            tag: class.type_tag,
-            is_enum: false,
-        },
-    );
+    let definition = recorded(program, class.type_tag);
+    let definition = b.leaves().define(&definition, &mut Carried::default());
+    let named = b.declaration(&class_name, class.type_tag, false, Some(definition));
+    let declaration = b.leaves().object(named).unwrap();
     let value = scalar(&mut b, field);
-    let start = b.entry_start();
-    b.entry(&class.fields[0].name.as_str().into(), value);
-    let fields = b.entry_range(start);
-    b.set_object(
-        object,
-        SnapshotObject::Instance {
-            type_arguments: btel_snapshot::Range::empty(),
-            declaration,
-            fields,
-            original_len: 1,
-        },
-    );
+    let instance = b.instance(declaration, [], std::iter::once(value), |_, value| {
+        (class.instance_fields()[0].name.as_str().into(), value)
+    });
+    let object = b.leaves().object(instance).unwrap();
     let mut roots = vec![Value::Object(object)];
     roots.extend(additional_args.iter().map(|value| scalar(&mut b, value)));
     finish(b, args, &roots)
+}
+
+/// The capture of an instance of the `@@rust_type` class `name`: its
+/// declaration, with no fields, since its state records nothing a reader
+/// could use.
+fn rust_instance(program: &Program, name: &str, args: bool) -> Snapshot {
+    let (class, class_name) = class_named(program, name);
+    assert!(matches!(class.body, bex_vm_types::ClassBody::RustType(_)));
+    let pool = SnapshotPool::unbounded(Limits::default());
+    let mut b = pool.try_acquire().unwrap();
+    let definition = recorded(program, class.type_tag);
+    let definition = b.leaves().define(&definition, &mut Carried::default());
+    let named = b.declaration(&class_name, class.type_tag, false, Some(definition));
+    let declaration = b.leaves().object(named).unwrap();
+    let instance = b.instance(
+        declaration,
+        [],
+        std::iter::empty(),
+        |_, never: std::convert::Infallible| match never {},
+    );
+    let object = b.leaves().object(instance).unwrap();
+    finish(b, args, &[Value::Object(object)])
 }
 
 async fn callable_shapes(program: &Program) {
@@ -900,14 +1392,14 @@ async fn exceptional_completion(program: &Program) {
             "matrix_panic",
             "captured panic",
             "baml.panics.UserPanic",
-            btel_types::InvocationOutcome::Errored,
+            proto::InvocationOutcome::Errored,
             false,
         ),
         (
             "matrix_cancel",
             "cancelled input",
             "baml.panics.Cancelled",
-            btel_types::InvocationOutcome::Cancelled,
+            proto::InvocationOutcome::Cancelled,
             true,
         ),
     ] {
@@ -938,10 +1430,10 @@ async fn exceptional_completion(program: &Program) {
                 outcome,
             );
             let expected = one_field_instance(program, class, &fields["message"], false, &[]);
-            recording.assert_capture(
-                done.value_cas_id.as_ref(),
-                (error == Some(true)).then_some(&expected),
-            );
+            // A panic is recorded unless the call declined it. A cancelled
+            // span records only its outcome.
+            let recorded = !cancel && error != Some(false);
+            recording.assert_capture(done.value_cas_id.as_ref(), recorded.then_some(&expected));
         }
     }
 }
@@ -971,26 +1463,13 @@ async fn unions_and_opaque_values(program: &Program) {
     assert_eq!(result.unwrap(), External::Int(1));
     assert_eq!(recording.spans.len(), 1);
     let (_, entry, done) = &recording.spans[0];
-    let placeholder = External::RustData(Arc::new(()));
     recording.assert_capture(
         entry.inputs_cas_id.as_ref(),
-        Some(&one_field_instance(
-            program,
-            "trace.Options",
-            &placeholder,
-            true,
-            &[],
-        )),
+        Some(&rust_instance(program, "trace.Options", true)),
     );
     recording.assert_capture(
         done.value_cas_id.as_ref(),
-        Some(&one_field_instance(
-            program,
-            "trace.Options",
-            &placeholder,
-            false,
-            &[],
-        )),
+        Some(&rust_instance(program, "trace.Options", false)),
     );
 }
 
@@ -1062,14 +1541,11 @@ async fn llm_capture_case(
         .collect();
     assert_eq!(root_spans.len(), 1, "the LLM invocation remains a span");
     let (_, entry, done) = root_spans[0];
-    assert_eq!(
-        entry.inputs_cas_id.is_some(),
-        inputs.unwrap_or(true),
-        "inputs={inputs:?}"
-    );
-    assert_eq!(
+    // AI policy requests capture independently of local options. False and
+    // null add no request, and neither can veto those applicable requests.
+    assert!(entry.inputs_cas_id.is_some(), "inputs={inputs:?}");
+    assert!(
         done.value_cas_id.is_some(),
-        (if fail { error } else { output }).unwrap_or(true),
         "output={output:?}/error={error:?}/fail={fail}",
     );
     assert_eq!(
@@ -1077,17 +1553,14 @@ async fn llm_capture_case(
             .unwrap()
             .outcome(),
         if fail {
-            btel_types::InvocationOutcome::Errored
+            proto::InvocationOutcome::Errored
         } else {
-            btel_types::InvocationOutcome::Ok
+            proto::InvocationOutcome::Ok
         },
     );
     if !fail {
         let expected = snapshot(false, &[text("captured llm")]);
-        recording.assert_capture(
-            done.value_cas_id.as_ref(),
-            output.unwrap_or(true).then_some(&expected),
-        );
+        recording.assert_capture(done.value_cas_id.as_ref(), Some(&expected));
     }
 }
 
@@ -1122,7 +1595,7 @@ fn trace_contract_end_to_end() {
         .build()
         .unwrap()
         .block_on(async {
-            let program = baml_db::testing::compile_source(include_str!(
+            let program = baml_test_support::compile_source(include_str!(
                 "../../../baml_tests/baml_src/ns_trace_capture/matrix.baml"
             ));
             for selected in ["default", "hidden", "timing", "span"] {
@@ -1177,14 +1650,16 @@ fn trace_contract_end_to_end() {
                 }
             }
             if mode == "medium" {
-                capture_flags(&program).await;
+                span_defaults(&program).await;
+                Box::pin(capture_flags(&program)).await;
                 Box::pin(scalar_values(&program)).await;
                 Box::pin(arguments_and_graphs(&program)).await;
-                call_structure(&program).await;
-                callable_shapes(&program).await;
+                Box::pin(typed_map_keys()).await;
+                Box::pin(call_structure(&program)).await;
+                Box::pin(callable_shapes(&program)).await;
                 exceptional_completion(&program).await;
-                unions_and_opaque_values(&program).await;
-                llm_policy(&program).await;
+                Box::pin(unions_and_opaque_values(&program)).await;
+                Box::pin(llm_policy(&program)).await;
             }
         });
 }

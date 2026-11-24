@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use baml_builtins2::{PromptAst, PromptAstSimple};
 use baml_tests::{baml_test, engine::TestOutput};
 use bex_engine::BexExternalValue;
 use bex_external_types::BexExternalAdt;
+use bex_vm_types::{PromptAst, PromptAstSimple};
 
 fn test_result(output: TestOutput) -> BexExternalValue {
     output.result.expect("BAML execution should succeed")
@@ -39,8 +39,8 @@ fn role_and_metadata(message: &PromptAst) -> (&str, &serde_json::Value) {
     }
 }
 
-fn collect_media_kinds(ast: &PromptAst, out: &mut Vec<baml_base::MediaKind>) {
-    fn collect_content(content: &PromptAstSimple, out: &mut Vec<baml_base::MediaKind>) {
+fn collect_media_kinds(ast: &PromptAst, out: &mut Vec<baml_base::ConcreteMediaKind>) {
+    fn collect_content(content: &PromptAstSimple, out: &mut Vec<baml_base::ConcreteMediaKind>) {
         match content {
             PromptAstSimple::String(_) | PromptAstSimple::CacheDelimiter(_) => {}
             PromptAstSimple::Media(media) => out.push(media.kind),
@@ -104,7 +104,7 @@ function main() -> ai.Prompt {
     let ast = prompt_ast(output);
     let mut media_kinds = Vec::new();
     collect_media_kinds(&ast, &mut media_kinds);
-    assert_eq!(media_kinds, vec![baml_base::MediaKind::Image]);
+    assert_eq!(media_kinds, vec![baml_base::ConcreteMediaKind::Image]);
 }
 
 #[tokio::test]
@@ -126,7 +126,7 @@ function main() -> ai.Prompt {
   let ctx = ai.Context {
     client: cc,
     tags: {},
-    _output_format: ai.internal.build_output_format(reflect.Type.of<string>()),
+    _output_format: ai.internal.build_output_format(string.type()),
   }
   let render = prompt`${system}Rules${user}Hello`
   render(ctx)

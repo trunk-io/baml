@@ -12,13 +12,15 @@ pub(crate) mod method;
 pub(crate) mod type_alias;
 pub(crate) mod typemap_file;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use baml_sdkgen_types::{FunctionArgumentDefault, Name, Symbol, SymbolPool, Ty};
+use baml_sdkgen_types::{
+    ClassCrossing, FunctionArgumentDefault, Name, Symbol, SymbolPool, Ty, is_nullable,
+};
 
 use crate::{
     emit::{
-        class::{PyClass, PyClassProperty},
+        class::{PyClass, PyClassBody, PyClassProperty},
         enum_::{PyEnum, PyEnumVariant},
         function::{PyFunction, SyncAsync},
         method::{MethodKind, OptionalArg, PyMethodBinding, RequiredArg},
@@ -62,14 +64,6 @@ pub(crate) fn build_emitted(
     pool: &SymbolPool,
     names: &PythonNames,
 ) -> Vec<(LeafPath, EmittedSymbol, SortKey)> {
-    let aliases: BTreeMap<Name, Ty> = pool
-        .iter()
-        .filter_map(|(name, symbol)| match symbol {
-            Symbol::TypeAlias(alias) => Some((name.clone(), alias.resolves_to.clone())),
-            _ => None,
-        })
-        .collect();
-
     // Determinism: SymbolPool is a HashMap, so iteration order is
     // nondeterministic. Sort pool entries by Name before the walk so
     // triples with identical sort keys (shouldn't happen in practice,
@@ -86,20 +80,33 @@ pub(crate) fn build_emitted(
         match symbol {
             Symbol::Class(c) => {
                 let sort_key = origin_key(&c.origin);
-                let properties = c
-                    .properties
-                    .iter()
-                    .map(|p| {
-                        let wire_name = p.name.as_str().to_string();
-                        PyClassProperty {
-                            name: names.field(key, &wire_name).into_owned(),
-                            wire_name,
-                            ty: p.ty.clone(),
-                            nullable: is_nullable(&p.ty, &aliases, &mut BTreeSet::new()),
-                            docstring: p.docstring.clone(),
-                        }
-                    })
-                    .collect();
+                // Streams, function specs, media and prompts keep their own
+                // host types, chosen by name when the leaf renders.
+                let body = match c.crossing {
+                    ClassCrossing::Opaque => PyClassBody::Opaque,
+                    // A host's own value crosses as the runtime's handle type
+                    // (`_BamlPyHandle`), so it has no definition of its own.
+                    ClassCrossing::HostValue => continue,
+                    ClassCrossing::Fields
+                    | ClassCrossing::Stream
+                    | ClassCrossing::FunctionSpec
+                    | ClassCrossing::Media(_)
+                    | ClassCrossing::Prompt => PyClassBody::Fields(
+                        c.properties
+                            .iter()
+                            .map(|p| {
+                                let wire_name = p.name.as_str().to_string();
+                                PyClassProperty {
+                                    name: names.field(key, &wire_name).into_owned(),
+                                    wire_name,
+                                    ty: p.ty.clone(),
+                                    nullable: is_nullable(&p.ty, pool),
+                                    docstring: p.docstring.clone(),
+                                }
+                            })
+                            .collect(),
+                    ),
+                };
                 // The class's pool key Display form is already the
                 // method-FQN root (`<pkg>.<ns…>.<ClassName>`). Methods
                 // append `.<method_bare>`; companions further append
@@ -146,7 +153,7 @@ pub(crate) fn build_emitted(
                         wire_generic_params,
                         type_var_names,
                         docstring: c.docstring.clone(),
-                        properties,
+                        body,
                         static_methods,
                         instance_methods,
                     }),
@@ -198,27 +205,6 @@ pub(crate) fn build_emitted(
     out
 }
 
-fn is_nullable(ty: &Ty, aliases: &BTreeMap<Name, Ty>, visiting: &mut BTreeSet<Name>) -> bool {
-    match ty {
-        Ty::Null => true,
-        Ty::Union(items) => items
-            .iter()
-            .any(|item| is_nullable(item, aliases, visiting)),
-        Ty::TypeAlias(name) => {
-            let Some(resolved) = aliases.get(name) else {
-                return false;
-            };
-            if !visiting.insert(name.clone()) {
-                return false;
-            }
-            let nullable = is_nullable(resolved, aliases, visiting);
-            visiting.remove(name);
-            nullable
-        }
-        _ => false,
-    }
-}
-
 /// Emit sync and async Python bindings for one exact BAML callable FQN.
 fn expand_function(
     leaf: &LeafPath,
@@ -252,7 +238,7 @@ fn expand_function(
         .collect();
     let func_docstring = f.docstring.clone();
     let raises_names = collect_raises_names(f.throws.as_ref(), names);
-    for role in [BindingRole::DirectSync, BindingRole::DirectAsync] {
+    for role in [BindingRole::Direct, BindingRole::DirectSync] {
         let arguments: Vec<_> = f.arguments.iter().collect();
         let wire_params: Vec<String> = arguments
             .iter()
@@ -363,7 +349,7 @@ fn expand_methods(
             .collect();
         let method_docstring = m.docstring.clone();
         let raises_names = collect_raises_names(m.throws.as_ref(), names);
-        for role in [BindingRole::DirectSync, BindingRole::DirectAsync] {
+        for role in [BindingRole::Direct, BindingRole::DirectSync] {
             let arguments: Vec<_> = m.arguments.iter().collect();
             let (required_args, optional_args) = split_arguments(&arguments, &fqn_root, names);
             let mode = if role.is_async() {

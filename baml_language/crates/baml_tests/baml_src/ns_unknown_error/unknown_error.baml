@@ -139,7 +139,7 @@ function ue_preserves_cause_chain() -> bool {
     ue_chained_normalized() catch_all (error, context) {
         baml.errors.UnknownError => {
             match (context.root_cause().error) {
-                let root: string => root == "root",
+                let cause: string => cause == "root",
                 _ => false,
             }
         },
@@ -178,7 +178,7 @@ function ue_context_survives_gc() -> bool {
     ue_gc_normalized() catch_all (error, context) {
         baml.errors.UnknownError => {
             match (context.root_cause().error) {
-                let root: UeRootCause => root.message == "root",
+                let cause: UeRootCause => cause.message == "root",
                 _ => false,
             }
         },
@@ -287,4 +287,21 @@ function ue_reflect_preserves_context() -> bool {
 
 test "unknown_error_reflect_preserves_context" {
     assert.is_true(ue_reflect_preserves_context())
+}
+
+// The function `reflect.call_any` runs is a frame of the trace, with the line
+// that threw: a function held as a typed function value is still named.
+function ue_reflect_names_callee() -> bool {
+    let target: reflect.AnyFunction<Returns = bool, Throws = unknown> = ue_reflect_origin;
+    ue_call_reflect(target) catch_all (error, context) {
+        _ => {
+            context.stack_trace.frames.some((frame: baml.errors.StackFrame) -> bool {
+                frame.function_name.includes("ue_reflect_origin") && frame.line > 0
+            })
+        },
+    }
+}
+
+test "unknown_error_reflect_names_callee" {
+    assert.is_true(ue_reflect_names_callee())
 }

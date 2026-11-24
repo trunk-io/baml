@@ -156,6 +156,7 @@ pub fn translate(sql: &str) -> Result<Translation, SqlError> {
 }
 
 fn parse(sql: &str) -> Result<Vec<Statement>, SqlError> {
+    let sql = &*slot_dots(sql);
     match Parser::parse_sql(&GenericDialect {}, sql) {
         Ok(statements) => Ok(statements),
         Err(error) => {
@@ -174,6 +175,67 @@ fn parse(sql: &str) -> Result<Vec<Statement>, SqlError> {
             Err(SqlError(format!("SQL syntax: {error}")))
         }
     }
+}
+
+fn slot_dots(sql: &str) -> std::borrow::Cow<'_, str> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() else {
+        return sql.into();
+    };
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let offset = |line: u64, column: u64| -> Option<usize> {
+        let start = *line_starts.get(usize::try_from(line).ok()?.checked_sub(1)?)?;
+        let skip = usize::try_from(column).ok()?.checked_sub(1)?;
+        Some(match sql[start..].char_indices().nth(skip) {
+            Some((at, _)) => start + at,
+            None => sql.len(),
+        })
+    };
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut after_slot = false;
+    for pair in tokens.windows(2) {
+        let [before, token] = pair else {
+            unreachable!("windows of two")
+        };
+        let before_slot = std::mem::take(&mut after_slot);
+        let Token::Number(number, false) = &token.token else {
+            continue;
+        };
+        let Some(slot) = number.strip_prefix('.') else {
+            continue;
+        };
+        let decimal = !slot.is_empty()
+            && slot.bytes().all(|b| b.is_ascii_digit())
+            && (slot == "0" || !slot.starts_with('0'));
+        let after_operand = before_slot
+            || matches!(
+                before.token,
+                Token::Word(_) | Token::RBracket | Token::RParen
+            );
+        if !decimal || !after_operand {
+            continue;
+        }
+        let Some(at) = offset(token.span.start.line, token.span.start.column) else {
+            continue;
+        };
+        if sql.get(at..at + number.len()) != Some(number.as_str()) {
+            continue;
+        }
+        out.push_str(&sql[copied..at]);
+        out.push('[');
+        out.push_str(slot);
+        out.push(']');
+        copied = at + number.len();
+        after_slot = true;
+    }
+    if out.is_empty() {
+        return sql.into();
+    }
+    out.push_str(&sql[copied..]);
+    out.into()
 }
 
 /// Wrap a translated set operation, whose branches kept value handles, so
@@ -1419,8 +1481,9 @@ impl Translator {
         Ok(compare_call(handle, op, item.clone()))
     }
 
-    /// `baml_value_state(v)` and `baml_kind(v)`: inspection functions over a
-    /// BAML value. Returns their translation, or `None` for other functions.
+    /// `baml_value_state(v)`, `baml_kind(v)` and `baml_code(v)`: inspection
+    /// functions over a BAML value. Returns their translation, or `None` for
+    /// other functions.
     fn value_function(&mut self, function: &mut Function) -> Result<Option<Expr>, SqlError> {
         let parts = object_name(&function.name)?;
         let [name] = parts.as_slice() else {
@@ -1430,6 +1493,8 @@ impl Translator {
             "__btel_value_state"
         } else if name.eq_ignore_ascii_case("baml_kind") {
             "__btel_kind"
+        } else if name.eq_ignore_ascii_case("baml_code") {
+            "__btel_code"
         } else {
             return Ok(None);
         };

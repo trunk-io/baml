@@ -55,7 +55,7 @@ for this test; keep its `threads-required` setting aligned with
 
 ## Running tests
 
-The six-model live provider matrix checks a bare `hello world` through normal and streamed calls in the `llm_providers::live` group. See [Live LLM provider tests](baml_src/ns_llm_providers/README.md) for the command using Infisical's `dev-llm-provider-tests` environment. The default offline profile excludes this group.
+The live provider matrix checks a bare `hello world` through normal and streamed calls, and `${cache()}` on the Anthropic, Bedrock, OpenAI and Azure clients, in the `llm_providers::live` group. See [Live LLM provider tests](baml_src/ns_llm_providers/README.md) for the command using Infisical's `dev-llm-provider-tests` environment. The default offline profile excludes this group.
 
 ```bash
 # Run compiler tests (the runtime corpus is owned by baml_cli)
@@ -105,13 +105,16 @@ run outright with the full rendered list.
 
 ## Benchmarks
 
-This crate also includes comprehensive performance benchmarks. See
-[BENCHMARKS.md](BENCHMARKS.md) for details.
+The bench targets, what each measures and how to read the results are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ```bash
-# Run benchmarks
-cargo bench --bench compiler_benchmark
+# One bench target
+cargo bench -p baml_tests --bench compiler_benchmark
 
-# Run specific benchmark
-cargo bench --bench compiler_benchmark bench_incremental_add_user_field
+# Filter by name
+cargo bench -p baml_tests --bench runtime_benchmark -- vm_
+
+# The syntax-layer benches live in baml_compiler2_ast
+cargo bench -p baml_compiler2_ast --bench syntax_benchmark
 ```

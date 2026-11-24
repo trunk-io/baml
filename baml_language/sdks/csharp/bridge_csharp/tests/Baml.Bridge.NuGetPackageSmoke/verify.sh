@@ -63,7 +63,7 @@ cp "$package" "$feed/baml-bridge.$version.nupkg"
 
 if [[ -z "$generated_source_root" ]]; then
   (cd "$language_root" && cargo run --quiet -p baml_cli -- \
-    generate --from "$fixture")
+    generate --project-dir "$fixture")
   generated_source_root="$fixture/baml_sdk"
 else
   generated_source_root="$(cd "$generated_source_root" && pwd -P)"
@@ -110,7 +110,7 @@ fi
 export BAML_CSHARP_PRODUCT_FEED="$dotnet_feed"
 project="$consumer/Baml.Bridge.NuGetPackageSmoke.csproj"
 config="$consumer/NuGet.Config"
-env -u BAML_BRIDGE_CSHARP_NATIVE_LIBRARY \
+env -u BAML_BRIDGE_PATH \
   NUGET_PACKAGES="$dotnet_packages" \
   dotnet restore "$project" --runtime "$rid" --configfile "$config" \
     -p:NuGetAudit=false \
@@ -122,7 +122,7 @@ restored_product_package="$(find "$packages/baml-bridge" \
   -type f -name '*.nupkg' | sed -n '1p')"
 cmp "$package" "$restored_product_package"
 
-env -u BAML_BRIDGE_CSHARP_NATIVE_LIBRARY \
+env -u BAML_BRIDGE_PATH \
   NUGET_PACKAGES="$dotnet_packages" \
   dotnet publish "$project" \
     --configuration Release \
@@ -142,7 +142,7 @@ unzip -p "$package" "runtimes/$rid/native/$canonical_native" \
   > "$work/package-native"
 cmp "$work/package-native" "$publish/$canonical_native"
 
-env -u BAML_BRIDGE_CSHARP_NATIVE_LIBRARY \
+env -u BAML_BRIDGE_PATH \
   dotnet "$publish/Baml.Bridge.NuGetPackageSmoke.dll" \
   | grep -Fx 'csharp_nuget_package_smoke=ok'
 

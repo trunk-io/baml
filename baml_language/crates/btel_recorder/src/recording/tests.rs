@@ -21,6 +21,50 @@ fn config() -> RecordingConfig {
 }
 
 #[test]
+fn sdk_completion_is_emitted_only_in_the_terminal_file() {
+    let exit = Arc::new(btel_types::ProcessExitSlot::default());
+    let mut builder =
+        RecordingBuilder::new(btel_types::new_recording_id(), RecordingConfig::default())
+            .unwrap()
+            .with_process(ProcessRecording {
+                info: btel_types::ProcessInfo {
+                    process_id: [9; 16],
+                    ..Default::default()
+                },
+                sources: None,
+                context: None,
+                exit: Arc::clone(&exit),
+                program_id: None,
+                build: None,
+            });
+    exit.set(btel_types::ProcessExit {
+        status: btel_types::ProcessStatus::Unknown,
+        at_unix_ns: 123,
+    });
+    builder.aggregate(AggregateDelta {
+        node: CallPathNodeId::new(CallPathId::new_non_root(7).unwrap(), false),
+        count: 1,
+        total_duration: ClockDuration::from_ticks(3),
+        ..Default::default()
+    });
+    let flushed = decode(&builder.flush_recording().unwrap().unwrap());
+    assert!(flushed.end.is_none());
+    assert_eq!(
+        flushed.header.unwrap().format_minor,
+        btel_core::recording::minor::PROCESS_CONTEXT
+    );
+    let ended = decode(&builder.end_recording().unwrap().unwrap());
+    assert_eq!(
+        ended.header.unwrap().format_minor,
+        btel_core::recording::minor::UNKNOWN_PROCESS_OUTCOME
+    );
+    let completion = ended.end.unwrap().process_end.unwrap();
+    assert_eq!(completion.status, proto::ProcessStatus::Unknown as i32);
+    assert_eq!(completion.at_unix_ns, 123);
+    assert!(builder.end_recording().unwrap().is_none());
+}
+
+#[test]
 fn metadata_prefix_merges_before_newer_resolution_and_clock_observations() {
     use proto::function_definition::Resolution;
 
@@ -123,8 +167,9 @@ fn recording_rejects_unrepresentable_deadline() {
 #[test]
 fn span_reservation_rejects_overflow_and_encoder_limit_without_allocating() {
     for records in [
-        encoding::MAX_BUFFER_BYTES / encoding::MAX_EVENT_BYTES + 1,
-        usize::MAX / encoding::MAX_EVENT_BYTES + 1,
+        btel_settings::encoding::MAX_BUFFER_BYTES / btel_core::recording::frame::MAX_EVENT_BYTES
+            + 1,
+        usize::MAX / btel_core::recording::frame::MAX_EVENT_BYTES + 1,
         usize::MAX,
     ] {
         let mut builder =
@@ -150,7 +195,7 @@ fn encoding_reservation_rejects_addition_overflow() {
         Err(RecordingError::EncodingTooLarge)
     );
     assert_eq!(
-        builder.reserve_encoding(encoding::MAX_BUFFER_BYTES),
+        builder.reserve_encoding(btel_settings::encoding::MAX_BUFFER_BYTES),
         Err(RecordingError::EncodingTooLarge)
     );
 }
@@ -211,7 +256,7 @@ fn decode(file: &SealedFile) -> proto::RecordingFile {
 fn aggregates_seal_before_definitions_without_rewriting_earlier_files() {
     let files = RefCell::new(Vec::new());
     let (thread, function, path) = ids();
-    let id = RecordingId::generate();
+    let id = btel_types::new_recording_id();
     let mut p = RecordingPublisher::new(id, config(), |f| files.borrow_mut().push(f)).unwrap();
     p.aggregate(delta(path));
     p.flush();
@@ -243,7 +288,7 @@ fn aggregates_seal_before_definitions_without_rewriting_earlier_files() {
 fn spans_and_announcements_forward_without_parent_or_definition_lookups() {
     let files = RefCell::new(Vec::new());
     let (thread, _, path) = ids();
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap();
@@ -312,11 +357,12 @@ fn size_boundary_recycles_the_input_chunk_before_handoff() {
             span_chunks: nz(1),
             max_producers: nz(1),
             preallocate: true,
+            overage_wait_base: btel_settings::transport::OVERAGE_WAIT_BASE_DURATION,
         })
         .unwrap();
     let files = RefCell::new(Vec::new());
     let copy = pool.clone();
-    let publisher = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let publisher = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         assert_eq!(copy.stats().free_chunks, 2);
         files.borrow_mut().push(f);
     })
@@ -347,9 +393,13 @@ fn size_boundary_recycles_the_input_chunk_before_handoff() {
 fn deadlines_start_once_do_not_slide_and_do_not_emit_empty_files() {
     let files = RefCell::new(Vec::new());
     let (thread, function, path) = ids();
-    let mut p = RecordingPublisher::new(RecordingId::generate(), RecordingConfig::default(), |f| {
-        files.borrow_mut().push(f);
-    })
+    let mut p = RecordingPublisher::new(
+        btel_types::new_recording_id(),
+        RecordingConfig::default(),
+        |f| {
+            files.borrow_mut().push(f);
+        },
+    )
     .unwrap();
     metadata(&mut p, thread, function, path);
     p.after_batch(2);
@@ -372,7 +422,7 @@ fn deadlines_start_once_do_not_slide_and_do_not_emit_empty_files() {
 #[test]
 fn sequence_exhaustion_never_wraps_or_reuses_a_file_number() {
     let files = RefCell::new(Vec::new());
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap();
@@ -394,6 +444,7 @@ fn idle_processor_seals_on_the_recording_deadline_without_more_input() {
             span_chunks: nz(1),
             max_producers: nz(1),
             preallocate: true,
+            overage_wait_base: btel_settings::transport::OVERAGE_WAIT_BASE_DURATION,
         })
         .unwrap();
     let mut producer = pool.register_producer().unwrap();
@@ -414,7 +465,7 @@ fn idle_processor_seals_on_the_recording_deadline_without_more_input() {
     let copy = pool.clone();
     let worker = std::thread::spawn(move || {
         let p = RecordingPublisher::new(
-            RecordingId::generate(),
+            btel_types::new_recording_id(),
             RecordingConfig {
                 flush_interval_duration: Duration::from_millis(10),
                 ..RecordingConfig::default()
@@ -452,7 +503,7 @@ fn idle_processor_seals_on_the_recording_deadline_without_more_input() {
 #[test]
 fn thread_lifecycle_and_clock_observations_are_forwarded_without_deduplication() {
     let files = RefCell::new(Vec::new());
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap();
@@ -510,9 +561,13 @@ fn thread_lifecycle_and_clock_observations_are_forwarded_without_deduplication()
 #[test]
 fn encoded_sections_survive_growth_and_thread_switches() {
     let files = RefCell::new(Vec::new());
-    let mut p = RecordingPublisher::new(RecordingId::generate(), RecordingConfig::default(), |f| {
-        files.borrow_mut().push(f);
-    })
+    let mut p = RecordingPublisher::new(
+        btel_types::new_recording_id(),
+        RecordingConfig::default(),
+        |f| {
+            files.borrow_mut().push(f);
+        },
+    )
     .unwrap();
     let a = allocate_telemetry_id();
     let b = allocate_telemetry_id();
@@ -595,9 +650,13 @@ fn encoded_sections_survive_growth_and_thread_switches() {
 #[test]
 fn batch_reservation_is_lazy_and_sealing_invalidates_unused_credit() {
     let files = RefCell::new(Vec::new());
-    let mut p = RecordingPublisher::new(RecordingId::generate(), RecordingConfig::default(), |f| {
-        files.borrow_mut().push(f);
-    })
+    let mut p = RecordingPublisher::new(
+        btel_types::new_recording_id(),
+        RecordingConfig::default(),
+        |f| {
+            files.borrow_mut().push(f);
+        },
+    )
     .unwrap();
     let (thread, _, path) = ids();
     let mut event = SpanRecord::FunctionSpanAnnouncement {
@@ -617,7 +676,7 @@ fn batch_reservation_is_lazy_and_sealing_invalidates_unused_credit() {
     p.aggregate(delta(path));
     p.span(thread, &mut event);
     let capacity = p.builder.buffer.spans.capacity();
-    assert!(capacity >= 8 * btel_settings::encoding::MAX_EVENT_BYTES);
+    assert!(capacity >= 8 * btel_core::recording::frame::MAX_EVENT_BYTES);
     for _ in 1..8 {
         p.span(thread, &mut event);
         assert_eq!(p.builder.buffer.spans.capacity(), capacity);
@@ -660,7 +719,7 @@ fn batch_reservation_is_lazy_and_sealing_invalidates_unused_credit() {
 fn size_hint_tracks_encoded_bodies_including_merge_growth_and_overflow() {
     let files = RefCell::new(Vec::new());
     let (thread, function, path) = ids();
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap()
@@ -750,14 +809,18 @@ fn population_outcomes_include_timing_only_calls_and_count_forwarded_spans_once(
             span_chunks: nz(1),
             max_producers: nz(1),
             preallocate: true,
+            overage_wait_base: btel_settings::transport::OVERAGE_WAIT_BASE_DURATION,
         })
         .unwrap();
     let files = RefCell::new(Vec::new());
-    let publisher =
-        RecordingPublisher::new(RecordingId::generate(), RecordingConfig::default(), |f| {
+    let publisher = RecordingPublisher::new(
+        btel_types::new_recording_id(),
+        RecordingConfig::default(),
+        |f| {
             files.borrow_mut().push(f);
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let mut processor = Processor::with_publisher(pool.bind_consumer().unwrap(), nz(8), publisher);
     let mut producer = pool.register_producer().unwrap();
     let thread = allocate_telemetry_id();
@@ -854,7 +917,7 @@ fn thread_heavy_files_seal_near_the_encoded_target() {
     let files = RefCell::new(Vec::new());
     let target = 64 * 1024;
     let mut p = RecordingPublisher::new(
-        RecordingId::generate(),
+        btel_types::new_recording_id(),
         RecordingConfig {
             target_bytes: nz(target),
             ..RecordingConfig::default()
@@ -896,9 +959,12 @@ fn thread_heavy_files_seal_near_the_encoded_target() {
 }
 
 fn snapshot() -> btel_snapshot::Snapshot {
-    let pool = btel_snapshot::SnapshotPool::new(1, btel_snapshot::Limits::default());
+    let pool = btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default());
     let b = pool.try_acquire().unwrap();
-    b.finish_value(btel_snapshot::SnapshotValue::Int(42))
+    b.finish(
+        btel_snapshot::SnapshotValue::Int(42),
+        &mut btel_snapshot::Shaper::default(),
+    )
 }
 
 #[test]
@@ -909,19 +975,19 @@ fn type_args_round_trip_at_minor_eight_beside_inputs() {
     let received = RefCell::new(Vec::new());
     let (thread, _, path) = ids();
     let mut p = RecordingPublisher::with_snapshot_receiver(
-        RecordingId::generate(),
+        btel_types::new_recording_id(),
         config(),
         |f| files.borrow_mut().push(f),
-        |snapshot| received.borrow_mut().push(crate::snapshot_id(&snapshot)),
+        |snapshot| received.borrow_mut().push(crate::cas_id(&snapshot)),
     )
     .unwrap();
-    let snapshots = btel_snapshot::SnapshotPool::new(2, btel_snapshot::Limits::default());
+    let snapshots = btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default());
     let capture = |value| {
-        let snapshot = snapshots
-            .try_acquire()
-            .unwrap()
-            .finish_value(btel_snapshot::SnapshotValue::Int(value));
-        let id = crate::snapshot_id(&snapshot);
+        let snapshot = snapshots.try_acquire().unwrap().finish(
+            btel_snapshot::SnapshotValue::Int(value),
+            &mut btel_snapshot::Shaper::default(),
+        );
+        let id = crate::cas_id(&snapshot);
         (snapshot, id)
     };
     let (inputs, inputs_id) = capture(1);
@@ -944,12 +1010,13 @@ fn type_args_round_trip_at_minor_eight_beside_inputs() {
     let file = decode(&files.borrow()[0]);
     assert_eq!(
         file.header.unwrap().format_minor,
-        btel_settings::encoding::TYPE_ARGS_FORMAT_MINOR
+        btel_core::recording::minor::TYPE_ARGS
     );
     let event = file.spans.unwrap().sections.remove(0).events.remove(0);
     assert_eq!(
         event.event,
         Some(Event::FunctionAnnouncement(proto::FunctionAnnouncement {
+            manual: false,
             id: id.get(),
             parent_id: thread.get(),
             call_path_id: path.get(),
@@ -975,7 +1042,7 @@ fn type_args_round_trip_at_minor_eight_beside_inputs() {
     let file = decode(&files.borrow()[1]);
     assert_eq!(
         file.header.unwrap().format_minor,
-        btel_settings::encoding::FORMAT_MINOR
+        btel_core::recording::minor::BASE
     );
     let Some(Event::FunctionAnnouncement(entry)) = file
         .spans
@@ -1000,7 +1067,7 @@ fn network_spans_round_trip_at_minor_seven() {
 
     let files = RefCell::new(Vec::new());
     let (thread, _, path) = ids();
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap();
@@ -1008,15 +1075,15 @@ fn network_spans_round_trip_at_minor_seven() {
     // Longer than a fixed event: the strings reserve their own bytes.
     let url = format!(
         "https://example.com/{}",
-        "a".repeat(4 * encoding::MAX_EVENT_BYTES)
+        "a".repeat(4 * btel_core::recording::frame::MAX_EVENT_BYTES)
     );
-    let snapshots = btel_snapshot::SnapshotPool::new(3, btel_snapshot::Limits::default());
+    let snapshots = btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default());
     let capture = |value| {
-        let snapshot = snapshots
-            .try_acquire()
-            .unwrap()
-            .finish_value(btel_snapshot::SnapshotValue::Int(value));
-        let id = crate::snapshot_id(&snapshot);
+        let snapshot = snapshots.try_acquire().unwrap().finish(
+            btel_snapshot::SnapshotValue::Int(value),
+            &mut btel_snapshot::Shaper::default(),
+        );
+        let id = crate::cas_id(&snapshot);
         (snapshot, id)
     };
     let (request, request_id) = capture(1);
@@ -1062,7 +1129,7 @@ fn network_spans_round_trip_at_minor_seven() {
     let file = decode(&files.borrow()[0]);
     assert_eq!(
         file.header.unwrap().format_minor,
-        btel_settings::encoding::NETWORK_FORMAT_MINOR
+        btel_core::recording::minor::NETWORK
     );
     let section = file.spans.unwrap().sections.remove(0);
     assert_eq!(section.thread_id, thread.get());
@@ -1120,23 +1187,100 @@ fn network_spans_round_trip_at_minor_seven() {
     p.flush_recording().unwrap();
     assert_eq!(
         decode(&files.borrow()[1]).header.unwrap().format_minor,
-        btel_settings::encoding::FORMAT_MINOR
+        btel_core::recording::minor::BASE
+    );
+}
+
+#[test]
+fn span_usage_rides_its_completion_at_minor_eleven() {
+    use proto::span_event::Event;
+
+    let files = RefCell::new(Vec::new());
+    let (thread, _, path) = ids();
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
+        files.borrow_mut().push(f);
+    })
+    .unwrap();
+    let span = allocate_telemetry_id();
+    let entry = btel_records::ModelUsage {
+        provider: "anthropic".into(),
+        model: Some("claude-opus-5-5".into()),
+        calls: 2,
+        input_tokens: Some(900),
+        output_tokens: Some(30),
+        cache_read_tokens: None,
+        cache_write_tokens: Some(100),
+        reasoning_tokens: None,
+    };
+    p.span(
+        thread,
+        &mut SpanRecord::SpanUsage(Box::new(btel_records::SpanUsage {
+            node: span,
+            entries: vec![entry],
+        })),
+    );
+    // Usage alone seals nothing: it waits for its node's completion, even
+    // across a flush.
+    p.flush_recording().unwrap();
+    assert!(files.borrow().is_empty());
+    p.span(
+        thread,
+        &mut SpanRecord::FunctionSpanCompletionOk {
+            id: span,
+            parent_id: thread,
+            call_path: path,
+            entered_at: ClockInstant::from_ticks(1),
+            exited_at: ClockInstant::from_ticks(2),
+            await_time: AwaitDuration::ZERO,
+            captured_value: None,
+        },
+    );
+    p.flush_recording().unwrap();
+    let file = decode(&files.borrow()[0]);
+    assert_eq!(
+        file.header.unwrap().format_minor,
+        btel_core::recording::minor::MODEL_USAGE
+    );
+    let event = file
+        .spans
+        .unwrap()
+        .sections
+        .remove(0)
+        .events
+        .remove(0)
+        .event;
+    let Some(Event::FunctionCompletion(completion)) = event else {
+        panic!("a function completion: {event:?}")
+    };
+    assert_eq!(completion.id, span.get());
+    assert_eq!(
+        completion.usage,
+        vec![proto::ModelUsage {
+            provider: "anthropic".into(),
+            model: Some("claude-opus-5-5".into()),
+            calls: 2,
+            input_tokens: Some(900),
+            output_tokens: Some(30),
+            cache_read_tokens: None,
+            cache_write_tokens: Some(100),
+            reasoning_tokens: None,
+        }]
     );
 }
 
 #[test]
 fn captures_move_after_chunk_recycle_and_duplicates_release_before_file_flush() {
     use btel_snapshot::{Limits, SnapshotPool, SnapshotValue};
-    let snapshots = SnapshotPool::new(2, Limits::default());
+    let snapshots = SnapshotPool::unbounded(Limits::default());
     let make = || {
-        snapshots
-            .try_acquire()
-            .unwrap()
-            .finish_value(SnapshotValue::Int(42))
+        snapshots.try_acquire().unwrap().finish(
+            SnapshotValue::Int(42),
+            &mut btel_snapshot::Shaper::default(),
+        )
     };
     let first = make();
     let second = make();
-    let expected = crate::snapshot_id(&first);
+    let expected = crate::cas_id(&first);
     let chunks =
         ChunkPool::<btel_records::TimingRecord, SpanRecord<Snapshot, Snapshot>>::new(Config {
             chunk_capacity: nz(4),
@@ -1144,6 +1288,7 @@ fn captures_move_after_chunk_recycle_and_duplicates_release_before_file_flush() 
             span_chunks: nz(1),
             max_producers: nz(1),
             preallocate: true,
+            overage_wait_base: btel_settings::transport::OVERAGE_WAIT_BASE_DURATION,
         })
         .unwrap();
     let mut producer = chunks.register_producer().unwrap();
@@ -1163,7 +1308,7 @@ fn captures_move_after_chunk_recycle_and_duplicates_release_before_file_flush() 
     let received = RefCell::new(Vec::new());
     let files = RefCell::new(Vec::new());
     let publisher = RecordingPublisher::with_snapshot_receiver(
-        RecordingId::generate(),
+        btel_types::new_recording_id(),
         RecordingConfig::default(),
         |file| files.borrow_mut().push(file),
         |snapshot| {
@@ -1200,9 +1345,9 @@ fn captures_move_after_chunk_recycle_and_duplicates_release_before_file_flush() 
 #[test]
 fn snapshot_receiver_panic_releases_pending_owners() {
     use btel_snapshot::{Limits, SnapshotPool, SnapshotValue};
-    let pool = SnapshotPool::new(2, Limits::default());
+    let pool = SnapshotPool::unbounded(Limits::default());
     let mut p = RecordingPublisher::with_snapshot_receiver(
-        RecordingId::generate(),
+        btel_types::new_recording_id(),
         RecordingConfig::default(),
         |_| {},
         |_: Snapshot| panic!("receiver failed"),
@@ -1213,7 +1358,7 @@ fn snapshot_receiver_panic_releases_pending_owners() {
         let snapshot = pool
             .try_acquire()
             .unwrap()
-            .finish_value(SnapshotValue::Int(n));
+            .finish(SnapshotValue::Int(n), &mut btel_snapshot::Shaper::default());
         p.span(
             thread,
             &mut SpanRecord::FunctionSpanAnnouncement {
@@ -1250,6 +1395,7 @@ fn known_function_metadata_is_published_once_and_unknown_functions_stay_placehol
         lambda_path: None,
         definition_key: None,
         package_name: Some("user".into()),
+        compilation_unit_hash: None,
         namespace: Vec::new(),
         argument_layout: Some(btel_types::ArgumentLayout {
             slots: vec![btel_types::ArgumentSlot {
@@ -1258,11 +1404,12 @@ fn known_function_metadata_is_published_once_and_unknown_functions_stay_placehol
             }],
         }),
         source_map: None,
+        model_invoke: false,
     };
     let table = std::sync::Arc::new(btel_types::FunctionMetadataTable {
         functions: vec![metadata_for(known)],
     });
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap()
@@ -1357,7 +1504,7 @@ fn clock_states(file: &proto::RecordingFile) -> Vec<(u64, i32, bool)> {
 #[test]
 fn flush_continues_the_recording_and_end_seals_it_once() {
     let files = RefCell::new(Vec::new());
-    let mut p = RecordingPublisher::new(RecordingId::generate(), config(), |f| {
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
         files.borrow_mut().push(f);
     })
     .unwrap();
@@ -1396,7 +1543,7 @@ fn flush_continues_the_recording_and_end_seals_it_once() {
 
 #[test]
 fn an_empty_recording_ends_with_a_header_only_file() {
-    let id = RecordingId::generate();
+    let id = btel_types::new_recording_id();
     let mut builder = RecordingBuilder::new(id, config()).unwrap();
     let file = decode(&builder.end_recording().unwrap().unwrap());
     assert_eq!(file.sequence, 1);
@@ -1411,7 +1558,7 @@ fn an_empty_recording_ends_with_a_header_only_file() {
 #[test]
 fn already_sealed_data_is_followed_by_an_end_only_file() {
     let (_, _, path) = ids();
-    let mut builder = RecordingBuilder::new(RecordingId::generate(), config()).unwrap();
+    let mut builder = RecordingBuilder::new(btel_types::new_recording_id(), config()).unwrap();
     builder.aggregate(delta(path));
     let data = decode(&builder.flush_recording().unwrap().unwrap());
     assert!(data.end.is_none());
@@ -1425,7 +1572,7 @@ fn already_sealed_data_is_followed_by_an_end_only_file() {
 #[test]
 fn input_after_the_end_is_rejected_by_both_flush_and_end() {
     let (_, _, path) = ids();
-    let mut builder = RecordingBuilder::new(RecordingId::generate(), config()).unwrap();
+    let mut builder = RecordingBuilder::new(btel_types::new_recording_id(), config()).unwrap();
     builder.aggregate(delta(path));
     assert!(
         decode(&builder.end_recording().unwrap().unwrap())
@@ -1446,7 +1593,7 @@ fn input_after_the_end_is_rejected_by_both_flush_and_end() {
 
 #[test]
 fn an_unsettled_clock_keeps_the_recording_unsealed_until_it_settles() {
-    let mut builder = RecordingBuilder::new(RecordingId::generate(), config()).unwrap();
+    let mut builder = RecordingBuilder::new(btel_types::new_recording_id(), config()).unwrap();
     let runtime = ClockRuntime::new(ClockMode::Monotonic);
     let clock = runtime.start_run();
     let epoch = clock.metadata().epoch.get();
@@ -1476,7 +1623,7 @@ fn an_unsettled_clock_keeps_the_recording_unsealed_until_it_settles() {
 
 #[test]
 fn clock_bookkeeping_holds_only_unsettled_runs_and_releases_them_once_final() {
-    let mut builder = RecordingBuilder::new(RecordingId::generate(), config()).unwrap();
+    let mut builder = RecordingBuilder::new(btel_types::new_recording_id(), config()).unwrap();
     let runtime = ClockRuntime::new(ClockMode::Monotonic);
     let (_, _, path) = ids();
     // Runs that settle before conversion are reported final inline and never kept.
@@ -1536,12 +1683,13 @@ fn processor_ends_the_recording_only_after_producers_stop_writing() {
             span_chunks: nz(4),
             max_producers: nz(2),
             preallocate: true,
+            overage_wait_base: btel_settings::transport::OVERAGE_WAIT_BASE_DURATION,
         })
         .unwrap();
     let (send, recv) = std::sync::mpsc::channel();
     let copy = pool.clone();
     let worker = std::thread::spawn(move || {
-        let p = RecordingPublisher::new(RecordingId::generate(), config(), move |file| {
+        let p = RecordingPublisher::new(btel_types::new_recording_id(), config(), move |file| {
             send.send(file).unwrap();
         })
         .unwrap();
@@ -1612,4 +1760,393 @@ fn processor_ends_the_recording_only_after_producers_stop_writing() {
         .map(|state| state.0)
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(finals.len(), 2, "both runs are final by the end");
+}
+
+#[test]
+fn owned_span_uses_function_wire_shape_and_general_neutral_close() {
+    use proto::span_event::Event;
+    let files = RefCell::new(Vec::new());
+    let (thread, _, path) = ids();
+    let id = allocate_telemetry_id();
+    let mut p = RecordingPublisher::with_snapshot_receiver(
+        btel_types::new_recording_id(),
+        config(),
+        |f| files.borrow_mut().push(f),
+        |_| {},
+    )
+    .unwrap();
+    p.span(
+        thread,
+        &mut SpanRecord::ManualSpanAnnouncement(Box::new(btel_records::ManualSpanAnnouncement {
+            id,
+            parent_id: thread,
+            call_path: path,
+            entered_at: ClockInstant::from_ticks(1),
+            captured_inputs: None,
+            captured_type_args: Some(snapshot()),
+        })),
+    );
+    p.flush_recording().unwrap();
+    let file = decode(&files.borrow()[0]);
+    assert_eq!(
+        file.header.unwrap().format_minor,
+        btel_core::recording::minor::OWNED_SPAN
+    );
+    let Some(Event::FunctionAnnouncement(entry)) = file
+        .spans
+        .unwrap()
+        .sections
+        .remove(0)
+        .events
+        .remove(0)
+        .event
+    else {
+        panic!("owned entry must use a function announcement");
+    };
+    assert!(!entry.manual);
+    assert!(entry.type_args_cas_id.is_some());
+    p.span(
+        thread,
+        &mut SpanRecord::ManualSpanCompletion(Box::new(btel_records::ManualSpanCompletion {
+            id,
+            parent_id: thread,
+            call_path: path,
+            entered_at: ClockInstant::from_ticks(1),
+            exited_at: ClockInstant::from_ticks(9),
+            await_time: AwaitDuration::ZERO.saturating_add(ClockDuration::from_ticks(4)),
+            outcome: None,
+            requires_announcement: true,
+            captured_value: None,
+        })),
+    );
+    p.flush_recording().unwrap();
+    let file = decode(&files.borrow()[1]);
+    assert_eq!(
+        file.header.unwrap().format_minor,
+        btel_core::recording::minor::OWNED_SPAN
+    );
+    let Some(Event::FunctionCompletion(done)) = file
+        .spans
+        .unwrap()
+        .sections
+        .remove(0)
+        .events
+        .remove(0)
+        .event
+    else {
+        panic!("owned completion must use a function completion");
+    };
+    assert_eq!(done.completion_flags, 16 | 8);
+    assert_eq!(done.self_await_ticks, 4);
+    assert_eq!(done.exited_at_ticks, 9);
+}
+
+/// A recording names its program, its process's platform, and each
+/// function's package; only one given a build names it in its header.
+#[test]
+fn package_identity_and_build_provenance_are_recorded() {
+    use proto::function_definition::Resolution;
+    let allocator = FunctionIdAllocator::default();
+    let function = allocator.allocate().unwrap();
+    let record = |with_build: bool| {
+        let files = RefCell::new(Vec::new());
+        let table = std::sync::Arc::new(btel_types::FunctionMetadataTable {
+            functions: vec![btel_types::FunctionMetadata {
+                function_id: function,
+                fqn: "user.main".into(),
+                display_name: "main".into(),
+                source_file: None,
+                source_span: None,
+                kind: btel_types::RuntimeFunctionKind::Bytecode,
+                origin: btel_types::RuntimeFunctionOrigin::UserDefined,
+                owner_type: None,
+                parent_function: None,
+                lambda_path: None,
+                definition_key: None,
+                package_name: Some("user".into()),
+                compilation_unit_hash: Some([7; 32]),
+                namespace: Vec::new(),
+                argument_layout: None,
+                source_map: None,
+                model_invoke: false,
+            }],
+        });
+        let mut publisher =
+            RecordingPublisher::new(btel_types::new_recording_id(), config(), |file| {
+                files.borrow_mut().push(file);
+            })
+            .unwrap()
+            .with_function_metadata(table)
+            .with_process(ProcessRecording {
+                info: btel_types::ProcessInfo {
+                    process_id: [9; 16],
+                    os: if with_build {
+                        "linux".into()
+                    } else {
+                        String::new()
+                    },
+                    arch: if with_build {
+                        "aarch64".into()
+                    } else {
+                        String::new()
+                    },
+                    ..Default::default()
+                },
+                sources: None,
+                context: None,
+                exit: Arc::default(),
+                program_id: Some([4; 16]),
+                build: with_build.then_some(btel_types::BuildRecord {
+                    build_id: [1; 16],
+                    timestamp_unix_ns: 7,
+                    origin: btel_types::BuildOrigin::Run,
+                    git: None,
+                    source_hash: [2; 32],
+                    compilation_unit_hash: [7; 32],
+                }),
+            });
+        publisher.span(
+            allocate_telemetry_id(),
+            &mut SpanRecord::CallPathDefined {
+                call_path: CallPathId::new_non_root(1).unwrap(),
+                parent_call_path: CallPathId::ROOT,
+                visible_caller: None,
+                caller_pc: 0,
+                callee: function,
+                edge: btel_types::CallPathEdge::Synchronous,
+            },
+        );
+        publisher.flush_recording().unwrap();
+        let file = decode(&files.borrow()[0]);
+        let header = file.header.unwrap();
+        let Some(Resolution::Metadata(definition)) =
+            file.definitions.unwrap().functions[0].resolution.clone()
+        else {
+            panic!("the function is defined")
+        };
+        (header, definition)
+    };
+
+    let (header, definition) = record(true);
+    assert_eq!(header.program_id, Some(vec![4; 16]));
+    assert_eq!(header.build.unwrap().origin, "run");
+    assert_eq!(header.os.as_deref(), Some("linux"));
+    assert_eq!(header.arch.as_deref(), Some("aarch64"));
+    assert_eq!(definition.compilation_unit_hash, Some(vec![7; 32]));
+    assert_eq!(
+        header.format_minor,
+        btel_core::recording::minor::PROCESS_PLATFORM
+    );
+
+    let (header, definition) = record(false);
+    assert_eq!(header.program_id, Some(vec![4; 16]));
+    assert_eq!(header.build, None);
+    assert_eq!((header.os, header.arch), (None, None));
+    assert_eq!(definition.compilation_unit_hash, Some(vec![7; 32]));
+    assert_eq!(
+        header.format_minor,
+        btel_core::recording::minor::PACKAGE_IDENTITY
+    );
+}
+
+#[test]
+fn a_log_carries_its_line_and_raises_the_file_minor_only_with_one() {
+    use proto::span_event::Event;
+
+    let files = RefCell::new(Vec::new());
+    let allocator = FunctionIdAllocator::default();
+    let (mapped, unmapped) = (allocator.allocate().unwrap(), allocator.allocate().unwrap());
+    let metadata_for = |function_id, source_map| btel_types::FunctionMetadata {
+        function_id,
+        fqn: "user.Logger".into(),
+        display_name: "Logger".into(),
+        source_file: Some("main.baml".into()),
+        source_span: Some(btel_types::SourceSpan {
+            file_id: 3,
+            start: 0,
+            end: 500,
+        }),
+        kind: btel_types::RuntimeFunctionKind::Bytecode,
+        origin: btel_types::RuntimeFunctionOrigin::UserDefined,
+        owner_type: None,
+        parent_function: None,
+        lambda_path: None,
+        definition_key: None,
+        package_name: Some("user".into()),
+        compilation_unit_hash: None,
+        namespace: Vec::new(),
+        argument_layout: None,
+        source_map,
+        model_invoke: false,
+    };
+    let table = Arc::new(btel_types::FunctionMetadataTable {
+        functions: vec![
+            metadata_for(
+                mapped,
+                Some(btel_types::SourceMap {
+                    code_bytes: 30,
+                    entries: vec![btel_types::SourceMapEntry {
+                        pc: 4,
+                        file_id: 3,
+                        start: 100,
+                        end: 110,
+                        line: 12,
+                    }],
+                }),
+            ),
+            metadata_for(unmapped, None),
+        ],
+    });
+    let mut p = RecordingPublisher::new(btel_types::new_recording_id(), config(), |f| {
+        files.borrow_mut().push(f);
+    })
+    .unwrap()
+    .with_function_metadata(table);
+    let thread = allocate_telemetry_id();
+    // One log per file: (function, pc) and the line the event must carry.
+    let cases = [
+        (mapped, 4, Some(12)),
+        (mapped, 29, Some(12)),
+        // Before the first mapped instruction, past the code, the sentinel.
+        (mapped, 0, None),
+        (mapped, 30, None),
+        (mapped, u32::MAX, None),
+        (unmapped, 4, None),
+    ];
+    for (function, pc, _) in cases {
+        p.span(
+            thread,
+            &mut SpanRecord::Log {
+                parent_id: thread,
+                function,
+                pc,
+                at: ClockInstant::from_ticks(1),
+                level: btel_records::LogLevel::Warn,
+                event_name: None,
+                captured_data: None,
+            },
+        );
+        p.flush_recording().unwrap();
+    }
+    let files = files.borrow();
+    assert_eq!(files.len(), cases.len());
+    for (file, (function, pc, line)) in files.iter().zip(cases) {
+        let file = decode(file);
+        // A file without a line stays readable at the minor logs came with.
+        assert_eq!(
+            file.header.unwrap().format_minor,
+            if line.is_some() {
+                btel_core::recording::minor::LOG_LINE
+            } else {
+                btel_core::recording::minor::LOG
+            },
+            "pc {pc}"
+        );
+        let Some(Event::Log(log)) = file
+            .spans
+            .unwrap()
+            .sections
+            .remove(0)
+            .events
+            .remove(0)
+            .event
+        else {
+            panic!("a log event");
+        };
+        assert_eq!((log.function_id, log.pc), (function.get(), pc));
+        assert_eq!(log.line, line, "pc {pc}");
+    }
+}
+
+#[test]
+fn a_thread_error_travels_on_its_threads_completion_and_raises_the_file_minor() {
+    use proto::span_event::Event;
+
+    let files = RefCell::new(Vec::new());
+    let received = RefCell::new(Vec::new());
+    let mut p = RecordingPublisher::with_snapshot_receiver(
+        btel_types::new_recording_id(),
+        config(),
+        |f| files.borrow_mut().push(f),
+        |snapshot| received.borrow_mut().push(crate::cas_id(&snapshot)),
+    )
+    .unwrap();
+    let clock = ClockRuntime::new(ClockMode::Monotonic).start_run();
+    let complete = |p: &mut RecordingPublisher<_, _>, thread, outcome| {
+        p.span(
+            thread,
+            &mut SpanRecord::ThreadSpanCompletion {
+                id: thread,
+                parent_id: None,
+                spawn_call_path: CallPathId::ROOT,
+                started_at: ClockInstant::from_ticks(1),
+                completed_at: ClockInstant::from_ticks(2),
+                outcome,
+                clock: Arc::clone(&clock),
+                name: None,
+            },
+        );
+    };
+    let error = snapshot();
+    let error_id = crate::cas_id(&error);
+    let (failed, plain, uncaptured) = (
+        allocate_telemetry_id(),
+        allocate_telemetry_id(),
+        allocate_telemetry_id(),
+    );
+    p.span(
+        failed,
+        &mut SpanRecord::ThreadSpanError {
+            captured_error: Some(error),
+        },
+    );
+    // The error waits for its own thread's completion, across a file and
+    // another thread's completion.
+    p.flush_recording().unwrap();
+    complete(&mut p, plain, InvocationOutcome::Errored);
+    p.flush_recording().unwrap();
+    complete(&mut p, failed, InvocationOutcome::Panicked);
+    p.flush_recording().unwrap();
+    // A capture the pool refused leaves the completion without an error.
+    p.span(
+        uncaptured,
+        &mut SpanRecord::ThreadSpanError {
+            captured_error: None,
+        },
+    );
+    complete(&mut p, uncaptured, InvocationOutcome::Errored);
+    p.flush_recording().unwrap();
+
+    // The error's snapshot is retained for the CAS like any capture.
+    assert_eq!(*received.borrow(), [error_id]);
+    let completions: Vec<(u32, u64, proto::ThreadCompletion)> = files
+        .borrow()
+        .iter()
+        .map(decode)
+        .filter_map(|file| {
+            let minor = file.header.unwrap().format_minor;
+            let mut section = file.spans?.sections.remove(0);
+            match section.events.remove(0).event {
+                Some(Event::ThreadCompletion(done)) => Some((minor, section.thread_id, done)),
+                other => panic!("only completions are events here: {other:?}"),
+            }
+        })
+        .collect();
+    let base = btel_core::recording::minor::BASE;
+    assert_eq!(
+        completions
+            .iter()
+            .map(|(minor, thread, done)| (*minor, *thread, done.error_cas_id, done.panicked))
+            .collect::<Vec<_>>(),
+        vec![
+            (base, plain.get(), None, false),
+            (
+                btel_core::recording::minor::THREAD_ERROR,
+                failed.get(),
+                Some(error_id),
+                true
+            ),
+            (base, uncaptured.get(), None, false),
+        ]
+    );
 }

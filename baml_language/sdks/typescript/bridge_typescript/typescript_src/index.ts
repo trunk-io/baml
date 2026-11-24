@@ -1,30 +1,38 @@
 // index.ts — mirrors bridge_python/python_src/baml_py/__init__.py
 
+// Must stay first: honors BAML_BRIDGE_PATH before the generated native loader runs.
+import './bridge_path.js';
 import {
     BamlRuntime,
     BamlHandle,
-    BamlCallContext,
-    HostSpanManager,
     cancelFunctionCall as nativeCancelFunctionCall,
     newFunctionCall as nativeNewFunctionCall,
 } from './native.js';
-import { encodeCallArgs, decodeCallResult } from './proto.js';
-import { installFlushOnExit } from './exit_hook.js';
+import { encodeCallArgs, decodeCallResult, hostAdapter } from './proto.js';
+import { registerHostAdapter } from './native.js';
+import { installShutdownOnExit } from './exit_hook.js';
+
+// The bridge encodes arguments against the program's declared types and
+// reaches back into the runtime for what only it knows (see `hostAdapter`).
+registerHostAdapter(hostAdapter);
 import { wrapNativeError } from './errors.js';
-import { attachCallContext } from './call_context.js';
+import { attachInvocation } from './call_context.js';
+// Adds `fromFile` to the native media classes.
+import './media.js';
 
 export {
     BamlRuntime,
-    BamlCallContext,
     BamlHandle,
-    HostSpanManager,
     getRuntime,
     getBridgeRuntimeVersion,
     getToolchainVersion,
     getVersion,
-    flushEvents,
 } from './native.js';
-export { _seedFunctionRefHandle, _seedGenericMediaHandle } from './native.js';
+// Explicit end of the BAML lifetime: drains work and seals telemetry. The
+// automatic call (exit_hook.ts) runs on Node's `beforeExit`, which does not
+// fire on `process.exit()`, on signals, or when a test runner ends workers.
+export { shutdownRuntime } from './native.js';
+export { _seedMediaHandle } from './native.js';
 // Runtime-owned stdlib value classes. Exported under their `Baml*` names only;
 // codegen aliases them as Image/Audio/Video/Pdf on re-export.
 export { BamlImage, BamlAudio, BamlVideo, BamlPdf } from './native.js';
@@ -32,9 +40,8 @@ export { BamlImage, BamlAudio, BamlVideo, BamlPdf } from './native.js';
 export { BamlStream } from './stream.js';
 export { BamlFunctionSpec } from './function_spec.js';
 export type { BamlFunctionSpecBuildRequestOptions, BamlFunctionSpecCallOptions } from './function_spec.js';
-export { BamlPrompt, encodeCallArgs, decodeCallResult } from './proto.js';
+export { BamlPrompt, BamlReference, encodeCallArgs, decodeCallResult } from './proto.js';
 export type { BamlPromptCallOptions, BamlPromptMessage } from './proto.js';
-export { CtxManager } from './ctx_manager.js';
 // Codegen support: typemap + placeholder sentinel + free runtime initializer.
 export { BamlTypeMap, setTypeMap, getTypeMap } from './typemap.js';
 // Callable factories the generated SDK emits for every BAML function/method.
@@ -106,16 +113,15 @@ export function callFunctionSync(
     rt: BamlRuntime,
     functionName: string,
     kwargs: Record<string, unknown>,
-    ctx?: HostSpanManager,
-    callCtx?: BamlCallContext,
+    baml?: InvocationOptions | null,
 ): FunctionResult {
     // Encode in sync mode so a host callable in the kwargs fast-fails
     // with a clear error instead of registering a tsfn and then hanging —
     // the sync path blocks the Node main thread on a tokio `block_on`,
     // starving libuv so the dispatch could never run.
     const callId = newFunctionCall();
-    const argsProto = encodeCallArgs(kwargs, { syncMode: true, callId, functionName });
-    const callCtxBinding = attachCallContext(callCtx, callId);
+    const encoded = encodeCallArgs(kwargs, { syncMode: true, callId, functionName, baml });
+    const callCtxBinding = attachInvocation(encoded.bytes, callId);
     // Only the napi call gets `wrapNativeError`'d — its `napi::Error`
     // messages need parsing into typed `Baml*Error` subclasses. The
     // decoder's throws (`BamlError`/`BamlPanic`, *or* a re-raised
@@ -124,7 +130,7 @@ export function callFunctionSync(
     try {
         let resultBytes: Buffer;
         try {
-            resultBytes = rt.callFunctionSync(argsProto, ctx ?? null);
+            resultBytes = rt.callFunctionSync(encoded.bytes, encoded.kwargs, encoded.cancel);
         } catch (err) {
             throw wrapNativeError(err);
         }
@@ -138,12 +144,11 @@ export async function callFunction(
     rt: BamlRuntime,
     functionName: string,
     kwargs: Record<string, unknown>,
-    ctx?: HostSpanManager,
-    callCtx?: BamlCallContext,
+    baml?: InvocationOptions | null,
 ): Promise<FunctionResult> {
     const callId = newFunctionCall();
-    const argsProto = encodeCallArgs(kwargs, { callId, functionName });
-    const callCtxBinding = attachCallContext(callCtx, callId);
+    const encoded = encodeCallArgs(kwargs, { callId, functionName, baml });
+    const callCtxBinding = attachInvocation(encoded.bytes, callId);
     // Only the napi call gets `wrapNativeError`'d — its `napi::Error`
     // messages need parsing into typed `Baml*Error` subclasses. The
     // decoder's throws (`BamlError`/`BamlPanic`, *or* a re-raised
@@ -152,7 +157,7 @@ export async function callFunction(
     try {
         let resultBytes: Buffer;
         try {
-            resultBytes = await rt.callFunction(argsProto, ctx ?? null);
+            resultBytes = await rt.callFunction(encoded.bytes, encoded.kwargs, encoded.cancel);
         } catch (err) {
             throw wrapNativeError(err);
         }
@@ -162,5 +167,11 @@ export async function callFunction(
     }
 }
 
-// Register flush on process exit (single registration; see exit_hook.ts).
-installFlushOnExit();
+// Register runtime shutdown on process exit (single registration; see exit_hook.ts).
+installShutdownOnExit();
+
+export { current as _currentExecutionContext, ExecutionContext as _ExecutionContext, currentContext as _currentTraceContext, currentContextAsync as _currentTraceContextAsync, currentCancelToken as _currentCancelToken, withExecutionContext as _withExecutionContext } from './execution_context.js';
+export { invoke as _invoke, invokeSync as _invokeSync } from './invocation.js';
+export { instrument as _instrument, TraceUsageError } from './instrumentation.js';
+export { registerCapture, captureFor } from './host_capture.js';
+import type { InvocationOptions } from './invocation.js';

@@ -125,6 +125,10 @@ impl BamlClassType for PackageReflectImpl {
         as_kind(vm, *self_value, baml_type::type_kind::TypeKind::Function)
     }
 
+    fn as_tuple(vm: &mut BexVm, self_value: &Value) -> Option<Value> {
+        as_kind(vm, *self_value, baml_type::type_kind::TypeKind::Tuple)
+    }
+
     fn _validate_renderable(vm: &mut BexVm, self_value: &Value) -> Result<(), VmRustFnError> {
         let type_value = cloned_type_value(vm, *self_value);
         let root = match &type_value.ty {
@@ -148,18 +152,19 @@ impl BamlClassType for PackageReflectImpl {
             ));
         }
 
-        let mut visited = std::collections::HashSet::new();
-        if let Some((path, non_data_ty)) =
-            first_non_data_type(vm, &type_value.ty, &root, &mut visited)
-        {
-            let diagnostic = if path == root {
-                baml_compiler_diagnostics::runtime_type::non_data_type_at_render(&non_data_ty)
-            } else {
-                baml_compiler_diagnostics::runtime_type::non_data_field_at_render(
-                    &path,
-                    &non_data_ty,
-                )
-            };
+        // An output of the unit type carries no information, so there is
+        // nothing for a model to produce. `null` is data only as part of a
+        // larger type (`string?`, a field).
+        if type_value.ty.as_runtime_ty().is_unit() {
+            let diagnostic = baml_compiler_diagnostics::runtime_type::non_data_type_at_render(
+                &type_value.ty.to_string(),
+            );
+            return Err(VmRustFnError::thrown_fresh(
+                super::type_kinds::alloc_compilation_error(vm, &[diagnostic]),
+            ));
+        }
+
+        if let Some(diagnostic) = unanswerable_output(vm, &type_value.ty, &root) {
             return Err(VmRustFnError::thrown_fresh(
                 super::type_kinds::alloc_compilation_error(vm, &[diagnostic]),
             ));
@@ -186,18 +191,28 @@ impl BamlClassType for PackageReflectImpl {
         }
     }
 
-    /// BEP-044: `class_t.implements(iface_t)`.
+    /// BEP-044: `t.implements(iface_t)`, for any concrete type `t` (a class,
+    /// an enum, a primitive, a list, ...).
     ///
     /// Selects over the program-wide impl-rule index: an impl applies when its
-    /// `for_ty_pattern` matches `class_t` (with bounds satisfied) and its
+    /// `for_ty_pattern` matches `t` (with bounds satisfied) and its
     /// implemented-interface args / associated bindings match the requested
     /// instantiation. Candidates are every impl of the interface in the program —
-    /// the orphan rule does *not* localize them to `class_t`'s or the interface's
+    /// the orphan rule does *not* localize them to `t`'s or the interface's
     /// package (see [`crate::package_load::PackageIndex`]); bound obligations
-    /// recurse the same way. Because the compiler (E0125) forces a class to
-    /// implement every interface in its `requires` closure, "direct impl" already
-    /// covers transitive satisfaction.
-    fn implements(vm: &BexVm, self_value: &Value, other: &Value) -> bool {
+    /// recurse the same way. Because the compiler (E0125) forces an implementor
+    /// to implement every interface in its `requires` closure, "direct impl"
+    /// already covers transitive satisfaction.
+    ///
+    /// `iface_t` is an interface-existential type value, which carries every
+    /// associated binding (the compiler fills the defaults), so the selected
+    /// impl must bind exactly those: unlike a generic bound, the request cannot
+    /// leave an associated type open.
+    ///
+    /// Both sides are `type` values: `implements` and `implemented_by` call
+    /// `as_type()` on their `reflect.TypeView` argument in BAML, and
+    /// `implemented_by` swaps the two before it gets here.
+    fn _implements(vm: &BexVm, self_value: &Value, other: &Value) -> bool {
         let Some(self_ty) = type_value_ty(vm, *self_value) else {
             return false;
         };
@@ -210,12 +225,6 @@ impl BamlClassType for PackageReflectImpl {
             &iface_args,
             &iface_assoc,
         )
-    }
-
-    /// BEP-044: `iface_t.implemented_by(class_t)` — same answer as
-    /// `class_t.implements(iface_t)` but with the receiver flipped.
-    fn implemented_by(vm: &BexVm, self_value: &Value, other: &Value) -> bool {
-        Self::implements(vm, other, self_value)
     }
 }
 
@@ -270,9 +279,17 @@ impl RenderDefinitionValidator<'_> {
                 if let Some(conflict) = self.check_name(&definition) {
                     return Some(conflict);
                 }
+                // One spelling per instantiation, as SAP keys it: with each
+                // argument's union flat, `Opt<T?>` at `int?` is `Opt<int?>`
+                // again, so a recursion through unions alone closes.
+                let args: &[bex_vm_types::RealizedTy] = &args
+                    .iter()
+                    .cloned()
+                    .map(bex_vm_types::RealizedTy::flatten_union)
+                    .collect::<Box<[_]>>();
                 let identity = RealizedClassIdentity {
                     head: *head,
-                    args: args.clone(),
+                    args: args.into(),
                 };
                 if let Some(start) = self
                     .class_ancestry
@@ -314,7 +331,7 @@ impl RenderDefinitionValidator<'_> {
                     display_name,
                     arity: args.len(),
                 });
-                for field in &class.fields {
+                for field in class.declared_fields() {
                     if field.skip {
                         continue;
                     }
@@ -380,6 +397,10 @@ impl RenderDefinitionValidator<'_> {
                 .iter()
                 .enumerate()
                 .find_map(|(index, member)| self.visit(member, &origins.union_member(index))),
+            bex_vm_types::RealizedTy::Tuple(elements) => elements
+                .iter()
+                .enumerate()
+                .find_map(|(index, element)| self.visit(element, &origins.tuple_element(index))),
             bex_vm_types::RealizedTy::Future(value, error) => self
                 .visit(value, &origins.future_value())
                 .or_else(|| self.visit(error, &origins.future_error())),
@@ -516,9 +537,9 @@ fn render_definition_display_name(vm: &BexVm, definition: &RenderDefinition) -> 
     | RenderDefinition::Enum(ptr)
     | RenderDefinition::TypeAlias(ptr)) = definition;
     match vm.get_object(*ptr) {
-        Object::Class(class) => class.name.display_name().to_string(),
-        Object::Enum(enm) => enm.name.display_name().to_string(),
-        Object::TypeAlias(alias) => alias.name.display_name().to_string(),
+        Object::Class(class) => class.name().display_name().to_string(),
+        Object::Enum(enm) => enm.name().display_name().to_string(),
+        Object::TypeAlias(alias) => alias.name().display_name().to_string(),
         _ => unreachable!("a render definition points at a nominal declaration"),
     }
 }
@@ -546,7 +567,7 @@ fn rendered_realized_class_name(
     class: &bex_vm_types::Class,
     args: &[bex_vm_types::RealizedTy],
 ) -> String {
-    let display_name = class.name.display_name();
+    let display_name = class.name().display_name();
     let base = class.alias.as_deref().unwrap_or(display_name.as_str());
     if args.is_empty() {
         base.to_string()
@@ -631,11 +652,25 @@ impl RenderDefinitionEquivalence<'_> {
                 if left.description != right.description
                     || left.alias != right.alias
                     || left.generic_param_count != right.generic_param_count
-                    || left.fields.len() != right.fields.len()
                 {
                     return false;
                 }
-                for (left, right) in left.fields.iter().zip(&right.fields) {
+                let (left_fields, right_fields) = match (&left.body, &right.body) {
+                    (
+                        bex_vm_types::ClassBody::RustType(left),
+                        bex_vm_types::ClassBody::RustType(right),
+                    ) => return left == right,
+                    (bex_vm_types::ClassBody::RustType(_), _) => return false,
+                    (
+                        bex_vm_types::ClassBody::Fields(left),
+                        bex_vm_types::ClassBody::Fields(right),
+                    ) => (left, right),
+                    (bex_vm_types::ClassBody::Fields(_), _) => return false,
+                };
+                if left_fields.len() != right_fields.len() {
+                    return false;
+                }
+                for (left, right) in left_fields.iter().zip(right_fields) {
                     if left.name != right.name
                         || left.description != right.description
                         || left.alias != right.alias
@@ -774,6 +809,9 @@ impl RenderDefinitionEquivalence<'_> {
             (RealizedTy::Union(left), RealizedTy::Union(right)) => {
                 self.type_lists_equivalent(left, right)
             }
+            (RealizedTy::Tuple(left), RealizedTy::Tuple(right)) => {
+                self.type_lists_equivalent(left, right)
+            }
             (
                 RealizedTy::Function {
                     params: left_params,
@@ -841,13 +879,20 @@ fn first_open_interface(
             // substitutes class arguments into field templates, so `Box<int>`
             // and `Box<OpenIface>` reach different field types — a declaration
             // key would let whichever arrives first swallow the other's walk.
-            if !visited.insert(ty.clone()) {
+            // Each argument's union is spelled flat, so a recursion through
+            // unions alone (`Opt<T?>`) meets its instantiation again and stops.
+            let args: &[bex_vm_types::RealizedTy] = &args
+                .iter()
+                .cloned()
+                .map(bex_vm_types::RealizedTy::flatten_union)
+                .collect::<Box<[_]>>();
+            if !visited.insert(bex_vm_types::RealizedTy::Class(*head, args.into())) {
                 return None;
             }
             let Object::Class(class) = vm.get_object(head.ptr()) else {
                 return None;
             };
-            for field in class.fields.iter().filter(|field| !field.skip) {
+            for field in class.declared_fields().iter().filter(|field| !field.skip) {
                 let child_path = format!("{path}.{}", field.name);
                 if let Some(runtime) = &field.runtime_type {
                     if let Some(found) = first_open_interface(vm, &runtime.ty, &child_path, visited)
@@ -876,6 +921,9 @@ fn first_open_interface(
         bex_vm_types::RealizedTy::Union(members) => members
             .iter()
             .find_map(|member| first_open_interface(vm, member, path, visited)),
+        bex_vm_types::RealizedTy::Tuple(elements) => elements
+            .iter()
+            .find_map(|element| first_open_interface(vm, element, path, visited)),
         bex_vm_types::RealizedTy::Future(value, error) => {
             first_open_interface(vm, value, path, visited)
                 .or_else(|| first_open_interface(vm, error, path, visited))
@@ -902,118 +950,70 @@ fn first_open_interface(
     }
 }
 
-/// Find the first type that has no output-format representation.
+/// The diagnostic for an output type a model's JSON answer cannot fill, read
+/// under the names a model is shown: one with no JSON form or no values, or
+/// one where the answer would have to fill `unknown`, an interface, or an
+/// enum variant type. A union member or an optional field with no JSON form
+/// is dropped instead (`uint8array | string` asks for a `string`), and a list
+/// of a type with no values is only the empty list.
 ///
-/// This match is exhaustive over `RealizedTy` so a newly added runtime type
-/// must make an explicit renderability decision at the shared LLM boundary.
-fn is_non_data_render_type(ty: &bex_vm_types::RealizedTy) -> bool {
-    match ty {
-        bex_vm_types::RealizedTy::Uint8Array
-        | bex_vm_types::RealizedTy::EnumVariant(..)
-        | bex_vm_types::RealizedTy::Function { .. }
-        | bex_vm_types::RealizedTy::Future(..)
-        | bex_vm_types::RealizedTy::RustType
-        | bex_vm_types::RealizedTy::Type
-        | bex_vm_types::RealizedTy::Resource
-        | bex_vm_types::RealizedTy::PromptAst
-        | bex_vm_types::RealizedTy::Void
-        | bex_vm_types::RealizedTy::Unknown
-        | bex_vm_types::RealizedTy::Never => true,
-        bex_vm_types::RealizedTy::Int
-        | bex_vm_types::RealizedTy::Bigint
-        | bex_vm_types::RealizedTy::Float
-        | bex_vm_types::RealizedTy::String
-        | bex_vm_types::RealizedTy::Bool
-        | bex_vm_types::RealizedTy::Null
-        | bex_vm_types::RealizedTy::Media(..)
-        | bex_vm_types::RealizedTy::Literal(..)
-        | bex_vm_types::RealizedTy::Class(..)
-        | bex_vm_types::RealizedTy::Interface(..)
-        | bex_vm_types::RealizedTy::Enum(..)
-        | bex_vm_types::RealizedTy::List(..)
-        | bex_vm_types::RealizedTy::Map { .. }
-        | bex_vm_types::RealizedTy::Union(..)
-        | bex_vm_types::RealizedTy::TypeAlias(..) => false,
-    }
-}
-
-fn first_non_data_type(
+/// `root` names the output in the path of a field the diagnostic is about.
+/// An enum with no variants is left to the empty-enum check (E0159).
+fn unanswerable_output(
     vm: &BexVm,
     ty: &bex_vm_types::RealizedTy,
-    path: &str,
-    visited: &mut std::collections::HashSet<bex_vm_types::HeapPtr>,
-) -> Option<(String, String)> {
-    if is_non_data_render_type(ty) {
-        return Some((path.to_string(), ty.to_string()));
-    }
+    root: &str,
+) -> Option<baml_compiler_diagnostics::Diagnostic> {
+    use baml_compiler_diagnostics::runtime_type;
+    use baml_type::json_inhabit::{
+        JsonError, JsonInhabitance, JsonNaming, JsonStatus, WitnessCause,
+    };
 
-    match ty {
-        bex_vm_types::RealizedTy::Class(head, args) => {
-            if !visited.insert(head.ptr()) {
-                return None;
-            }
-            let Object::Class(class) = vm.get_object(head.ptr()) else {
-                return None;
-            };
-            for field in class.fields.iter().filter(|field| !field.skip) {
-                let child_path = format!("{path}.{}", field.name);
-                if let Some(runtime) = &field.runtime_type {
-                    if let Some(found) = first_non_data_type(vm, &runtime.ty, &child_path, visited)
-                    {
-                        return Some(found);
-                    }
-                    continue;
+    use crate::json_defs::{HeapDefs, OutputReject};
+
+    let field_path = |fields: &[&str]| -> String {
+        std::iter::once(root)
+            .chain(fields.iter().copied())
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let at = |fields: &[&str], ty: &str| {
+        if fields.is_empty() {
+            runtime_type::non_data_type_at_render(ty)
+        } else {
+            runtime_type::non_data_field_at_render(&field_path(fields), ty)
+        }
+    };
+    let root_ty = ty.as_runtime_ty();
+    let analysis = match JsonInhabitance::of(root_ty, &HeapDefs::output(vm), JsonNaming::Aliased) {
+        Ok(analysis) => analysis,
+        Err(JsonError { error, path }) => {
+            let fields: Vec<&str> = path.iter().map(String::as_str).collect();
+            return Some(match error {
+                OutputReject::Interface(open) => {
+                    runtime_type::open_interface_at_render(&field_path(&fields), &open)
                 }
-                let field_ty =
-                    field.field_template.substitute(args, vm).ok().or_else(|| {
-                        bex_vm_types::RealizedTy::try_from(field.field_type.clone()).ok()
-                    });
-                if let Some(field_ty) = field_ty
-                    && let Some(found) = first_non_data_type(vm, &field_ty, &child_path, visited)
-                {
-                    return Some(found);
-                }
-            }
-            None
+                OutputReject::Unknown(ty) | OutputReject::Unrenderable(ty) => at(&fields, &ty),
+            });
         }
-        bex_vm_types::RealizedTy::List(element) => first_non_data_type(vm, element, path, visited),
-        bex_vm_types::RealizedTy::Map { key, value, .. } => {
-            first_non_data_type(vm, key, path, visited)
-                .or_else(|| first_non_data_type(vm, value, path, visited))
-        }
-        bex_vm_types::RealizedTy::Union(members) => members
-            .iter()
-            .find_map(|member| first_non_data_type(vm, member, path, visited)),
-        bex_vm_types::RealizedTy::TypeAlias(head) => {
-            if !visited.insert(head.ptr()) {
-                return None;
-            }
-            vm.type_alias_definition(head.ptr())
-                .cloned()
-                .and_then(|alias| first_non_data_type(vm, &alias, path, visited))
-        }
-        bex_vm_types::RealizedTy::Int
-        | bex_vm_types::RealizedTy::Bigint
-        | bex_vm_types::RealizedTy::Float
-        | bex_vm_types::RealizedTy::String
-        | bex_vm_types::RealizedTy::Bool
-        | bex_vm_types::RealizedTy::Null
-        | bex_vm_types::RealizedTy::Uint8Array
-        | bex_vm_types::RealizedTy::Media(..)
-        | bex_vm_types::RealizedTy::Literal(..)
-        | bex_vm_types::RealizedTy::Interface(..)
-        | bex_vm_types::RealizedTy::Enum(..)
-        | bex_vm_types::RealizedTy::EnumVariant(..)
-        | bex_vm_types::RealizedTy::Function { .. }
-        | bex_vm_types::RealizedTy::Future(..)
-        | bex_vm_types::RealizedTy::RustType
-        | bex_vm_types::RealizedTy::Type
-        | bex_vm_types::RealizedTy::Resource
-        | bex_vm_types::RealizedTy::PromptAst
-        | bex_vm_types::RealizedTy::Void
-        | bex_vm_types::RealizedTy::Unknown
-        | bex_vm_types::RealizedTy::Never => None,
+    };
+    if analysis.status(root_ty) == JsonStatus::Json
+        || matches!(ty, bex_vm_types::RealizedTy::Enum(_))
+    {
+        return None;
     }
+    let witness = analysis.witness(root_ty);
+    let mut fields: Vec<&str> = witness.path.iter().map(|(_, field)| *field).collect();
+    Some(match witness.cause {
+        WitnessCause::Leaf(leaf) => at(&fields, &leaf.to_string()),
+        WitnessCause::Unfillable { field, ty, .. } => {
+            fields.push(field);
+            runtime_type::unfillable_skip_field_at_render(&field_path(&fields), &ty.to_string())
+        }
+        WitnessCause::Cyclic { head, .. } => {
+            runtime_type::cyclic_type_at_render(&baml_type::HeadDisplay::head_display_name(head))
+        }
+    })
 }
 
 fn cloned_type_value(vm: &BexVm, value: Value) -> TypeValue {
@@ -1118,6 +1118,12 @@ fn render_named_ty_source(ty: &baml_type::RealizedTy<baml_type::TaggedTypeName>)
                 render_named_ty_source(value)
             )
         }
+        baml_type::RealizedTy::Tuple(elements) => baml_type::render_tuple(
+            &elements
+                .iter()
+                .map(render_named_ty_source)
+                .collect::<Vec<_>>(),
+        ),
         baml_type::RealizedTy::Class(head, args) if args.is_empty() => {
             head.display_name().to_string()
         }
@@ -1150,7 +1156,7 @@ fn render_witness_sources(
             continue;
         };
         source.push_str("\n  implements ");
-        source.push_str(interface.name.render_user_facing().as_str());
+        source.push_str(interface.name().display_name().as_str());
         let args = rule
             .interface_args
             .iter()
@@ -1183,7 +1189,7 @@ fn render_witness_sources(
             source.push_str(&render_ty_source(&ty, spellings));
         }
         for (declared, slot) in interface.fields.iter().zip(&*rule.field_links) {
-            let Some(field) = class.fields.get(*slot as usize) else {
+            let Some(field) = class.declared_fields().get(*slot as usize) else {
                 continue;
             };
             source.push_str("\n    ");
@@ -1239,7 +1245,7 @@ fn expanded_type_value_nominals(
         let Object::Class(class) = vm.get_object(ptr) else {
             continue;
         };
-        for field in &class.fields {
+        for field in class.declared_fields() {
             let field_ty = field
                 .runtime_type
                 .as_ref()
@@ -1271,8 +1277,8 @@ fn render_type_value_source(vm: &BexVm, type_value: &TypeValue) -> String {
     let mut spellings = indexmap::IndexMap::new();
     for ptr in enum_ptrs.iter().chain(&class_ptrs) {
         let (tag, base) = match vm.get_object(*ptr) {
-            Object::Class(class) => (class.type_tag, class.name.display_name().to_string()),
-            Object::Enum(enm) => (enm.type_tag, enm.name.display_name().to_string()),
+            Object::Class(class) => (class.type_tag, class.name().display_name().to_string()),
+            Object::Enum(enm) => (enm.type_tag, enm.name().display_name().to_string()),
             _ => continue,
         };
         if spellings.contains_key(&tag) {
@@ -1289,7 +1295,7 @@ fn render_type_value_source(vm: &BexVm, type_value: &TypeValue) -> String {
         };
         let name = spellings
             .get(&enm.type_tag)
-            .map_or_else(|| enm.name.display_name().to_string(), Clone::clone);
+            .map_or_else(|| enm.name().display_name().to_string(), Clone::clone);
         if !rendered_declarations.insert(name.clone()) {
             continue;
         }
@@ -1327,7 +1333,7 @@ fn render_type_value_source(vm: &BexVm, type_value: &TypeValue) -> String {
         };
         let name = spellings
             .get(&class.type_tag)
-            .map_or_else(|| class.name.display_name().to_string(), Clone::clone);
+            .map_or_else(|| class.name().display_name().to_string(), Clone::clone);
         if !rendered_declarations.insert(name.clone()) {
             continue;
         }
@@ -1336,7 +1342,7 @@ fn render_type_value_source(vm: &BexVm, type_value: &TypeValue) -> String {
         source.push_str("class ");
         source.push_str(&name);
         source.push_str(" {");
-        for field in &class.fields {
+        for field in class.declared_fields() {
             source.push('\n');
             push_docstring(&mut source, field.docstring.as_deref(), "  ");
             source.push_str("  ");
@@ -1434,26 +1440,7 @@ mod renderability_tests {
     use super::*;
 
     fn empty_package() -> bex_vm_types::types::Package {
-        bex_vm_types::types::Package {
-            name: baml_type::Name::default(),
-            edges: indexmap::IndexMap::new(),
-            classes: indexmap::IndexMap::new(),
-            enums: indexmap::IndexMap::new(),
-            interfaces: indexmap::IndexMap::new(),
-            impl_rules: indexmap::IndexMap::new(),
-            type_aliases: indexmap::IndexMap::new(),
-            globals: indexmap::IndexMap::new(),
-            slots: bex_vm_types::types::Slots::Own {
-                cells: Box::new([]),
-                initialized: true,
-            },
-            objects: bex_vm_types::types::Objects::Own(Box::new([])),
-            surface: bex_vm_types::types::ExportSurface::Projected,
-            init: None,
-            test_init: None,
-            diagnostics: Vec::new(),
-            session: None,
-        }
+        bex_vm_types::types::Package::empty(baml_type::Name::new(baml_type::RESERVED_USER_PACKAGE))
     }
 
     fn alloc_test_class(
@@ -1464,18 +1451,21 @@ mod renderability_tests {
     ) -> (bex_vm_types::HeapPtr, baml_type::typetag::TypeTag) {
         let type_tag = baml_type::typetag::TypeTag::fresh_dynamic();
         let ptr = vm.tlab.alloc(Object::Class(Box::new(bex_vm_types::Class {
-            name: bex_vm_types::DeclarationName::Anonymous(baml_type::Name::new(name)),
-            fields: Vec::new(),
+            declared_crossing: baml_type::ClassCrossing::Fields,
+            path: bex_vm_types::types::LocalName::new(Vec::new(), baml_type::Name::new(name)),
+            body: bex_vm_types::ClassBody::Fields(Vec::new()),
             description: description.map(str::to_string),
             alias: None,
             docstring: None,
             other: indexmap::IndexMap::new(),
             stream_done: false,
             type_tag,
-            has_cleanup: false,
+            cleanup: None,
             methods: IndexMap::new(),
             generic_param_count: 0,
             owner: bex_vm_types::types::Owner::Package(owner),
+            telemetry_definition: bex_vm_types::DefinitionCell::default(),
+            redact: false,
         })));
         (ptr, type_tag)
     }
@@ -1502,13 +1492,20 @@ mod renderability_tests {
         let (second_shared, _) =
             alloc_test_class(&mut vm, "Shared", Some("second definition"), second_package);
 
-        let Object::Package(package) = vm.get_object_mut(first_package) else {
+        // SAFETY: a single-threaded test VM; nothing else reaches the package.
+        #[expect(unsafe_code, reason = "single-threaded test VM")]
+        let mut metered = unsafe { vm.get_object_mut(first_package) };
+
+        let Object::Package(package) = &mut *metered else {
             unreachable!("test package pointer")
         };
         package
             .classes
             .insert(package_member_name("Shared"), first_shared);
-        let Object::Package(package) = vm.get_object_mut(second_package) else {
+        // SAFETY: a single-threaded test VM; nothing else reaches the package.
+        #[expect(unsafe_code, reason = "single-threaded test VM")]
+        let mut metered = unsafe { vm.get_object_mut(second_package) };
+        let Object::Package(package) = &mut *metered else {
             unreachable!("test package pointer")
         };
         package
@@ -1530,72 +1527,5 @@ mod renderability_tests {
             first_type_value_render_schema_error(&vm, &type_value).as_deref(),
             Some("type `Shared` has non-equivalent definitions in the same LLM render context")
         );
-    }
-
-    #[test]
-    fn full_realized_type_family_has_an_explicit_renderability_classification() {
-        // Heads never reach the classifier — it matches on variant shape alone —
-        // so an unresolved one is the honest stand-in for "some declaration".
-        let name =
-            bex_vm_types::TypeHead::unresolved_operand(bex_vm_types::ObjectIndex::from_raw(0));
-        let non_data = vec![
-            bex_vm_types::RealizedTy::Uint8Array,
-            bex_vm_types::RealizedTy::EnumVariant(name, baml_type::Name::new("VALUE")),
-            bex_vm_types::RealizedTy::Function {
-                params: Box::new([]),
-                ret: Box::new(bex_vm_types::RealizedTy::int()),
-                throws: Box::new(bex_vm_types::RealizedTy::never()),
-            },
-            bex_vm_types::RealizedTy::Future(
-                Box::new(bex_vm_types::RealizedTy::int()),
-                Box::new(bex_vm_types::RealizedTy::never()),
-            ),
-            bex_vm_types::RealizedTy::RustType,
-            bex_vm_types::RealizedTy::Type,
-            bex_vm_types::RealizedTy::Resource,
-            bex_vm_types::RealizedTy::PromptAst,
-            bex_vm_types::RealizedTy::Void,
-            bex_vm_types::RealizedTy::unknown(),
-            bex_vm_types::RealizedTy::never(),
-        ];
-        for ty in non_data {
-            assert!(
-                is_non_data_render_type(&ty),
-                "expected `{ty}` to be rejected before output-format rendering"
-            );
-        }
-
-        let data = vec![
-            bex_vm_types::RealizedTy::int(),
-            bex_vm_types::RealizedTy::Bigint,
-            bex_vm_types::RealizedTy::Float,
-            bex_vm_types::RealizedTy::string(),
-            bex_vm_types::RealizedTy::Bool,
-            bex_vm_types::RealizedTy::null(),
-            bex_vm_types::RealizedTy::Media(baml_type::MediaKind::Image),
-            bex_vm_types::RealizedTy::Literal(
-                baml_type::Literal::String("value".to_string()),
-                baml_type::Freshness::Regular,
-            ),
-            bex_vm_types::RealizedTy::Class(name, Box::new([])),
-            bex_vm_types::RealizedTy::Interface(name, Box::new([]), Box::new([])),
-            bex_vm_types::RealizedTy::Enum(name),
-            bex_vm_types::RealizedTy::list(bex_vm_types::RealizedTy::string()),
-            bex_vm_types::RealizedTy::Map {
-                key: Box::new(bex_vm_types::RealizedTy::string()),
-                value: Box::new(bex_vm_types::RealizedTy::int()),
-            },
-            bex_vm_types::RealizedTy::Union(Box::new([
-                bex_vm_types::RealizedTy::string(),
-                bex_vm_types::RealizedTy::null(),
-            ])),
-            bex_vm_types::RealizedTy::TypeAlias(name),
-        ];
-        for ty in data {
-            assert!(
-                !is_non_data_render_type(&ty),
-                "expected `{ty}` to remain eligible for output-format rendering"
-            );
-        }
     }
 }

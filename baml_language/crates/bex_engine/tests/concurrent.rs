@@ -11,7 +11,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder, RuntimeTy};
+use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder};
+use bex_vm_types::RustDataArc as _;
 use common::compile_for_engine;
 use sys_native::SysOpsExt;
 
@@ -116,7 +117,7 @@ async fn test_concurrent_allocations_no_overlap() {
         // Verify the result is correct
         let value = result.unwrap();
         let expected = BexExternalValue::Array {
-            element_type: RuntimeTy::String,
+            element_type: bex_engine::WireTy::String,
             items: vec![
                 BexExternalValue::String("a".to_string().into()),
                 BexExternalValue::String("b".to_string().into()),
@@ -303,7 +304,7 @@ async fn test_concurrent_array_allocations() {
 
         // Build expected array [0, 1, 2, ..., size-1]
         let expected = BexExternalValue::Array {
-            element_type: RuntimeTy::Int,
+            element_type: bex_engine::WireTy::Int,
             items: (0..size).map(BexExternalValue::Int).collect(),
         };
         assert_eq!(value, expected, "Array mismatch for size {size}");
@@ -360,7 +361,7 @@ async fn test_call_function_with_external_args() {
 
     // Test passing an array via BexExternalValue
     let arr = BexExternalValue::Array {
-        element_type: RuntimeTy::Int,
+        element_type: bex_engine::WireTy::Int,
         items: vec![
             BexExternalValue::Int(1),
             BexExternalValue::Int(2),
@@ -429,7 +430,7 @@ async fn test_closures_in_loop_vars() {
         .call_function(
             "sum_array",
             vec![BexExternalValue::Array {
-                element_type: RuntimeTy::int(),
+                element_type: bex_engine::WireTy::Int,
                 items: vec![
                     BexExternalValue::from(1i64),
                     BexExternalValue::from(2i64),
@@ -444,4 +445,233 @@ async fn test_closures_in_loop_vars() {
         .expect("call_function failed");
 
     assert_eq!(result, BexExternalValue::Int(10));
+}
+
+/// Native authentication calls back through `RuntimeIo` into the host's IO table.
+/// Sharing that table must not share the invoking call's context or env result.
+#[tokio::test]
+async fn runtime_io_preserves_concurrent_invocation_contexts() {
+    let program = compile_for_engine(
+        r#"
+        function quota_project() -> string? {
+            ai.internal._gcp_quota_project_id(`{"quota_project_id":"credential-project"}`)
+        }
+        "#,
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+    let mut sys_ops = sys_native::SysOps::native();
+    sys_ops.baml_env_get = {
+        let reads = Arc::clone(&reads);
+        Arc::new(move |heap, permit, mut args, ctx, _call_id| {
+            assert_eq!(args.len(), 1);
+            assert_eq!(
+                args.pop()
+                    .unwrap()
+                    .as_string(heap, permit)
+                    .unwrap()
+                    .as_str(),
+                "GOOGLE_CLOUD_QUOTA_PROJECT",
+            );
+            let capture = ctx
+                .spawner
+                .capture_invocation()
+                .expect("nested IO must retain the invoking call")
+                .downcast_payload::<bex_engine::InvocationCapture>()
+                .unwrap_or_else(|_| panic!("expected engine invocation capture"));
+            let environment = capture.host_environment();
+            assert_eq!(
+                capture.state.trace_context().distinct_id(),
+                Some(format!("request-{environment}").as_str()),
+            );
+            assert!(!capture.state.is_cancelled());
+            reads.fetch_add(1, Ordering::SeqCst);
+            let cancel = ctx.cancel.clone();
+            let rendezvous = Arc::clone(&rendezvous);
+            sys_types::SysOpResult::Async(Box::pin(async move {
+                // Neither callback may finish before the other has entered
+                // the generated adapter; fail promptly if one never arrives.
+                tokio::time::timeout(std::time::Duration::from_secs(5), rendezvous.wait())
+                    .await
+                    .expect("both invocation callbacks must overlap");
+                assert!(!cancel.is_cancelled());
+                Ok(match environment {
+                    1 => BexExternalValue::String("environment-project".into()),
+                    2 => BexExternalValue::Null,
+                    _ => panic!("wrong invocation environment: {environment}"),
+                }
+                .into())
+            }))
+        })
+    };
+    let engine = Arc::new(BexEngine::new(program, Arc::new(sys_ops), Vec::new()).unwrap());
+    let mut calls = Vec::new();
+    for environment in [1, 2] {
+        let engine = Arc::clone(&engine);
+        calls.push(tokio::spawn(async move {
+            engine
+                .call_function(
+                    "quota_project",
+                    vec![],
+                    FunctionCallContextBuilder::new(sys_types::CallId::next())
+                        .with_host_environment(environment)
+                        .with_trace_options(bex_vm_types::trace::TraceOptionsData {
+                            context: Some(
+                                btel_types::context::ContextPatch {
+                                    distinct_id: Some(format!("request-{environment}")),
+                                    ..Default::default()
+                                }
+                                .into(),
+                            ),
+                            ..Default::default()
+                        })
+                        .build(),
+                    true,
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    for (call, expected) in calls
+        .into_iter()
+        .zip(["environment-project", "credential-project"])
+    {
+        assert_eq!(
+            call.await.unwrap(),
+            BexExternalValue::String(expected.into()),
+        );
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
+/// Spawned tasks hammering one shared array and one shared map, on worker
+/// threads that really run in parallel. The containers' locks are the only
+/// thing keeping a racing `push` from tearing the `Vec` (or a racing insert
+/// from corrupting the map's table) while it reallocates, and contended
+/// waiters back off for a long time between looks, so this checks that no
+/// write is lost, none lands twice, and readers only ever see initialized
+/// elements.
+///
+/// A BAML `test` block can't pick a multi-threaded runtime, so this one lives
+/// here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawned_tasks_share_containers_without_losing_writes() {
+    let source = r#"
+        function push_n(arr: int[], start: int, n: int) -> int {
+            let i = 0;
+            while i < n { arr.push(start + i); i += 1; };
+            0
+        }
+
+        // Counts reads that saw something no writer pushed. The array only
+        // grows, so its last element at a read of `length()` stays in bounds.
+        function read_n(arr: int[], n: int) -> int {
+            let i = 0;
+            let bad = 0;
+            while i < n {
+                let len = arr.length();
+                if len > 0 {
+                    let v = arr[len - 1];
+                    if v < 0 || v >= 40000 { bad += 1; };
+                };
+                i += 1;
+            };
+            bad
+        }
+
+        function put_n(m: map<int, int>, start: int, n: int) -> int {
+            let i = 0;
+            while i < n { m[start + i] = start * 2 + i; i += 1; };
+            0
+        }
+
+        function shared_array() -> int[] {
+            let arr: int[] = [];
+            let a = spawn { push_n(arr, 0, 10000) };
+            let b = spawn { push_n(arr, 10000, 10000) };
+            let r1 = spawn { read_n(arr, 10000) };
+            let c = spawn { push_n(arr, 20000, 10000) };
+            let r2 = spawn { read_n(arr, 10000) };
+            let d = spawn { push_n(arr, 30000, 10000) };
+            let bad = (await r1) + (await r2);
+            (await a) + (await b) + (await c) + (await d);
+            if bad > 0 { [-bad] } else { arr }
+        }
+
+        // The number of keys whose value is wrong or missing, or -1 when the
+        // map's size is off.
+        function shared_map() -> int {
+            let m: map<int, int> = {};
+            let a = spawn { put_n(m, 0, 5000) };
+            let b = spawn { put_n(m, 5000, 5000) };
+            let c = spawn { put_n(m, 10000, 5000) };
+            let d = spawn { put_n(m, 15000, 5000) };
+            (await a) + (await b) + (await c) + (await d);
+            if m.length() != 20000 { return -1; };
+            let wrong = 0;
+            for (let start = 0; start < 20000; start += 5000) {
+                for (let i = 0; i < 5000; i += 1) {
+                    let k = start + i;
+                    if !m.has(k) || m[k] != start * 2 + i { wrong += 1; };
+                };
+            };
+            wrong
+        }
+    "#;
+
+    let engine = Arc::new(
+        BexEngine::new(
+            compile_for_engine(source),
+            Arc::new(sys_native::SysOps::native()),
+            Vec::new(),
+        )
+        .expect("engine"),
+    );
+    for round in 0..5 {
+        let pushed = engine
+            .call_function(
+                "shared_array",
+                vec![],
+                FunctionCallContextBuilder::new(sys_types::CallId::next()).build(),
+                true,
+            )
+            .await
+            .expect("shared_array");
+        let BexExternalValue::Array { items, .. } = pushed else {
+            panic!("round {round}: expected an int array, got {pushed:?}");
+        };
+        let mut values: Vec<i64> = items
+            .iter()
+            .map(|item| match item {
+                BexExternalValue::Int(v) => *v,
+                other => panic!("round {round}: non-int element {other:?}"),
+            })
+            .collect();
+        assert!(
+            values.len() != 1 || values[0] >= 0,
+            "round {round}: {} reads saw an element no writer pushed",
+            -values[0]
+        );
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..40000).collect::<Vec<i64>>(),
+            "round {round}: a push was lost or landed twice"
+        );
+
+        let wrong = engine
+            .call_function(
+                "shared_map",
+                vec![],
+                FunctionCallContextBuilder::new(sys_types::CallId::next()).build(),
+                true,
+            )
+            .await
+            .expect("shared_map");
+        assert_eq!(
+            wrong,
+            BexExternalValue::Int(0),
+            "round {round}: shared map lost or tore an insert (-1 = wrong size)"
+        );
+    }
 }

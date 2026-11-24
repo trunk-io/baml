@@ -286,7 +286,7 @@ public static byte[] round_trip_uint8_array(byte[] b) {
 > `BamlType.union(BamlType.INT, BamlType.STRING)`), pooled per holder as a
 > `private static final BamlType $RET{n}` constant — so the decoder resolves union
 > arm order and element types without trusting the wire shape. A wholly
-> wire-driven return (bigint / uint8array / null / void / media / callable /
+> wire-driven return (bigint / uint8array / null / media / callable /
 > handle / the `unknown`-family) passes the literal `null`. The old
 > stringly-typed grammar (`"int"`, `"union[int;string]"`) and its hand-rolled
 > parser were **deleted** (`763a226ef`). Python's `.pyi` is the typed surface;
@@ -583,10 +583,11 @@ class is generated for it (`translate_ty.rs:101-108`; `lib.rs` test asserts
 // baml_bridge/src/main/java/baml_sdk/baml/media/Image.java (runtime-owned, hand-written)
 public final class Image implements BamlMedia {
     public static Image from_url(String url, String mimeType) { … }
-    public static Image from_file(String path, String mimeType) { … }
+    public static Image from_file(String path, String mimeType) { … }   // reads the file now
+    public static Image from_file_content(String file, String base64, String mimeType) { … }
     public static Image from_base64(String base64, String mimeType) { … }
     public String url()  { return handle.mediaUrl(); }
-    public String file() { return handle.mediaFile(); }
+    public String name() { return handle.mediaName(); }   // the file's base name, if any
     public String base64() { return handle.mediaBase64(); }
     public String mime_type() { return handle.mediaMimeType(); }   // PreserveCase: NOT mimeType()
 }
@@ -830,7 +831,8 @@ public static java.lang.String call_with_typed_throws_propagating(
 ```
 
 > ⚠ **Deviation from Python:** Python renders a callable param as
-> `typing.Callable[[int], str]`; Java maps by arity/return onto the concrete
+> `typing.Callable[[int], str | Coroutine[Any, Any, str]]` (a plain function or an
+> `async def`); Java maps by arity/return onto the concrete
 > `Runnable` / `Supplier` / `Consumer` / `Function` / `BiConsumer` / `BiFunction`
 > shapes. A callable with **optional params or arity > 2** — which has no
 > `java.util.function` equivalent — is emitted as a **generated
@@ -846,10 +848,11 @@ public static java.lang.String call_with_typed_throws_propagating(
 **LANDED** (commit `202883518`, per the owner-accepted A1–F1 brief). The whole
 slice is wired end-to-end — `function_calls` is 154/0:
 
-- **Registry (A1):** a Java-side `ConcurrentHashMap<Long,Object>` in `BamlFfi`
-  holds callables *and* opaque throwables under one keyspace
-  (`registerHostCallable` / `lookupHostValue` / `hostRelease`,
-  `BamlFfi.java:582-616`); Rust is a pure router. `assertSame` identity is free
+- **Registry (A1):** a Java-side `ConcurrentHashMap` in `HostCalls` holds
+  callables *and* opaque throwables under one keyspace, each with a count of the
+  references to its key that are out (`registerCallable` / `sendAgain` /
+  `lookup` / `release(key, count)`, the last reached from `BamlFfi.hostRelease`);
+  Rust is a pure router. `assertSame` identity is free
   (objects never leave the JVM).
 - **Executor (B1):** a dedicated cached **daemon `ExecutorService`**
   (`HOST_DISPATCH_EXECUTOR`, `BamlFfi.java:104-105`) runs user callables off the

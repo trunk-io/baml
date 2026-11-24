@@ -49,6 +49,24 @@ impl<N: Clone> RealizedTy<N> {
         RealizedTy::List(Box::new(inner))
     }
 
+    /// `T | null`, flattened into an existing union and idempotent, as
+    /// [`crate::RuntimeTy::optional`].
+    pub fn optional(inner: RealizedTy<N>) -> Self {
+        match inner {
+            RealizedTy::Union(members) => {
+                if members.iter().any(RealizedTy::is_null) {
+                    RealizedTy::Union(members)
+                } else {
+                    let mut members = members.into_vec();
+                    members.push(RealizedTy::null());
+                    RealizedTy::Union(members.into())
+                }
+            }
+            n @ RealizedTy::Null => n,
+            other => RealizedTy::Union(Box::new([other, RealizedTy::null()])),
+        }
+    }
+
     /// True if this is exactly the `null` type.
     pub fn is_null(&self) -> bool {
         matches!(self, RealizedTy::Null)
@@ -58,6 +76,29 @@ impl<N: Clone> RealizedTy<N> {
     /// Mirrors [`crate::RuntimeTy::is_nullable_union`].
     pub fn is_nullable_union(&self) -> bool {
         matches!(self, RealizedTy::Union(members) if members.iter().any(RealizedTy::is_null))
+    }
+
+    /// This type with its union, if it is one, spelled flat and without
+    /// repeated members, first occurrences in place ([`crate::flat_union`]):
+    /// `(int | null) | null` is `int | null`. Mirrors
+    /// [`crate::RuntimeTy::flatten_union`].
+    #[must_use]
+    pub fn flatten_union(self) -> Self
+    where
+        N: PartialEq,
+    {
+        match self {
+            RealizedTy::Union(members) => crate::flat_union(
+                members,
+                |ty| match ty {
+                    RealizedTy::Union(members) => Ok(members),
+                    ty => Err(ty),
+                },
+                RealizedTy::Never,
+                RealizedTy::Union,
+            ),
+            ty => ty,
+        }
     }
 
     /// Remove `null` from a nullable union, collapsing the result. Mirrors
@@ -104,6 +145,28 @@ mod tests {
         assert_eq!(Ty::<TypeName>::from(runtime), ty);
     }
 
+    /// `flatten_union` splices nested unions, drops repeats at their first
+    /// occurrence, unwraps a single member, and leaves everything below a
+    /// constructor alone.
+    #[test]
+    fn flatten_union_keeps_first_occurrences_in_order() {
+        type R = RealizedTy<TypeName>;
+        let union = |members: Vec<R>| R::Union(members.into());
+
+        assert_eq!(
+            union(vec![union(vec![R::Int, R::Null]), R::Null]).flatten_union(),
+            union(vec![R::Int, R::Null])
+        );
+        assert_eq!(
+            union(vec![R::String, union(vec![R::Int, R::String]), R::Int]).flatten_union(),
+            union(vec![R::String, R::Int])
+        );
+        assert_eq!(union(vec![R::Int, R::Int]).flatten_union(), R::Int);
+        assert_eq!(union(vec![]).flatten_union(), R::Never);
+        let nested = R::list(union(vec![R::Int, R::Int]));
+        assert_eq!(nested.clone().flatten_union(), nested);
+    }
+
     #[test]
     fn round_trip_nested_list_of_class() {
         // list<Class<int>>
@@ -144,7 +207,7 @@ mod tests {
                 ),
             ]),
             ret: Box::new(Ty::<TypeName>::Bool {}),
-            throws: Box::new(Ty::<TypeName>::Void {}),
+            throws: Box::new(Ty::<TypeName>::Never {}),
         };
         assert_round_trips(ty);
     }
@@ -217,7 +280,7 @@ mod tests {
         let ty: LoweringTy<TypeName> = LoweringTy::<TypeName>::Function {
             params: Box::new([]),
             ret: Box::new(LoweringTy::<TypeName>::Infer {}),
-            throws: Box::new(LoweringTy::<TypeName>::Void {}),
+            throws: Box::new(LoweringTy::<TypeName>::Never {}),
         };
         assert_eq!(
             RealizedTy::try_from(&ty),

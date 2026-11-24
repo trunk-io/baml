@@ -19,16 +19,29 @@
 use std::collections::BTreeSet;
 
 use baml_base::{Literal, MediaKind};
-use baml_sdkgen_types::{CodegenFunctionParamMode, Name, Ty};
+use baml_sdkgen_types::{ClassCrossing, CodegenFunctionParamMode, Name, Symbol, SymbolPool, Ty};
 
 use crate::{
     routing::{LeafPath, route},
     ts_string,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranslateCtx {
+#[derive(Clone)]
+pub(crate) struct TranslateCtx<'a> {
     pub(crate) current_leaf: LeafPath,
+    /// The program's declarations, consulted for how a referenced class
+    /// crosses the boundary.
+    pub(crate) pool: &'a SymbolPool,
+}
+
+impl TranslateCtx<'_> {
+    /// How the class `name` crosses the boundary, if the program declares it.
+    fn crossing(&self, name: &Name) -> Option<ClassCrossing> {
+        match self.pool.get(name)? {
+            Symbol::Class(class) => Some(class.crossing),
+            Symbol::Enum(_) | Symbol::TypeAlias(_) | Symbol::Function(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -46,6 +59,9 @@ impl TranslatedType {
     }
 }
 
+/// Translate a host-provided value type and collect its cross-leaf imports.
+/// Host callbacks accept immediate or Promise results, independently of their
+/// throws contract; callable arguments supplied by BAML use closure types.
 pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
     match ty {
         Ty::Int => TranslatedType::bare("number"),
@@ -56,11 +72,9 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
         Ty::Null => TranslatedType::bare("null"),
         Ty::Uint8Array => TranslatedType::bare("Uint8Array"),
         Ty::Unknown | Ty::Interface(..) => TranslatedType::bare("unknown"),
-        Ty::Void => TranslatedType::bare("null"),
         Ty::Never => TranslatedType::bare("never"),
         // `_BamlHandle` is the runtime opaque-handle type; Phase 4 emits the
         // `import type { BamlHandle as _BamlHandle }` when this token appears.
-        Ty::RustType => TranslatedType::bare("_BamlHandle"),
         Ty::Type => TranslatedType::bare("BamlType"),
         Ty::Resource | Ty::PromptAst | Ty::Future(..) => TranslatedType::bare("unknown"),
 
@@ -111,6 +125,21 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
             };
             TranslatedType { expr, imports }
         }
+        Ty::Tuple(items) => {
+            let mut imports = BTreeSet::new();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    let t = translate_ty(item, ctx);
+                    imports.extend(t.imports);
+                    t.expr
+                })
+                .collect();
+            TranslatedType {
+                expr: format!("[{}]", parts.join(", ")),
+                imports,
+            }
+        }
         Ty::Union(items) => {
             let mut imports = BTreeSet::new();
             let parts: Vec<String> = items
@@ -133,10 +162,26 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
 
         Ty::Class(name, args) => {
             // Host token positions intentionally erase the distinct reflected
-            // kind hierarchy (H-9). All `reflect.<kind>.Type` values cross
+            // kind hierarchy (H-9). All `reflect.<Kind>` values cross
             // the bridge as the same opaque `BamlType` definition handle.
             if is_reflect_kind_type(name) {
                 return TranslatedType::bare("BamlType");
+            }
+            match ctx.crossing(name) {
+                // A host's own value crosses as the host's handle to it.
+                Some(ClassCrossing::HostValue) => {
+                    debug_assert!(args.is_empty(), "`{name}` takes no type arguments");
+                    return TranslatedType::bare("_BamlHandle");
+                }
+                Some(
+                    ClassCrossing::Fields
+                    | ClassCrossing::Opaque
+                    | ClassCrossing::Stream
+                    | ClassCrossing::FunctionSpec
+                    | ClassCrossing::Media(_)
+                    | ClassCrossing::Prompt,
+                )
+                | None => {}
             }
             let mut result = render_name_ref(name, ctx);
             if !args.is_empty() {
@@ -178,7 +223,10 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
             // before the user's callback runs.
             let mut translated_params = Vec::new();
             for (idx, p) in params.iter().enumerate() {
-                let t = translate_ty(&p.ty, ctx);
+                // BAML makes the values it passes to a host callback, so a
+                // function-typed argument is a BAML closure (async, with
+                // `callSync`), typed like a returned function.
+                let t = translate_return_ty(&p.ty, ctx);
                 imports.extend(t.imports);
                 let arg_name = p
                     .name
@@ -218,8 +266,21 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
                     opt_fields.join("; ")
                 ));
             }
+            // A host callback may be `async`: the bridge awaits the Promise it
+            // returns (and a closure BAML returned is itself Promise-returning).
+            // `throws` describes the error channel, independently of whether
+            // the successful result is immediate or awaited. In particular,
+            // `throws never` must not remove Promise support or widen `ret`.
+            let ret_expr = if matches!(ret.as_ref(), Ty::Function { .. }) {
+                format!("({})", ret_t.expr)
+            } else {
+                ret_t.expr
+            };
             TranslatedType {
-                expr: format!("({}) => {}", positional.join(", "), ret_t.expr),
+                expr: format!(
+                    "({}) => {ret_expr} | Promise<{ret_expr}>",
+                    positional.join(", ")
+                ),
                 imports,
             }
         }
@@ -228,20 +289,20 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
 
 fn is_reflect_kind_type(name: &Name) -> bool {
     const KINDS: &[&str] = &[
-        "array",
-        "class",
-        "enum",
-        "function",
-        "interface",
-        "literal",
-        "map",
-        "primitive",
-        "union",
+        "Array",
+        "Class",
+        "Enum",
+        "Function",
+        "Interface",
+        "Literal",
+        "Map",
+        "Primitive",
+        "Tuple",
+        "Union",
     ];
     name.package().as_str() == "reflect"
-        && name.name() == "Type"
-        && name.namespace().len() == 1
-        && KINDS.contains(&name.namespace()[0].as_str())
+        && name.namespace().is_empty()
+        && KINDS.contains(&name.name().as_str())
 }
 
 fn media_ref(bare: &str, ctx: &TranslateCtx) -> TranslatedType {
@@ -294,6 +355,119 @@ fn render_name_ref(name: &Name, ctx: &TranslateCtx) -> TranslatedType {
     }
 }
 
+/// Returned engine functions carry invocation controls; application callbacks
+/// keep their application-only signatures.
+pub(crate) fn translate_return_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
+    match ty {
+        Ty::Function { params, ret, .. } => {
+            let result = translate_return_ty(ret, ctx);
+            let mut imports = result.imports;
+            let mut positional = Vec::new();
+            let mut optional = Vec::new();
+            let required_names: Vec<String> = params
+                .iter()
+                .enumerate()
+                .filter(|(_, param)| param.mode != CodegenFunctionParamMode::Optional)
+                .map(|(index, param)| {
+                    param
+                        .name
+                        .as_ref()
+                        .map_or_else(|| format!("arg{index}"), |name| name.as_str().to_string())
+                })
+                .collect();
+            let required_refs: Vec<&str> = required_names.iter().map(String::as_str).collect();
+            let mut projected_required =
+                crate::leaf::safe_required_param_names(&required_refs, true).into_iter();
+            for (index, param) in params.iter().enumerate() {
+                let translated = translate_ty(&param.ty, ctx);
+                imports.extend(translated.imports);
+                let name = param
+                    .name
+                    .as_ref()
+                    .map_or_else(|| format!("arg{index}"), |name| name.as_str().to_string());
+                if param.mode == CodegenFunctionParamMode::Optional {
+                    optional.push(format!(
+                        "{}?: {} | undefined",
+                        crate::leaf::option_field_name(&name),
+                        translated.expr
+                    ));
+                } else {
+                    let name = projected_required
+                        .next()
+                        .expect("every required callback parameter has a projected name");
+                    positional.push(format!("{name}: {}", translated.expr));
+                }
+            }
+            let up = "../".repeat(ctx.current_leaf.segments.len());
+            let prefix = if up.is_empty() { "./" } else { &up };
+            optional.push(format!(
+                "$baml?: import(\"{prefix}_invocation.js\").BamlOptions | null | undefined"
+            ));
+            positional.push(format!("$opts?: {{ {} }} | undefined", optional.join("; ")));
+            let args = positional.join(", ");
+            TranslatedType {
+                expr: format!(
+                    "{{ ({args}): Promise<{}>; callSync({args}): {} }}",
+                    result.expr, result.expr
+                ),
+                imports,
+            }
+        }
+        Ty::List(inner) => {
+            let mut result = translate_return_ty(inner, ctx);
+            if matches!(inner.as_ref(), Ty::Union(..) | Ty::Function { .. }) {
+                result.expr = format!("({})[]", result.expr);
+            } else {
+                result.expr = format!("{}[]", result.expr);
+            }
+            result
+        }
+        Ty::Map { key, value, .. } => {
+            let key = translate_ty(key, ctx);
+            let value = translate_return_ty(value, ctx);
+            let mut imports = key.imports;
+            imports.extend(value.imports);
+            let expr = if key.expr == "string" {
+                format!("{{ [key: string]: {} }}", value.expr)
+            } else {
+                format!("{{ [key in {}]?: {} }}", key.expr, value.expr)
+            };
+            TranslatedType { expr, imports }
+        }
+        Ty::Tuple(items) => {
+            let mut imports = BTreeSet::new();
+            let parts: Vec<_> = items
+                .iter()
+                .map(|item| {
+                    let result = translate_return_ty(item, ctx);
+                    imports.extend(result.imports);
+                    result.expr
+                })
+                .collect();
+            TranslatedType {
+                expr: format!("[{}]", parts.join(", ")),
+                imports,
+            }
+        }
+        Ty::Union(items) => {
+            let mut imports = BTreeSet::new();
+            let parts: Vec<_> = items
+                .iter()
+                .map(|item| {
+                    let result = translate_return_ty(item, ctx);
+                    imports.extend(result.imports);
+                    result.expr
+                })
+                .collect();
+            TranslatedType {
+                expr: parts.join(" | "),
+                imports,
+            }
+        }
+        _ => translate_ty(ty, ctx),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use baml_base::Name as BaseName;
@@ -303,7 +477,7 @@ mod tests {
     struct Case {
         label: &'static str,
         ty: Ty,
-        ctx: TranslateCtx,
+        ctx: TranslateCtx<'static>,
         expected_expr: &'static str,
         expected_imports: &'static [&'static [&'static str]],
     }
@@ -313,9 +487,12 @@ mod tests {
             segments: segments.iter().map(ToString::to_string).collect(),
         }
     }
-    fn ctx(segments: &[&str]) -> TranslateCtx {
+    fn ctx(segments: &[&str]) -> TranslateCtx<'static> {
+        static EMPTY_POOL: std::sync::LazyLock<SymbolPool> =
+            std::sync::LazyLock::new(SymbolPool::new);
         TranslateCtx {
             current_leaf: leaf(segments),
+            pool: &EMPTY_POOL,
         }
     }
     fn name(pkg: &str, namespace_path: &[&str], bare_name: &str) -> Name {
@@ -377,6 +554,125 @@ mod tests {
         }
     }
 
+    #[test]
+    fn returned_callable_names_are_legal_unique_and_reserve_options() {
+        let params = ["default", "new", "arguments", "eval", "$opts", "$opts_"]
+            .into_iter()
+            .map(|name| baml_sdkgen_types::CallableParam {
+                name: Some(BaseName::new(name)),
+                ty: Ty::Int,
+                mode: CodegenFunctionParamMode::Required,
+            })
+            .collect();
+        let translated = translate_return_ty(&callable(params, boxed(Ty::Int)), &ctx(&[]));
+        assert!(translated.expr.contains("default_: number, new_: number, arguments_: number, eval_: number, $opts_: number, $opts__: number, $opts?:"));
+        assert!(translated.expr.contains("callSync("));
+    }
+
+    /// Every throws shape keeps the same successful callback result contract.
+    #[test]
+    fn callback_promise_support_is_independent_of_throws() {
+        for throws in [
+            Ty::Never,
+            Ty::Unknown,
+            class_ty(name("user", &["errors"], "CallbackError"), Vec::new()),
+            union(vec![Ty::String, Ty::Int]),
+        ] {
+            let ty = Ty::Function {
+                params: vec![callable_param(Ty::String)].into(),
+                ret: Box::new(Ty::String),
+                throws: Box::new(throws),
+            };
+            let translated = translate_ty(&ty, &ctx(&[]));
+            assert_eq!(
+                translated.expr,
+                "(arg0: string) => string | Promise<string>"
+            );
+            assert!(translated.imports.is_empty());
+        }
+    }
+
+    /// Factories await their own result separately from each nested callback.
+    #[test]
+    fn nested_host_callbacks_keep_promises_at_each_return_boundary() {
+        let callback = callable(vec![callable_param(Ty::String)], Box::new(Ty::String));
+        let factory = callable(Vec::new(), Box::new(callback.clone()));
+        assert_eq!(
+            translate_ty(&factory, &ctx(&[])).expr,
+            "() => ((arg0: string) => string | Promise<string>) | Promise<((arg0: string) => string | Promise<string>)>"
+        );
+        let list_factory = callable(Vec::new(), Box::new(list(Box::new(callback))));
+        assert_eq!(
+            translate_ty(&list_factory, &ctx(&[])).expr,
+            "() => ((arg0: string) => string | Promise<string>)[] | Promise<((arg0: string) => string | Promise<string>)[]>"
+        );
+    }
+
+    #[test]
+    fn returned_callables_are_async_and_host_callbacks_may_be() {
+        // A function BAML returns: `f(x)` is a Promise; `f.callSync(x)` blocks.
+        let adder = callable(
+            vec![baml_sdkgen_types::CallableParam {
+                name: Some(BaseName::new("x")),
+                ty: Ty::Int,
+                mode: CodegenFunctionParamMode::Required,
+            }],
+            boxed(Ty::Int),
+        );
+        let returned = translate_return_ty(&adder, &ctx(&[]));
+        assert!(
+            returned.expr.starts_with("{ (x: number, $opts?:"),
+            "{}",
+            returned.expr
+        );
+        assert!(
+            returned
+                .expr
+                .contains("): Promise<number>; callSync(x: number, $opts?:"),
+            "{}",
+            returned.expr
+        );
+        assert!(returned.expr.ends_with("): number }"), "{}", returned.expr);
+
+        // A host callback may return the value or a Promise of it, and a
+        // function BAML passes to it is a BAML closure, typed as above.
+        let hof = callable(
+            vec![baml_sdkgen_types::CallableParam {
+                name: Some(BaseName::new("f")),
+                ty: adder,
+                mode: CodegenFunctionParamMode::Required,
+            }],
+            boxed(Ty::Int),
+        );
+        let callback = translate_ty(&hof, &ctx(&[])).expr;
+        assert!(callback.starts_with("(f: { (x: number"), "{callback}");
+        assert!(callback.contains("callSync(x: number"), "{callback}");
+        assert!(
+            callback.ends_with(") => number | Promise<number>"),
+            "{callback}"
+        );
+    }
+
+    #[test]
+    fn returned_callable_maps_preserve_partial_enum_keys() {
+        let ty = Ty::Map {
+            key: Box::new(enum_ty(name("user", &[], "Color"))),
+            value: Box::new(callable(Vec::new(), boxed(Ty::Int))),
+        };
+        let translated = translate_return_ty(&ty, &ctx(&[]));
+        assert!(translated.expr.contains("]?: { ("));
+        assert!(translated.expr.contains("callSync("));
+    }
+
+    #[test]
+    fn returned_callable_tuple_slots_keep_invocation_controls() {
+        let ty = Ty::Tuple(vec![callable(Vec::new(), boxed(Ty::Int)), Ty::String].into());
+        let translated = translate_return_ty(&ty, &ctx(&[]));
+        assert!(translated.expr.starts_with("[{ ("));
+        assert!(translated.expr.contains("): Promise<number>; callSync("));
+        assert!(translated.expr.ends_with(", string]"));
+    }
+
     /// Forces this test file to be updated whenever a `Ty` variant is added.
     fn check_exhaustive(ty: &Ty) {
         match ty {
@@ -398,12 +694,11 @@ mod tests {
             | Ty::List(..)
             | Ty::Map { .. }
             | Ty::Union(..)
+            | Ty::Tuple(..)
             | Ty::Unknown
             | Ty::Function { .. }
             | Ty::Future(..)
-            | Ty::Void
             | Ty::Never
-            | Ty::RustType
             | Ty::Type
             | Ty::Resource
             | Ty::PromptAst => {}
@@ -498,13 +793,6 @@ mod tests {
                 expected_imports: &[],
             },
             Case {
-                label: "unit",
-                ty: Ty::Void,
-                ctx: ctx(&[]),
-                expected_expr: "null",
-                expected_imports: &[],
-            },
-            Case {
                 label: "never",
                 ty: Ty::Never,
                 ctx: ctx(&[]),
@@ -517,13 +805,6 @@ mod tests {
                 ctx: ctx(&[]),
                 expected_expr: "baml.Options",
                 expected_imports: &[&["baml"]],
-            },
-            Case {
-                label: "rust_type",
-                ty: Ty::RustType,
-                ctx: ctx(&[]),
-                expected_expr: "_BamlHandle",
-                expected_imports: &[],
             },
             // ── Literals ──
             Case {
@@ -637,7 +918,37 @@ mod tests {
                 label: "list_callback",
                 ty: list(boxed(callable(Vec::new(), boxed(Ty::Bool)))),
                 ctx: ctx(&[]),
-                expected_expr: "(() => boolean)[]",
+                expected_expr: "(() => boolean | Promise<boolean>)[]",
+                expected_imports: &[],
+            },
+            Case {
+                label: "tuple_int_string",
+                ty: Ty::Tuple(vec![Ty::Int, Ty::String].into()),
+                ctx: ctx(&[]),
+                expected_expr: "[number, string]",
+                expected_imports: &[],
+            },
+            Case {
+                label: "one_tuple",
+                ty: Ty::Tuple(vec![Ty::Bool].into()),
+                ctx: ctx(&[]),
+                expected_expr: "[boolean]",
+                expected_imports: &[],
+            },
+            Case {
+                label: "list_of_tuple",
+                ty: list(boxed(Ty::Tuple(
+                    vec![union(vec![Ty::String, Ty::Null]), media(MediaKind::Image)].into(),
+                ))),
+                ctx: ctx(&["lorem"]),
+                expected_expr: "[string | null, baml.media.Image][]",
+                expected_imports: &[&["baml", "media"]],
+            },
+            Case {
+                label: "optional_tuple",
+                ty: union(vec![Ty::Tuple(vec![Ty::Int].into()), Ty::Null]),
+                ctx: ctx(&[]),
+                expected_expr: "[number] | null",
                 expected_imports: &[],
             },
             Case {
@@ -668,7 +979,7 @@ mod tests {
                 label: "nullable_callback",
                 ty: union(vec![callable(Vec::new(), boxed(Ty::Bool)), Ty::Null]),
                 ctx: ctx(&[]),
-                expected_expr: "(() => boolean) | null",
+                expected_expr: "(() => boolean | Promise<boolean>) | null",
                 expected_imports: &[],
             },
             // ── Name refs (same / cross leaf) ──
@@ -799,7 +1110,7 @@ mod tests {
                 label: "callable_zero",
                 ty: callable(vec![], boxed(Ty::Bool)),
                 ctx: ctx(&[]),
-                expected_expr: "() => boolean",
+                expected_expr: "() => boolean | Promise<boolean>",
                 expected_imports: &[],
             },
             Case {
@@ -809,14 +1120,14 @@ mod tests {
                     boxed(Ty::Bool),
                 ),
                 ctx: ctx(&[]),
-                expected_expr: "(arg0: number, arg1: string) => boolean",
+                expected_expr: "(arg0: number, arg1: string) => boolean | Promise<boolean>",
                 expected_imports: &[],
             },
             Case {
                 label: "callable_optional_only",
                 ty: callable(vec![optional_callable_param("x", Ty::Int)], boxed(Ty::Bool)),
                 ctx: ctx(&[]),
-                expected_expr: "($opts?: { x?: number | undefined } | undefined) => boolean",
+                expected_expr: "($opts?: { x?: number | undefined } | undefined) => boolean | Promise<boolean>",
                 expected_imports: &[],
             },
             Case {
@@ -833,7 +1144,7 @@ mod tests {
                     boxed(Ty::String),
                 ),
                 ctx: ctx(&[]),
-                expected_expr: "(x: number, $opts?: { y?: number | undefined } | undefined) => string",
+                expected_expr: "(x: number, $opts?: { y?: number | undefined } | undefined) => string | Promise<string>",
                 expected_imports: &[],
             },
             Case {
@@ -843,7 +1154,7 @@ mod tests {
                     boxed(union(vec![Ty::String, Ty::Null])),
                 ),
                 ctx: ctx(&[]),
-                expected_expr: "(arg0: number[]) => string | null",
+                expected_expr: "(arg0: number[]) => string | null | Promise<string | null>",
                 expected_imports: &[],
             },
         ];

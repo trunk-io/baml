@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use btel_core::recording::field;
 use btel_processor::AggregateDelta;
 use btel_records::SpanRecord;
 use btel_snapshot::Snapshot;
@@ -18,27 +19,15 @@ mod flags;
 mod functions;
 mod merge;
 mod recording;
-pub use flags::CompletionFlags;
+pub use btel_core::recording::CompletionFlags;
+/// The recording format's messages, as `btel-core` defines them: the wire, never the VM's
+/// in-memory layout. Scalar span messages encode while borrowed; no input references escape the
+/// callback.
+pub use btel_core::recording::v2 as proto;
 pub use recording::{
     ProcessRecording, RecordingBuilder, RecordingConfig, RecordingError, RecordingId,
     RecordingPublisher, SealedFile,
 };
-
-/// Generated wire messages, never the VM's in-memory layout. Scalar span
-/// messages encode while borrowed; no input references escape the callback.
-#[allow(clippy::all, clippy::pedantic, clippy::empty_structs_with_brackets)]
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/baml.btel.recording.v2.rs"));
-}
-
-impl From<proto::SnapshotId> for btel_snapshot::SnapshotId {
-    fn from(id: proto::SnapshotId) -> Self {
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&id.low.to_le_bytes());
-        bytes[8..].copy_from_slice(&id.high.to_le_bytes());
-        Self::from_bytes(bytes)
-    }
-}
 
 /// Cold sections retained until sealing; spans are already encoded.
 #[derive(Default)]
@@ -69,6 +58,11 @@ struct ConversionBuffer {
     // Unwinds in progress, at most one per telemetry thread. Empty unless an
     // exception is being unwound, so ordinary completions pay one length check.
     unwinds: errors::ActiveUnwinds,
+    // Model usage awaiting its node's completion, which the VM writes right
+    // after it; kept across files like `unwinds`. Empty without model calls.
+    usage: BTreeMap<u64, Vec<proto::ModelUsage>>,
+    /// The error each thread ended with, until the thread's completion, which carries it.
+    thread_errors: BTreeMap<u64, proto::CasId>,
 }
 // Count each newly constructed metadata message once; never rescan the file.
 fn push_message<M: prost::Message>(output: &mut Vec<M>, bytes: &mut usize, tag: u32, value: M) {
@@ -76,7 +70,29 @@ fn push_message<M: prost::Message>(output: &mut Vec<M>, bytes: &mut usize, tag: 
     output.push(value);
 }
 impl ConversionBuffer {
-    fn event(&mut self, thread: TelemetryId, event: proto::span_event::Event) {
+    fn event(&mut self, thread: TelemetryId, mut event: proto::span_event::Event) {
+        use proto::span_event::Event;
+        if let Event::ThreadCompletion(completion) = &mut event
+            && let Some(error) = self.thread_errors.remove(&thread.get())
+        {
+            completion.error_cas_id = Some(error);
+        }
+        if !self.usage.is_empty() {
+            match &mut event {
+                Event::FunctionCompletion(completion)
+                | Event::LateFunctionCompletion(completion) => {
+                    if let Some(usage) = self.usage.remove(&completion.id) {
+                        completion.usage = usage;
+                    }
+                }
+                Event::ThreadCompletion(completion) => {
+                    if let Some(usage) = self.usage.remove(&thread.get()) {
+                        completion.usage = usage;
+                    }
+                }
+                _ => {}
+            }
+        }
         self.spans.event(thread, event);
     }
 
@@ -92,7 +108,7 @@ impl ConversionBuffer {
         push_message(
             &mut self.pending.definitions.threads,
             &mut self.pending_encoded_bytes,
-            3,
+            field::definitions::THREADS,
             proto::ThreadDefinition {
                 thread_id: id.get(),
                 parent_id: parent.map(TelemetryId::get),
@@ -105,7 +121,7 @@ impl ConversionBuffer {
         push_message(
             &mut self.pending.definitions.clock_epochs,
             &mut self.pending_encoded_bytes,
-            4,
+            field::definitions::CLOCK_EPOCHS,
             clock::definition(clock.metadata()),
         );
         let state = clock::state(clock);
@@ -119,7 +135,7 @@ impl ConversionBuffer {
         push_message(
             &mut self.pending.clock_states.states,
             &mut self.pending_encoded_bytes,
-            1,
+            field::clock_state_batch::STATES,
             state,
         );
     }
@@ -134,7 +150,7 @@ impl ConversionBuffer {
             let state = clock::state(epoch);
             let settled = state.r#final;
             if settled || latest {
-                push_message(states, bytes, 1, state);
+                push_message(states, bytes, field::clock_state_batch::STATES, state);
             }
             !settled
         });
@@ -148,7 +164,7 @@ impl ConversionBuffer {
             push_message(
                 &mut self.pending.definitions.functions,
                 &mut self.pending_encoded_bytes,
-                1,
+                field::definitions::FUNCTIONS,
                 proto::FunctionDefinition {
                     function_id: function.get(),
                     resolution: Some(resolution),
@@ -194,6 +210,9 @@ impl ConversionBuffer {
             self.link_unwound(thread, record);
         }
         match record {
+            SpanRecord::HostFunctionDefined(metadata) => {
+                self.functions.register_host(metadata);
+            }
             SpanRecord::ThreadSelected { .. } => panic!("processor must consume selectors"),
             SpanRecord::Log {
                 parent_id,
@@ -220,7 +239,8 @@ impl ConversionBuffer {
                         at_ticks: at.get(),
                         level: level as i32,
                         event_name: event_name.as_deref().map(str::to_owned),
-                        data_cas_id: captured_data.as_ref().map(snapshot_id),
+                        data_cas_id: captured_data.as_ref().map(cas_id),
+                        line: self.functions.line(*function, *pc),
                     }),
                 );
             }
@@ -228,7 +248,7 @@ impl ConversionBuffer {
                 self.spans.select_context(
                     thread,
                     captured_context.as_ref().map(|snapshot| {
-                        proto::thread_section::Context::ContextCasId(snapshot_id(snapshot))
+                        proto::thread_section::Context::ContextCasId(cas_id(snapshot))
                     }),
                 );
             }
@@ -241,9 +261,33 @@ impl ConversionBuffer {
             SpanRecord::ContextReferenced { id } => {
                 self.spans.select_context(
                     thread,
-                    Some(proto::thread_section::Context::ContextCasId(
-                        snapshot_reference(*id),
-                    )),
+                    Some(proto::thread_section::Context::ContextCasId(cas_reference(
+                        *id,
+                    ))),
+                );
+            }
+            SpanRecord::ThreadSpanError { captured_error } => {
+                if let Some(error) = captured_error.as_ref().map(cas_id) {
+                    self.thread_errors.insert(thread.get(), error);
+                }
+            }
+            SpanRecord::SpanUsage(usage) => {
+                self.usage.insert(
+                    usage.node.get(),
+                    usage
+                        .entries
+                        .iter()
+                        .map(|entry| proto::ModelUsage {
+                            provider: entry.provider.to_string(),
+                            model: entry.model.as_deref().map(str::to_owned),
+                            calls: entry.calls,
+                            input_tokens: entry.input_tokens,
+                            output_tokens: entry.output_tokens,
+                            cache_read_tokens: entry.cache_read_tokens,
+                            cache_write_tokens: entry.cache_write_tokens,
+                            reasoning_tokens: entry.reasoning_tokens,
+                        })
+                        .collect(),
                 );
             }
             SpanRecord::ThreadSpanAnnouncement {
@@ -293,6 +337,8 @@ impl ConversionBuffer {
                         completed_at_ticks: completed_at.get(),
                         outcome: flags::outcome(*outcome) as i32,
                         panicked: *outcome == btel_types::InvocationOutcome::Panicked,
+                        usage: Vec::new(),
+                        error_cas_id: None,
                     }),
                 );
                 // A raise that never ended cannot claim anything after its thread.
@@ -311,7 +357,7 @@ impl ConversionBuffer {
                     started_at_ticks: span.started_at.get(),
                     method: span.method.to_string(),
                     url: span.url.to_string(),
-                    request_cas_id: span.request.as_ref().map(snapshot_id),
+                    request_cas_id: span.request.as_ref().map(cas_id),
                 }),
             ),
             SpanRecord::NetworkEvent(event) => self.event(
@@ -320,7 +366,7 @@ impl ConversionBuffer {
                     span_id: event.span.get(),
                     name: event.name.as_str().to_owned(),
                     at_ticks: event.at.get(),
-                    payload_cas_id: event.payload.as_ref().map(snapshot_id),
+                    payload_cas_id: event.payload.as_ref().map(cas_id),
                 }),
             ),
             SpanRecord::NetworkSpanCompletion(done) => self.event(
@@ -330,7 +376,7 @@ impl ConversionBuffer {
                     completed_at_ticks: done.completed_at.get(),
                     outcome: flags::outcome(done.outcome) as i32,
                     panicked: done.outcome == btel_types::InvocationOutcome::Panicked,
-                    error_cas_id: done.error.as_ref().map(snapshot_id),
+                    error_cas_id: done.error.as_ref().map(cas_id),
                 }),
             ),
             SpanRecord::ErrorRaiseOrigin { raise_id, origin } => {
@@ -384,12 +430,13 @@ impl ConversionBuffer {
                 self.event(
                     thread,
                     Event::FunctionAnnouncement(proto::FunctionAnnouncement {
+                        manual: false,
                         id: id.get(),
                         parent_id: parent_id.get(),
                         call_path_id: call_path.get(),
                         entered_at_ticks: entered_at.get(),
-                        inputs_cas_id: captured_inputs.as_ref().map(snapshot_id),
-                        type_args_cas_id: captured_type_args.as_ref().map(snapshot_id),
+                        inputs_cas_id: captured_inputs.as_ref().map(cas_id),
+                        type_args_cas_id: captured_type_args.as_ref().map(cas_id),
                     }),
                 );
             }
@@ -404,7 +451,7 @@ impl ConversionBuffer {
                 push_message(
                     &mut self.pending.definitions.call_paths,
                     &mut self.pending_encoded_bytes,
-                    2,
+                    field::definitions::CALL_PATHS,
                     proto::CallPathDefinition {
                         call_path_id: call_path.get(),
                         thread_id: thread.get(),
@@ -427,6 +474,46 @@ impl ConversionBuffer {
                     self.define_function(function);
                 }
             }
+            SpanRecord::ManualSpanAnnouncement(entry) => {
+                self.spans.require(btel_core::recording::minor::OWNED_SPAN);
+                self.event(
+                    thread,
+                    Event::FunctionAnnouncement(proto::FunctionAnnouncement {
+                        manual: false,
+                        id: entry.id.get(),
+                        parent_id: entry.parent_id.get(),
+                        call_path_id: entry.call_path.get(),
+                        entered_at_ticks: entry.entered_at.get(),
+                        inputs_cas_id: entry.captured_inputs.as_ref().map(cas_id),
+                        type_args_cas_id: entry.captured_type_args.as_ref().map(cas_id),
+                    }),
+                );
+            }
+            SpanRecord::ManualSpanCompletion(done) => {
+                self.spans.require(btel_core::recording::minor::OWNED_SPAN);
+                // A span closed without an outcome is closed, not completed.
+                let completion_flags = match done.outcome {
+                    Some(outcome) => {
+                        flags::completed(flags::outcome(outcome), done.requires_announcement)
+                    }
+                    None => CompletionFlags::closed(done.requires_announcement, false).bits(),
+                };
+                self.event(
+                    thread,
+                    Event::FunctionCompletion(proto::FunctionCompletion {
+                        id: done.id.get(),
+                        parent_id: done.parent_id.get(),
+                        node: CallPathNodeId::new(done.call_path, false).get(),
+                        entered_at_ticks: done.entered_at.get(),
+                        exited_at_ticks: done.exited_at.get(),
+                        self_await_ticks: done.await_time.get().get(),
+                        completion_flags,
+                        value_cas_id: done.captured_value.as_ref().map(cas_id),
+                        panicked: done.outcome == Some(btel_types::InvocationOutcome::Panicked),
+                        usage: Vec::new(),
+                    }),
+                );
+            }
             SpanRecord::FunctionSpanCompletionOk {
                 id,
                 parent_id,
@@ -445,9 +532,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(1).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Ok, false),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -469,9 +557,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(9).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Ok, true),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -493,9 +582,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(1).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Ok, false),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -517,9 +607,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(9).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Ok, true),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -541,9 +632,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -565,9 +660,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(10).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Errored, true),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -589,9 +685,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -613,9 +713,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(10).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Errored, true),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -637,9 +738,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(3).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Cancelled,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -662,9 +767,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: true,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -686,9 +795,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(11).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Cancelled,
+                            true,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -710,9 +823,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(10).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Errored, true),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: true,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -734,9 +848,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(3).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Cancelled,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -759,9 +877,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: true,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -783,9 +905,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(11).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Cancelled,
+                            true,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -807,9 +933,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(10).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Errored, true),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: true,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -831,9 +958,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(1).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Ok, false),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -855,9 +983,10 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(1).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(proto::InvocationOutcome::Ok, false),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -879,9 +1008,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -903,9 +1036,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -927,9 +1064,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(3).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Cancelled,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -952,9 +1093,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: true,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -976,9 +1121,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(3).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Cancelled,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: false,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -1000,9 +1149,13 @@ impl ConversionBuffer {
                         entered_at_ticks: entered_at.get(),
                         exited_at_ticks: exited_at.get(),
                         self_await_ticks: await_time.get().get(),
-                        completion_flags: CompletionFlags::from_variant(2).bits(),
-                        value_cas_id: captured_value.as_ref().map(snapshot_id),
+                        completion_flags: flags::completed(
+                            proto::InvocationOutcome::Errored,
+                            false,
+                        ),
+                        value_cas_id: captured_value.as_ref().map(cas_id),
                         panicked: true,
+                        usage: Vec::new(),
                     }),
                 );
             }
@@ -1022,12 +1175,12 @@ impl ConversionBuffer {
 #[cfg(test)]
 mod tests;
 
-pub(crate) fn snapshot_id(snapshot: &Snapshot) -> proto::SnapshotId {
-    snapshot_reference(snapshot.id())
+pub(crate) fn cas_id(snapshot: &Snapshot) -> proto::CasId {
+    cas_reference(snapshot.root_id())
 }
 
-fn snapshot_reference(bytes: btel_snapshot::SnapshotId) -> proto::SnapshotId {
-    proto::SnapshotId {
+fn cas_reference(bytes: btel_snapshot::CasId) -> proto::CasId {
+    proto::CasId {
         low: u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap()),
         high: u64::from_le_bytes(bytes.as_bytes()[8..].try_into().unwrap()),
     }

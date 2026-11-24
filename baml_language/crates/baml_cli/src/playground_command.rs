@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use baml_db::{find_baml_project_root, resolve_project_search_start};
 use clap::Args;
 
-use crate::project_load::{SourceLocation, load_project_from, resolve_source_location};
+use crate::{
+    output::{Command, CommandContext, Outcome},
+    project_load::{SourceLocation, load_project_from, resolve_source_location},
+};
 
 /// Open the BAML playground in a browser.
 ///
@@ -18,7 +21,7 @@ Examples:
     baml playground
 
   Serve a specific project without opening a browser:
-    baml playground --project ./my-project --no-open
+    baml playground --project-dir ./my-project --no-open
 
   Serve a standalone file on a fixed port:
     baml playground --file script.baml --port 4265")]
@@ -29,10 +32,6 @@ pub struct PlaygroundArgs {
     /// Standalone single-file source. Loads only this file (no project discovery).
     #[arg(long, value_name = "PATH", help_heading = "Project options")]
     pub file: Option<PathBuf>,
-
-    /// Deprecated alias for `--project`.
-    #[arg(long, value_name = "PATH", hide = true)]
-    pub from: Option<PathBuf>,
 
     /// Listen on exactly this port (errors if unavailable).
     /// Default: the first free port from 4265.
@@ -45,29 +44,30 @@ pub struct PlaygroundArgs {
     pub no_open: bool,
 }
 
-impl PlaygroundArgs {
-    #[expect(
-        clippy::print_stdout,
-        reason = "the banner is this command's primary output"
-    )]
-    pub fn run(&self) -> Result<crate::ExitCode> {
+/// Serves until interrupted, so there is no result: the banner is status.
+impl Command for PlaygroundArgs {
+    type Output = ();
+
+    #[expect(clippy::print_stderr, reason = "the banner is status output")]
+    fn run(&self, cx: &CommandContext) -> Result<Outcome<()>> {
         let playground_dir = resolve_playground_assets()?;
 
-        let roots = workspace_roots(self.from.as_deref(), self.file.as_deref())?;
+        let roots = workspace_roots(cx.project_dir.as_deref(), self.file.as_deref())?;
         // The server owns no terminal output (in editor mode its stdout is
         // the LSP channel), so the banner is printed from here once the port
         // is bound.
         let banner_roots = roots.clone();
         let options = baml_lsp_server::PlaygroundServerOptions {
             port: self.port,
-            open_browser: !self.no_open
-                && !is_headless_session(|key| std::env::var_os(key).is_some()),
+            open_browser: !self.no_open && !is_headless_session(baml_env::has_var),
             on_listening: Some(Box::new(move |port| {
-                println!("{}", playground_banner(port, &banner_roots));
+                if !crate::reporter::quiet() {
+                    eprintln!("{}", playground_banner(port, &banner_roots));
+                }
             })),
         };
         baml_lsp_server::run_playground_server(roots, playground_dir, options)?;
-        Ok(crate::ExitCode::Success)
+        Ok(Outcome::ok(()))
     }
 }
 
@@ -127,8 +127,7 @@ fn workspace_roots(from: Option<&Path>, file: Option<&Path>) -> Result<Vec<PathB
 }
 
 fn resolve_playground_assets() -> Result<Option<PathBuf>> {
-    if std::env::var_os("BAML_PLAYGROUND_DEV_PORT").is_some()
-        || std::env::var_os("BAML_PLAYGROUND_DIR").is_some()
+    if baml_env::has_var("DEV_BAML_PLAYGROUND_PORT") || baml_env::has_var("DEV_BAML_PLAYGROUND_DIR")
     {
         return Ok(None);
     }
@@ -140,7 +139,7 @@ fn resolve_playground_assets() -> Result<Option<PathBuf>> {
     anyhow::bail!(
         "could not find packaged playground assets. For local debugging, run \
          `pnpm --filter app-vscode-webview dev -- --host 127.0.0.1 --port 4000` \
-         and set `BAML_PLAYGROUND_DEV_PORT=4000`, or set `BAML_PLAYGROUND_DIR` \
+         and set `DEV_BAML_PLAYGROUND_PORT=4000`, or set `DEV_BAML_PLAYGROUND_DIR` \
          to a built app-vscode-webview/dist directory."
     );
 }

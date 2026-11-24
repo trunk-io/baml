@@ -4,6 +4,7 @@ using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 
 using Baml.Proto;
+using Google.Protobuf;
 
 namespace Baml.Cffi;
 
@@ -25,7 +26,7 @@ internal static unsafe class NativeCallbacks
     internal static delegate* unmanaged[Cdecl]<ulong, uint, byte*, nuint, void>
         HostDispatchPointer => &OnHostDispatchV1;
 
-    internal static delegate* unmanaged[Cdecl]<ulong, void> HostReleasePointer => &OnHostRelease;
+    internal static delegate* unmanaged[Cdecl]<ulong, ulong, void> HostReleasePointer => &OnHostRelease;
 
     internal static void Register(NativeApi api)
     {
@@ -38,7 +39,8 @@ internal static unsafe class NativeCallbacks
         cleanupApi = api;
         api.Table->RegisterCallback(&OnResult);
         api.Table->RegisterHostReleaseCallback(&OnHostRelease);
-        api.Table->RegisterHostDispatchCallback(&OnHostDispatchV1);
+        api.Table->RegisterHostDispatchV2(&OnHostDispatchV2);
+        api.Table->RegisterHostCancelCallback(&OnHostCancel);
     }
 
     internal static (uint Id, Task<byte[]> Task) AddPending()
@@ -126,6 +128,101 @@ internal static unsafe class NativeCallbacks
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static void OnHostCancel(uint callbackId)
+    {
+        try { HostValueRegistry.Shared.CancelInvocation(callbackId); } catch { }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static void OnHostDispatchV2(byte* content, nuint length)
+    {
+        NativeApi? api = Volatile.Read(ref cleanupApi);
+        if (api is null) return;
+        global::BamlBridge.Cffi.V1.HostInvocation? wire = null;
+        BamlSafeHandle? state = null;
+        OutboundOwnershipScope? controls = null;
+        HostCallArguments? arguments = null;
+        HostInvocation? invocation = null;
+        try
+        {
+            if (length > int.MaxValue || (length != 0 && content is null))
+                throw new InvalidDataException("Invalid host invocation buffer.");
+            wire = global::BamlBridge.Cffi.V1.HostInvocation.Parser.ParseFrom(new ReadOnlySpan<byte>(content, (int)length));
+            state = api.OwnHandle(wire.EffectiveState);
+            controls = OutboundOwnershipScope.Create(new global::BamlBridge.Cffi.V1.BamlOutboundResult { Ok = wire.Cancel }, api);
+            // The adapter owns the arguments' references from here on, so
+            // every exit below releases them unless an invocation takes them.
+            arguments = HostCallArguments.Parse(wire.ApplicationArgs.Span, api);
+            if (wire.CallbackId == 0 || wire.HostValueKey == 0 || wire.Cancel is null)
+                throw new InvalidDataException("Incomplete host invocation controls.");
+            invocation = HostValueRegistry.Shared.TryStartInvocation(
+                wire.HostValueKey, wire.CallbackId, arguments, out string? diagnostic,
+                wire.HostEnvironment) ?? throw new InvalidDataException(diagnostic);
+            arguments = null;
+            invocation.EffectiveState = state;
+            invocation.Controls = controls;
+            state = null;
+            controls = null;
+            var ownedCancel = CloneControl(wire.Cancel, api);
+            var cancelValue = PrimitiveProtocol.DecodeCallResult(new global::BamlBridge.Cffi.V1.BamlOutboundResult { Ok = ownedCancel }.ToByteArray(), "<effective cancellation>", api);
+            invocation.Frame = new global::Baml.Generated.V1.BamlInvocationCapture(invocation.EffectiveState.CloneOwned(), cancelValue, invocation.CancellationToken);
+            ThreadPool.UnsafeQueueUserWorkItem(
+                static work => _ = HostCallDispatcher.ExecuteAsync(work.Api, work.Invocation),
+                new HostDispatchWork(api, invocation), preferLocal: false);
+        }
+        catch (Exception error)
+        {
+            if (invocation is not null)
+            {
+                invocation.Frame?.State.Dispose();
+                invocation.Complete();
+            }
+            state?.Dispose();
+            controls?.Dispose();
+            arguments?.Dispose();
+            if (wire is not null) HostCallDispatcher.QueueBoundaryFailure(api, wire.CallbackId, error);
+        }
+    }
+
+    private static global::BamlBridge.Cffi.V1.BamlOutboundValue CloneControl(global::BamlBridge.Cffi.V1.BamlOutboundValue value, NativeApi api)
+    {
+        var result = value.Clone(); var owners = new List<BamlSafeHandle>();
+        ulong CloneRow(ulong source)
+        {
+            ulong key = 0;
+            if (api.Table->HandleClone(source, &key) != BamlCffiStatus.Ok || key == 0) throw new InvalidDataException("Inactive invocation control handle.");
+            owners.Add(api.OwnHandle(key));
+            return key;
+        }
+        void Clone(global::BamlBridge.Cffi.V1.BamlOutboundValue item)
+        {
+            switch (item.ValueCase)
+            {
+                case global::BamlBridge.Cffi.V1.BamlOutboundValue.ValueOneofCase.HandleValue:
+                    // A host value's own key is the host's; the clone takes its own pin.
+                    if (item.HandleValue.HandleType is global::BamlBridge.Cffi.V1.BamlHandleType.HostValueCallable or global::BamlBridge.Cffi.V1.BamlHandleType.HostValueOpaque)
+                    {
+                        if (item.HandleValue.Pin != 0) item.HandleValue.Pin = CloneRow(item.HandleValue.Pin);
+                        break;
+                    }
+                    item.HandleValue.Key = CloneRow(item.HandleValue.Key); break;
+                case global::BamlBridge.Cffi.V1.BamlOutboundValue.ValueOneofCase.ClassValue:
+                    foreach (var field in item.ClassValue.Fields) Clone(field.Value); break;
+                case global::BamlBridge.Cffi.V1.BamlOutboundValue.ValueOneofCase.ListValue:
+                    foreach (var field in item.ListValue.Items) Clone(field); break;
+                case global::BamlBridge.Cffi.V1.BamlOutboundValue.ValueOneofCase.TupleValue:
+                    foreach (var field in item.TupleValue.Items) Clone(field); break;
+                case global::BamlBridge.Cffi.V1.BamlOutboundValue.ValueOneofCase.MapValue:
+                    foreach (var field in item.MapValue.Entries) Clone(field.Value); break;
+                case global::BamlBridge.Cffi.V1.BamlOutboundValue.ValueOneofCase.UnionVariantValue:
+                    Clone(item.UnionVariantValue.Value); break;
+            }
+        }
+        try { Clone(result); foreach (var owner in owners) owner.TransferOwnership(); return result; }
+        finally { foreach (var owner in owners) owner.Dispose(); }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static void OnHostDispatchV1(
         ulong hostKey,
         uint hostCallId,
@@ -145,6 +242,7 @@ internal static unsafe class NativeCallbacks
             return;
         }
 
+        HostCallArguments? arguments = null;
         try
         {
             if (length > int.MaxValue || (length != 0 && content is null))
@@ -153,18 +251,22 @@ internal static unsafe class NativeCallbacks
                     $"Native host dispatch {hostCallId} supplied an invalid borrowed buffer.");
             }
 
-            byte[] copy = length == 0
-                ? []
-                : new ReadOnlySpan<byte>(content, checked((int)length)).ToArray();
+            arguments = HostCallArguments.Parse(
+                length == 0
+                    ? ReadOnlySpan<byte>.Empty
+                    : new ReadOnlySpan<byte>(content, checked((int)length)),
+                api);
             HostInvocation? invocation = HostValueRegistry.Shared.TryStartInvocation(
                 hostKey,
                 hostCallId,
-                copy,
+                arguments,
                 out string? diagnostic);
             if (invocation is null)
             {
                 throw new InvalidDataException(diagnostic);
             }
+
+            arguments = null;
 
             ThreadPool.UnsafeQueueUserWorkItem(
                 static state => _ = HostCallDispatcher.ExecuteAsync(state.Api, state.Invocation),
@@ -173,20 +275,17 @@ internal static unsafe class NativeCallbacks
         }
         catch (Exception error)
         {
-            HostCallDispatcher.QueueBoundaryException(
-                api,
-                hostCallId,
-                functionCallId: 0,
-                error);
+            arguments?.Dispose();
+            HostCallDispatcher.QueueBoundaryFailure(api, hostCallId, error);
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static void OnHostRelease(ulong hostKey)
+    private static void OnHostRelease(ulong hostKey, ulong count)
     {
         try
         {
-            HostValueRegistry.Shared.Release(hostKey);
+            HostValueRegistry.Shared.Release(hostKey, count);
         }
         catch
         {

@@ -12,15 +12,23 @@
 //! let engine = BexEngine::new(program, SysOps::native())?;
 //! ```
 
+#![warn(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 
 pub mod host_dispatch;
 mod host_impls;
 #[cfg(feature = "bundle-http")]
+mod http_client_body;
+#[cfg(feature = "bundle-http")]
 mod http_server;
+mod installation;
 mod io_impls;
-pub mod registry;
 pub mod shell;
+#[cfg(feature = "bundle-http")]
+mod sse;
+#[cfg(feature = "bundle-http")]
+mod ws;
 
 pub use sys_ops::{SysOps, io};
 pub use sys_types::{CallId, CompletionHandle, OpError, SysOp, SysOpContext, VmInternalError};
@@ -105,15 +113,24 @@ impl WorkingDir {
 
     /// The program a child process runs, the way a shell reads it: a name
     /// with a directory component (`./build.sh`, `tools/gen`) is a path and
-    /// resolves like one; a bare name (`git`) is left to the `PATH` lookup.
-    pub fn resolve_program(&self, program: &str) -> PathBuf {
+    /// resolves against the child's requested directory; a bare name (`git`)
+    /// is left to the `PATH` lookup.
+    pub fn resolve_program(
+        &self,
+        program: &str,
+        requested: Option<&str>,
+    ) -> std::io::Result<PathBuf> {
         let has_directory = Path::new(program)
             .parent()
             .is_some_and(|dir| !dir.as_os_str().is_empty());
-        if has_directory {
-            self.resolve(program)
+        if has_directory && !Path::new(program).is_absolute() {
+            let base = match self.for_child(requested) {
+                Some(base) => base,
+                None => std::env::current_dir()?,
+            };
+            std::path::absolute(base.join(program))
         } else {
-            PathBuf::from(program)
+            Ok(PathBuf::from(program))
         }
     }
 }
@@ -175,5 +192,44 @@ impl SysOpsExt for SysOps {
 
     fn native_in(working_dir: PathBuf) -> Self {
         SysOps::from_impl(NativeSysOps::new(WorkingDir::Fixed(working_dir)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bex_heap::{BexHeap, HeapPermitManager};
+
+    use super::*;
+
+    /// A static method's `RuntimeIo` form takes no receiver, and the adapter
+    /// hands the sys-op only the method's own arguments.
+    #[tokio::test]
+    async fn runtime_io_static_methods_take_no_receiver() {
+        let io = sys_ops::build_runtime_io(
+            &Arc::new(SysOps::native()),
+            &BexHeap::new(vec![]),
+            &Arc::new(HeapPermitManager::new()),
+            &SysOpContext::empty(),
+        );
+
+        let now = io.time_instant_now().await.expect("`Instant.now` runs");
+        assert!(*now._nanoseconds > num_bigint::BigInt::ZERO);
+
+        // A static constructor of a class only the runtime builds.
+        #[cfg(feature = "bundle-http")]
+        {
+            let response = io
+                .http_response_new(
+                    201,
+                    indexmap::IndexMap::from([("x-sheep".to_owned(), "🐑".to_owned())]),
+                    b"baa".to_vec(),
+                )
+                .await
+                .expect("`Response.new` runs");
+            assert_eq!(response.status_code, 201);
+            assert_eq!(response.headers["x-sheep"], "🐑");
+        }
     }
 }

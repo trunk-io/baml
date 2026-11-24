@@ -4,8 +4,9 @@
 //! [`ProgramPackage`] map (it must be `HeapPtr`-free — there is no heap at emit
 //! time, and a `HeapPtr` can't serialize). At load we allocate the heap
 //! `Object::Package` / `Object::ImplRule` objects from it and build the
-//! [`PackageIndex`] (package name → its `Object::Package` pointer, plus the
-//! program-wide interface → impl-rules index).
+//! [`PackageIndex`] (each package's `Object::Package` pointer by ordinal and
+//! each language package's by identity, plus the program-wide interface →
+//! impl-rules index).
 //!
 //! These are *cross-referencing compile-time objects* — their `HeapPtr` fields
 //! point at interfaces / functions / classes / other packages — and a
@@ -14,33 +15,38 @@
 //! reserve a placeholder slot per impl rule and per package, build the heap
 //! unsealed, fill each slot with its resolved pointers, then seal.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
 };
 
-use baml_type::{MediaKind, Name};
-use bex_heap::{BexHeap, Generation};
+use baml_base::{LangItem, LangPackage};
+use baml_type::{ConcreteMediaKind, Name};
+use bex_heap::BexHeap;
 use bex_vm_types::{
-    HeapPtr, Object, ObjectIndex, TypeHead,
-    types::{LocalName, MethodImpl, Package, ProgramImplRule, ProgramPackage, RuntimeImplRule},
+    HeapPtr, Object, ObjectIndex, RootVisitor, TypeHead, Weak,
+    types::{
+        LocalName, MethodImpl, Package, PackageKind, ProgramImplRule, ProgramPackage,
+        RuntimeImplRule,
+    },
 };
 use indexmap::IndexMap;
 
-/// One anonymous-class witness in the dynamic dispatch table.
+/// The anonymous-class witnesses of one interface: each runtime class's
+/// rules, under the class.
 ///
-/// Both pointers are **weak**: the table never keeps a minted definition or its
-/// rule alive. `class` decides liveness (the witness dies with its class);
-/// `rule` is the heap `Object::ImplRule` the resolver borrows — the one
+/// Every pointer is **weak**: the table never keeps a minted definition or its
+/// rule alive. The class decides liveness (its witnesses die with it); a rule
+/// is the heap `Object::ImplRule` the resolver borrows — the one
 /// authoritative copy, so the collector's fixup of that object is what keeps
 /// the rule's own `interface_head`/`methods[].fqn` pointers current. The
 /// class keeps its rules alive itself, as the witnesses of its
 /// [`Owner::Anonymous`](bex_vm_types::types::Owner::Anonymous).
-#[derive(Clone, Copy, Debug)]
-pub struct DynRuleEntry {
-    pub class: HeapPtr,
-    pub rule: HeapPtr,
-}
+///
+/// Keyed by class because a witness's `for` pattern is exactly its class: a
+/// lookup for a receiver of class `C` needs `C`'s rules only, not every
+/// minted class's.
+type DynClassRules = IndexMap<Weak, Vec<Weak>>;
 
 /// Engine-local side tables for runtime-created nominal definitions.
 ///
@@ -50,19 +56,45 @@ pub struct DynRuleEntry {
 /// `impl_rules` map uses. It is a *findability* index only: the class holds
 /// its rules, nothing here is a GC root, and every entry is dropped the moment
 /// its class is collected.
+///
+/// The tables also own the engine's resolution generation. Every VM of the
+/// engine keeps its own cache of impl-resolver answers and drops it when this
+/// number moves, so a change to the rules any resolver can see must bump it.
 #[derive(Default, Debug)]
 pub struct DynDispatchTables {
-    impl_rules: RwLock<IndexMap<HeapPtr, Vec<DynRuleEntry>>>,
+    impl_rules: RwLock<IndexMap<Weak, DynClassRules>>,
+    generation: AtomicU64,
 }
 
 impl DynDispatchTables {
-    pub fn register_rule(&self, interface: HeapPtr, entry: DynRuleEntry) {
+    /// Index `rule`, a witness that `class` implements `interface`. Every
+    /// pointer is held weakly: the class owns its rules, and the entry goes
+    /// when the class does.
+    pub fn register_rule(&self, interface: HeapPtr, class: HeapPtr, rule: HeapPtr) {
         self.impl_rules
             .write()
             .expect("dynamic-impl table lock poisoned")
-            .entry(interface)
+            .entry(Weak::new(interface))
             .or_default()
-            .push(entry);
+            .entry(Weak::new(class))
+            .or_default()
+            .push(Weak::new(rule));
+        // After the push: a VM that reads the new generation also sees the rule.
+        self.bump_generation();
+    }
+
+    /// The current resolution generation. A cached resolver answer is valid
+    /// only while this number has not moved since the answer was computed.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Record a change to the impl rules a resolver can see: a registered
+    /// witness, or a package whose rule tables were rewritten. Call it after
+    /// the change is visible, so a VM that reads the new generation also
+    /// reads the new rules.
+    pub fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// The witness rules registered for `interface`, as pointers to their heap
@@ -72,10 +104,25 @@ impl DynDispatchTables {
         self.impl_rules
             .read()
             .expect("dynamic-impl table lock poisoned")
-            .get(&interface)
+            .get(&Weak::new(interface))
+            .into_iter()
+            .flat_map(IndexMap::values)
+            .flatten()
+            .map(|rule| rule.ptr())
+            .collect()
+    }
+
+    /// The witness rules `class` registered for `interface`: the only dynamic
+    /// rules that can apply to a receiver of that class.
+    pub fn rules_of_class(&self, interface: HeapPtr, class: HeapPtr) -> Vec<HeapPtr> {
+        self.impl_rules
+            .read()
+            .expect("dynamic-impl table lock poisoned")
+            .get(&Weak::new(interface))
+            .and_then(|classes| classes.get(&Weak::new(class)))
             .into_iter()
             .flatten()
-            .map(|entry| entry.rule)
+            .map(|rule| rule.ptr())
             .collect()
     }
 
@@ -92,60 +139,51 @@ impl DynDispatchTables {
             .read()
             .expect("dynamic-impl table lock poisoned")
             .values()
+            .filter_map(|classes| classes.get(&Weak::new(class)))
             .flatten()
-            .filter(|entry| entry.class == class)
-            .map(|entry| entry.rule)
+            .map(|rule| rule.ptr())
             .collect()
     }
 
-    /// Update weak pointers after a moving collection and sweep entries whose
-    /// owning runtime class died.
+    /// Walk every weak pointer in the table for a collection: forward what
+    /// moved, and sweep the entries whose owning runtime class died.
     ///
-    /// Death is decided by `survived`, not by mere absence from `forwarding`:
-    /// a *minor* collection identity-maps every Gen2 object it does not
-    /// visit, so an old runtime class reachable only from other old objects is
-    /// alive yet absent from the map. Treating absence as death there evicted
-    /// live classes on every minor GC. `survived` must answer for exactly the
-    /// pointers the collection left in place.
-    pub fn sweep_and_forward(
-        &self,
-        forwarding: &HashMap<HeapPtr, HeapPtr>,
-        survived: impl Fn(HeapPtr) -> bool,
-    ) {
-        // Forward a weak pointer, or report it dead.
-        let follow = |ptr: &mut HeapPtr| -> bool {
-            if let Some(&forwarded) = forwarding.get(ptr) {
-                *ptr = forwarded;
-                true
-            } else {
-                survived(*ptr)
-            }
-        };
+    /// Death is the visitor's verdict, never mere absence from the forwarding
+    /// map: the compile-time region is never collected, so a pointer into it
+    /// is live however many collections leave it in place.
+    pub fn visit_weak_entries(&self, visitor: &mut dyn RootVisitor) {
         let mut table = self
             .impl_rules
             .write()
             .expect("dynamic-impl table lock poisoned");
-        // The keys are interface pointers, which move too when the interface
-        // was declared at runtime — rebuild the map through the forwarding.
+        // The keys are interface and class pointers, which move too (an
+        // interface when it was declared at runtime) — rebuild both levels
+        // through the visitor.
         let entries = std::mem::take(&mut *table);
-        for (mut interface, mut rules) in entries {
-            if !follow(&mut interface) {
+        for (mut interface, classes) in entries {
+            if !interface.visit(visitor) {
                 continue;
             }
-            rules.retain_mut(|entry| {
-                if !follow(&mut entry.class) {
-                    return false;
+            for (mut class, mut rules) in classes {
+                if !class.visit(visitor) {
+                    continue;
                 }
-                // The rule is reachable iff its class is; a class that survived
-                // keeps its rule alive through the same tracing that found the
-                // class, so a live class with an unforwarded rule means the rule
-                // sat in a generation the collection left in place.
-                let rule_live = follow(&mut entry.rule);
-                debug_assert!(rule_live, "a witness rule outlived by its class");
-                rule_live
-            });
-            if !rules.is_empty() {
-                table.entry(interface).or_default().extend(rules);
+                rules.retain_mut(|rule| {
+                    // The rule is reachable iff its class is: a class that
+                    // survived keeps its rule alive through the same tracing
+                    // that found the class.
+                    let rule_live = rule.visit(visitor);
+                    debug_assert!(rule_live, "a witness rule outlived by its class");
+                    rule_live
+                });
+                if !rules.is_empty() {
+                    table
+                        .entry(interface)
+                        .or_default()
+                        .entry(class)
+                        .or_default()
+                        .extend(rules);
+                }
             }
         }
     }
@@ -156,42 +194,29 @@ impl DynDispatchTables {
             .read()
             .expect("dynamic-impl table lock poisoned")
             .values()
+            .flat_map(IndexMap::values)
             .map(Vec::len)
             .sum()
     }
 }
 
 /// Permit-holder view. Dynamic entries are weak (no roots), but this holder
-/// observes every forwarding map to sweep dead rules and move live pointers.
+/// observes every collection to sweep dead rules and move live pointers.
 #[derive(Clone, Debug)]
 pub struct DynDispatchRoot {
     pub tables: Arc<DynDispatchTables>,
-    heap: Arc<BexHeap>,
 }
 
 impl DynDispatchRoot {
-    pub fn new(tables: Arc<DynDispatchTables>, heap: Arc<BexHeap>) -> Self {
-        Self { tables, heap }
+    pub fn new(tables: Arc<DynDispatchTables>) -> Self {
+        Self { tables }
     }
 }
 
 impl bex_vm_types::RootHaver for DynDispatchRoot {
-    fn collect_roots(&self, _roots: &mut Vec<HeapPtr>) {}
-
-    fn forward_roots(&mut self, forwarding: &HashMap<HeapPtr, HeapPtr>) {
-        // A pointer the collection left in place is one that still lives in
-        // Gen2 (a minor collection never moves or frees Gen2; a major moves
-        // every survivor to a fresh buffer, so no stale address lands there)
-        // or in the compile-time region (never collected). Everything else
-        // absent from the map was in a swept generation and is dead. Only the
-        // positive range tests are consulted, never the Gen0 fallthrough.
-        let heap = Arc::clone(&self.heap);
-        self.tables.sweep_and_forward(forwarding, move |ptr| {
-            matches!(
-                heap.generation_of(ptr),
-                Generation::Gen2 | Generation::CompileTime
-            )
-        });
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self { tables } = self;
+        tables.visit_weak_entries(visitor);
     }
 }
 
@@ -301,6 +326,12 @@ pub struct PackageIndex {
     /// The root package's pointer — null only for the empty index of a VM
     /// with no executable, where nothing resolves.
     root: HeapPtr,
+    /// Each language package's `Object::Package` pointer, indexed by its
+    /// position in [`LangPackage::ALL`]; null where the executable does not
+    /// load that package. How the language's own implementation reaches the
+    /// standard library: by what a package is, never by a name the program
+    /// gives it ([`Self::lang_declaration`]).
+    lang: [HeapPtr; LangPackage::ALL.len()],
     /// Canonical `Object::Interface` pointer → every `Object::ImplRule` of that
     /// interface in the program, in package-load order.
     impl_rules: IndexMap<HeapPtr, Vec<HeapPtr>>,
@@ -331,18 +362,43 @@ impl PackageIndex {
         root.accessible(self.root, name)
     }
 
-    /// Whether `package` is one of the language packages the root reaches
-    /// under a fixed name — the prelude every package reaches without
-    /// declaring an edge to it.
-    pub fn is_prelude(&self, package: HeapPtr) -> bool {
-        baml_builtins2::stdlib_package_names()
-            .iter()
-            .any(|name| self.accessible(&Name::new(name)) == Some(package))
-    }
-
     /// Every loaded package's `Object::Package` pointer, by ordinal.
     pub fn package_ptrs(&self) -> impl Iterator<Item = HeapPtr> + '_ {
         self.packages.iter().copied()
+    }
+
+    /// The language package `package`, if the executable loads it.
+    pub fn lang_package(&self, package: LangPackage) -> Option<HeapPtr> {
+        let ptr = self.lang[package as usize];
+        (!ptr.is_null()).then_some(ptr)
+    }
+
+    /// The class, enum, interface, or recursive type alias `item` names, if
+    /// the executable loads its package. By identity: the package by what it
+    /// is, the item by its path there — no name the program gives a package
+    /// is consulted, so a root that calls itself `baml` captures nothing.
+    pub fn lang_declaration(&self, item: LangItem) -> Option<HeapPtr> {
+        let package_ptr = self.lang_package(item.package())?;
+        // SAFETY: the index holds compile-time package objects.
+        #[expect(unsafe_code, reason = "deref a compile-time package pointer")]
+        let package = (unsafe { package_ptr.get() }).as_package()?;
+        package.declaration(item.namespace(), item.name())
+    }
+
+    /// The head of the declaration `item` names — its pointer and the tag it
+    /// carries — if the executable loads its package.
+    pub fn lang_head(&self, item: LangItem) -> Option<TypeHead> {
+        let ptr = self.lang_declaration(item)?;
+        // SAFETY: a package's declaration pointers are compile-time objects.
+        #[expect(unsafe_code, reason = "deref a compile-time declaration pointer")]
+        let tag = match unsafe { ptr.get() } {
+            Object::Class(class) => class.type_tag,
+            Object::Enum(enm) => enm.type_tag,
+            Object::Interface(interface) => interface.type_tag,
+            Object::TypeAlias(alias) => alias.type_tag,
+            _ => return None,
+        };
+        Some(TypeHead::new(ptr, tag))
     }
 
     /// Every impl rule of the interface at `iface_ptr`, across all packages.
@@ -409,8 +465,16 @@ fn fill_package_slots(
     let mut index = PackageIndex {
         packages: package_ptrs.clone(),
         root: package_ptrs[root as usize],
+        lang: [HeapPtr::null(); LangPackage::ALL.len()],
         impl_rules: IndexMap::new(),
     };
+    for (pkg, &ptr) in packages.iter().zip(&package_ptrs) {
+        if let PackageKind::Language(language) = pkg.kind {
+            // `Program::validate` admits one package per language package.
+            debug_assert!(index.lang[language as usize].is_null());
+            index.lang[language as usize] = ptr;
+        }
+    }
     for (pkg, slots) in packages.iter().zip(layout) {
         // Impl rules first: a package's `impl_rules` map points at their slots.
         let mut impl_rules: IndexMap<HeapPtr, Vec<HeapPtr>> = IndexMap::new();
@@ -445,6 +509,7 @@ fn fill_package_slots(
         }
         let package = Package {
             name: pkg.name.clone(),
+            kind: pkg.kind,
             edges: pkg
                 .edges
                 .iter()
@@ -458,6 +523,7 @@ fn fill_package_slots(
                     )
                 })
                 .collect(),
+            metadata: pkg.metadata.clone(),
             classes: resolve_members(heap, &pkg.classes),
             enums: resolve_members(heap, &pkg.enums),
             interfaces: resolve_members(heap, &pkg.interfaces),
@@ -501,72 +567,70 @@ fn fill_package_slots(
                 ),
             }
         }
+        // So does every function the package placed in the pool
+        // (`ProgramPackage::objects`): named functions and bodies, its
+        // initializers and their helpers, its closure bodies — which is what
+        // renders a static function's name, and its telemetry's parent and
+        // package, under its package.
+        for index in pkg.objects.clone() {
+            if let Object::Function(function) = heap.compile_time_object_mut(index as usize) {
+                function.owner = owner;
+            }
+        }
     }
     index
 }
 
-/// Look up a class, enum, or interface object pointer by its fully-qualified
-/// dotted name — the package as the root reaches it, then the item path —
-/// from the root's viewpoint. The free-function form of
-/// [`crate::vm::BexVm::lookup_type_by_fqn`], usable before a `BexVm` exists
-/// (e.g. to pre-resolve builtin error/panic classes in `BexVm::new`).
-pub fn lookup_type_by_fqn(packages: &PackageIndex, fqn: &str) -> Option<HeapPtr> {
-    let mut parts: Vec<Name> = fqn.split('.').map(Name::new).collect();
-    let name = parts.pop()?;
-    if parts.is_empty() {
-        return None;
+impl crate::BexVm {
+    /// Whether the object at `ptr` is a language package — one of the
+    /// standard library's, the prelude ([`PackageKind::Language`]). `false`
+    /// for an ordinary package and for anything that is not a package (an
+    /// anonymous declaration an edge reaches).
+    pub fn is_language_package(&self, ptr: HeapPtr) -> bool {
+        matches!(
+            self.get_object(ptr),
+            Object::Package(package) if matches!(package.kind, PackageKind::Language(_))
+        )
     }
-    let pkg = parts.remove(0);
-    let pkg_ptr = packages.accessible(&pkg)?;
-    // SAFETY: `packages` only ever holds compile-time `Object::Package` pointers.
-    #[expect(unsafe_code, reason = "deref a compile-time package pointer")]
-    let package = (unsafe { pkg_ptr.get() }).as_package()?;
-    let local = LocalName {
-        namespace: parts,
-        name,
-    };
-    package
-        .classes
-        .get(&local)
-        .or_else(|| package.enums.get(&local))
-        .or_else(|| package.interfaces.get(&local))
-        .copied()
-}
 
-/// The head of the class, enum, interface, or type alias `fqn` names — its
-/// pointer and the tag it carries — from the root's viewpoint. Usable before
-/// a `BexVm` exists.
-pub fn declaration_head_by_fqn(packages: &PackageIndex, fqn: &str) -> Option<TypeHead> {
-    let mut parts: Vec<Name> = fqn.split('.').map(Name::new).collect();
-    let name = parts.pop()?;
-    if parts.is_empty() {
-        return None;
+    /// The prelude under the fixed names the root reaches it by: the root's
+    /// edges whose target is a language package, in edge order. Empty for a
+    /// VM with no executable.
+    pub fn prelude(&self) -> impl Iterator<Item = (Name, HeapPtr)> + '_ {
+        let root = self.packages.root();
+        let root = (!root.is_null())
+            .then(|| self.get_object(root).as_package())
+            .flatten();
+        root.into_iter().flat_map(|root| {
+            root.edges
+                .iter()
+                .filter(|(_, edge)| self.is_language_package(edge.target))
+                .map(|(name, edge)| (name.clone(), edge.target))
+        })
     }
-    let pkg = parts.remove(0);
-    let pkg_ptr = packages.accessible(&pkg)?;
-    // SAFETY: `packages` only ever holds compile-time `Object::Package` pointers.
-    #[expect(unsafe_code, reason = "deref a compile-time package pointer")]
-    let package = (unsafe { pkg_ptr.get() }).as_package()?;
-    let local = LocalName {
-        namespace: parts,
-        name,
-    };
-    let ptr = *package
-        .classes
-        .get(&local)
-        .or_else(|| package.enums.get(&local))
-        .or_else(|| package.interfaces.get(&local))
-        .or_else(|| package.type_aliases.get(&local))?;
-    // SAFETY: a package's declaration pointers are compile-time objects.
-    #[expect(unsafe_code, reason = "deref a compile-time declaration pointer")]
-    let tag = match unsafe { ptr.get() } {
-        Object::Class(class) => class.type_tag,
-        Object::Enum(enm) => enm.type_tag,
-        Object::Interface(interface) => interface.type_tag,
-        Object::TypeAlias(alias) => alias.type_tag,
-        _ => return None,
-    };
-    Some(TypeHead::new(ptr, tag))
+
+    /// Add the prelude to a runtime package's edge table, under the fixed
+    /// names the root reaches it by: a runtime package (a `Package.compile`
+    /// result, a `with_types` view) reaches the same language packages as the
+    /// host image. Its own edges are `$`-named, which no identifier spells,
+    /// or aliases already refused when they take a reserved name, so a
+    /// prelude name is always free.
+    pub fn add_prelude(&self, edges: &mut IndexMap<Name, bex_vm_types::types::Edge>) {
+        for (name, target) in self.prelude() {
+            let previous = edges.insert(
+                name,
+                bex_vm_types::types::Edge {
+                    target,
+                    kind: bex_vm_types::types::EdgeKind::Dependency,
+                },
+            );
+            debug_assert!(
+                previous.is_none(),
+                "a runtime package's own edges cannot take a prelude name: they are `$`-named \
+                 or aliases validated against the reserved names"
+            );
+        }
+    }
 }
 
 /// One of the stdlib time classes a CSV cell decodes to.
@@ -578,88 +642,104 @@ pub enum TimeClass {
 }
 
 /// The stdlib declarations the runtime recognizes structurally — the CSV
-/// cell classes, the JSON media wrappers, the `json` alias, the prompt cache
-/// delimiter, and the live
-/// capabilities a host proxies — resolved to heads once from the loaded
-/// packages and shared by every VM the engine spawns, like the error and
-/// panic class tables.
+/// cell classes, the JSON media wrappers, the `json` alias and the classes
+/// whose instances it reads by shape —
+/// resolved to heads once from the loaded packages and shared by every VM
+/// the engine spawns, like the error and panic class tables.
 ///
 /// A program that does not load one of them (no stdlib) has no value of that
 /// type, so the entry is absent and nothing matches it.
 #[derive(Debug, Default)]
 pub struct StdlibHeads {
     time: Vec<(TimeClass, TypeHead)>,
-    media: Vec<(MediaKind, TypeHead)>,
+    media: Vec<(ConcreteMediaKind, TypeHead)>,
     json: Option<TypeHead>,
-    cache_delimiter: Option<TypeHead>,
-    capabilities: Vec<(StdlibCapability, TypeHead)>,
+    classes: Vec<(StdlibClass, TypeHead)>,
 }
 
-/// A live stdlib capability a host reaches through a proxy rather than a
-/// value: an instance stays on the heap behind a handle.
+/// A stdlib class the runtime reads by shape: native code knows an
+/// instance's fields, so it must know the instance is the stdlib's own class
+/// and not one that merely renders under the same name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StdlibCapability {
-    /// `ai.FunctionSpec`.
-    FunctionSpec,
-    /// `ai.stream.Stream`.
-    Stream,
+pub enum StdlibClass {
+    /// `ai.Role`.
+    PromptRole,
+    /// `ai.Prompt`.
+    Prompt,
+    /// `reflect.interface.Implementation`.
+    InterfaceImplementation,
+    /// `reflect.WithMeta`.
+    WithMeta,
+    /// `reflect.enum.Value`.
+    EnumValue,
+    /// `reflect.Meta`.
+    Meta,
+    /// `ai.CacheDelimiter`, the value `${cache(args)}` interpolates into a
+    /// prompt.
+    CacheDelimiter,
+}
+
+impl StdlibClass {
+    const ALL: [Self; 7] = [
+        Self::PromptRole,
+        Self::Prompt,
+        Self::InterfaceImplementation,
+        Self::WithMeta,
+        Self::EnumValue,
+        Self::Meta,
+        Self::CacheDelimiter,
+    ];
+
+    /// The class by identity: its language package and its path there. Read
+    /// once, at load.
+    const fn item(self) -> LangItem {
+        match self {
+            Self::PromptRole => crate::lang_items::AI_ROLE,
+            Self::Prompt => crate::lang_items::AI_PROMPT,
+            Self::InterfaceImplementation => crate::lang_items::REFLECT_INTERFACE_IMPLEMENTATION,
+            Self::WithMeta => crate::lang_items::REFLECT_WITH_META,
+            Self::EnumValue => crate::lang_items::REFLECT_ENUM_VALUE,
+            Self::Meta => crate::lang_items::REFLECT_META,
+            Self::CacheDelimiter => crate::lang_items::AI_CACHE_DELIMITER,
+        }
+    }
 }
 
 impl StdlibHeads {
+    /// Every head by identity, once, at load: the language package by what it
+    /// is and the item by its path there; nothing here is ever derived from a
+    /// name the program gives a package or from a declaration's rendering.
     pub fn resolve(packages: &PackageIndex) -> Self {
-        let head = |fqn: &str| declaration_head_by_fqn(packages, fqn);
+        let head = |item: LangItem| packages.lang_head(item);
         let time = [
-            (TimeClass::Instant, "baml.time.Instant"),
-            (TimeClass::PlainDate, "baml.time.PlainDate"),
-            (TimeClass::PlainDateTime, "baml.time.PlainDateTime"),
-        ]
-        .into_iter()
-        .filter_map(|(class, fqn)| Some((class, head(fqn)?)))
-        .collect();
-        // A runtime media value is an instance of one of these classes; there
-        // is no `Generic` media value, and no wrapper class for it.
-        let media = [
-            MediaKind::Image,
-            MediaKind::Audio,
-            MediaKind::Video,
-            MediaKind::Pdf,
-        ]
-        .into_iter()
-        .filter_map(|kind| Some((kind, head(kind.wrapper_class_name()?)?)))
-        .collect();
-        // Resolved from the root's viewpoint under the prelude's fixed names,
-        // once, at load: a package of the user's spelled `ai` cannot be
-        // reached under that name (the edge is reserved), and nothing here is
-        // ever re-derived from a declaration's rendered name.
-        let capabilities = [
+            (TimeClass::Instant, crate::lang_items::BAML_TIME_INSTANT),
             (
-                StdlibCapability::FunctionSpec,
-                baml_type::qualified_name::AI_FUNCTION_SPEC,
+                TimeClass::PlainDate,
+                crate::lang_items::BAML_TIME_PLAIN_DATE,
             ),
             (
-                StdlibCapability::Stream,
-                baml_type::qualified_name::AI_STREAM_STREAM,
+                TimeClass::PlainDateTime,
+                crate::lang_items::BAML_TIME_PLAIN_DATE_TIME,
             ),
         ]
         .into_iter()
-        .filter_map(|(capability, fqn)| Some((capability, head(fqn)?)))
+        .filter_map(|(class, item)| Some((class, head(item)?)))
         .collect();
+        // A runtime media value is an instance of one of these classes.
+        let media = ConcreteMediaKind::ALL
+            .into_iter()
+            .filter_map(|kind| Some((kind, head(kind.wrapper_class())?)))
+            .collect();
+        let classes = StdlibClass::ALL
+            .into_iter()
+            .filter_map(|class| Some((class, head(class.item())?)))
+            .collect();
         Self {
             time,
             media,
-            json: head("baml.json.json"),
-            cache_delimiter: head("ai.CacheDelimiter"),
-            capabilities,
+            json: head(crate::lang_items::BAML_JSON_JSON),
+            classes,
         }
-    }
-
-    /// Which live stdlib capability the declaration tagged `tag` is, if any:
-    /// the stdlib's own declaration, by identity, never a same-spelled one.
-    pub fn capability(&self, tag: baml_type::typetag::TypeTag) -> Option<StdlibCapability> {
-        self.capabilities
-            .iter()
-            .find(|(_, head)| head.tag() == tag)
-            .map(|(capability, _)| *capability)
     }
 
     /// Which stdlib time class `head` is, if any.
@@ -670,18 +750,20 @@ impl StdlibHeads {
             .map(|(class, _)| *class)
     }
 
+    /// The wrapper class of media of `kind`, if the program loads it.
+    pub fn media_wrapper(&self, kind: ConcreteMediaKind) -> Option<TypeHead> {
+        self.media
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, head)| *head)
+    }
+
     /// Which media wrapper class `head` is, if any.
-    pub fn media_kind(&self, head: TypeHead) -> Option<MediaKind> {
+    pub fn media_kind(&self, head: TypeHead) -> Option<ConcreteMediaKind> {
         self.media
             .iter()
             .find(|(_, h)| *h == head)
             .map(|(kind, _)| *kind)
-    }
-
-    /// Whether `head` is `ai.CacheDelimiter`, the value `${cache(args)}`
-    /// interpolates into a prompt.
-    pub fn is_cache_delimiter(&self, head: TypeHead) -> bool {
-        self.cache_delimiter == Some(head)
     }
 
     /// The recursive `baml.json.json` alias, if the program loads it.
@@ -692,6 +774,14 @@ impl StdlibHeads {
     /// Whether `head` is the recursive `baml.json.json` alias.
     pub fn is_json_alias(&self, head: TypeHead) -> bool {
         self.json == Some(head)
+    }
+
+    /// Whether the declaration tagged `tag` is the stdlib's own `class` — by
+    /// identity, never a class that merely renders the same.
+    pub fn is_class(&self, class: StdlibClass, tag: baml_type::typetag::TypeTag) -> bool {
+        self.classes
+            .iter()
+            .any(|(known, head)| *known == class && head.tag() == tag)
     }
 }
 
@@ -752,9 +842,10 @@ pub fn build_heap_with_packages(
     mut compile_time_objects: Vec<Object>,
     packages: &[ProgramPackage],
     root: u32,
+    gc: bex_heap::gc_policy::GcSettings,
 ) -> (Arc<BexHeap>, PackageIndex) {
     let layout = reserve_package_slots(&mut compile_time_objects, packages);
-    let mut heap = BexHeap::build_unsealed_default(compile_time_objects);
+    let mut heap = BexHeap::build_unsealed_default_with_gc(compile_time_objects, gc);
     let index = fill_package_slots(&mut heap, packages, root, &layout);
     // Every slot is now real (impl rules carry heads in their patterns), so
     // this is the one point where the whole image can bind — and prove it
@@ -766,8 +857,8 @@ pub fn build_heap_with_packages(
 
 #[cfg(test)]
 mod tests {
-    use bex_heap::{CollectionLevel, Tlab};
-    use bex_vm_types::{RootHaver, types::Object};
+    use bex_heap::Tlab;
+    use bex_vm_types::{ForwardRoots, RootHaverExt, types::Object};
 
     use super::*;
 
@@ -801,10 +892,31 @@ mod tests {
             let head =
                 bex_vm_types::TypeHead::new(owner, baml_type::typetag::TypeTag::fresh_dynamic());
             let rule = tlab.alloc(Object::ImplRule(Box::new(empty_rule(interface, head))));
-            tables.register_rule(interface, DynRuleEntry { class: owner, rule });
+            tables.register_rule(interface, owner, rule);
             owners.push(owner);
         }
         (tlab, owners)
+    }
+
+    /// A class's lookup sees its own witnesses only, however many other
+    /// classes witnessed the same interface (B-2000).
+    #[test]
+    fn a_class_finds_only_its_own_witnesses() {
+        let heap = BexHeap::new(vec![Object::String(bex_str::BexStr::from(
+            "static interface",
+        ))]);
+        let interface = heap.compile_time_ptr(0);
+        let tables = DynDispatchTables::default();
+        let (_tlab, owners) = register_witnesses(&heap, &tables, interface, 1000);
+
+        assert_eq!(tables.rules_of(interface).len(), 1000);
+        for &owner in &owners {
+            let rules = tables.rules_of_class(interface, owner);
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules, tables.rules_for_class(owner));
+        }
+        // Any pointer that registered nothing, here the interface itself.
+        assert!(tables.rules_of_class(interface, interface).is_empty());
     }
 
     #[test]
@@ -814,7 +926,7 @@ mod tests {
         ))]);
         let interface = heap.compile_time_ptr(0);
         let tables = Arc::new(DynDispatchTables::default());
-        let mut hook = DynDispatchRoot::new(Arc::clone(&tables), Arc::clone(&heap));
+        let mut hook = DynDispatchRoot::new(Arc::clone(&tables));
         let (mut tlab, owners) = register_witnesses(&heap, &tables, interface, 128);
 
         // Root every other owner AND its rule, as a live class's own reachability
@@ -824,19 +936,23 @@ mod tests {
         live.extend(tables.rules_of(interface).into_iter().step_by(2));
         #[expect(unsafe_code, reason = "standalone stop-the-world GC test")]
         let (_stats, _remapped, forwarding) = unsafe { heap.collect_garbage(&live) };
-        hook.forward_roots(&forwarding);
+        hook.forward_roots(&mut ForwardRoots::new(&forwarding, &*heap));
         assert_eq!(
             tables.rule_count(),
             64,
             "dead owners must sweep their rules"
         );
         let forwarded_owner = forwarding
-            .get(&owners[0])
-            .copied()
+            .get(owners[0])
             .expect("live owner must be forwarded");
         assert!(
             !tables.rules_for_class(forwarded_owner).is_empty(),
             "live owner pointers must follow relocation"
+        );
+        assert_eq!(
+            tables.rules_of_class(interface, forwarded_owner),
+            tables.rules_for_class(forwarded_owner),
+            "the per-class index must follow relocation too"
         );
         for rule in tables.rules_of(interface) {
             #[expect(unsafe_code, reason = "reading a just-forwarded pointer")]
@@ -850,71 +966,11 @@ mod tests {
         tlab.invalidate();
         #[expect(unsafe_code, reason = "standalone stop-the-world GC test")]
         let (_stats, _remapped, forwarding) = unsafe { heap.collect_garbage(&[]) };
-        hook.forward_roots(&forwarding);
+        hook.forward_roots(&mut ForwardRoots::new(&forwarding, &*heap));
         assert_eq!(
             tables.rule_count(),
             0,
             "dropping the last runtime class/witness reachability must sweep every rule"
         );
-    }
-
-    /// A minor collection identity-maps every Gen2 object it does not visit, so
-    /// an old runtime class reachable only from other old objects is alive yet
-    /// absent from the forwarding map. The sweep must not evict it.
-    #[test]
-    fn minor_collection_keeps_unvisited_old_witnesses() {
-        let heap = BexHeap::new(vec![Object::String(bex_str::BexStr::from(
-            "static interface",
-        ))]);
-        let interface = heap.compile_time_ptr(0);
-        let tables = Arc::new(DynDispatchTables::default());
-        let mut hook = DynDispatchRoot::new(Arc::clone(&tables), Arc::clone(&heap));
-        let (mut tlab, owners) = register_witnesses(&heap, &tables, interface, 8);
-
-        // Promote everything into Gen2: two minors move Gen0 -> Gen1 -> Gen2.
-        // `roots[0]` is the first owner throughout — each collection returns
-        // the remapped root list in order.
-        let mut roots = owners;
-        roots.extend(tables.rules_of(interface));
-        #[expect(unsafe_code, reason = "standalone stop-the-world GC test")]
-        let (_, roots, forwarding) =
-            unsafe { heap.collect_garbage_generational(&roots, CollectionLevel::Minor) };
-        hook.forward_roots(&forwarding);
-        #[expect(unsafe_code, reason = "standalone stop-the-world GC test")]
-        let (_, roots, forwarding) =
-            unsafe { heap.collect_garbage_generational(&roots, CollectionLevel::Minor) };
-        hook.forward_roots(&forwarding);
-        assert_eq!(tables.rule_count(), 8);
-        let old_class = roots[0];
-        assert_eq!(heap.generation_of(old_class), Generation::Gen2);
-
-        // Now a minor collection with NO roots at all: nothing young is live,
-        // and the old witnesses are simply not visited. They must all survive.
-        tlab.invalidate();
-        #[expect(unsafe_code, reason = "standalone stop-the-world GC test")]
-        let (_, _, forwarding) =
-            unsafe { heap.collect_garbage_generational(&[], CollectionLevel::Minor) };
-        assert!(
-            !forwarding.contains_key(&old_class),
-            "precondition: an unvisited Gen2 object is absent from a minor forwarding map"
-        );
-        hook.forward_roots(&forwarding);
-        assert_eq!(
-            tables.rule_count(),
-            8,
-            "a minor collection must not evict live, unvisited old witnesses"
-        );
-        assert!(
-            !tables.rules_for_class(old_class).is_empty(),
-            "the unvisited owner keeps its witness"
-        );
-
-        // A major with no roots reclaims them for real.
-        #[expect(unsafe_code, reason = "standalone stop-the-world GC test")]
-        let (_, _, forwarding) =
-            unsafe { heap.collect_garbage_generational(&[], CollectionLevel::Major) };
-        hook.forward_roots(&forwarding);
-        assert_eq!(tables.rule_count(), 0);
-        drop(roots);
     }
 }

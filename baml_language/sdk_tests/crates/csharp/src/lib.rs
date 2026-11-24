@@ -1,10 +1,11 @@
+#![allow(clippy::disallowed_methods)]
+
 #[cfg(test)]
 mod tests {
     use std::{
         env,
         path::PathBuf,
         process::{Command, Output},
-        sync::OnceLock,
     };
 
     use sdk_test_harness_runner::{
@@ -57,6 +58,28 @@ mod tests {
         );
     }
 
+    // SDK_PARITY_LINT(skip): exercises the C# release ABI probe before publication
+    #[test]
+    fn test_release_abi_lifetimes_match_current_native_library() {
+        let project = manifest_dir().join("../../../sdks/csharp/bridge_csharp/tests/Baml.Bridge.AbiLifetimeProbe/Baml.Bridge.AbiLifetimeProbe.csproj");
+        let native = env::var("BAML_BRIDGE_PATH").expect("native library from C# setup");
+        let bytecode =
+            env::var("BAML_CSHARP_ABI_PROBE_BYTECODE").expect("ABI fixture from C# setup");
+        let output = run_project(
+            &project,
+            &[
+                "-p:BamlNativeProbeMode=Direct",
+                "--",
+                &native,
+                baml_version::CANONICAL_VERSION,
+                &bytecode,
+            ],
+        );
+        assert_stdout_contains(&output, "pre_and_inflight_cancellation=ok");
+        assert_stdout_contains(&output, "media_handle_clone_release=ok");
+        assert_stdout_contains(&output, "callback_boundary=contained");
+    }
+
     // SDK_PARITY_LINT(skip): exercises C#-specific native SDK integration coverage
     #[test]
     fn test_basic_calls_executes_sync_and_async() {
@@ -75,6 +98,31 @@ mod tests {
             .join("TypeRoundtrips.csproj");
         let output = run_project(&project, &[]);
         assert_stdout_contains(&output, "csharp_type_roundtrips=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): exercises C#-specific native SDK integration coverage
+    #[test]
+    fn test_tuples_execute_native_and_named_tuples_in_every_position() {
+        let manifest = manifest_dir();
+        let project = manifest.join("tuples").join("Tuples.csproj");
+        let output = run_project(&project, &[]);
+        assert_stdout_contains(&output, "csharp_tuples=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): C# runs its tuple streams from its own fixture, not llm_functions
+    #[test]
+    fn test_tuples_stream_items() {
+        let project = manifest_dir().join("tuples").join("Tuples.csproj");
+        let output = run_project(&project, &["--", "stream_items"]);
+        assert_stdout_contains(&output, "csharp_tuples_stream_items=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): C# runs its tuple streams from its own fixture, not llm_functions
+    #[test]
+    fn test_tuples_stream_final() {
+        let project = manifest_dir().join("tuples").join("Tuples.csproj");
+        let output = run_project(&project, &["--", "stream_final"]);
+        assert_stdout_contains(&output, "csharp_tuples_stream_final=ok");
     }
 
     // SDK_PARITY_LINT(skip): exercises C#-specific native SDK integration coverage
@@ -128,39 +176,82 @@ mod tests {
         assert_stdout_contains(&output, "csharp_streaming_request=ok");
     }
 
-    fn host_callables_output() -> &'static Output {
-        static OUTPUT: OnceLock<Output> = OnceLock::new();
-
+    // SDK_PARITY_LINT(skip): C# canonical coverage executes through its native integration harness
+    #[test]
+    fn test_baml_closures_execute_host_arguments_structured_returns_and_mutable_captures() {
         let manifest = manifest_dir();
         let project = manifest.join("host_callables").join("HostCallables.csproj");
-        OUTPUT.get_or_init(|| run_project(&project, &[]))
-    }
-
-    fn assert_host_callables_marker(marker: &str) {
-        let output = host_callables_output();
-        assert_stdout_contains(output, marker);
-    }
-
-    // SDK_PARITY_LINT(skip): C# canonical coverage executes through its native integration harness
-    #[test]
-    fn test_baml_closure_is_a_native_callable_with_host_language_arguments() {
-        assert_host_callables_marker(
+        // Nextest runs each Rust test in a separate process. Check all markers
+        // from one execution instead of caching the output in a process-local
+        // OnceLock that reruns the full consumer for every marker.
+        let output = run_project(&project, &[]);
+        for marker in [
             "baml_closure_is_a_native_callable_with_host_language_arguments=ok",
-        );
-    }
-
-    // SDK_PARITY_LINT(skip): C# canonical coverage executes through its native integration harness
-    #[test]
-    fn test_baml_closure_decodes_multiple_args_and_structured_return_values() {
-        assert_host_callables_marker(
             "baml_closure_decodes_multiple_args_and_structured_return_values=ok",
-        );
+            "baml_closure_is_reusable_and_retains_mutable_captures=ok",
+            "host_callable_void_signatures=ok",
+            "engine_typed_containers_round_trip=ok",
+        ] {
+            assert_stdout_contains(&output, marker);
+        }
     }
 
     // SDK_PARITY_LINT(skip): C# canonical coverage executes through its native integration harness
     #[test]
-    fn test_baml_closure_is_reusable_and_retains_mutable_captures() {
-        assert_host_callables_marker("baml_closure_is_reusable_and_retains_mutable_captures=ok");
+    fn test_host_callable_hof_receives_a_baml_closure() {
+        let manifest = manifest_dir();
+        let project = manifest.join("host_callables").join("HostCallables.csproj");
+        let output = run_project(&project, &["--", "hof"]);
+        assert_stdout_contains(&output, "host_callable_hof_receives_a_baml_closure=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): observes the C# host registry draining through the native release callback
+    #[test]
+    fn test_host_callables_host_values_are_given_back_once_unreferenced() {
+        let manifest = manifest_dir();
+        let project = manifest.join("host_callables").join("HostCallables.csproj");
+        let output = run_project(&project, &["--", "given-back"]);
+        assert_stdout_contains(&output, "host_values_are_given_back_once_unreferenced=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): C# completion-contract coverage executes through its native integration harness
+    #[test]
+    fn test_host_callables_callback_faults_complete_by_whose_they_are() {
+        let manifest = manifest_dir();
+        let project = manifest.join("host_callables").join("HostCallables.csproj");
+        let output = run_project(&project, &["--", "completion"]);
+        assert_stdout_contains(&output, "host_callable_completion_contract=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): C# measures typed lists and class chains at the wire's exact limit
+    #[test]
+    fn test_host_callables_json_nested_deeper_than_the_wire_carries_is_refused_as_a_callback_result()
+     {
+        let manifest = manifest_dir();
+        let project = manifest.join("host_callables").join("HostCallables.csproj");
+        let output = run_project(&project, &["--", "depth-result"]);
+        assert_stdout_contains(
+            &output,
+            "host_callable_result_deeper_than_the_wire_is_refused=ok",
+        );
+    }
+
+    // SDK_PARITY_LINT(skip): C# measures typed lists and class chains at the wire's exact limit
+    #[test]
+    fn test_host_callables_json_nested_deeper_than_the_wire_carries_is_refused_as_an_argument() {
+        let manifest = manifest_dir();
+        let project = manifest.join("host_callables").join("HostCallables.csproj");
+        let output = run_project(&project, &["--", "depth-argument"]);
+        assert_stdout_contains(&output, "argument_deeper_than_the_wire_is_refused=ok");
+    }
+
+    // SDK_PARITY_LINT(skip): exercises C#-specific ownership of a runtime declaration's repeated key
+    #[test]
+    fn test_dynamic_values_type_naming_a_runtime_declaration_twice_round_trips() {
+        let manifest = manifest_dir();
+        let project = manifest.join("dynamic_values").join("DynamicValues.csproj");
+        let output = run_project(&project, &["--", "runtime-type-twice"]);
+        assert_stdout_contains(&output, "csharp_runtime_type_named_twice_round_trips=ok");
     }
 
     fn stdlib_resources_output(arguments: &[&str]) -> Output {

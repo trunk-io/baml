@@ -9,6 +9,7 @@
 // import time; resolution is lazy and memoized on first lookup.
 
 import { BamlError } from './errors.js';
+import { registerProgramDescriptor } from './native.js';
 
 /** A deferred resolver for a generated class / enum / type alias. */
 export type LazyEntry = () => unknown;
@@ -25,17 +26,31 @@ export class BamlTypeMap {
     // five stdlib media/stream wrappers encode via `instanceof` in proto.ts,
     // so they don't need to be seeded here.
     private reverse: Map<unknown, string> | null = null;
+    // The embedded program descriptor (the program's declared surface, as the
+    // generator encoded it), or null for a typemap that declares no types.
+    // TypeScript never reads it: the bridge decodes it natively and encodes
+    // arguments against the types it declares. A typemap without one (bridge
+    // tests, call-by-name without a generated SDK) declares no types, and the
+    // bridge then takes each argument as the type its JavaScript value has.
+    private _descriptor: string | null = null;
 
     static fromLazyEntries(args: {
         classes: Record<string, LazyEntry>;
         enums: Record<string, LazyEntry>;
         typeAliases: Record<string, LazyEntry>;
+        descriptor?: string;
     }): BamlTypeMap {
         const m = new BamlTypeMap();
         for (const [fqn, le] of Object.entries(args.classes)) m.classLazy.set(fqn, le);
         for (const [fqn, le] of Object.entries(args.enums)) m.enumLazy.set(fqn, le);
         for (const [fqn, le] of Object.entries(args.typeAliases)) m.aliasLazy.set(fqn, le);
+        m._descriptor = args.descriptor ?? null;
         return m;
+    }
+
+    /** The embedded program descriptor, or null when this typemap declares no types. */
+    get descriptor(): string | null {
+        return this._descriptor;
     }
 
     private _resolve(
@@ -77,7 +92,7 @@ export class BamlTypeMap {
      * its BAML FQN, or "" if it is not a codegen-emitted class. Builds the
      * reverse map lazily by resolving every class/enum thunk once.
      */
-    jsTypeToBamlType(ctor: unknown): string {
+    private ensureReverse(): void {
         if (this.reverse === null) {
             this.reverse = new Map();
             for (const [fqn, thunk] of this.classLazy) {
@@ -95,9 +110,19 @@ export class BamlTypeMap {
                 }
             }
         }
+    }
+
+    /** Identity-only lookup for capture; never inspects application prototypes. */
+    captureType(ctor: unknown): string {
+        this.ensureReverse();
+        return this.reverse!.get(ctor) ?? '';
+    }
+
+    jsTypeToBamlType(ctor: unknown): string {
+        this.ensureReverse();
         let cur: unknown = ctor;
         while (cur != null) {
-            const fqn = this.reverse.get(cur);
+            const fqn = this.reverse!.get(cur);
             if (fqn !== undefined) return fqn;
             cur = Object.getPrototypeOf(cur);
         }
@@ -112,8 +137,11 @@ export class BamlTypeMap {
 }
 
 let _TYPE_MAP = new BamlTypeMap();
+/** Install `m` as the runtime typemap and hand its program descriptor to the
+ * bridge, which encodes every argument against the types it declares. */
 export function setTypeMap(m: BamlTypeMap): void {
     _TYPE_MAP = m;
+    registerProgramDescriptor(m.descriptor);
 }
 export function getTypeMap(): BamlTypeMap {
     return _TYPE_MAP;

@@ -4,11 +4,12 @@
 //! Compare its 0-iteration and 100k-iteration medians to derive dispatch cost
 //! with the compile constant cancelled; `static_stdlib_dispatch` is the same
 //! loop compiled into the host image and uses the same delta calculation.
+#![allow(clippy::disallowed_methods)]
 
 use std::{path::Path, sync::Arc};
 
 use baml_compiler2_emit::OptLevel;
-use baml_db::{ProjectDatabase, compile_program};
+use baml_db::{CheckedWorld, ProjectDatabase};
 use baml_tests::engine::TestDbExt;
 use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder};
 use divan::{Bencher, black_box};
@@ -45,7 +46,7 @@ function compare_hot<T extends baml.ops.Compare>(value: T, n: int) -> int throws
 }
 function run(n: int) -> int throws never { compare_hot<int>(7, n) }
 ` })
-  let run = package.get_function<(int) -> int>("root.run") ?? throw "missing run"
+  let run = package.get_function<(int) -> int>("root.run")
   run(n)
 }
 "####;
@@ -67,7 +68,9 @@ fn engine() -> Arc<BexEngine> {
     let mut db = ProjectDatabase::new();
     let package = db.workspace(Path::new("."));
     db.file("package_compile_bench.baml", OUTER_SOURCE);
-    let program = compile_program(&db, package, OptLevel::One)
+    let program = CheckedWorld::collect(&db, package)
+        .expect("the world checks")
+        .compile(OptLevel::One)
         .expect("compile Package.compile benchmark host");
     Arc::new(
         BexEngine::new_with_runtime_compiler(

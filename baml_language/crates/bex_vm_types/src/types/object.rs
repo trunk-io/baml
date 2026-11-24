@@ -1,14 +1,12 @@
-use std::{any::Any, sync::Arc};
-
 use borsh::{BorshDeserialize, BorshSerialize};
-use indexmap::IndexMap;
 
+use super::cell::cell_tag;
 use crate::{
-    ArrayContainer, BoundMethod, Class, Enum, Function, GenericFunction, HostClosure, Instance,
-    MapContainer, Uint8ArrayContainer, Value, Variant,
+    ArrayContainer, BoundMethod, Class, CleanupLatch, Enum, Function, GenericFunction, HeapPtr,
+    HostClosure, Uint8ArrayContainer, Value, Variant,
     types::{
         Array, Cell, Closure, FunctionType, FutureType, InterfaceDef, Map, Package,
-        RuntimeImplRule, TypeAliasDef,
+        RuntimeImplRule, RustInstance, TypeAliasDef,
     },
 };
 
@@ -20,44 +18,50 @@ use crate::{
 /// into the `Vm::objects` pool.
 ///
 /// Read `Vm::objects` for more information.
+/// `repr(u64)` puts the variant tag in the first word, ahead of the payload,
+/// and each tag sets [`OBJECT_BODY`](crate::OBJECT_BODY): the tag is the
+/// header of the object's cell (see `types/cell.rs`).
 #[derive(Clone, Debug)]
+#[repr(u64)]
 pub enum Object {
     /// Package object.
-    Package(Box<Package>),
+    Package(Box<Package>) = cell_tag(0),
 
     /// Function object.
-    Function(Box<Function>),
+    Function(Box<Function>) = cell_tag(1),
 
     /// Represents an interface definition. Not a value object.
-    Interface(Box<InterfaceDef>),
+    Interface(Box<InterfaceDef>) = cell_tag(2),
 
     /// Represents an implementation rule for an interface.
-    ImplRule(Box<RuntimeImplRule>),
+    ImplRule(Box<RuntimeImplRule>) = cell_tag(3),
 
     /// Class object.
-    Class(Box<Class>),
+    Class(Box<Class>) = cell_tag(4),
 
-    /// Class instance object.
-    Instance(Instance),
+    /// What [`HeapPtr::get`](crate::HeapPtr::get) shows for a class
+    /// instance. An instance lives in a cell of its own, never in an
+    /// `Object` slot; read it through [`InstanceRef`](crate::InstanceRef).
+    Instance = cell_tag(5),
 
     /// Enum object.
-    Enum(Box<Enum>),
+    Enum(Box<Enum>) = cell_tag(6),
 
     /// Type-alias object. A declaration, not a value — only recursive aliases
     /// reach the runtime, and they exist so a nominal reference can point at the
     /// indirection rather than expand it away.
-    TypeAlias(Box<TypeAliasDef>),
+    TypeAlias(Box<TypeAliasDef>) = cell_tag(7),
 
     /// Enum value object.
-    Variant(Variant),
+    Variant(Variant) = cell_tag(8),
 
     /// A closure: a function paired with captured variable cells.
-    Closure(Closure),
+    Closure(Closure) = cell_tag(9),
 
     /// A method bound to a specific receiver instance.
     /// Created by `MakeBoundMethod`. The receiver is inserted as `self`
     /// at call time by `CallIndirect`.
-    BoundMethod(BoundMethod),
+    BoundMethod(BoundMethod) = cell_tag(10),
 
     /// A generic function instantiation carrying concrete type arguments
     /// (`foo<int>` referenced as a value, not called). Pooled and interned at
@@ -66,7 +70,7 @@ pub enum Object {
     /// `function` via the global table and seeds `frame.type_args` from
     /// `type_args`, so type-reifying bodies (`reflect.Type.of<T>`, json natives)
     /// work through the value.
-    GenericFunction(GenericFunction),
+    GenericFunction(GenericFunction) = cell_tag(11),
 
     /// A host-language callable bound to a BAML function type.
     ///
@@ -74,59 +78,70 @@ pub enum Object {
     /// `RuntimeTy::Function` parameter. Calling it (`CallIndirect`) dispatches
     /// `SysOp::BamlHostCallHostValue`, which fires the bridge's
     /// `HostDispatchFn` and awaits the host's response.
-    HostClosure(HostClosure),
+    HostClosure(HostClosure) = cell_tag(12),
 
     /// A mutable cell holding a single captured value.
-    Cell(Cell),
+    Cell(Cell) = cell_tag(13),
 
     /// Heap allocated string backed by [`bex_str::BexStr`].
     ///
     /// `BexStr` avoids allocating for small strings (up to ~22 bytes inline)
     /// and reference-counts larger ones, making clone cheap.
-    String(bex_str::BexStr),
+    String(bex_str::BexStr) = cell_tag(14),
 
     /// Heap-allocated arbitrary-precision integer.
     ///
     /// `Value: Copy` so bigints must live on the heap behind an `Arc`. The
     /// `Arc` lets multiple values share the same allocation (e.g. after a
     /// `let y = x` assignment) without deep-copying the underlying digit slice.
-    Bigint(std::sync::Arc<num_bigint::BigInt>),
+    Bigint(std::sync::Arc<num_bigint::BigInt>) = cell_tag(15),
 
     /// Byte array (uint8array). Wrapped in [`Uint8ArrayContainer`] so the
     /// underlying `Vec<u8>` is protected by a [`LazyBiasedMutex`](`crate::lazy_biased_mutex::LazyBiasedMutex`) against
     /// racing mutation under `spawn`.
-    Uint8Array(Uint8ArrayContainer),
+    Uint8Array(Uint8ArrayContainer) = cell_tag(16),
 
     /// List of values. Wrapped in [`ArrayContainer`] so the underlying
     /// `Vec<Value>` is protected by a [`LazyBiasedMutex`](`crate::lazy_biased_mutex::LazyBiasedMutex`) against racing
     /// mutation under `spawn`.
-    Array(Array),
+    Array(Array) = cell_tag(17),
 
-    /// Map of values. Wrapped in [`MapContainer`] so the underlying
-    /// `IndexMap` is protected by a [`LazyBiasedMutex`](`crate::lazy_biased_mutex::LazyBiasedMutex`) against racing
+    /// Map of values. Wrapped in [`crate::MapContainer`] so the underlying
+    /// [`crate::MapData`] is protected by a [`LazyBiasedMutex`](`crate::lazy_biased_mutex::LazyBiasedMutex`) against racing
     /// mutation under `spawn`.
-    Map(Map),
+    Map(Map) = cell_tag(18),
+
+    Tuple(crate::Tuple),
 
     /// Boxed 64-bit float. Floats are heap-allocated because `Value`
     /// itself is a single tagged 64-bit word with no inline encoding
     /// for full-precision f64. Allocation rate is low in practice —
     /// BAML programs are integer-and-object-heavy.
-    Float(f64),
+    Float(f64) = cell_tag(19),
 
-    Future(crate::Future),
+    Future(crate::Future) = cell_tag(20),
 
-    /// Opaque Rust-managed data, accessed via `Arc<dyn Any>` downcast.
-    /// Used for `$rust_type` fields in builtin classes (including media classes Pdf, Audio, Video, Image).
-    RustData(Arc<dyn Any + Send + Sync>),
+    /// An instance of a `@@rust_type` class: its class, its type arguments,
+    /// and its Rust-owned state in place of fields. Unlike a field-backed
+    /// instance, it is an object cell: its state is one Rust value, not a
+    /// run of slots its class lays out.
+    RustInstance(RustInstance) = cell_tag(21),
 
     /// A type descriptor value — wraps a [`crate::types::TypeValue`]. The
     /// described type is the whole of it: `==` is type equivalence, so a GC
     /// copy, a `baml.deep_copy`, and a wire round trip all denote the same
     /// type by construction.
-    Type(Box<crate::types::TypeValue>),
+    Type(Box<crate::types::TypeValue>) = cell_tag(22),
+
+    /// What is in a cell reserved and not yet published
+    /// (`bex_heap::Reservation`), or, under `heap_debug`, a cell a collection
+    /// found dead. Nothing live points at a tombstone, except a member of a
+    /// reserved group naming a sibling that is published before anything
+    /// reads it; reaching one any other way is a use-after-free.
+    Tombstone = cell_tag(23),
 
     #[cfg(feature = "heap_debug")]
-    Sentinel(crate::types::SentinelKind),
+    Sentinel(crate::types::SentinelKind) = cell_tag(24),
 }
 
 const _: () = assert!(
@@ -135,6 +150,117 @@ const _: () = assert!(
 );
 
 impl Object {
+    /// Whether this object is a value a BAML program can hold: a value of
+    /// some BAML type, which a host may hand back as the reference it
+    /// received. A declaration, a closure's capture cell or a runtime payload
+    /// is the runtime's own and never a value by itself.
+    #[must_use]
+    pub fn is_first_class_value(&self) -> bool {
+        match self {
+            Object::Instance
+            | Object::RustInstance(_)
+            | Object::Variant(_)
+            | Object::Function(_)
+            | Object::Closure(_)
+            | Object::BoundMethod(_)
+            | Object::GenericFunction(_)
+            | Object::HostClosure(_)
+            | Object::String(_)
+            | Object::Bigint(_)
+            | Object::Uint8Array(_)
+            | Object::Array(_)
+            | Object::Tuple(_)
+            | Object::Map(_)
+            | Object::Float(_)
+            | Object::Future(_)
+            | Object::Type(_) => true,
+            Object::Package(_)
+            | Object::Interface(_)
+            | Object::ImplRule(_)
+            | Object::Class(_)
+            | Object::Enum(_)
+            | Object::TypeAlias(_)
+            | Object::Cell(_)
+            | Object::Tombstone => false,
+            #[cfg(feature = "heap_debug")]
+            Object::Sentinel(_) => false,
+        }
+    }
+
+    /// The class the instance at `ptr` belongs to and the type arguments it
+    /// was built at, for a field-backed or a `@@rust_type` instance alike:
+    /// what every class test (`is`, `match`, a typed `catch`) and every
+    /// class-keyed dispatch asks of a value. A field-backed instance keeps
+    /// both in its cell, so this reads the pointer, not an `Object`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`HeapPtr::get`]: the cell must be live.
+    #[must_use]
+    pub unsafe fn class_instance_at(
+        ptr: HeapPtr,
+    ) -> Option<(HeapPtr, &'static [crate::RealizedTy])> {
+        // SAFETY: the caller keeps the cell live.
+        match unsafe { ptr.get() } {
+            Object::Instance => {
+                // SAFETY: as above; the tag says the cell is an instance.
+                let instance = unsafe { crate::InstanceRef::of(ptr) }
+                    .unwrap_or_else(|| unreachable!("an instance tag names an instance cell"));
+                Some((instance.class(), instance.type_args()))
+            }
+            Object::RustInstance(instance) => Some((instance.class, &instance.class_type_args)),
+            Object::Package(_)
+            | Object::Function(_)
+            | Object::Interface(_)
+            | Object::ImplRule(_)
+            | Object::Class(_)
+            | Object::Enum(_)
+            | Object::TypeAlias(_)
+            | Object::Variant(_)
+            | Object::Closure(_)
+            | Object::BoundMethod(_)
+            | Object::GenericFunction(_)
+            | Object::HostClosure(_)
+            | Object::Cell(_)
+            | Object::String(_)
+            | Object::Bigint(_)
+            | Object::Uint8Array(_)
+            | Object::Array(_)
+            | Object::Map(_)
+            | Object::Tuple(_)
+            | Object::Float(_)
+            | Object::Future(_)
+            | Object::Type(_)
+            | Object::Tombstone => None,
+            #[cfg(feature = "heap_debug")]
+            Object::Sentinel(_) => None,
+        }
+    }
+
+    /// The failure for code that followed a reference and found an
+    /// [`Object::Tombstone`]. Code that walks slots by position never calls
+    /// this: a tombstone there is expected and simply has no contents.
+    #[cold]
+    #[track_caller]
+    pub fn tombstone_reached() -> ! {
+        unreachable!("followed a reference to a tombstone: the object it named is gone")
+    }
+
+    /// The qualified name of a nominal declaration, if it has one: its path
+    /// under its package's display name, put together on demand (see
+    /// `declaration_name`). An anonymous (runtime-created) declaration has
+    /// none. Display and boundary spelling only — never an identity.
+    #[must_use]
+    pub fn declaration_name(&self) -> Option<baml_type::TypeName> {
+        match self {
+            Object::Class(class) => class.name().declared().cloned(),
+            Object::Enum(enm) => enm.name().declared().cloned(),
+            Object::Interface(interface) => interface.name().declared().cloned(),
+            Object::TypeAlias(alias) => alias.name().declared().cloned(),
+            _ => None,
+        }
+    }
+
     /// The tag under which this object can head a nominal type, or `None`
     /// when it is not a declaration.
     #[must_use]
@@ -152,17 +278,19 @@ impl Object {
             | Object::Type(_)
             | Object::Package(_)
             | Object::ImplRule(_)
-            | Object::Instance(_)
+            | Object::Instance
             | Object::Variant(_)
             | Object::Closure(_)
             | Object::BoundMethod(_)
             | Object::HostClosure(_)
             | Object::Cell(_)
             | Object::Array(_)
+            | Object::Tuple(_)
             | Object::Map(_)
             | Object::Float(_)
             | Object::Future(_)
-            | Object::RustData(_) => None,
+            | Object::RustInstance(_)
+            | Object::Tombstone => None,
             #[cfg(feature = "heap_debug")]
             Object::Sentinel(_) => None,
         }
@@ -184,17 +312,19 @@ impl Object {
             | Object::Type(_)
             | Object::Package(_)
             | Object::ImplRule(_)
-            | Object::Instance(_)
+            | Object::Instance
             | Object::Variant(_)
             | Object::Closure(_)
             | Object::BoundMethod(_)
             | Object::HostClosure(_)
             | Object::Cell(_)
             | Object::Array(_)
+            | Object::Tuple(_)
             | Object::Map(_)
             | Object::Float(_)
             | Object::Future(_)
-            | Object::RustData(_) => return false,
+            | Object::RustInstance(_)
+            | Object::Tombstone => return false,
             #[cfg(feature = "heap_debug")]
             Object::Sentinel(_) => return false,
         }
@@ -237,7 +367,7 @@ enum ObjectWire {
     Interface(Box<InterfaceDef>),
     ImplRule(Box<RuntimeImplRule>),
     Class(Box<Class>),
-    Instance(Instance),
+    Instance,
     Enum(Box<Enum>),
     TypeAlias(Box<TypeAliasDef>),
     Variant(Variant),
@@ -259,11 +389,8 @@ enum ObjectWire {
     ),
     Uint8Array(Vec<u8>),
     Array(Box<crate::RealizedTy>, Vec<Value>),
-    Map(
-        Box<crate::RealizedTy>,
-        Box<crate::RealizedTy>,
-        IndexMap<String, Value>,
-    ),
+    // Reserved tag. Runtime maps need VM Hash callbacks to rebuild their index.
+    Map,
     Float(f64),
     Future(crate::Future),
     /// Carries the described type, which is the whole of a `type` value: two
@@ -273,6 +400,7 @@ enum ObjectWire {
     /// (`ConstValue::Type` templates materialize through the VM's `LoadType`),
     /// so this round trip is exercised only by unit/link tooling.
     Type(Box<crate::RealizedTy>),
+    Tuple(Vec<crate::RealizedTy>, Vec<Value>),
 }
 
 impl BorshSerialize for Object {
@@ -288,7 +416,12 @@ impl BorshSerialize for Object {
             }
             Self::ImplRule(v) => ObjectWire::ImplRule(v.clone()),
             Self::Class(v) => ObjectWire::Class(v.clone()),
-            Self::Instance(v) => ObjectWire::Instance(v.clone()),
+            Self::Instance => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "an instance has no wire form",
+                ));
+            }
             Self::Enum(v) => ObjectWire::Enum(v.clone()),
             Self::TypeAlias(v) => ObjectWire::TypeAlias(v.clone()),
             Self::Variant(v) => ObjectWire::Variant(v.clone()),
@@ -300,27 +433,32 @@ impl BorshSerialize for Object {
             Self::Bigint(v) => ObjectWire::Bigint((**v).clone()),
             Self::Uint8Array(v) => ObjectWire::Uint8Array(v.lock().clone()),
             Self::Array(v) => ObjectWire::Array(v.element_ty.clone(), v.data.lock().clone()),
-            Self::Map(v) => ObjectWire::Map(
-                v.key_ty.clone(),
-                v.value_ty.clone(),
-                v.to_index_map()
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect(),
-            ),
+            Self::Map(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "runtime maps cannot be serialized; hash indexes require the VM",
+                ));
+            }
             Self::Float(v) => ObjectWire::Float(*v),
             Self::Future(v) => ObjectWire::Future(v.clone()),
             Self::Type(v) => ObjectWire::Type(Box::new(v.ty.clone())),
-            Self::RustData(_) => {
+            Self::Tuple(v) => ObjectWire::Tuple(v.element_tys.to_vec(), v.slot_values().collect()),
+            Self::RustInstance(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "RustData cannot be serialized",
+                    "a `@@rust_type` instance cannot be serialized",
                 ));
             }
             Self::HostClosure(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "HostClosure cannot be serialized",
+                ));
+            }
+            Self::Tombstone => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Tombstone cannot be serialized",
                 ));
             }
             #[cfg(feature = "heap_debug")]
@@ -343,7 +481,12 @@ impl BorshDeserialize for Object {
             ObjectWire::Interface(v) => Self::Interface(v),
             ObjectWire::ImplRule(v) => Self::ImplRule(v),
             ObjectWire::Class(v) => Self::Class(v),
-            ObjectWire::Instance(v) => Self::Instance(v),
+            ObjectWire::Instance => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "an instance has no wire form",
+                ));
+            }
             ObjectWire::Enum(v) => Self::Enum(v),
             ObjectWire::TypeAlias(v) => Self::TypeAlias(v),
             ObjectWire::Variant(v) => Self::Variant(v),
@@ -358,19 +501,19 @@ impl BorshDeserialize for Object {
                 element_ty: ty,
                 data: ArrayContainer::new(data),
             }),
-            ObjectWire::Map(key_ty, value_ty, data) => Self::Map(Map {
-                key_ty,
-                value_ty,
-                data: MapContainer::new(
-                    data.into_iter()
-                        .map(|(k, v)| (bex_str::BexStr::from(k), v))
-                        .collect::<IndexMap<bex_str::BexStr, Value>>()
-                        .into(),
-                ),
-            }),
+            ObjectWire::Map => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "runtime maps cannot be deserialized; hash indexes require the VM",
+                ));
+            }
             ObjectWire::Float(v) => Self::Float(v),
             ObjectWire::Future(v) => Self::Future(v),
             ObjectWire::Type(v) => Self::Type(Box::new(crate::types::TypeValue::new(*v))),
+            ObjectWire::Tuple(tys, data) => Self::Tuple(
+                crate::Tuple::new(tys, data)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
+            ),
         })
     }
 }
@@ -379,11 +522,11 @@ impl std::fmt::Display for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Object::Function(function) => function.fmt(f),
-            Object::Interface(interface) => write!(f, "<interface {}>", interface.name),
+            Object::Interface(interface) => write!(f, "<interface {}>", interface.name()),
             Object::Package(_) => write!(f, "<package>"),
             Object::ImplRule(_) => write!(f, "<impl_rule>"),
             Object::Class(class) => class.fmt(f),
-            Object::Instance(instance) => instance.fmt(f),
+            Object::Instance => write!(f, "<instance>"),
             Object::Enum(enm) => enm.fmt(f),
             Object::TypeAlias(alias) => alias.fmt(f),
             Object::Variant(value) => value.fmt(f),
@@ -413,10 +556,12 @@ impl std::fmt::Display for Object {
                 map.value_ty,
                 map.data.lock().len()
             ),
-            Object::RustData(_) => write!(f, "<rust_data>"),
+            Object::Tuple(tuple) => write!(f, "<tuple len={}>", tuple.len()),
+            Object::RustInstance(instance) => instance.fmt(f),
             Object::Type(tv) => write!(f, "<type: {}>", tv.ty),
             Object::Future(future) => write!(f, "{}", future.read()),
             Object::Float(v) => write!(f, "{v}"),
+            Object::Tombstone => write!(f, "<tombstone>"),
             #[cfg(feature = "heap_debug")]
             Object::Sentinel(kind) => write!(f, "<sentinel {kind:?}>"),
             // Object::BamlType(type_ir) => write!(f, "<baml type: {type_ir}>"),
@@ -447,8 +592,12 @@ pub enum ObjectType {
     Variant,
     Future(FutureType),
     Type,
-    RustData,
+    /// An instance of a `@@rust_type` class.
+    RustInstance,
     Float,
+    /// Not a value: the slot's object is gone. See [`Object::Tombstone`].
+    Tombstone,
+    Tuple,
 }
 
 impl ObjectType {
@@ -465,7 +614,7 @@ impl ObjectType {
 
             Object::Cell(_) => Self::Cell,
             Object::Class(_) => Self::Class,
-            Object::Instance(_) => Self::Instance,
+            Object::Instance => Self::Instance,
             Object::Enum(_) => Self::Enum,
             Object::TypeAlias(_) => Self::TypeAlias,
             Object::Variant(_) => Self::Enum,
@@ -474,10 +623,12 @@ impl ObjectType {
             Object::Uint8Array(_) => Self::Uint8Array,
             Object::Array(_) => Self::Array,
             Object::Map(_) => Self::Map,
-            Object::RustData(_) => Self::RustData,
+            Object::Tuple(_) => Self::Tuple,
+            Object::RustInstance(_) => Self::RustInstance,
             Object::Type(_) => Self::Type,
             Object::Future(fut) => Self::Future(fut.into()),
             Object::Float(_) => Self::Float,
+            Object::Tombstone => Self::Tombstone,
             #[cfg(feature = "heap_debug")]
             Object::Sentinel(_) => Self::Any,
             // Object::BamlType(_) => Self::Any, // TODO
@@ -519,18 +670,60 @@ impl std::fmt::Display for ObjectType {
             ObjectType::Bigint => write!(f, "bigint"),
             ObjectType::Uint8Array => write!(f, "uint8array"),
             ObjectType::Type => write!(f, "type"),
-            ObjectType::RustData => write!(f, "rust_data"),
+            ObjectType::RustInstance => write!(f, "rust_instance"),
             ObjectType::Float => write!(f, "float"),
+            ObjectType::Tombstone => write!(f, "tombstone"),
+            ObjectType::Tuple => write!(f, "tuple"),
         }
     }
 }
 
 #[cfg(test)]
-mod type_wire_tests {
+mod wire_tests {
     use borsh::BorshDeserialize;
 
     use super::*;
     use crate::types::TypeValue;
+
+    #[test]
+    fn runtime_maps_do_not_persist_cached_hashes() {
+        for data in [
+            crate::MapData::new(),
+            crate::MapData::from_hashed_entries([(123, Value::int(1), Value::int(2))]),
+        ] {
+            let object = Object::Map(Map::new(
+                crate::RealizedTy::int(),
+                crate::RealizedTy::int(),
+                data,
+            ));
+            let error = borsh::to_vec(&object).expect_err("runtime map has no artifact wire form");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("runtime maps cannot be serialized")
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_map_wire_tag_is_rejected_without_changing_later_tags() {
+        let encoded = borsh::to_vec(&ObjectWire::Map).unwrap();
+        assert_eq!(encoded, vec![16]);
+        let error = Object::try_from_slice(&encoded).expect_err("runtime map tag is reserved");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("runtime maps cannot be deserialized")
+        );
+        let float = borsh::to_vec(&Object::Float(1.0)).unwrap();
+        assert_eq!(float[0], 17);
+        assert!(matches!(
+            Object::try_from_slice(&float),
+            Ok(Object::Float(1.0))
+        ));
+    }
 
     #[test]
     fn type_wire_round_trips_the_described_type() {
@@ -550,5 +743,98 @@ mod type_wire_tests {
             panic!("decoded object should be a type")
         };
         assert_eq!(type_value.ty, ty);
+    }
+}
+
+/// The instance a BEP-042 `cleanup` finalizer runs on: its class and its
+/// run-once latch. Field-backed and `@@rust_type` instances both qualify, so
+/// the collector and the run-once guard read every instance the same way;
+/// whether the class has a finalizer is the class's to say.
+#[derive(Clone, Copy)]
+pub enum CleanupSubject {
+    /// A field-backed instance, whose latch is its cell header's
+    /// [`CLEANED`](crate::CLEANED) bit.
+    Instance(crate::InstanceRef),
+    /// A `@@rust_type` instance, an object cell whose header is its variant
+    /// tag, so its latch is inline.
+    Rust {
+        class: HeapPtr,
+        latch: &'static CleanupLatch,
+    },
+}
+
+impl CleanupSubject {
+    /// The cleanup subject at `ptr`, if it is an instance.
+    ///
+    /// # Safety
+    ///
+    /// As for [`HeapPtr::get`]: the cell must be live.
+    #[must_use]
+    pub unsafe fn at(ptr: HeapPtr) -> Option<Self> {
+        // SAFETY: the caller keeps the cell live.
+        match unsafe { ptr.get() } {
+            // SAFETY: as above; the tag says the cell is an instance.
+            Object::Instance => Some(Self::Instance(
+                unsafe { crate::InstanceRef::of(ptr) }
+                    .unwrap_or_else(|| unreachable!("an instance tag names an instance cell")),
+            )),
+            Object::RustInstance(instance) => Some(Self::Rust {
+                class: instance.class,
+                latch: &instance.cleaned,
+            }),
+            Object::Package(_)
+            | Object::Function(_)
+            | Object::Interface(_)
+            | Object::ImplRule(_)
+            | Object::Class(_)
+            | Object::Enum(_)
+            | Object::TypeAlias(_)
+            | Object::Variant(_)
+            | Object::Closure(_)
+            | Object::BoundMethod(_)
+            | Object::GenericFunction(_)
+            | Object::HostClosure(_)
+            | Object::Cell(_)
+            | Object::String(_)
+            | Object::Bigint(_)
+            | Object::Uint8Array(_)
+            | Object::Array(_)
+            | Object::Map(_)
+            | Object::Tuple(_)
+            | Object::Float(_)
+            | Object::Future(_)
+            | Object::Type(_)
+            | Object::Tombstone => None,
+            #[cfg(feature = "heap_debug")]
+            Object::Sentinel(_) => None,
+        }
+    }
+
+    /// The class whose `cleanup` runs.
+    #[must_use]
+    pub fn class(self) -> HeapPtr {
+        match self {
+            Self::Instance(instance) => instance.class(),
+            Self::Rust { class, .. } => class,
+        }
+    }
+
+    /// Test-and-set the latch on cleanup entry: `true` iff this call is the
+    /// first, which runs the body.
+    #[must_use]
+    pub fn begin(self) -> bool {
+        match self {
+            Self::Instance(instance) => instance.begin_cleanup(),
+            Self::Rust { latch, .. } => latch.begin(),
+        }
+    }
+
+    /// Whether cleanup has started.
+    #[must_use]
+    pub fn is_cleaned(self) -> bool {
+        match self {
+            Self::Instance(instance) => instance.is_cleaned(),
+            Self::Rust { latch, .. } => latch.is_cleaned(),
+        }
     }
 }

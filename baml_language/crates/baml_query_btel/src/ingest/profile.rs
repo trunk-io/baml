@@ -12,7 +12,7 @@
 //! that never ended is summed from those rows when the profiler is built.
 use std::collections::hash_map::Entry;
 
-use btel_reader::timing::{Clock, TimingState};
+use btel_core::reader::timing::{Clock, TimingState};
 use rusqlite::{Connection, Transaction, params, types::ValueRef};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
@@ -328,7 +328,7 @@ fn build(tx: &Transaction<'_>, process: &[u8]) -> Result<(), Error> {
             .zip(children_total)
             .map(|(total, kids)| (total - kids).max(0));
         // Only a spawn edge leads to a future; every other node is a function.
-        let future = !node.synchronous && node.parent.is_some();
+        let future = !node.synchronous;
         let returned = node
             .invocations
             .zip(node.errored.zip(node.cancelled))

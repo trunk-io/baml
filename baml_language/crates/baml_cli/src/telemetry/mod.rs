@@ -14,9 +14,7 @@
 //!    ```
 //!
 //! That's it. Delivery, crash-safety, opt-out, retries, and rate concerns
-//! are all handled underneath. Validate with
-//! `BAML_TELEMETRY_DEBUG=1 cargo run -- <cmd>`, which prints the payload
-//! to stderr instead of sending it.
+//! are all handled underneath.
 //!
 //! ## Architecture (for the curious)
 //!
@@ -44,7 +42,7 @@
 //!
 //!   - No HTTP on any user-visible code path, ever.
 //!   - Never fail or interfere with a command: every error is swallowed.
-//!   - Respect opt-out: `DO_NOT_TRACK`, `BAML_TELEMETRY_DISABLED`, and the
+//!   - Respect opt-out: `DO_NOT_TRACK` and the
 //!     persistent `enabled = false` in `telemetry.toml` (a flush child
 //!     that finds opt-out deletes the backlog instead of sending it).
 
@@ -92,16 +90,4 @@ pub(crate) fn run_flush_child() {
     // events were queued is honored (backlog gets deleted, not sent).
     let telemetry = Telemetry::load();
     queue::drain(&queue::queue_dir(), !telemetry.is_enabled());
-}
-
-/// The PostHog project API key, shared with `baml feedback` (which sends
-/// person-profile events, unlike telemetry). Public write-only `phc_...`
-/// ingestion key; safe to embed.
-pub(crate) fn posthog_api_key() -> &'static str {
-    post::posthog_api_key()
-}
-
-/// The PostHog ingestion host, shared with `baml feedback`.
-pub(crate) fn posthog_host() -> &'static str {
-    post::posthog_host()
 }

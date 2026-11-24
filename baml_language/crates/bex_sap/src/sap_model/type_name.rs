@@ -4,8 +4,9 @@ use std::{borrow::Cow, fmt};
 
 use crate::sap_model::{
     ArrayTy, BigintLiteralTy, BigintTy, BoolLiteralTy, BoolTy, ClassTy, EnumTy, EnumVariantTy,
-    FloatTy, IntLiteralTy, IntTy, LiteralTy, MapTy, MediaTy, NullTy, PrimitiveTy, StreamStateTy,
-    StringLiteralTy, StringTy, Ty, TyResolved, TyResolvedRef, TypeIdent, UnionTy,
+    FloatTy, IntLiteralTy, IntTy, LiteralTy, MapTy, MediaTy, NullTy, PrimitiveTy, ShapedTy,
+    StreamStateTy, StringLiteralTy, StringTy, TupleTy, Ty, TyResolved, TyResolvedRef, TypeIdent,
+    UnionTy,
 };
 
 /// A trait that provides a type name for a given type.
@@ -111,6 +112,17 @@ impl<N: TypeIdent> TypeName for ArrayTy<'_, N> {
     }
 }
 
+impl<N: TypeIdent> TypeName for TupleTy<'_, N> {
+    fn type_name(&self) -> Cow<'static, str> {
+        let items: Vec<String> = self
+            .items
+            .iter()
+            .map(|item| item.type_name().into_owned())
+            .collect();
+        Cow::Owned(baml_type::render_tuple(&items))
+    }
+}
+
 impl<N: TypeIdent> TypeName for MapTy<'_, N> {
     fn type_name(&self) -> Cow<'static, str> {
         Cow::Owned(format!(
@@ -141,6 +153,9 @@ impl<N: TypeIdent> TypeName for EnumVariantTy<'_, N> {
 
 impl<N: TypeIdent> TypeName for UnionTy<'_, N> {
     fn type_name(&self) -> Cow<'static, str> {
+        if self.variants.is_empty() {
+            return Cow::Borrowed("never");
+        }
         let variants: Vec<_> = self.variants.iter().map(Ty::type_name).collect();
         Cow::Owned(variants.join(" | "))
     }
@@ -161,13 +176,23 @@ impl<N: TypeIdent> TypeName for TyResolved<'_, N> {
             TyResolved::LiteralBigint(v) => v.type_name(),
             TyResolved::LiteralBool(v) => v.type_name(),
             TyResolved::Array(a) => a.type_name(),
+            TyResolved::Tuple(t) => t.type_name(),
             TyResolved::Map(m) => m.type_name(),
             TyResolved::Class(c) => c.type_name(),
             TyResolved::Enum(e) => e.type_name(),
             TyResolved::EnumVariant(e) => e.type_name(),
             TyResolved::Union(u) => u.type_name(),
             TyResolved::StreamState(s) => s.type_name(),
+            TyResolved::Shaped(s) => s.type_name(),
         }
+    }
+}
+
+/// The declared type's name: a model writes its shape, but the value is the
+/// declared type.
+impl<N: TypeIdent> TypeName for ShapedTy<'_, N> {
+    fn type_name(&self) -> Cow<'static, str> {
+        Cow::Owned(self.name.to_string())
     }
 }
 
@@ -192,12 +217,14 @@ impl<N: TypeIdent> TypeName for TyResolvedRef<'_, N> {
             TyResolvedRef::LiteralBigint(v) => v.type_name(),
             TyResolvedRef::LiteralBool(v) => v.type_name(),
             TyResolvedRef::Array(a) => a.type_name(),
+            TyResolvedRef::Tuple(t) => t.type_name(),
             TyResolvedRef::Map(m) => m.type_name(),
             TyResolvedRef::Class(c) => c.type_name(),
             TyResolvedRef::Enum(e) => e.type_name(),
             TyResolvedRef::EnumVariant(e) => e.type_name(),
             TyResolvedRef::Union(u) => u.type_name(),
             TyResolvedRef::StreamState(s) => Cow::Owned(format!("stream_state<{}>", s.type_name())),
+            TyResolvedRef::Shaped(s) => s.type_name(),
         }
     }
 }

@@ -30,17 +30,11 @@ impl HeapDebuggerConfig {
     }
 }
 
-pub(crate) struct HeapDebuggerState {
-    config: HeapDebuggerConfig,
-}
+pub(crate) struct HeapDebuggerState;
 
 impl HeapDebuggerState {
-    pub(crate) fn new(config: HeapDebuggerConfig) -> Self {
-        Self { config }
-    }
-
-    pub(crate) fn config(&self) -> &HeapDebuggerConfig {
-        &self.config
+    pub(crate) fn new(_config: HeapDebuggerConfig) -> Self {
+        Self
     }
 
     pub(crate) fn bump_epoch(&self) -> u32 {
@@ -54,11 +48,6 @@ impl HeapDebuggerState {
 
 impl BexHeap {
     #[inline]
-    pub fn debug_config(&self) -> &HeapDebuggerConfig {
-        self.debug_state().config()
-    }
-
-    #[inline]
     pub fn verify_quick(&self) {}
 
     /// Create a HeapPtr from a raw pointer.
@@ -69,15 +58,6 @@ impl BexHeap {
     }
 
     #[inline]
-    pub(crate) fn record_tlab_canary(&self, _idx: usize) {}
-
-    #[inline]
-    pub(crate) fn clear_tlab_canaries(&self) {}
-
-    #[inline]
-    pub(crate) fn debug_verify_tlab_canaries(&self) {}
-
-    #[inline]
     pub(crate) fn bump_epoch(&self) -> u32 {
         self.debug_state().bump_epoch()
     }
@@ -85,20 +65,6 @@ impl BexHeap {
     #[allow(dead_code)]
     pub(crate) fn heap_epoch(&self) -> u32 {
         self.debug_state().epoch()
-    }
-
-    pub(crate) fn placeholder_object(&self) -> Object {
-        Object::String(bex_str::BexStr::empty())
-    }
-
-    pub(crate) fn tlab_canary_object(&self, _chunk_start: usize, _chunk_end: usize) -> Object {
-        Object::String(bex_str::BexStr::empty())
-    }
-
-    pub(crate) fn finalize_inactive_space(&self) {
-        unsafe {
-            (*self.inactive.get()).clear();
-        }
     }
 
     #[inline]

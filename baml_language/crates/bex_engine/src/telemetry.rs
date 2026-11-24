@@ -1,53 +1,110 @@
 //! Engine integration for the chunk processor and recording publisher.
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
+use bcs_api::diagnostics::{
+    Context as AuthorizationContext, CredentialSource, Operation, Outcome, RecordingOverride,
+};
 use btel_recorder::{RecordingBuilder, RecordingConfig, RecordingId};
+use btel_settings::artifact::{ArtifactTelemetry, InitialFailureAction, InitialFailurePolicy};
 
 use crate::{BexEngine, EngineError, RuntimeCompiler};
 
-const BOUNDARY_URL: &str = "BOUNDARY_URL";
 const BOUNDARY_API_KEY: &str = "BOUNDARY_API_KEY";
 
+mod environment;
+
 /// One recording per engine, delivered to local files or BCS. Cloud payload
-/// failures discard that payload and allow later delivery. Local storage and
-/// fatal worker failures disable recording. Errors remain available through
-/// `BexEngine::telemetry_result`; they do not fail BAML execution.
+/// failures discard that payload and allow later delivery. Initial cloud authorization
+/// failure warns and stops the export by default; artifacts can explicitly opt into
+/// aborting execution. Later revocation only stops the export. A stopped export
+/// never disables recording, so span ids and `$trace` hooks keep working. Local
+/// storage and fatal worker failures disable recording. Delivery errors remain available through
+/// `BexEngine::telemetry_result` and initial refusal through
+/// `BexEngine::initial_cloud_authorization_error`.
 pub struct TelemetryRecording {
     id: RecordingId,
     config: RecordingConfig,
     destination: Destination,
     host: String,
     sources: Vec<(String, String)>,
+    build: Option<BuildProvider>,
+    upload_source: bool,
     exit: Arc<btel_types::ProcessExitSlot>,
+    initial_failure: Option<InitialFailurePolicy>,
+    recording_override: RecordingOverride,
 }
+
+/// Describes the build of a program's package; see
+/// [`TelemetryRecording::with_build`].
+pub type BuildProvider = Box<dyn FnOnce() -> Option<btel_types::BuildRegistration> + Send>;
 enum Destination {
+    InvalidConfiguration(Box<bcs_api::diagnostics::Diagnostic>),
     LocalFiles {
         recordings: PathBuf,
         cas: PathBuf,
     },
-    UserFiles,
+    UserFiles {
+        project_from_cwd: bool,
+    },
     Cloud {
         publisher: btel_bcs::CloudPublisherConfig,
         delivery: Box<btel_bcs::delivery::DeliveryConfig>,
+        authorization_context: AuthorizationContext,
     },
 }
 
 #[derive(Clone)]
 pub(crate) enum RecordingDelivery {
     Local(Arc<btel_file::LocalDelivery>),
-    Cloud(Arc<btel_bcs::delivery::BcsDelivery>),
+    Cloud {
+        delivery: Arc<btel_bcs::delivery::BcsDelivery>,
+        initial_auth_cancel: crate::CancellationToken,
+        authorization_context: AuthorizationContext,
+        initial_auth_error: Arc<OnceLock<EngineError>>,
+        initial_failure: InitialFailurePolicy,
+        recording_override: RecordingOverride,
+        /// Builds registered with BCS carry their source text.
+        upload_source: bool,
+        #[cfg(feature = "telemetry_diagnostics")]
+        gauges: Arc<btel_bcs::PublisherGauges>,
+    },
 }
 
 impl RecordingDelivery {
+    /// How a package compiled at run time describes itself as a build, when
+    /// this delivery registers builds: only BCS takes them.
+    pub(crate) fn record_build(&self) -> Option<bex_vm_types::RecordBuild> {
+        match self {
+            Self::Cloud { upload_source, .. } => Some(bex_vm_types::RecordBuild {
+                upload_source: *upload_source,
+            }),
+            Self::Local(_) => None,
+        }
+    }
+
+    /// Register a build with BCS in the background.
+    pub(crate) fn register_build(&self, build: &btel_types::BuildRegistration) {
+        if let Self::Cloud { delivery, .. } = self {
+            delivery.handle().register_build(build);
+        }
+    }
+
+    /// Start cloud delivery's shutdown timeout. Local files have none.
+    pub(crate) fn start_draining(&self) {
+        if let Self::Cloud { delivery, .. } = self {
+            delivery.start_draining();
+        }
+    }
+
     pub(crate) fn finish(&self) -> Result<(), btel_processor::RuntimeError> {
         match self {
             Self::Local(delivery) => delivery
                 .finish()
                 .map_err(|error| btel_processor::RuntimeError(error.to_string())),
-            Self::Cloud(delivery) => delivery
+            Self::Cloud { delivery, .. } => delivery
                 .finish()
                 .map_err(|error| btel_processor::RuntimeError(error.to_string())),
         }
@@ -58,44 +115,284 @@ impl RecordingDelivery {
             Self::Local(delivery) => delivery
                 .result()
                 .map(|result| result.map_err(|e| btel_processor::RuntimeError(e.to_string()))),
-            Self::Cloud(delivery) => delivery
+            Self::Cloud { delivery, .. } => delivery
                 .result()
                 .map(|result| result.map_err(|e| btel_processor::RuntimeError(e.to_string()))),
         }
     }
 
+    pub(crate) fn initial_auth_cancel(&self) -> Option<&crate::CancellationToken> {
+        match self {
+            Self::Cloud {
+                initial_auth_cancel,
+                ..
+            } => Some(initial_auth_cancel),
+            Self::Local(_) => None,
+        }
+    }
+
+    fn initial_auth_error(&self) -> Option<EngineError> {
+        match self {
+            Self::Cloud {
+                delivery,
+                authorization_context,
+                initial_auth_error,
+                initial_failure,
+                recording_override,
+                ..
+            } if initial_failure.action == InitialFailureAction::Abort => {
+                match delivery.initial_authorization() {
+                    btel_bcs::delivery::InitialAuthorization::Rejected(failure) => Some(
+                        initial_auth_error
+                            .get_or_init(|| {
+                                EngineError::CloudAuthorization(Box::new(
+                                    authorization_context
+                                        .rejected_failure(&failure, Outcome::ExecutionCancelled)
+                                        .with_recording_override(recording_override.clone()),
+                                ))
+                            })
+                            .clone(),
+                    ),
+                    btel_bcs::delivery::InitialAuthorization::Failed(error) => Some(
+                        initial_auth_error
+                            .get_or_init(|| {
+                                EngineError::CloudAuthorization(Box::new(
+                                    initial_diagnostic(
+                                        authorization_context,
+                                        &error,
+                                        Outcome::ExecutionCancelled,
+                                    )
+                                    .with_recording_override(recording_override.clone()),
+                                ))
+                            })
+                            .clone(),
+                    ),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn initial_failure_handled(&self) -> bool {
+        matches!(self, Self::Cloud { delivery, initial_failure, .. }
+            if initial_failure.action != InitialFailureAction::Abort
+                && matches!(delivery.initial_authorization(), btel_bcs::delivery::InitialAuthorization::Rejected(_) | btel_bcs::delivery::InitialAuthorization::Failed(_)))
+    }
+
     fn directory(&self) -> Option<&Path> {
         match self {
             Self::Local(delivery) => Some(delivery.directory()),
-            Self::Cloud(_) => None,
+            Self::Cloud { .. } => None,
         }
     }
 
     fn heartbeat_error(&self) -> Option<btel_bcs::liveness::HeartbeatError> {
         match self {
             Self::Local(_) => None,
-            Self::Cloud(delivery) => delivery.heartbeat_error(),
+            Self::Cloud { delivery, .. } => delivery.heartbeat_error(),
         }
     }
 }
 
 impl TelemetryRecording {
-    /// Configure cloud delivery when both Boundary environment variables are
-    /// non-empty and the URL parses. Delivery validates the URL and bearer
-    /// header at engine construction; a rejected config disables recording.
-    pub fn from_boundary_env() -> Option<Self> {
-        let url = std::env::var(BOUNDARY_URL).ok()?;
-        let key = std::env::var(BOUNDARY_API_KEY).ok()?;
-        if url.is_empty() || key.is_empty() {
-            return None;
+    /// Resolve an artifact's explicitly permitted bindings without changing process
+    /// environment. Embedded credentials never fall back to an ambient login or key.
+    pub fn from_artifact(policy: &ArtifactTelemetry) -> Result<Self, EngineError> {
+        Self::destination_of(policy)
+            .map(|recording| recording.with_source_upload(!policy.omit_source))
+    }
+
+    fn destination_of(policy: &ArtifactTelemetry) -> Result<Self, EngineError> {
+        use btel_settings::artifact::IngestionSelection;
+        if policy.resolve_level().is_none() {
+            return Ok(Self::user_files(RecordingConfig::default()));
         }
-        let mut delivery = btel_bcs::delivery::DeliveryConfig::new(url.parse().ok()?);
-        delivery.bearer_token = Some(key);
-        Some(Self::cloud(
+        let selection = policy
+            .select_ingestion_with(baml_env::os_var)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        if matches!(&selection, IngestionSelection::Caller { api_key: Some(key), .. } if key == bcs_api::credentials::LOCAL_API_KEY)
+            || matches!(&selection, IngestionSelection::Embedded(embedded) if embedded.api_key.expose() == bcs_api::credentials::LOCAL_API_KEY)
+        {
+            return Ok(Self::user_files(RecordingConfig::default()));
+        }
+        // An unusable endpoint must not stop the program. Record locally, as
+        // without cloud credentials.
+        let endpoint = match bcs_api::endpoint(policy.api_url.as_deref()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::debug!(%error, "cloud telemetry disabled; recording locally");
+                return Ok(Self::user_files(RecordingConfig::default()));
+            }
+        };
+        let (credential, target, source) = match selection {
+            IngestionSelection::Embedded(embedded) => (
+                embedded.api_key.expose().to_owned(),
+                bcs_api::credentials::Target::default(),
+                CredentialSource::Embedded,
+            ),
+            IngestionSelection::Caller { project, api_key } => {
+                let (credential, source) = match api_key {
+                    Some(key) => (key, CredentialSource::ApiKey),
+                    None => {
+                        let saved = match bcs_api::store(&endpoint).read() {
+                            Ok(saved) => saved,
+                            Err(error) => {
+                                return Err(artifact_configuration_error(
+                                    policy,
+                                    Some(endpoint),
+                                    CredentialSource::SavedLogin,
+                                    error,
+                                ));
+                            }
+                        };
+                        match saved {
+                            Some(saved) => (
+                                saved.refresh_token.expose().to_owned(),
+                                CredentialSource::SavedLogin,
+                            ),
+                            None if policy.embedded.is_none() => {
+                                return Ok(Self::user_files(RecordingConfig::default()));
+                            }
+                            None => {
+                                return Err(artifact_configuration_error(
+                                    policy,
+                                    Some(endpoint),
+                                    CredentialSource::SavedLogin,
+                                    bcs_api::Error::MissingCredentials,
+                                ));
+                            }
+                        }
+                    }
+                };
+                (
+                    credential,
+                    bcs_api::credentials::Target {
+                        project,
+                        ..Default::default()
+                    },
+                    source,
+                )
+            }
+        };
+        let authentication = bcs_api::credentials::Authentication::shared(
+            endpoint.as_str(),
+            bcs_api::Secret::new(credential),
+        );
+        let mut delivery = btel_bcs::delivery::DeliveryConfig::new(
+            endpoint
+                .as_str()
+                .parse()
+                .map_err(|_| EngineError::Other("Invalid Boundary API URL.".into()))?,
+        );
+        delivery.authorization = Some(bcs_api::credentials::RequestAuthorization {
+            authentication,
+            target: Some(target),
+        });
+        let mut recording = Self::cloud(
             RecordingConfig::default(),
             btel_bcs::CloudPublisherConfig::default(),
             delivery,
-        ))
+        );
+        if let Destination::Cloud {
+            authorization_context,
+            ..
+        } = &mut recording.destination
+        {
+            authorization_context.source = source;
+        }
+        Ok(recording)
+    }
+
+    /// Resolve the selected endpoint and credential without making a network request.
+    pub fn from_boundary_env() -> Option<Self> {
+        btel_settings::mode::from_env().ok().flatten()?;
+        if baml_env::string_var(BOUNDARY_API_KEY).ok()?.as_deref()
+            == Some(bcs_api::credentials::LOCAL_API_KEY)
+        {
+            return Some(Self::user_files(RecordingConfig::default()));
+        }
+        Self::from_boundary_defaults(None, None)
+    }
+
+    /// Hosts pass artifact/project defaults; process environment variables take precedence.
+    /// Invalid Boundary configuration cancels engine startup with a shared diagnostic.
+    /// `None` selects the host's local
+    /// default, either because there is no cloud credential or the key is `local`.
+    pub fn from_boundary_defaults(project: Option<&str>, api_url: Option<&str>) -> Option<Self> {
+        btel_settings::mode::from_env().ok().flatten()?;
+        let api_key = baml_env::string_var(BOUNDARY_API_KEY).ok()?;
+        if api_key.as_deref() == Some(bcs_api::credentials::LOCAL_API_KEY) {
+            return None;
+        }
+        let endpoint = match bcs_api::endpoint(api_url) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                let mut recording = Self::user_files(RecordingConfig::default());
+                recording.destination = Destination::InvalidConfiguration(Box::new(
+                    AuthorizationContext {
+                        endpoint: None,
+                        source: CredentialSource::Configured,
+                        operation: Operation::Ingest,
+                    }
+                    .report(error, Outcome::ExecutionCancelled)
+                    .diagnostic,
+                ));
+                return Some(recording);
+            }
+        };
+        let source = if api_key.is_some() {
+            CredentialSource::ApiKey
+        } else {
+            CredentialSource::SavedLogin
+        };
+        let key = match api_key {
+            Some(key) => key,
+            None => match bcs_api::store(&endpoint).read() {
+                Ok(Some(saved)) => saved.refresh_token.expose().to_owned(),
+                Ok(None) => return None,
+                Err(error) => {
+                    let mut recording = Self::user_files(RecordingConfig::default());
+                    recording.destination = Destination::InvalidConfiguration(Box::new(
+                        AuthorizationContext {
+                            endpoint: Some(endpoint),
+                            source: CredentialSource::SavedLogin,
+                            operation: Operation::Ingest,
+                        }
+                        .report(error, Outcome::ExecutionCancelled)
+                        .diagnostic,
+                    ));
+                    return Some(recording);
+                }
+            },
+        };
+        let target = bcs_api::credentials::Target {
+            project: baml_env::string_var("BOUNDARY_PROJECT")
+                .ok()?
+                .or_else(|| project.map(str::to_owned)),
+            ..Default::default()
+        };
+        let mut delivery = btel_bcs::delivery::DeliveryConfig::new(endpoint.as_str().parse().ok()?);
+        delivery.authorization = Some(bcs_api::credentials::RequestAuthorization {
+            authentication: bcs_api::credentials::Authentication::shared(
+                endpoint.as_str(),
+                bcs_api::Secret::new(key),
+            ),
+            target: Some(target),
+        });
+        let mut recording = Self::cloud(
+            RecordingConfig::default(),
+            btel_bcs::CloudPublisherConfig::default(),
+            delivery,
+        );
+        if let Destination::Cloud {
+            authorization_context,
+            ..
+        } = &mut recording.destination
+        {
+            authorization_context.source = source;
+        }
+        Some(recording)
     }
 
     /// Deliver through the proposed BCS prepare protocol and presigned PUTs.
@@ -105,31 +402,43 @@ impl TelemetryRecording {
         publisher: btel_bcs::CloudPublisherConfig,
         delivery: btel_bcs::delivery::DeliveryConfig,
     ) -> Self {
+        let authorization_context = AuthorizationContext {
+            endpoint: bcs_api::Endpoint::parse(delivery.prepare_base_url.as_str()).ok(),
+            source: CredentialSource::Configured,
+            operation: Operation::Ingest,
+        };
         Self {
-            id: RecordingId::generate(),
+            id: btel_types::new_recording_id(),
             config,
             host: "unknown".to_owned(),
             sources: Vec::new(),
+            build: None,
+            upload_source: true,
             exit: Arc::default(),
             destination: Destination::Cloud {
                 publisher,
                 delivery: Box::new(delivery),
+                authorization_context,
             },
+            initial_failure: None,
+            recording_override: RecordingOverride::default(),
         }
     }
 
     /// Write to `<project-root>/.baml/btel/recordings/<recording-id>`.
-    /// Snapshots share `<project-root>/.baml/btel/cas/v2` across recordings.
+    /// Snapshots share `<project-root>/.baml/btel/cas/v4` across recordings.
     /// The caller supplies the resolved BAML project root; the engine does not
     /// rediscover it from the working directory or source paths. Packed binary
     /// hosts without a project root should use [`Self::user_files`].
     /// File output remains explicitly enabled.
     pub fn local_files(project_root: impl AsRef<Path>, config: RecordingConfig) -> Self {
         Self {
-            id: RecordingId::generate(),
+            id: btel_types::new_recording_id(),
             config,
             host: "unknown".to_owned(),
             sources: Vec::new(),
+            build: None,
+            upload_source: true,
             exit: Arc::default(),
             destination: Destination::LocalFiles {
                 recordings: project_root
@@ -139,44 +448,77 @@ impl TelemetryRecording {
                     .as_ref()
                     .join(btel_settings::local_files::CAS_DIRECTORY),
             },
+            initial_failure: None,
+            recording_override: RecordingOverride::default(),
         }
     }
 
     /// Override the root: recordings use `<directory>/<recording-id>` and shared
-    /// CAS uses `<directory>/cas/v2`. No I/O or worker
+    /// CAS uses `<directory>/cas/v4`. No I/O or worker
     /// starts until engine construction; `BAML_TELEMETRY=off` ignores this output.
     /// Existing recording directories are never reused. Shutdown awaits writes.
     pub fn local_files_in(directory: impl Into<PathBuf>, config: RecordingConfig) -> Self {
         let recordings = directory.into();
         let cas = recordings.join("cas");
         Self {
-            id: RecordingId::generate(),
+            id: btel_types::new_recording_id(),
             config,
             host: "unknown".to_owned(),
             sources: Vec::new(),
+            build: None,
+            upload_source: true,
             exit: Arc::default(),
             destination: Destination::LocalFiles { recordings, cas },
+            initial_failure: None,
+            recording_override: RecordingOverride::default(),
         }
     }
 
-    /// Write beneath the current user's home: `~/.baml/btel/recordings`.
-    /// Packed programs share `~/.baml/btel/cas/v2` on this machine.
-    /// Resolve the home directory only when the enabled engine starts recording.
-    /// Fail explicitly if no home directory can be determined; never fall back
-    /// to the working directory. Intended for packed programs without a project.
+    /// Write recordings and shared CAS blobs beneath the BAML home: `BAML_HOME`
+    /// when non-empty, otherwise `~/.baml` (or `.baml` when no home is available).
+    /// Uses `btel/recordings` and `btel/cas` within that root.
+    /// Resolve the BAML home only when the enabled engine starts recording.
+    /// Intended for packed programs and SDK hosts without a project.
     pub fn user_files(config: RecordingConfig) -> Self {
         Self {
-            id: RecordingId::generate(),
+            id: btel_types::new_recording_id(),
             config,
             host: "unknown".to_owned(),
             sources: Vec::new(),
+            build: None,
+            upload_source: true,
             exit: Arc::default(),
-            destination: Destination::UserFiles,
+            destination: Destination::UserFiles {
+                project_from_cwd: false,
+            },
+            initial_failure: None,
+            recording_override: RecordingOverride::default(),
         }
+    }
+
+    /// When recording to the BAML home without an explicit `BAML_HOME`, prefer
+    /// the BAML project enclosing the working directory, where
+    /// `baml query --local` reads. Falls back to the BAML home when there is no
+    /// project or its directory cannot be created. For SDK hosts, which run
+    /// from their project; a packed program launched elsewhere must not write
+    /// into an unrelated project.
+    #[must_use]
+    pub fn preferring_cwd_project(mut self) -> Self {
+        if let Destination::UserFiles { project_from_cwd } = &mut self.destination {
+            *project_from_cwd = true;
+        }
+        self
     }
 
     pub fn id(&self) -> RecordingId {
         self.id
+    }
+
+    #[must_use]
+    pub fn with_artifact_telemetry(mut self, policy: ArtifactTelemetry) -> Self {
+        self.recording_override = artifact_recovery(&policy);
+        self.initial_failure = Some(policy.initial_failure);
+        self
     }
 
     /// What runs this engine: `baml` (the CLI), `lsp`, `pack`, `python`, ...
@@ -194,12 +536,87 @@ impl TelemetryRecording {
         self
     }
 
+    /// How to describe the build of the program's package (its git commit,
+    /// source hash and unit hash). Called at most once, and only when the
+    /// recording starts, so a host pays for reading git and formatting
+    /// sources only then. Every recording writes the build in its header;
+    /// a cloud recording also registers it with BCS (BEP-088).
+    #[must_use]
+    pub fn with_build(mut self, build: BuildProvider) -> Self {
+        self.build = Some(build);
+        self
+    }
+
+    /// Whether builds registered with BCS carry their source text: the
+    /// program's own, and those of packages it compiles at run time.
+    /// On unless the project opts out (`upload_source = false`).
+    #[must_use]
+    pub fn with_source_upload(mut self, upload_source: bool) -> Self {
+        self.upload_source = upload_source;
+        self
+    }
+
+    /// Whether this recording's destination takes builds: only BCS does.
+    #[must_use]
+    pub fn registers_builds(&self) -> bool {
+        matches!(self.destination, Destination::Cloud { .. })
+    }
+
+    /// Register `build` with this recording's BCS destination on the
+    /// calling thread, for a build that runs no program (`baml pack`,
+    /// `baml generate`). Nothing is sent to any other destination.
+    ///
+    /// # Errors
+    ///
+    /// The Boundary configuration is invalid, or BCS did not take the build.
+    pub fn register_build(
+        &self,
+        mut build: btel_types::BuildRegistration,
+    ) -> Result<(), EngineError> {
+        if !self.upload_source {
+            build.source = None;
+        }
+        match &self.destination {
+            Destination::Cloud { delivery, .. } => {
+                btel_bcs::build::register_blocking(delivery, &build)
+                    .map_err(|error| EngineError::Other(error.to_string()))
+            }
+            Destination::InvalidConfiguration(diagnostic) => {
+                Err(EngineError::CloudAuthorization(diagnostic.clone()))
+            }
+            Destination::LocalFiles { .. } | Destination::UserFiles { .. } => Ok(()),
+        }
+    }
+
+    /// The build of the program's package, without its source text when the
+    /// project keeps it from BCS.
+    fn build(&mut self) -> Option<btel_types::BuildRegistration> {
+        let mut build = self.build.take()?()?;
+        if !self.upload_source {
+            build.source = None;
+        }
+        Some(build)
+    }
+
     /// Where the host records how the process ended.
     pub(crate) fn process_exit(&self) -> Arc<btel_types::ProcessExitSlot> {
         Arc::clone(&self.exit)
     }
 
-    fn process(&self) -> btel_recorder::ProcessRecording {
+    /// Assemble process identity and its captured context. Cloud recordings add
+    /// allowlisted environment metadata and omit arguments/sources; local
+    /// recordings retain the caller's context and existing debugging details.
+    fn process(
+        &self,
+        launch_context: &btel_types::context::Context,
+        program_id: Option<[u8; 16]>,
+        build: Option<btel_types::BuildRecord>,
+    ) -> btel_recorder::ProcessRecording {
+        let recorded_context = if matches!(self.destination, Destination::Cloud { .. }) {
+            environment::context(launch_context)
+        } else {
+            launch_context.clone()
+        };
         btel_recorder::ProcessRecording {
             info: btel_types::ProcessInfo {
                 process_id: bex_events::ids::ProcessEuid::current().0,
@@ -216,27 +633,38 @@ impl TelemetryRecording {
                         .collect()
                 },
                 started_at_unix_ns: process_started_at_unix_ns(),
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
             },
-            sources: (!self.sources.is_empty())
-                .then(|| {
-                    let pool = btel_snapshot::SnapshotPool::new(
-                        1,
-                        btel_snapshot::Limits {
-                            max_bytes: Some(SOURCES_MAX_BYTES),
-                            ..btel_snapshot::Limits::default()
-                        },
-                    );
-                    btel_snapshot::string_map(&pool, &self.sources)
-                })
-                .flatten(),
+            // Cloud source uploads are a separate feature; local recordings retain their code.
+            sources: (matches!(
+                self.destination,
+                Destination::LocalFiles { .. } | Destination::UserFiles { .. }
+            ) && !self.sources.is_empty())
+            .then(|| {
+                let pool = btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default());
+                btel_snapshot::string_map(&pool, &self.sources, SOURCES_MAX_BYTES)
+            })
+            .flatten(),
+            context: btel_snapshot::context::capture(
+                &recorded_context,
+                &btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default()),
+            ),
             exit: Arc::clone(&self.exit),
+            program_id,
+            // BCS names the build of a span from the header: it links the
+            // functions of the package the build produced to it.
+            build,
         }
     }
 
     pub(crate) fn start(
-        self,
+        mut self,
         source_snapshot: Option<[u8; 32]>,
+        program_id: Option<[u8; 16]>,
+        program_build: Option<btel_types::BuildRecord>,
         functions: Arc<btel_types::FunctionMetadataTable>,
+        launch_context: &btel_types::context::Context,
     ) -> Result<
         (
             Arc<btel_processor::TelemetryRuntime>,
@@ -245,52 +673,85 @@ impl TelemetryRecording {
         EngineError,
     > {
         let transport = btel_settings::transport::ChunkConfig::default();
-        let process = self.process();
+        let build = self.build();
+        // A host that compiled the program describes the build; a program
+        // read from an artifact carries the build that wrote the artifact.
+        let named = build
+            .as_ref()
+            .map(|registration| registration.build.clone())
+            .or(program_build);
+        let process = self.process(launch_context, program_id, named);
         self.config
             .validate_transport(&transport)
             .map_err(|error| EngineError::Other(error.to_owned()))?;
-        let root = match self.destination {
+        let roots = match self.destination {
+            Destination::InvalidConfiguration(diagnostic) => {
+                return Err(EngineError::CloudAuthorization(diagnostic));
+            }
             Destination::Cloud {
                 publisher,
                 delivery,
+                authorization_context,
             } => {
                 return Self::start_cloud(
                     self.id,
                     self.config,
                     publisher,
                     *delivery,
+                    &authorization_context,
+                    self.initial_failure.as_ref(),
+                    &self.recording_override,
                     source_snapshot,
                     functions,
                     transport,
                     process,
+                    build.as_ref(),
+                    self.upload_source,
                 );
             }
-            Destination::UserFiles => std::env::home_dir()
-                .map(|home| {
-                    (
-                        home.join(btel_settings::local_files::RECORDINGS_DIRECTORY),
-                        home.join(btel_settings::local_files::CAS_DIRECTORY),
-                    )
-                })
-                .ok_or_else(|| std::io::Error::other("cannot determine telemetry home directory")),
-            Destination::LocalFiles { recordings, cas } => Ok((recordings, cas)),
+            Destination::UserFiles { project_from_cwd } => user_file_roots(
+                baml_env::os_var("BAML_HOME"),
+                project_from_cwd
+                    .then(std::env::current_dir)
+                    .and_then(Result::ok)
+                    .as_deref(),
+                std::env::home_dir(),
+            ),
+            Destination::LocalFiles { recordings, cas } => vec![(recordings, cas)],
         };
         let mut delivery = None;
         let runtime =
             btel_processor::TelemetryRuntime::with_publisher_factory(transport, |control| {
-                let failure = control.clone();
-                let writer = root.and_then(|(root, cas)| {
-                    btel_file::LocalDelivery::create_with_cas(
-                        &root,
-                        &cas,
-                        self.id,
-                        btel_file::LocalDeliveryConfig::default(),
-                        move |error| {
-                            failure.disable(btel_processor::RuntimeError(error.to_string()));
-                            tracing::warn!(%error, "telemetry recording disabled");
-                        },
-                    )
-                });
+                let mut writer = Err(std::io::Error::other("no telemetry directory"));
+                let last = roots.len().saturating_sub(1);
+                for (index, (root, cas)) in roots.into_iter().enumerate() {
+                    let failure = control.clone();
+                    // The CAS is first written with the first snapshot, after a
+                    // fallback is no longer possible.
+                    let cas_ready = if index < last {
+                        cas_accepts_writes(&cas, self.id)
+                    } else {
+                        Ok(())
+                    };
+                    writer = cas_ready.and_then(|()| {
+                        btel_file::LocalDelivery::create_with_cas(
+                            &root,
+                            &cas,
+                            self.id,
+                            btel_file::LocalDeliveryConfig::default(),
+                            move |error| {
+                                failure.disable(btel_processor::RuntimeError(error.to_string()));
+                                tracing::warn!(%error, "telemetry recording disabled");
+                            },
+                        )
+                    });
+                    match &writer {
+                        Ok(_) => break,
+                        Err(error) => {
+                            tracing::debug!(%error, root = %root.display(), "telemetry directory unavailable");
+                        }
+                    }
+                }
                 let builder = RecordingBuilder::new(self.id, self.config)
                     .map_err(std::io::Error::other)?
                     .with_source_snapshot(source_snapshot)
@@ -307,7 +768,7 @@ impl TelemetryRecording {
                         // prevent application startup. No automatic retry.
                         tracing::warn!(%error, "telemetry recording startup disabled");
                         control.disable(btel_processor::RuntimeError(format!(
-                            "telemetry file startup: {error}"
+                            "telemetry recording startup: {error}"
                         )));
                         btel_file::LocalPublisher::disabled(builder)
                     }
@@ -315,19 +776,27 @@ impl TelemetryRecording {
                 Ok(publisher)
             })
             .map_err(|error| EngineError::Other(format!("telemetry processor startup: {error}")))?;
+        #[cfg(feature = "telemetry_diagnostics")]
+        runtime.on_overage(warn_host);
         Ok((runtime, delivery.map(RecordingDelivery::Local)))
     }
 
+    /// Start bounded cloud recording; only an explicit abort policy may cancel application work.
     #[expect(clippy::too_many_arguments)]
     fn start_cloud(
         id: RecordingId,
         config: RecordingConfig,
         publisher_config: btel_bcs::CloudPublisherConfig,
-        delivery_config: btel_bcs::delivery::DeliveryConfig,
+        mut delivery_config: btel_bcs::delivery::DeliveryConfig,
+        authorization_context: &AuthorizationContext,
+        initial_failure: Option<&InitialFailurePolicy>,
+        recording_override: &RecordingOverride,
         source_snapshot: Option<[u8; 32]>,
         functions: Arc<btel_types::FunctionMetadataTable>,
         transport: btel_settings::transport::ChunkConfig,
         process: btel_recorder::ProcessRecording,
+        build: Option<&btel_types::BuildRegistration>,
+        upload_source: bool,
     ) -> Result<
         (
             Arc<btel_processor::TelemetryRuntime>,
@@ -335,38 +804,220 @@ impl TelemetryRecording {
         ),
         EngineError,
     > {
+        delivery_config.initial_recording_id = Some(id);
+        // Apply the resolved policy to every initial connection failure.
+        delivery_config.terminal_initial_connection = true;
+        // Telemetry observes execution. Reuse the artifact fail-open policy unless
+        // the publisher explicitly selected a different initial-failure action.
+        let initial_failure = initial_failure.cloned().unwrap_or_default();
+        let initial_auth_cancel = crate::CancellationToken::new();
         let mut delivery = None;
+        #[cfg(feature = "telemetry_diagnostics")]
+        let gauges = Arc::new(btel_bcs::PublisherGauges::default());
         let runtime =
             btel_processor::TelemetryRuntime::with_publisher_factory(transport, |control| {
                 let failure = control.clone();
+                let cancel = initial_auth_cancel.clone();
+                let policy = initial_failure.clone();
+                let context = authorization_context.clone();
+                let warning_override = recording_override.clone();
                 let handle = match btel_bcs::delivery::BcsDelivery::new(
                     delivery_config.clone(),
                     move |error| {
-                        failure.disable(btel_processor::RuntimeError(error.to_string()));
-                        tracing::warn!(%error, "cloud telemetry disabled");
+                        if matches!(
+                            error,
+                            btel_bcs::delivery::DeliveryError::InitialAuthorization(_)
+                                | btel_bcs::delivery::DeliveryError::InitialConnection(_)
+                        ) {
+                            match policy.action {
+                                InitialFailureAction::Abort => cancel.cancel(),
+                                InitialFailureAction::Warn => {
+                                    emit_initial_warning(
+                                        &policy,
+                                        &context,
+                                        &error,
+                                        &warning_override,
+                                    );
+                                }
+                                InitialFailureAction::Ignore => {}
+                            }
+                        }
+                        // Only the export stops: execution keeps its spans and hooks.
+                        failure.fail_export(btel_processor::RuntimeError(error.to_string()));
+                        if !matches!(
+                            error,
+                            btel_bcs::delivery::DeliveryError::InitialAuthorization(_)
+                                | btel_bcs::delivery::DeliveryError::InitialConnection(_)
+                        ) {
+                            tracing::warn!(%error, "cloud telemetry disabled");
+                        }
                     },
                 ) {
                     Ok(worker) => {
                         let handle = worker.handle();
-                        delivery = Some(RecordingDelivery::Cloud(Arc::new(worker)));
+                        if let Some(build) = build {
+                            handle.register_build(build);
+                        }
+                        delivery = Some(RecordingDelivery::Cloud {
+                            delivery: Arc::new(worker),
+                            upload_source,
+                            initial_auth_cancel: initial_auth_cancel.clone(),
+                            authorization_context: authorization_context.clone(),
+                            initial_auth_error: Arc::new(OnceLock::new()),
+                            initial_failure: initial_failure.clone(),
+                            recording_override: recording_override.clone(),
+                            #[cfg(feature = "telemetry_diagnostics")]
+                            gauges: Arc::clone(&gauges),
+                        });
                         handle
                     }
                     Err(error) => {
-                        control.disable(btel_processor::RuntimeError(error.to_string()));
+                        control.fail_export(btel_processor::RuntimeError(error.to_string()));
                         btel_bcs::delivery::BcsDeliveryHandle::disabled(error, delivery_config)
                     }
                 };
-                btel_bcs::CloudPublisher::new(id, config, publisher_config, handle)
+                let publisher = btel_bcs::CloudPublisher::new(id, config, publisher_config, handle)
                     .map(|publisher| {
                         publisher
                             .with_source_snapshot(source_snapshot)
                             .with_function_metadata(functions)
                             .with_process(process)
                     })
-                    .map_err(std::io::Error::other)
+                    .map_err(std::io::Error::other)?;
+                #[cfg(feature = "telemetry_diagnostics")]
+                let publisher = publisher.with_gauges(Arc::clone(&gauges));
+                Ok(publisher)
             })
             .map_err(|error| EngineError::Other(format!("telemetry processor startup: {error}")))?;
+        #[cfg(feature = "telemetry_diagnostics")]
+        runtime.on_overage(warn_host);
         Ok((runtime, delivery))
+    }
+}
+
+/// Recording and CAS directories for [`TelemetryRecording::user_files`], most
+/// preferred first. `cwd` is set only when the recording prefers the project
+/// enclosing it.
+fn user_file_roots(
+    baml_home: Option<std::ffi::OsString>,
+    cwd: Option<&Path>,
+    home_dir: Option<PathBuf>,
+) -> Vec<(PathBuf, PathBuf)> {
+    use btel_settings::local_files::{CAS_DIRECTORY, RECORDINGS_DIRECTORY};
+    let baml_home = baml_home.filter(|value| !value.is_empty());
+    let project = cwd
+        .filter(|_| baml_home.is_none())
+        .and_then(baml_project_root::find_baml_project_root);
+    let btel = baml_env::baml_home_from(baml_home, home_dir).join("btel");
+    project
+        .map(|root| (root.join(RECORDINGS_DIRECTORY), root.join(CAS_DIRECTORY)))
+        .into_iter()
+        .chain([(btel.join("recordings"), btel.join("cas"))])
+        .collect()
+}
+
+fn cas_accepts_writes(cas: &Path, id: RecordingId) -> std::io::Result<()> {
+    std::fs::create_dir_all(cas)?;
+    let probe = btel_file::recording_directory(cas, id);
+    std::fs::create_dir(&probe)?;
+    std::fs::remove_dir(&probe)
+}
+
+fn artifact_recovery(policy: &ArtifactTelemetry) -> RecordingOverride {
+    let names = match &policy.destination_overrides {
+        btel_settings::artifact::DestinationOverrides::Default if policy.embedded.is_none() => {
+            Some(("BOUNDARY_PROJECT".to_owned(), "BOUNDARY_API_KEY".to_owned()))
+        }
+        btel_settings::artifact::DestinationOverrides::Named { project, api_key } => {
+            Some((project.clone(), api_key.clone()))
+        }
+        _ => None,
+    };
+    RecordingOverride::Artifact {
+        level: policy.recording_control_envvar().map(str::to_owned),
+        project: names.as_ref().map(|names| names.0.clone()),
+        api_key: names.map(|names| names.1),
+    }
+}
+
+fn artifact_configuration_error(
+    policy: &ArtifactTelemetry,
+    endpoint: Option<bcs_api::Endpoint>,
+    source: CredentialSource,
+    error: bcs_api::Error,
+) -> EngineError {
+    let diagnostic = AuthorizationContext {
+        endpoint,
+        source,
+        operation: Operation::Ingest,
+    }
+    .report(error, Outcome::ExecutionCancelled)
+    .diagnostic
+    .with_recording_override(artifact_recovery(policy));
+    EngineError::CloudAuthorization(Box::new(diagnostic))
+}
+
+/// A warning the host must see, on stderr: SDK hosts install no `tracing`
+/// subscriber. A closed or broken stderr is not worth a panic.
+fn warn_host(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
+}
+
+fn emit_initial_warning(
+    policy: &InitialFailurePolicy,
+    context: &AuthorizationContext,
+    failure: &btel_bcs::delivery::DeliveryError,
+    recording_override: &RecordingOverride,
+) {
+    let message = policy.warning_message.clone().unwrap_or_else(|| {
+        initial_diagnostic(context, failure, Outcome::TelemetryDisabled)
+            .with_recording_override(recording_override.clone())
+            .to_string()
+    });
+    warn_host(&message);
+}
+
+/// Append `diagnostics` to `path` as one JSON line, in one write: processes
+/// sharing the file append concurrently, and a line written in pieces would
+/// interleave with theirs.
+#[cfg(feature = "telemetry_diagnostics")]
+pub fn append_diagnostics_line(
+    path: &std::path::Path,
+    diagnostics: &serde_json::Value,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let line = format!("{diagnostics}\n");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+}
+
+/// The file `DEV_BAML_TELEMETRY_DIAGNOSTICS_FILE` names, read once at engine
+/// construction. A dev-only, feature-gated knob: an invalid value (a relative
+/// path, or not unicode) panics with a clear message instead of being ignored.
+#[cfg(feature = "telemetry_diagnostics")]
+pub(crate) fn diagnostics_file() -> Option<std::path::PathBuf> {
+    baml_env::path_var("DEV_BAML_TELEMETRY_DIAGNOSTICS_FILE")
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn initial_diagnostic(
+    context: &AuthorizationContext,
+    failure: &btel_bcs::delivery::DeliveryError,
+    outcome: Outcome,
+) -> bcs_api::diagnostics::Diagnostic {
+    match failure {
+        btel_bcs::delivery::DeliveryError::InitialAuthorization(failure)
+        | btel_bcs::delivery::DeliveryError::Api(failure) => {
+            context.rejected_failure(failure, outcome)
+        }
+        btel_bcs::delivery::DeliveryError::InitialConnection(error) => {
+            initial_diagnostic(context, error, outcome)
+        }
+        _ => context.connection_failed(outcome),
     }
 }
 
@@ -395,8 +1046,9 @@ impl BexEngine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The process is exiting with `status`: engines shut down after this
-    /// end their recordings with it. Hosts call it once, before shutdown.
+    /// The host is finalizing its BAML lifetime with `status`: engines shut
+    /// down after this end their recordings with it. Hosts call it before
+    /// shutdown; SDK hosts use `Unknown` when the OS exit outcome is not known.
     pub fn record_process_exit(&self, status: btel_types::ProcessStatus) {
         if let Some(exit) = self
             .telemetry
@@ -421,13 +1073,16 @@ impl BexEngine {
         clock_mode: btel_clock::ClockMode,
         recording: TelemetryRecording,
     ) -> Result<Self, EngineError> {
-        Self::build(
+        Self::new_with_config(
             program,
             sys_ops,
             argv,
-            runtime_compiler,
-            clock_mode,
-            Some(recording),
+            crate::EngineConfig {
+                runtime_compiler,
+                clock_mode,
+                recording: Some(recording),
+                ..crate::EngineConfig::default()
+            },
         )
     }
 
@@ -461,15 +1116,44 @@ impl BexEngine {
             .and_then(super::telemetry_state::EngineTelemetry::result)
     }
 
+    /// Initial ingestion failure is fatal only under an explicit abort policy.
+    /// Shutdown joins the initial request even when the program produces no recordings.
+    pub fn initial_cloud_authorization_error(&self) -> Option<EngineError> {
+        self.telemetry
+            .as_ref()?
+            .delivery
+            .as_ref()?
+            .initial_auth_error()
+    }
+
+    /// The recording policy already warned or deliberately ignored an initial failure.
+    /// Delivery errors remain inspectable through `telemetry_result`.
+    pub fn initial_telemetry_failure_handled(&self) -> bool {
+        self.telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.delivery.as_ref())
+            .is_some_and(RecordingDelivery::initial_failure_handled)
+    }
+
+    pub(crate) fn initial_cloud_auth_cancel(&self) -> Option<&crate::CancellationToken> {
+        self.telemetry
+            .as_ref()?
+            .delivery
+            .as_ref()?
+            .initial_auth_cancel()
+    }
+
     /// Number of discarded cloud prepare groups or upload targets, not events or
-    /// retry attempts. Zero for local recording or when telemetry is off.
+    /// retry attempts. Zero for local recording or when telemetry is off. Work
+    /// dropped once delivery is disabled, including by the shutdown timeout, is
+    /// not counted: `telemetry_result` reports the disabling error.
     pub fn telemetry_delivery_loss_count(&self) -> u64 {
         match self
             .telemetry
             .as_ref()
             .and_then(|state| state.delivery.as_ref())
         {
-            Some(RecordingDelivery::Cloud(delivery)) => delivery.handle().loss_count(),
+            Some(RecordingDelivery::Cloud { delivery, .. }) => delivery.handle().loss_count(),
             _ => 0,
         }
     }
@@ -482,10 +1166,198 @@ impl BexEngine {
             .as_ref()
             .and_then(|state| state.delivery.as_ref())
         {
-            Some(RecordingDelivery::Cloud(delivery)) => {
+            Some(RecordingDelivery::Cloud { delivery, .. }) => {
                 delivery.handle().metadata_replay_evictions()
             }
             _ => 0,
+        }
+    }
+
+    /// Everything the `telemetry_diagnostics` feature counts, as JSON: the
+    /// producers' pools and cold paths, and cloud delivery's progress and
+    /// losses. `None` when telemetry is off. Readable at any time; shutdown
+    /// logs it and appends it to `DEV_BAML_TELEMETRY_DIAGNOSTICS_FILE` when set.
+    #[cfg(feature = "telemetry_diagnostics")]
+    pub fn telemetry_diagnostics(&self) -> Option<serde_json::Value> {
+        // Every field of every reading is named here, so a field added to
+        // one of them is a compile error until it is reported or dismissed.
+        let telemetry = self.telemetry.as_ref()?;
+        let btel_processor::Diagnostics {
+            captures:
+                btel_snapshot::PoolStats {
+                    allocated,
+                    in_use,
+                    allocation_misses,
+                    idle_bytes,
+                    held_bytes,
+                    budget_bytes,
+                    peak_held_bytes,
+                    overage_acquisitions,
+                    allocated_bytes,
+                    peak_accounted_bytes,
+                    growths,
+                },
+            transport:
+                btel_processor::TransportStats {
+                    allocated_timing_chunks,
+                    allocated_span_chunks,
+                    free_chunks,
+                    ready_chunks,
+                    active_producers,
+                    sealed_chunks,
+                    sealed_records,
+                    wakeups,
+                },
+            lanes:
+                btel_processor::LaneDiagnostics {
+                    exhausted_waits,
+                    overage_allocations,
+                    peak_overage_chunks,
+                },
+            snapshot_wait_nanos,
+            overage_warned,
+        } = telemetry.runtime.diagnostics();
+        let delivery = match telemetry.delivery.as_ref() {
+            Some(RecordingDelivery::Cloud {
+                delivery, gauges, ..
+            }) => {
+                let handle = delivery.handle();
+                let btel_bcs::delivery::DeliveryDiagnostics {
+                    pending_plans,
+                    pending_captures,
+                    recording_reserved_used,
+                    cas_reserved_used,
+                    peaks:
+                        btel_bcs::delivery::HeldPeaks {
+                            pending_plans: peak_pending_plans,
+                            pending_captures: peak_pending_captures,
+                            recording_reserved_used: peak_recording_reserved_used,
+                        },
+                    prepares,
+                    puts,
+                } = handle.diagnostics();
+                let btel_bcs::PublisherDiagnostics {
+                    retained_captures,
+                    retained_bytes,
+                    queued_blobs,
+                    queued_bytes,
+                    staged_files,
+                    staged_bytes,
+                    open_file_bytes,
+                    offered_ids,
+                    peak_retained_bytes,
+                    peak_queued_bytes,
+                    peak_staged_bytes,
+                } = gauges.read();
+                let request = |btel_bcs::delivery::RequestDiagnostics {
+                                   count,
+                                   total_nanos,
+                                   max_nanos,
+                                   bytes,
+                               }| {
+                    serde_json::json!({
+                        "count": count,
+                        "total_nanos": total_nanos,
+                        "mean_nanos": total_nanos.checked_div(count).unwrap_or(0),
+                        "max_nanos": max_nanos,
+                        "bytes": bytes,
+                    })
+                };
+                serde_json::json!({
+                    "kind": "cloud",
+                    "loss_count": handle.loss_count(),
+                    "recording_acked_through": handle.recording_acked_through(),
+                    "metadata_replay_evictions": handle.metadata_replay_evictions(),
+                    "disabled": handle.is_disabled(),
+                    "pending_plans": pending_plans,
+                    "pending_captures": pending_captures,
+                    "recording_reserved_used": recording_reserved_used,
+                    "cas_reserved_used": cas_reserved_used,
+                    "peak_pending_plans": peak_pending_plans,
+                    "peak_pending_captures": peak_pending_captures,
+                    "peak_recording_reserved_used": peak_recording_reserved_used,
+                    "prepare": request(prepares),
+                    "put": request(puts),
+                    "publisher": {
+                        "retained_captures": retained_captures,
+                        "retained_bytes": retained_bytes,
+                        "queued_blobs": queued_blobs,
+                        "queued_bytes": queued_bytes,
+                        "staged_files": staged_files,
+                        "staged_bytes": staged_bytes,
+                        "open_file_bytes": open_file_bytes,
+                        "offered_ids": offered_ids,
+                        "peak_retained_bytes": peak_retained_bytes,
+                        "peak_queued_bytes": peak_queued_bytes,
+                        "peak_staged_bytes": peak_staged_bytes,
+                    },
+                })
+            }
+            Some(RecordingDelivery::Local(_)) => serde_json::json!({ "kind": "local" }),
+            None => serde_json::Value::Null,
+        };
+        Some(serde_json::json!({
+            "pid": std::process::id(),
+            "recording_id": telemetry.recording_id.map(|id| {
+                use std::fmt::Write as _;
+                id.as_bytes().iter().fold(String::with_capacity(32), |mut hex, byte| {
+                    write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+                    hex
+                })
+            }),
+            "captures": {
+                "budget_bytes": budget_bytes,
+                "held_bytes": held_bytes,
+                "peak_held_bytes": peak_held_bytes,
+                "overage_acquisitions": overage_acquisitions,
+                "allocated": allocated,
+                "in_use": in_use,
+                "allocation_misses": allocation_misses,
+                "growths": growths,
+                "idle_bytes": idle_bytes,
+                "allocated_bytes": allocated_bytes,
+                "peak_accounted_bytes": peak_accounted_bytes,
+                "wait_nanos": snapshot_wait_nanos,
+            },
+            "chunks": {
+                "allocated_timing": allocated_timing_chunks,
+                "allocated_span": allocated_span_chunks,
+                "free": free_chunks,
+                "ready": ready_chunks,
+                "active_producers": active_producers,
+                "sealed_chunks": sealed_chunks,
+                "sealed_records": sealed_records,
+                "wakeups": wakeups,
+                "exhausted_waits": exhausted_waits,
+                "overage_allocations": overage_allocations,
+                "peak_overage_chunks": peak_overage_chunks,
+            },
+            "overage_warned": overage_warned,
+            "delivery": delivery,
+        }))
+    }
+
+    /// At shutdown: log the diagnostics, and append them as one JSON line to
+    /// the file `DEV_BAML_TELEMETRY_DIAGNOSTICS_FILE` named at construction,
+    /// so every engine of a load test leaves its row.
+    #[cfg(feature = "telemetry_diagnostics")]
+    pub(crate) fn report_telemetry_diagnostics(&self) {
+        let Some(diagnostics) = self.telemetry_diagnostics() else {
+            return;
+        };
+        tracing::info!(target: "baml.telemetry.diagnostics", diagnostics = %diagnostics);
+        let Some(path) = self
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.diagnostics_file.as_deref())
+        else {
+            return;
+        };
+        if let Err(error) = append_diagnostics_line(path, &diagnostics) {
+            warn_host(&format!(
+                "telemetry diagnostics were not written to {}: {error}",
+                path.display()
+            ));
         }
     }
 
@@ -504,3 +1376,115 @@ mod failure_tests;
 
 #[cfg(test)]
 mod boundary_env_tests;
+
+#[cfg(test)]
+mod user_files_tests;
+
+#[cfg(test)]
+mod source_privacy_tests {
+    use super::*;
+
+    #[test]
+    /// Cloud process snapshots gain environment metadata without source text,
+    /// which reaches BCS by the build's registration; local snapshots retain
+    /// their sources and unmodified launch context. Both name the build.
+    fn cloud_recordings_exclude_sources_while_local_recordings_remain_readable() {
+        let sources = vec![(
+            "main.baml".to_owned(),
+            "function Secret() -> int { 42 }".to_owned(),
+        )];
+        let build = || btel_types::BuildRegistration {
+            build: btel_types::BuildRecord {
+                build_id: [1; 16],
+                timestamp_unix_ns: 7,
+                origin: btel_types::BuildOrigin::Run,
+                git: None,
+                source_hash: [2; 32],
+                compilation_unit_hash: [3; 32],
+            },
+            package: btel_types::PackageRecord {
+                compilation_unit_hash: [3; 32],
+                package_interface: [5; 32],
+                dependencies: Vec::new(),
+                name: "app".into(),
+                version: None,
+                compiler_version: "test".into(),
+            },
+            program: None,
+            source: Some(
+                [(
+                    "main.baml".to_owned(),
+                    "function Secret() -> int { 42 }".to_owned(),
+                )]
+                .into(),
+            ),
+        };
+        let mut local =
+            TelemetryRecording::local_files("/tmp/baml-source-privacy", RecordingConfig::default())
+                .with_sources(sources.clone())
+                .with_build(Box::new(move || Some(build())));
+        let mut cloud = TelemetryRecording::cloud(
+            RecordingConfig::default(),
+            btel_bcs::CloudPublisherConfig::default(),
+            btel_bcs::delivery::DeliveryConfig::new(
+                "https://boundary.example.test".parse().unwrap(),
+            ),
+        )
+        .with_sources(sources)
+        .with_build(Box::new(move || Some(build())))
+        .with_source_upload(false);
+        let program_id = Some([4; 16]);
+        let described = local.build();
+        assert_eq!(described, Some(build()));
+        let local_process = local.process(
+            &btel_types::context::Context::default(),
+            program_id,
+            described.map(|registration| registration.build),
+        );
+        assert!(local_process.sources.is_some());
+        assert_eq!(local_process.build, Some(build().build));
+        assert_eq!(local_process.program_id, program_id);
+        // A project that opts out registers its builds without their text.
+        let registered = cloud.build();
+        assert_eq!(
+            registered,
+            Some(btel_types::BuildRegistration {
+                source: None,
+                ..build()
+            })
+        );
+        let cloud_process = cloud.process(
+            &btel_types::context::Context::default(),
+            program_id,
+            registered.map(|registration| registration.build),
+        );
+        assert!(cloud_process.sources.is_none());
+        assert_eq!(cloud_process.build, Some(build().build));
+        assert_eq!(cloud_process.program_id, program_id);
+        let context = btel_types::context::Context::default();
+        let snapshot = |context: &btel_types::context::Context| {
+            btel_snapshot::context::capture(
+                context,
+                &btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default()),
+            )
+            .unwrap()
+            .root_id()
+        };
+        assert_eq!(
+            local
+                .process(&context, None, None)
+                .context
+                .unwrap()
+                .root_id(),
+            snapshot(&context)
+        );
+        assert_ne!(
+            cloud
+                .process(&context, None, None)
+                .context
+                .unwrap()
+                .root_id(),
+            snapshot(&context)
+        );
+    }
+}

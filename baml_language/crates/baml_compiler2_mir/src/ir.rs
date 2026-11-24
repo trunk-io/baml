@@ -12,9 +12,9 @@ use baml_type::DeclName;
 /// MIR's types are headed by the compiler's own identity: a declaration IS
 /// its [`DeclName`] (the declaring root plus its path), never a spelling. A
 /// head is rendered as a name only where MIR is displayed or emitted as
-/// display metadata, through the program's spelling table; emit anchors every
-/// head to its declaration's object by identity, so nothing between the
-/// checker and the unit re-derives a declaration from a name.
+/// display metadata, canonically from a viewpoint; emit anchors every head to
+/// its declaration's object by identity, so nothing between the checker and
+/// the unit re-derives a declaration from a name.
 pub type RuntimeTy = baml_type::RuntimeTy<DeclName>;
 /// See [`RuntimeTy`].
 pub type RealizedTy = baml_type::RealizedTy<DeclName>;
@@ -37,7 +37,7 @@ use subenum::subenum;
 ///   testing individual instructions (e.g. `unary_op -` for `-5`).
 /// - `Two`: Everything in `One` plus MIR-level constant folding and future
 ///   advanced transforms (e.g. type-tag switch dispatch).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::Update)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub enum OptLevel {
     Zero,
     #[default]
@@ -145,9 +145,6 @@ pub struct RuntimeSignature {
     pub throws_type: TyTemplate,
     /// The declaration's joined `///` doc-comment lines, if any.
     pub docstring: Option<String>,
-    /// The name the declaration was written with; `None` for lambdas
-    /// (which have no source-level name).
-    pub name: Option<String>,
     /// Display strings for the generic type parameters (`T extends Bound`).
     pub display_type_params: Vec<String>,
     /// The name of each type-argument slot in the callee frame, in slot
@@ -181,7 +178,7 @@ pub struct RuntimeInterfaceBound {
 /// bug and never a user error (lowering runs only on a program with no
 /// errors). A function or initializer that hits one has no MIR — lowering
 /// answers with this instead, and the compile fails.
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub struct MirInternalError {
     pub message: String,
     /// The source being lowered when the inconsistency was found.
@@ -221,25 +218,10 @@ pub struct MirFunction<'db> {
     pub signature: Option<RuntimeSignature>,
 }
 
-// Safety: replacement-only `Update` (always report changed). MIR feeds the
-// untracked emit stage, so backdating buys nothing, and the tree has no
-// `PartialEq` to compare with; unconditionally replacing the old value is
-// always sound under the `Update` contract ONLY under this premise:
-// `MirFunction` OWNS all of its data — its sole `'db` members are Copy
-// interned ids (no `&'db` references, no drop glue that could observe the
-// old revision). Adding any `&'db` field would make the blind replacement
-// UB; re-derive that before extending the struct.
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[expect(unsafe_code)]
-unsafe impl salsa::Update for MirFunction<'_> {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        // SAFETY: pointer is Salsa-owned and valid for replacement.
-        unsafe {
-            std::ptr::drop_in_place(old_pointer);
-            std::ptr::write(old_pointer, new_value);
-        }
-        true
-    }
-}
+unsafe impl salsa::SalsaValue for MirFunction<'_> {}
 
 // ============================================================================
 // Identifiers
@@ -396,6 +378,19 @@ pub enum IntrinsicOp {
     /// compares the two directly, and a lossy conversion there would decide a
     /// soundness question (whether a template read is clobbered) by accident.
     BindType(u32),
+    /// Resolve a declaration hook and begin the target after it returns.
+    ApplyTraceHook,
+    /// Apply a standard mode hook directly, without a callable or Options value.
+    BuiltinTraceHook(BuiltinTraceHook),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinTraceHook {
+    Hidden,
+    Timing,
+    Span,
+    Rich,
+    EmptySpan,
 }
 
 /// The kind of a MIR statement.
@@ -423,7 +418,7 @@ pub enum StatementKind<'db> {
     /// Only ever targets a local whose `is_captured` is set, and every read,
     /// write, or closure capture of that local is dominated by one of its
     /// `FreshCell`s: that is what makes a deref load discardable
-    /// ([`Rvalue::can_discard`]) and per-iteration closures correct.
+    /// and per-iteration closures correct.
     FreshCell { local: Local, carry_value: bool },
 
     /// Compiler intrinsic — a void side effect (log, send event).
@@ -730,18 +725,6 @@ pub enum Terminator<'db> {
         context: Operand<'db>,
     },
 
-    /// If the value is a panic instance (`baml.panics.*`), throw it.
-    /// Otherwise continue to `otherwise` block.
-    ///
-    /// Used before wildcard catch arms to prevent them from swallowing
-    /// panics the programmer didn't explicitly name.
-    ThrowIfPanic {
-        value: Operand<'db>,
-        /// The value's `baml.errors.Context`, carried by the rethrow.
-        context: Operand<'db>,
-        otherwise: BlockId,
-    },
-
     /// Short-circuit `&&` / `||` / `??`.
     ///
     /// On the short-circuit edge, assign `operand` to `destination` and go
@@ -804,7 +787,6 @@ impl Terminator<'_> {
                 succs
             }
             Terminator::Throw { .. } | Terminator::Rethrow { .. } => vec![],
-            Terminator::ThrowIfPanic { otherwise, .. } => vec![*otherwise],
             Terminator::ShortCircuit { eval_rhs, join, .. } => vec![*eval_rhs, *join],
         }
     }
@@ -821,6 +803,7 @@ pub enum IndexKind {
     Array,
     /// Map indexing: `map[key]`
     Map,
+    Tuple,
 }
 
 /// A place in memory (lvalue).
@@ -921,10 +904,28 @@ impl fmt::Display for Place {
 
 /// A value computation (rvalue).
 ///
+/// Where a bound method's frame type arguments come from.
+#[derive(Debug, Clone)]
+pub enum BoundFrame {
+    /// Curried from the receiver at bind time: its class arguments, which ARE
+    /// the owner frame of a class-inherent method (the VM's `MakeBoundMethod`).
+    Receiver,
+    /// Supplied by the reference site, one template per frame slot (the VM's
+    /// `MakeGenericBoundMethod`): an interface's default body bound to `self`
+    /// inside an `implements` block (`default.m` as a value), whose
+    /// `[Self, interface args..]` frame the receiver's class arguments cannot
+    /// express.
+    Explicit(Vec<TyTemplate>),
+}
+
 /// Rvalues are computations that produce values. They appear on the right-hand
 /// side of assignments.
 #[derive(Debug, Clone)]
 pub enum Rvalue<'db> {
+    /// Detached settings, or null when hook selection is suppressed.
+    TraceHookSettings {
+        with_settings: bool,
+    },
     /// Use an operand directly.
     Use(Operand<'db>),
 
@@ -936,7 +937,15 @@ pub enum Rvalue<'db> {
     },
 
     /// Unary operation: `!_1`, `-_1`
-    UnaryOp { op: UnaryOp, operand: Operand<'db> },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Operand<'db>,
+    },
+
+    /// Strings joined left to right, in one step: `concat(_1, _2, _3)`. What
+    /// a chain of string `+` (and so a template) lowers to; always three or
+    /// more parts, since two are a plain [`Rvalue::BinaryOp`].
+    ConcatStrings(Vec<Operand<'db>>),
 
     /// Create an array: `[_1, _2, _3]`. The first field is the static element
     /// type (a [`TyTemplate`] so a generic `T[]` resolves against the frame's
@@ -971,7 +980,6 @@ pub enum Rvalue<'db> {
     /// - Classes: assigned unique IDs starting at 100
     TypeTag(Place),
 
-    /// Get length of array: `len(_1)`
     Len(Place),
 
     /// Type check for pattern matching: `is_type(_1, Type)`
@@ -1002,7 +1010,20 @@ pub enum Rvalue<'db> {
     /// emitter to sniff out. `tag` is a `baml_type::typetag` constant; the
     /// emitter lowers this to the same `IsType`-against-`Int` bytecode as the
     /// other coarse tag checks.
-    IsTypeTag { operand: Operand<'db>, tag: i64 },
+    IsTypeTag {
+        operand: Operand<'db>,
+        tag: i64,
+    },
+
+    /// Whether the type value `ty` satisfies the interface bound `bound`, the
+    /// check a `let type T extends I = …` statement makes: the question a
+    /// generic parameter's bound asks, at run time. The bound is a constraint,
+    /// not a type: only the associated types it pins are compared. Lowers to
+    /// `LoadType` of the constraint, then `SatisfiesBound`; yields a bool.
+    SatisfiesBound {
+        ty: Operand<'db>,
+        bound: TyTemplateInterface,
+    },
 
     /// Allocate a closure object from a child lambda function.
     ///
@@ -1020,11 +1041,13 @@ pub enum Rvalue<'db> {
         type_arg_templates: Vec<TyTemplate>,
     },
 
-    /// Create a bound method value from a class-inherent method and its
-    /// receiver: `receiver` is the instance the method is bound to.
+    /// Create a bound method value from a method and its receiver:
+    /// `receiver` is the instance the method is bound to, and `frame` is
+    /// where the callee's frame type arguments come from.
     MakeBoundMethod {
         func: baml_compiler2_hir_ty::extern_loc::FunctionRef<'db>,
         receiver: Operand<'db>,
+        frame: BoundFrame,
     },
 
     /// Create a bound method value for an *interface* method whose impl is
@@ -1068,7 +1091,7 @@ pub enum Rvalue<'db> {
         method: String,
         /// Method-level type-argument OPERANDS from the reference site,
         /// appended to the resolved impl frame by the VM. Every argument is
-        /// a template today - a scoped `type T = …` slot included - so these
+        /// a template today - a scoped `let type T = …` slot included - so these
         /// could be templates; they stay operands because the producer
         /// materializes each as a `LoadType` temp anyway and the VM pops an
         /// `Object::Type` either way, which keeps one stack discipline for
@@ -1139,18 +1162,34 @@ pub enum Rvalue<'db> {
     /// Lowers to `Instruction::LoadType(const_idx)` in bytecode.
     LoadType(TyTemplate),
 
-    /// Reify the package lexically enclosing this call site. The package name
-    /// is baked by lowering; dynamically compiled code substitutes its owning
-    /// runtime package at execution.
-    CurrentPackage(String),
+    /// Reify the package lexically enclosing this call site: the unit's own,
+    /// identified by whoever lays the unit into an executable; dynamically
+    /// compiled code substitutes its owning runtime package at execution.
+    CurrentPackage,
 }
 
-impl Rvalue<'_> {
-    /// Whether an unused evaluation can be erased, including its operand reads.
-    /// Allocation identity is unobservable when the result does not escape, but
-    /// evaluating an initializer can still fail (checked arithmetic or indexing).
-    pub fn can_discard(&self) -> bool {
-        self.can_discard_with(|_| false)
+impl<'db> Rvalue<'db> {
+    /// For `x == null` / `x != null` (a `==`/`!=` with a `null` constant on
+    /// either side): `x`, and whether the test is negated. `null` is the one
+    /// value of its type and equals itself alone, so the comparison is a test
+    /// of `x` against the `null` word, with only `x` to evaluate.
+    pub fn null_test(&self) -> Option<(&Operand<'db>, bool)> {
+        let Self::BinaryOp { op, left, right } = self else {
+            return None;
+        };
+        let negate = match op {
+            BinOp::Eq => false,
+            BinOp::Ne => true,
+            _ => return None,
+        };
+        let is_null = |operand: &Operand<'db>| matches!(operand, Operand::Constant(Constant::Null));
+        if is_null(right) {
+            Some((left, negate))
+        } else if is_null(left) {
+            Some((right, negate))
+        } else {
+            None
+        }
     }
 
     /// A bounds proof applies to this evaluation site, not to the entire local.
@@ -1193,14 +1232,18 @@ impl Rvalue<'_> {
             Self::IsType { operand: arg, .. } | Self::IsTypeTag { operand: arg, .. } => {
                 operand(arg)
             }
+            Self::SatisfiesBound { ty, .. } => operand(ty),
             Self::TypeTag(place) | Self::Discriminant(place) | Self::Len(place) => {
                 read(place, &in_bounds)
             }
+            Self::TraceHookSettings { .. } => false,
             Self::LoadType(_)
-            | Self::CurrentPackage(_)
+            | Self::CurrentPackage
             | Self::Uint8Array(_)
             | Self::MakeGenericFunction { .. } => true,
+            // Joining strings cannot fail.
             Self::Array(_, elements)
+            | Self::ConcatStrings(elements)
             | Self::Aggregate {
                 fields: elements, ..
             } => elements.iter().all(operand),
@@ -1231,7 +1274,7 @@ pub enum AggregateKind<'db> {
     ///
     /// `class` is the declaration the literal constructs, wherever it lives;
     /// its wire spelling is rendered only at emit's boundary
-    /// ([`crate::class_link_name`]). `type_arg_templates` is non-empty only
+    /// ([`crate::class_display_name`]). `type_arg_templates` is non-empty only
     /// for generic class instantiations: each element corresponds to one
     /// class-level type parameter in De Bruijn order (matching
     /// `enclosing_generic_params()`). These templates are emitted as
@@ -1240,6 +1283,9 @@ pub enum AggregateKind<'db> {
     Class {
         class: baml_compiler2_hir_ty::extern_loc::ClassRef<'db>,
         type_arg_templates: Vec<TyTemplate>,
+    },
+    Tuple {
+        element_templates: Vec<TyTemplate>,
     },
 }
 
@@ -1304,7 +1350,7 @@ pub enum Constant<'db> {
     /// (an instance, a closure, ...), not a `Function` object. The only
     /// non-function item that is a value; a type declaration in value
     /// position is a checker error and never reaches here.
-    GlobalItem(baml_compiler2_hir::loc::LetLoc<'db>),
+    GlobalItem(baml_compiler2_hir_ty::extern_loc::GlobalRef<'db>),
     /// A generic function instantiated with concrete type arguments
     /// (`foo<int>` referenced as a value). Emitted as a pooled, interned
     /// `Object::GenericFunction` so identical instantiations share one object
@@ -1331,7 +1377,7 @@ pub enum Constant<'db> {
 /// A function's identity in MIR: its declaration, or — for a lambda or a
 /// tagged-template body closure — the owner it was lowered inside plus its
 /// ordinal there. Rendered to a name only at emit's boundary
-/// ([`MirFunctionId::link_name`] / [`crate::function_link_name`]).
+/// ([`MirFunctionId::display_name`] / [`crate::function_display_name`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirFunctionId<'db> {
     Declared(baml_compiler2_hir::loc::FunctionLoc<'db>),
@@ -1364,13 +1410,13 @@ pub enum FunctionOwner<'db> {
 }
 
 impl MirFunctionId<'_> {
-    /// The name this function links and displays as — the declaration's
-    /// link name, or the synthetic spelling `<lambda(owner, i)>` /
+    /// The name this function displays as — the declaration's canonical
+    /// display name, or the synthetic spelling `<lambda(owner, i)>` /
     /// `<tagged(owner, i)>` under an EMPTY package segment (the historical
     /// rendering, which the bytecode display pins).
-    pub fn link_name(&self, db: &dyn crate::Db) -> String {
+    pub fn display_name(&self, db: &dyn crate::Db) -> String {
         match self {
-            MirFunctionId::Declared(func) => crate::lower::definition_link_name(
+            MirFunctionId::Declared(func) => crate::lower::definition_display_name(
                 db,
                 baml_compiler2_hir::contributions::Definition::Function(*func),
             ),
@@ -1403,17 +1449,17 @@ impl MirFunctionId<'_> {
     }
 
     /// This identity as a [`fmt::Display`] value that renders
-    /// [`Self::link_name`] when formatted, not when created.
+    /// [`Self::display_name`] when formatted, not when created.
     pub fn display<'a>(&'a self, db: &'a dyn crate::Db) -> impl fmt::Display + 'a {
         // Assertion messages format their arguments only when they fire, so
-        // a caller that never fails never pays for `definition_link_name`.
+        // a caller that never fails never pays for `definition_display_name`.
         struct Lazy<'a, 'db> {
             db: &'a dyn crate::Db,
             id: &'a MirFunctionId<'db>,
         }
         impl fmt::Display for Lazy<'_, '_> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.id.link_name(self.db))
+                f.write_str(&self.id.display_name(self.db))
             }
         }
         Lazy { db, id: self }

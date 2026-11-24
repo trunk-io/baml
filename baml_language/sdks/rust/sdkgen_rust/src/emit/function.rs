@@ -1,14 +1,16 @@
-//! Callable emission — free functions and class methods: one sync + one
-//! `_async` binding per BAML callable, both thin wrappers over
-//! `baml_bridge::runtime`.
+//! Callable emission — free functions and class methods: one async binding
+//! (the plain name) and one blocking `_sync` binding per BAML callable, both
+//! thin wrappers over `baml_bridge::runtime`.
 
-use baml_sdkgen_types::{Function, Name};
+use baml_sdkgen_types::{ClassCrossing, Function, Name};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::{
     SkipWarning, idents,
+    names::{Binding, CallableId},
     translate_ty::{self, TyCtx},
+    wire_ty,
 };
 
 /// How a binding receives its subject: free functions and static methods
@@ -31,18 +33,24 @@ pub(crate) fn emit(
 ) -> Result<TokenStream, SkipWarning> {
     let fqn = name.to_string();
     if name.name().as_str().contains('$') {
-        return Err(SkipWarning {
-            fqn,
-            reason: "legacy `$` companion functions are not emitted; callable companions use `@`"
-                .to_string(),
-        });
+        return Err(SkipWarning::new(
+            name,
+            "legacy `$` companion functions are not emitted; callable companions use `@`",
+        ));
     }
     // Generic free functions ARE emitted: their `<...>` params become Rust
     // generics bound by `BamlValue`. TypeVars that appear in positions the
     // translator can't represent still make the whole function skip, at the
     // per-type translation site.
-    let binding_name = name.name().as_str().replace('@', "_");
-    emit_binding(&fqn, &binding_name, function, Receiver::None, &[], ctx)
+    emit_binding(
+        &fqn,
+        name.is_local(),
+        &CallableId::Function(name.clone()),
+        function,
+        Receiver::None,
+        &[],
+        ctx,
+    )
 }
 
 /// Emit the sync + async bindings for a static or instance method, shaped
@@ -67,21 +75,32 @@ pub(crate) fn emit_method(
     let method_name = method.name.as_str();
     let fqn = format!("{class_name}.{method_name}");
     if method_name.contains('$') {
-        return Err(SkipWarning {
-            fqn,
-            reason: "legacy `$` companion methods are not emitted; callable companions use `@`"
-                .to_string(),
-        });
+        return Err(SkipWarning::member(
+            class_name,
+            method_name,
+            "legacy `$` companion methods are not emitted; callable companions use `@`",
+        ));
     }
-    let binding_name = method_name.replace('@', "_");
-    emit_binding(&fqn, &binding_name, method, receiver, class_params, ctx)
+    emit_binding(
+        &fqn,
+        class_name.is_local(),
+        &CallableId::Method {
+            class: class_name.clone(),
+            method: method.name.clone(),
+        },
+        method,
+        receiver,
+        class_params,
+        ctx,
+    )
 }
 
 /// Shared body of [`emit`] / [`emit_method`]: translate the signature and
 /// build the sync + async wrapper pair.
 fn emit_binding(
     fqn: &str,
-    binding_name: &str,
+    local: bool,
+    callable: &CallableId,
     function: &Function,
     receiver: Receiver,
     class_params: &[String],
@@ -89,6 +108,7 @@ fn emit_binding(
 ) -> Result<TokenStream, SkipWarning> {
     let skip = |reason: String| SkipWarning {
         fqn: fqn.to_string(),
+        local,
         reason,
     };
 
@@ -142,6 +162,11 @@ fn emit_binding(
         .iter()
         .filter(|argument| !argument.injected)
         .collect();
+    let names = &ctx.analysis.names;
+    let param_names: Vec<&str> = host_arguments
+        .iter()
+        .map(|argument| names.param(callable, &argument.name))
+        .collect();
 
     let ret = translate_ty::translate(&function.return_type, &gctx)
         .map_err(|u| skip(format!("return: {}", u.reason)))?;
@@ -151,9 +176,33 @@ fn emit_binding(
             .map_err(|u| skip(format!("throws contract: {}", u.reason)))?,
     };
 
+    // Every argument is stated under the type its parameter declares, each
+    // type variable spelled as the Rust type the call binds it to.
+    let own_type_var = wire_ty::own_type_var(&translation_scope);
+    let declared = |ty: &baml_sdkgen_types::Ty| wire_ty::wire_ty(ty, &gctx, &own_type_var);
+    // A callback's open effect (its synthetic effect parameter) is the
+    // caller's closure's to decide: its function type states it `unknown`.
+    let callback_type_var = |name: &str| {
+        if effect_params.iter().any(|param| param == name) {
+            Some(quote! {
+                ::baml_bridge::baml_value::internal::leaf_ty(
+                    ::baml_bridge::wire::baml_ty::Ty::Unknown(::baml_bridge::wire::BamlTyUnknown {}),
+                )
+            })
+        } else {
+            own_type_var(name)
+        }
+    };
+    // The arguments builder the call's encoding closure receives, named
+    // apart from every parameter.
+    let mut arguments_name = "__baml_arguments".to_string();
+    while param_names.contains(&arguments_name.as_str()) {
+        arguments_name.push('_');
+    }
+    let arguments = idents::ident(&arguments_name);
     let mut params = Vec::new();
     let mut converts = Vec::new();
-    let mut kwarg_entries = Vec::new();
+    let mut argument_stmts = Vec::new();
     // Callable parameters contribute two generic parameters each — the
     // closure type and its `HostCallback` marker — merged into the binding's
     // generics, and are registered as host closures rather than sent by value.
@@ -163,21 +212,14 @@ fn emit_binding(
         // The receiver rides the wire as an ordinary kwarg named `self`,
         // deep-copied like every other argument (no bridge special-casing;
         // the python and node SDKs send the same entry).
-        kwarg_entries.push(quote! {
-            (
-                "self",
-                ::std::option::Option::Some(
-                    ::baml_bridge::baml_value::internal::__BamlValuePrivate::to_baml(self),
-                ),
-            )
-        });
+        argument_stmts.push(quote! { #arguments.receiver(self)?; });
     }
-    for arg in &host_arguments {
+    for (arg, param_name) in host_arguments.iter().zip(&param_names) {
         let arg_name = arg.name.as_str();
-        let param = idents::ident(arg_name);
+        let param = idents::ident(param_name);
         // A direct callable parameter (`(…) -> R`) is registered as a host
         // closure rather than sent as a value: the binding takes it as a
-        // generic bound by `HostCallback`, erases it via `callable_handle`,
+        // generic bound by `HostCallback`, registers it with the arguments builder,
         // and sends the resulting handle on the wire. Only a *direct*,
         // non-defaulted callable is handled here; one nested in a
         // union/optional or behind a default falls through to `translate_ty`
@@ -191,6 +233,26 @@ fn emit_binding(
                 host_params,
             } = translate_callable(&arg.ty, &gctx)
                 .map_err(|u| skip(format!("callback `{arg_name}`: {}", u.reason)))?;
+            let baml_sdkgen_types::Ty::Function {
+                params: callback_params,
+                ret: callback_ret,
+                throws: callback_throws,
+            } = &arg.ty
+            else {
+                unreachable!("matched a function type above");
+            };
+            let wire_ty::FunctionParts {
+                params: wire_params,
+                ret: wire_ret,
+                throws: wire_throws,
+            } = wire_ty::function_parts(
+                callback_params,
+                callback_ret,
+                callback_throws,
+                &gctx,
+                &callback_type_var,
+            )
+            .map_err(|u| skip(format!("callback `{arg_name}`: {}", u.reason)))?;
             let cb_ident = format_ident!("__BamlCb{callable_index}");
             let marker_ident = format_ident!("__BamlCbMarker{callable_index}");
             callable_index += 1;
@@ -206,19 +268,24 @@ fn emit_binding(
             });
             callable_generic_decls.push(quote! { #marker_ident });
             params.push(quote! { #param: #cb_ident });
-            converts.push(quote! {
-                let #param = ::baml_bridge::host_value::callable_handle(
+            argument_stmts.push(quote! {
+                #arguments.callable(
+                    #arg_name,
                     #param,
                     &[#(#host_params),*],
-                );
-            });
-            kwarg_entries.push(quote! {
-                (#arg_name, ::std::option::Option::Some(#param))
+                    ::baml_bridge::host_value::CallableTy::new(
+                        ::std::vec![#(#wire_params),*],
+                        #wire_ret,
+                        #wire_throws,
+                    ),
+                )?;
             });
             continue;
         }
         let ty = translate_ty::translate(&arg.ty, &gctx)
             .map_err(|u| skip(format!("argument `{arg_name}`: {}", u.reason)))?;
+        let slot =
+            declared(&arg.ty).map_err(|u| skip(format!("argument `{arg_name}`: {}", u.reason)))?;
         if arg.default.is_some() {
             // A defaulted BAML parameter: the wrapper accepts anything
             // convertible into `OptionalArg` so call sites pass a plain
@@ -230,8 +297,9 @@ fn emit_binding(
             converts.push(quote! {
                 let #param = ::std::convert::Into::<::baml_bridge::OptionalArg<#ty>>::into(#param);
             });
-            kwarg_entries.push(quote! { (#arg_name, #param.to_baml_opt()) });
+            argument_stmts.push(quote! { #arguments.optional(#arg_name, &#param, &#slot)?; });
         } else {
+            let mut value = quote! { &#param };
             // Union-typed parameters accept anything convertible into the
             // synthesized enum, so call sites pass bare arm values
             // through the per-arm `From` impls.
@@ -240,17 +308,20 @@ fn emit_binding(
                 converts.push(quote! {
                     let #param: #ty = ::std::convert::Into::into(#param);
                 });
+            } else if let baml_sdkgen_types::Ty::Class(name, _) = &arg.ty
+                && gctx.analysis.crossing(name) != Some(ClassCrossing::HostValue)
+            {
+                // Encoding only reads the argument, so class-typed
+                // parameters accept `value` or `&value` (or an `Arc`/`Box`
+                // of it): a caller reusing one value across calls does not
+                // clone it per call. A host's own value is a shared handle
+                // (`baml_bridge::HostValue`), taken by value.
+                params.push(quote! { #param: impl ::std::borrow::Borrow<#ty> });
+                value = quote! { ::std::borrow::Borrow::<#ty>::borrow(&#param) };
             } else {
                 params.push(quote! { #param: #ty });
             }
-            kwarg_entries.push(quote! {
-                (
-                    #arg_name,
-                    ::std::option::Option::Some(
-                        ::baml_bridge::baml_value::internal::__BamlValuePrivate::to_baml(&#param),
-                    ),
-                )
-            });
+            argument_stmts.push(quote! { #arguments.value(#arg_name, #value, &#slot)?; });
         }
     }
 
@@ -274,8 +345,16 @@ fn emit_binding(
         Receiver::None => TokenStream::new(),
         Receiver::RefSelf => quote! { &self, },
     };
-    let sync_name = idents::ident(binding_name);
-    let async_name = format_ident!("{}_async", idents::dir_segment(binding_name));
+    let binding = |binding| idents::ident(names.binding(callable, binding));
+    let sync_name = binding(Binding::Sync);
+    let async_name = binding(Binding::Async);
+    let sync_options_name = binding(Binding::SyncWithOptions);
+    let async_options_name = binding(Binding::AsyncWithOptions);
+    let mut control_name = "baml".to_string();
+    while param_names.contains(&control_name.as_str()) {
+        control_name.push('_');
+    }
+    let control = idents::ident(&control_name);
     let result_ty = quote! { ::std::result::Result<#ret, ::baml_bridge::Error<#throws>> };
     // The receiver counts toward clippy's tally (`self` is one of the
     // `fn_decl` inputs), so it counts here too.
@@ -339,8 +418,8 @@ fn emit_binding(
     };
 
     let stream_with_bindings = if fqn.ends_with("@stream") {
-        let with_name = format_ident!("{}_with", idents::dir_segment(binding_name));
-        let with_async_name = format_ident!("{}_with_async", idents::dir_segment(binding_name));
+        let with_name = binding(Binding::StreamWith);
+        let with_async_name = binding(Binding::StreamWithAsync);
         quote! {
             #(#doc_attrs)*
             #too_many_arguments_attr
@@ -351,12 +430,12 @@ fn emit_binding(
                 options: ::baml_bridge::CallOptions,
             ) -> #result_ty {
                 crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
-                #(#converts)*
-                let mut kwargs = ::baml_bridge::encode::kwargs(
-                    ::std::vec![#(#kwarg_entries),*]
-                );
-                options.append_to(&mut kwargs);
-                ::baml_bridge::runtime::invoke_sync(#fqn, kwargs, #type_args_expr)
+                ::baml_bridge::runtime::invoke_sync(#fqn, |#arguments| {
+                    #(#converts)*
+                    #(#argument_stmts)*
+                    options.append_to(#arguments)?;
+                    ::std::result::Result::Ok(#type_args_expr)
+                })
             }
 
             #(#doc_attrs)*
@@ -368,16 +447,66 @@ fn emit_binding(
                 options: ::baml_bridge::CallOptions,
             ) -> #result_ty {
                 crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
-                #(#converts)*
-                let mut kwargs = ::baml_bridge::encode::kwargs(
-                    ::std::vec![#(#kwarg_entries),*]
-                );
-                options.append_to(&mut kwargs);
-                ::baml_bridge::runtime::invoke(#fqn, kwargs, #type_args_expr).await
+                ::baml_bridge::runtime::invoke(#fqn, |#arguments| {
+                    #(#converts)*
+                    #(#argument_stmts)*
+                    options.append_to(#arguments)?;
+                    ::std::result::Result::Ok(#type_args_expr)
+                })
+                .await
             }
         }
     } else {
         TokenStream::new()
+    };
+
+    let controlled_bindings = quote! {
+        #(#doc_attrs)*
+        #[allow(clippy::too_many_arguments)]
+        #schema_method_name_attr
+        pub fn #sync_options_name #generics_decl (#self_param #(#params,)* #control: impl ::std::convert::Into<crate::BamlOptions>) -> #result_ty {
+            crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
+            let invocation_options: ::baml_bridge::invocation::InvocationOptions = ::std::convert::Into::<crate::BamlOptions>::into(#control).into();
+            ::baml_bridge::runtime::invoke_sync_with_options(#fqn, |#arguments| {
+                #(#converts)*
+                #(#argument_stmts)*
+                ::std::result::Result::Ok(#type_args_expr)
+            }, invocation_options)
+        }
+        #(#doc_attrs)*
+        #[allow(clippy::too_many_arguments)]
+        #schema_method_name_attr
+        pub async fn #async_options_name #generics_decl (#self_param #(#params,)* #control: impl ::std::convert::Into<crate::BamlOptions>) -> #result_ty {
+            crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
+            let invocation_options: ::baml_bridge::invocation::InvocationOptions = ::std::convert::Into::<crate::BamlOptions>::into(#control).into();
+            ::baml_bridge::runtime::invoke_with_options(#fqn, |#arguments| {
+                #(#converts)*
+                #(#argument_stmts)*
+                ::std::result::Result::Ok(#type_args_expr)
+            }, invocation_options).await
+        }
+    };
+    let sync_body = if fqn == "trace.current_context" {
+        quote! { ::baml_bridge::invocation::current_context() }
+    } else {
+        quote! {
+            ::baml_bridge::runtime::invoke_sync_with_options(#fqn, |#arguments| {
+                #(#converts)*
+                #(#argument_stmts)*
+                ::std::result::Result::Ok(#type_args_expr)
+            }, ::baml_bridge::invocation::InvocationOptions::default())
+        }
+    };
+    let async_body = if fqn == "trace.current_context" {
+        quote! { ::baml_bridge::invocation::current_context() }
+    } else {
+        quote! {
+            ::baml_bridge::runtime::invoke_with_options(#fqn, |#arguments| {
+                #(#converts)*
+                #(#argument_stmts)*
+                ::std::result::Result::Ok(#type_args_expr)
+            }, ::baml_bridge::invocation::InvocationOptions::default()).await
+        }
     };
 
     Ok(quote! {
@@ -386,12 +515,7 @@ fn emit_binding(
         #schema_method_name_attr
         pub fn #sync_name #generics_decl (#self_param #(#params),*) -> #result_ty {
             crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
-            #(#converts)*
-            ::baml_bridge::runtime::invoke_sync(
-                #fqn,
-                ::baml_bridge::encode::kwargs(::std::vec![#(#kwarg_entries),*]),
-                #type_args_expr,
-            )
+            #sync_body
         }
 
         #(#doc_attrs)*
@@ -399,16 +523,11 @@ fn emit_binding(
         #schema_method_name_attr
         pub async fn #async_name #generics_decl (#self_param #(#params),*) -> #result_ty {
             crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
-            #(#converts)*
-            ::baml_bridge::runtime::invoke(
-                #fqn,
-                ::baml_bridge::encode::kwargs(::std::vec![#(#kwarg_entries),*]),
-                #type_args_expr,
-            )
-            .await
+            #async_body
         }
 
         #stream_with_bindings
+        #controlled_bindings
     })
 }
 

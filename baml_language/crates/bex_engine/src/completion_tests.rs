@@ -10,7 +10,7 @@ use super::*;
 fn engine(source: &str) -> Arc<BexEngine> {
     Arc::new(
         BexEngine::new(
-            baml_db::testing::compile_source(source),
+            baml_test_support::compile_source(source),
             Arc::new(sys_native::SysOps::native()),
             vec![],
         )
@@ -31,7 +31,9 @@ async fn entry(
 }
 
 fn assert_completed(engine: &BexEngine, expected: &[(u64, InvocationOutcome)]) {
-    let mut actual = engine.completed_threads.lock().unwrap().clone();
+    let mut actual: Vec<_> = (engine.completed_threads.lock().unwrap().iter())
+        .map(|&(id, outcome)| (id.get(), outcome))
+        .collect();
     actual.sort_by_key(|(id, _)| *id);
     assert_eq!(
         actual, expected,
@@ -56,22 +58,28 @@ async fn conversion_errors_and_terminal_outcomes_finalize() {
     for (source, return_type, throws_type, cancelled, outcome) in [
         (
             "function Main() -> int { 1 }",
-            RuntimeTy::int(),
+            bex_vm_types::RealizedTy::Int,
             None,
             false,
             InvocationOutcome::Ok,
         ),
         (
             "function Main() -> int { 1 }",
-            RuntimeTy::union([RuntimeTy::string(), RuntimeTy::bool()]),
+            bex_vm_types::RealizedTy::Union(Box::from_iter([
+                bex_vm_types::RealizedTy::String,
+                bex_vm_types::RealizedTy::Bool,
+            ])),
             None,
             false,
             InvocationOutcome::Errored,
         ),
         (
             "function Main() -> int throws int { throw 7; }",
-            RuntimeTy::int(),
-            Some(RuntimeTy::union([RuntimeTy::string(), RuntimeTy::bool()])),
+            bex_vm_types::RealizedTy::Int,
+            Some(bex_vm_types::RealizedTy::Union(Box::from_iter([
+                bex_vm_types::RealizedTy::String,
+                bex_vm_types::RealizedTy::Bool,
+            ]))),
             false,
             InvocationOutcome::Errored,
         ),
@@ -79,7 +87,7 @@ async fn conversion_errors_and_terminal_outcomes_finalize() {
         // token has fired, and its value stands.
         (
             "function Main() -> int { 1 }",
-            RuntimeTy::int(),
+            bex_vm_types::RealizedTy::Int,
             None,
             true,
             InvocationOutcome::Ok,
@@ -87,14 +95,14 @@ async fn conversion_errors_and_terminal_outcomes_finalize() {
         // The first checkpoint after the token fires delivers `Cancelled`.
         (
             "function Main() -> int { baml.sys.sleep(baml.time.Duration.from_milliseconds(1)); 1 }",
-            RuntimeTy::int(),
+            bex_vm_types::RealizedTy::Int,
             None,
             true,
             InvocationOutcome::Cancelled,
         ),
         (
             "function Main() -> int { baml.sys.exit(7); 1 }",
-            RuntimeTy::int(),
+            bex_vm_types::RealizedTy::Int,
             None,
             false,
             // Exit stops the call; it did not fail.
@@ -104,14 +112,21 @@ async fn conversion_errors_and_terminal_outcomes_finalize() {
         let engine = engine(source);
         let cancel = CancellationToken::new();
         let thread = entry(&engine, &cancel, &[]).await;
-        let id = thread.vm.thread_id;
+        let id = thread.vm.thread_id.get();
         // Set cancellation after entry so the loop's delivery, not
         // call_function's preflight cancellation check, owns completion.
         if cancelled {
             cancel.cancel();
         }
         let result = engine
-            .run_thread_event_loop(return_type, throws_type, thread, CallId::next(), None, true)
+            .run_thread_event_loop(
+                engine.hold_ty(return_type),
+                throws_type.map(|ty| engine.hold_ty(ty)),
+                thread,
+                CallId::next(),
+                None,
+                true,
+            )
             .await;
         if source.contains("baml.sys.exit") {
             assert!(matches!(result, Err(EngineError::Exit { code: 7 })));
@@ -138,7 +153,7 @@ async fn conversion_errors_and_terminal_outcomes_finalize() {
 async fn ready_and_suspended_sysop_failures_finalize() {
     for suspended in [false, true] {
         let mut ops = sys_native::SysOps::native();
-        ops.baml_sys_sleep = Arc::new(move |_, _, _, _, _| {
+        ops.baml_sys__sleep = Arc::new(move |_, _, _, _, _| {
             let failure = Err(sys_types::OpError::new(
                 SysOp::BamlSysSleep,
                 bex_vm_types::errors::VmInternalError::BridgeFailure {
@@ -154,12 +169,19 @@ async fn ready_and_suspended_sysop_failures_finalize() {
                 SysOpResult::Ready(failure)
             }
         });
-        let engine = Arc::new(BexEngine::new(baml_db::testing::compile_source("function Main() -> int { baml.sys.sleep(baml.time.Duration.from_nanoseconds(0n)); 1 }"), Arc::new(ops), vec![]).unwrap());
+        let engine = Arc::new(BexEngine::new(baml_test_support::compile_source("function Main() -> int { baml.sys.sleep(baml.time.Duration.from_nanoseconds(0n)); 1 }"), Arc::new(ops), vec![]).unwrap());
         let cancel = CancellationToken::new();
         let thread = entry(&engine, &cancel, &[]).await;
-        let id = thread.vm.thread_id;
+        let id = thread.vm.thread_id.get();
         let result = engine
-            .run_thread_event_loop(RuntimeTy::int(), None, thread, CallId::next(), None, true)
+            .run_thread_event_loop(
+                engine.hold_ty(bex_vm_types::RealizedTy::Int),
+                None,
+                thread,
+                CallId::next(),
+                None,
+                true,
+            )
             .await;
         assert!(result.is_err());
         assert_completed(&engine, &[(id, InvocationOutcome::Errored)]);
@@ -178,8 +200,8 @@ async fn await_lookup_failure_finalizes() {
         // fails the engine registry lookup before releasing the permit.
         let future = thread.vm.tlab_mut().alloc_future(Future::pending(
             FutureId::from_usize(usize::MAX),
-            RealizedTy::int(),
-            RealizedTy::never(),
+            RealizedTy::Int,
+            RealizedTy::Never,
             cancel.clone(),
         ));
         let (function, _) =
@@ -187,9 +209,16 @@ async fn await_lookup_failure_finalizes() {
         thread
             .vm
             .set_entry_point(*function, &[Value::object(future)]);
-        let id = thread.vm.thread_id;
+        let id = thread.vm.thread_id.get();
         let result = engine
-            .run_thread_event_loop(RuntimeTy::int(), None, thread, CallId::next(), None, true)
+            .run_thread_event_loop(
+                engine.hold_ty(bex_vm_types::RealizedTy::Int),
+                None,
+                thread,
+                CallId::next(),
+                None,
+                true,
+            )
             .await;
         assert!(matches!(result, Err(EngineError::FutureNotFound { .. })));
         assert_completed(&engine, &[(id, InvocationOutcome::Errored)]);
@@ -206,8 +235,8 @@ async fn suspended_await_failure_and_cancellation_finalize() {
             let cancel = CancellationToken::new();
             let mut thread = engine.new_root_thread(cancel.clone()).await;
             let (future_id, future) = engine.futures.acquire(thread.proof()).await.new_future(
-                RealizedTy::int(),
-                RealizedTy::never(),
+                RealizedTy::Int,
+                RealizedTy::Never,
                 CancellationToken::new(),
                 "test".into(),
             );
@@ -216,9 +245,9 @@ async fn suspended_await_failure_and_cancellation_finalize() {
             thread
                 .vm
                 .set_entry_point(*function, &[Value::object(future)]);
-            let id = thread.vm.thread_id;
+            let id = thread.vm.thread_id.get();
             let running = engine.run_thread_event_loop(
-                RuntimeTy::int(),
+                engine.hold_ty(bex_vm_types::RealizedTy::Int),
                 None,
                 thread,
                 CallId::next(),
@@ -321,7 +350,7 @@ async fn queued_and_running_child_cancellation_finish_once() {
         (
             false,
             r#"function Main() -> int {
-            let g = baml.spawn.Limit.new(1);
+            let g = baml.sync.Semaphore.new(1);
             let token = baml.spawn.CancelToken.new();
             let active = spawn with g { 7 };
             let queued = spawn with g, token { 99 };
@@ -348,7 +377,7 @@ async fn queued_and_running_child_cancellation_finish_once() {
     ] {
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ops = sys_native::SysOps::native();
-        ops.baml_sys_sleep = Arc::new(move |_, _, _, _, _| {
+        ops.baml_sys__sleep = Arc::new(move |_, _, _, _, _| {
             let started_tx = started_tx.clone();
             SysOpResult::Async(Box::pin(async move {
                 // Report only after this child's sys-op future is polled.
@@ -358,7 +387,7 @@ async fn queued_and_running_child_cancellation_finish_once() {
         });
         let engine = Arc::new(
             BexEngine::new(
-                baml_db::testing::compile_source(source),
+                baml_test_support::compile_source(source),
                 Arc::new(ops),
                 vec![],
             )
@@ -410,7 +439,14 @@ async fn child_internal_error_settles_and_finishes_both_threads() {
     // inside a dispatched child and propagation through its parent's await.
     let thread = entry(&engine, &cancel, &[Value::int(7)]).await;
     let result = engine
-        .run_thread_event_loop(RuntimeTy::int(), None, thread, CallId::next(), None, true)
+        .run_thread_event_loop(
+            engine.hold_ty(bex_vm_types::RealizedTy::Int),
+            None,
+            thread,
+            CallId::next(),
+            None,
+            true,
+        )
         .await;
     assert!(result.is_err());
     assert_completed(
@@ -428,7 +464,7 @@ async fn clock_restore_invalidates_inflight_timing_without_changing_execution() 
 
     let engine = Arc::new(
         BexEngine::new_with_telemetry_clock(
-            baml_db::testing::compile_source("function Main() -> int { 7 }"),
+            baml_test_support::compile_source("function Main() -> int { 7 }"),
             Arc::new(sys_native::SysOps::native()),
             vec![],
             None,
@@ -439,12 +475,19 @@ async fn clock_restore_invalidates_inflight_timing_without_changing_execution() 
     let cancel = CancellationToken::new();
     let thread = entry(&engine, &cancel, &[]).await;
     let old = Arc::clone(thread.vm.telemetry_clock().unwrap());
-    let id = thread.vm.thread_id;
+    let id = thread.vm.thread_id.get();
     let replacement = engine.reset_telemetry_clock_after_restore().unwrap();
     assert_eq!(old.status(), TimingStatus::Restored);
     assert_ne!(replacement.metadata().epoch, old.metadata().epoch);
     let result = engine
-        .run_thread_event_loop(RuntimeTy::int(), None, thread, CallId::next(), None, true)
+        .run_thread_event_loop(
+            engine.hold_ty(bex_vm_types::RealizedTy::Int),
+            None,
+            thread,
+            CallId::next(),
+            None,
+            true,
+        )
         .await;
     assert!(matches!(
         result,

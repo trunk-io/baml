@@ -196,7 +196,7 @@ pub const MAX_UNIFY_DEPTH: usize = 256;
 pub fn contains_bound_typevar(ty: &Ty, generic_params: &[ParamTy]) -> bool {
     match ty {
         Ty::TypeVar(name) => generic_params.contains(name),
-        Ty::Class(_, args) | Ty::Union(args) => args
+        Ty::Class(_, args) | Ty::Union(args) | Ty::Tuple(args) => args
             .iter()
             .any(|arg| contains_bound_typevar(arg, generic_params)),
         Ty::Interface(_, args, associated_bindings) => {
@@ -237,7 +237,7 @@ pub fn contains_bound_typevar(ty: &Ty, generic_params: &[ParamTy]) -> bool {
 pub fn all_typevars_within(ty: &Ty, vars: &[ParamTy]) -> bool {
     match ty {
         Ty::TypeVar(name) => vars.contains(name),
-        Ty::Class(_, args) | Ty::Union(args) => {
+        Ty::Class(_, args) | Ty::Union(args) | Ty::Tuple(args) => {
             args.iter().all(|arg| all_typevars_within(arg, vars))
         }
         Ty::Interface(_, args, associated_bindings) => {
@@ -289,7 +289,7 @@ pub fn var_under_union(param: &ParamTy, ty: &Ty) -> bool {
         match ty {
             Ty::TypeVar(candidate) => in_union && candidate == param,
             Ty::Union(members) => members.iter().any(|m| occurs(param, m, true)),
-            Ty::Class(_, args) => args.iter().any(|a| occurs(param, a, in_union)),
+            Ty::Class(_, args) | Ty::Tuple(args) => args.iter().any(|a| occurs(param, a, in_union)),
             Ty::Interface(_, args, assoc) => {
                 args.iter().any(|a| occurs(param, a, in_union))
                     || assoc.iter().any(|(_, t)| occurs(param, t, in_union))
@@ -330,11 +330,9 @@ pub fn var_under_union(param: &ParamTy, ty: &Ty) -> bool {
             | Ty::Literal(..)
             | Ty::Enum(..)
             | Ty::EnumVariant(..)
-            | Ty::RustType
             | Ty::Type
             | Ty::Resource
             | Ty::PromptAst
-            | Ty::Void
             | Ty::TypeAlias(..)
             | Ty::Unknown
             | Ty::Never
@@ -361,6 +359,7 @@ pub fn nf(ty: &Ty, enum_variants: EnumVariants) -> Ty {
             enum_variants,
         ),
         Ty::List(inner) => Ty::List(Box::new(nf(inner, enum_variants))),
+        Ty::Tuple(elements) => Ty::Tuple(elements.iter().map(|e| nf(e, enum_variants)).collect()),
         Ty::Map { key, value } => Ty::Map {
             key: Box::new(nf(key, enum_variants)),
             value: Box::new(nf(value, enum_variants)),
@@ -620,6 +619,9 @@ fn unify_into_at(
             ))
         }
         (Ty::List(xi), Ty::List(yi)) => unify_into_at(xi, yi, vars, env, bindings, depth + 1),
+        (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
+            unify_all(xs, ys, vars, env, bindings, depth + 1)
+        }
         (
             Ty::Map {
                 key: xk, value: xv, ..
@@ -713,6 +715,7 @@ fn unify_into_at(
             | Ty::Interface(..)
             | Ty::List(..)
             | Ty::Map { .. }
+            | Ty::Tuple(..)
             | Ty::Future(..)
             | Ty::Int
             | Ty::Bigint
@@ -726,11 +729,9 @@ fn unify_into_at(
             | Ty::Enum(..)
             | Ty::EnumVariant(..)
             | Ty::Function { .. }
-            | Ty::RustType
             | Ty::Type
             | Ty::Resource
             | Ty::PromptAst
-            | Ty::Void
             | Ty::TypeAlias(..)
             | Ty::TypeVar(..)
             | Ty::Unknown
@@ -963,6 +964,7 @@ pub fn rewrite_ty<N: Head>(ty: &Ty<N>, rewrite: &mut dyn FnMut(&Ty<N>) -> Option
         Ty::Union(members) => {
             normalize_union_members(members.iter().map(|m| rewrite_ty(m, rewrite)))
         }
+        Ty::Tuple(elements) => Ty::Tuple(elements.iter().map(|e| rewrite_ty(e, rewrite)).collect()),
         Ty::Function {
             params,
             ret,
@@ -1064,8 +1066,8 @@ fn unions_set_equal(xs: &[Ty], ys: &[Ty], env: &AliasEquivCtx<'_>) -> bool {
 /// associated bindings). On top of it sit the two top-level subtypings that invariance
 /// leaves above the constructor level — `literal <: base` and `variant <: enum`
 /// (`is_literal_subtype`) — and the pairs `unify_into` cannot decide without the impl
-/// registry — a concrete type vs an interface, two *different* interfaces, an opaque
-/// `$rust_type` (`needs_conservative_membership`) — which are treated conservatively as
+/// registry — a concrete type vs an interface, two *different* interfaces
+/// (`needs_conservative_membership`) — which are treated conservatively as
 /// a *possible* overlap (`Yes`), never a wrong `No`. All of these arms only fire when
 /// `unify_into` already returned `No` without binding anything, so they leave `bindings`
 /// untouched. Registry-precise `C implements I` / `I requires J` is a later refinement.
@@ -1118,13 +1120,10 @@ pub fn is_literal_subtype(member: &Ty, candidate: &Ty) -> bool {
 
 /// Whether this pair's subtyping cannot be decided without the impl registry, so the
 /// covering oracle must fall back to a conservative `Yes`: a concrete type vs an
-/// interface (needs `C implements I`), two *different* interfaces (needs `I requires J`),
-/// or an opaque `$rust_type`. Two interfaces of the *same* name are decided precisely by
+/// interface (needs `C implements I`) or two *different* interfaces (needs `I requires J`).
+/// Two interfaces of the *same* name are decided precisely by
 /// `unify_into` (generic args + associated bindings), so they are **not** conservative.
 fn needs_conservative_membership(a: &Ty, b: &Ty) -> bool {
-    if matches!(a, Ty::RustType) || matches!(b, Ty::RustType) {
-        return true;
-    }
     match (a, b) {
         (Ty::Interface(qa, ..), Ty::Interface(qb, ..)) => qa != qb,
         (Ty::Interface(..), _) | (_, Ty::Interface(..)) => true,
@@ -1261,7 +1260,7 @@ fn occurs_in(n: &ParamTy, t: &Ty, vars: &[ParamTy], bindings: &TypeBindings) -> 
     let t = chase_var(t, vars, bindings);
     match &t {
         Ty::TypeVar(m) => m == n,
-        Ty::Class(_, args) | Ty::Union(args) => {
+        Ty::Class(_, args) | Ty::Union(args) | Ty::Tuple(args) => {
             args.iter().any(|a| occurs_in(n, a, vars, bindings))
         }
         Ty::Interface(_, args, assoc) => {
@@ -1304,11 +1303,9 @@ fn occurs_in(n: &ParamTy, t: &Ty, vars: &[ParamTy], bindings: &TypeBindings) -> 
         | Ty::Literal(..)
         | Ty::Enum(..)
         | Ty::EnumVariant(..)
-        | Ty::RustType
         | Ty::Type
         | Ty::Resource
         | Ty::PromptAst
-        | Ty::Void
         | Ty::TypeAlias(..)
         | Ty::Unknown
         | Ty::Never

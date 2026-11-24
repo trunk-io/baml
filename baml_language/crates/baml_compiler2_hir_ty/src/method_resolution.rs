@@ -169,6 +169,10 @@ pub enum MemberDeclarer<'db> {
     /// one possible target).
     VirtualMethod {
         interface: InterfaceRef<'db>,
+        /// The realized declaring-interface view the slot is reached
+        /// through: the runtime resolver's key, recorded so no consumer
+        /// derives it again from the receiver's type.
+        realized: InferInterface,
         method: FunctionRef<'db>,
     },
     /// A concrete receiver's method through a matched impl: the method
@@ -199,6 +203,10 @@ pub enum MemberDeclarer<'db> {
 pub struct PendingOwnGenerics<'db> {
     pub callable: FunctionRef<'db>,
     pub prefix: Vec<Ty>,
+    /// The arms of a union receiver: the signature is instantiated once per
+    /// arm (`instantiate_member_signature`). `None` for every other
+    /// receiver.
+    pub arms: Option<Vec<Ty>>,
 }
 
 /// The outcome of an interface-member lookup. Ambiguity is a DISTINCT
@@ -246,6 +254,20 @@ pub(crate) fn member_roots<'db>(
     facts: &Facts<'db>,
     receiver: &Ty,
 ) -> Option<(Vec<InferInterface>, bool)> {
+    let (mut roots, existential) = declared_member_roots(db, facts, receiver)?;
+    for interface in crate::impls::applicable_structural_interface_roots(db, facts, receiver) {
+        if !roots.contains(&interface) {
+            roots.push(interface);
+        }
+    }
+    Some((roots, existential))
+}
+
+fn declared_member_roots<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    facts: &Facts<'db>,
+    receiver: &Ty,
+) -> Option<(Vec<InferInterface>, bool)> {
     match receiver.kind() {
         InferTy::Interface(qtn, args, pins) => Some((
             vec![InferInterface::new(qtn.clone(), args.clone(), pins.clone())],
@@ -269,6 +291,56 @@ pub(crate) fn member_roots<'db>(
             ..
         } => Some((assoc_bound_roots(db, facts, base, interface, member), false)),
         _ => None,
+    }
+}
+
+/// A declared bound or applicable explicit impl outranks a structural fallback.
+/// Interface identity alone cannot distinguish those sources.
+/// A shared union view is a fallback only if every arm gets it implicitly.
+pub(crate) fn prefer_explicit_members<'db, T>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    viewer: baml_base::SourceRoot,
+    facts: &Facts<'db>,
+    receiver: &Ty,
+    candidates: &mut Vec<T>,
+    interface: impl Fn(&T) -> InferInterface,
+) {
+    fn explicit<'db>(
+        db: &'db dyn baml_compiler2_hir::Db,
+        viewer: baml_base::SourceRoot,
+        facts: &Facts<'db>,
+        receiver: &Ty,
+        interface: &InferInterface,
+    ) -> bool {
+        if let InferTy::Union(arms) = receiver.kind() {
+            return arms
+                .iter()
+                .any(|arm| explicit(db, viewer, facts, arm, interface));
+        }
+        if let Some((roots, _)) = declared_member_roots(db, facts, receiver) {
+            return roots.iter().any(|root| {
+                root == interface
+                    || crate::impls::direct_requires_closure(db, root, receiver, 8)
+                        .contains(interface)
+            });
+        }
+        impls_for_receiver(db, viewer, receiver)
+            .iter()
+            .any(|resolved| {
+                env_discharges_rigid_bounds(db, facts, resolved)
+                    && resolved.implemented() == *interface
+            })
+    }
+    if candidates.len() < 2 {
+        return;
+    }
+    let priorities: Vec<_> = candidates
+        .iter()
+        .map(|candidate| explicit(db, viewer, facts, receiver, &interface(candidate)))
+        .collect();
+    if priorities.iter().any(|explicit| *explicit) {
+        let mut priorities = priorities.into_iter();
+        candidates.retain(|_| priorities.next().expect("one priority per candidate"));
     }
 }
 
@@ -303,13 +375,22 @@ pub fn lookup_interface_member<'db>(
             declarers.push((realized.clone(), member));
         }
     };
+    // A value receiver's members: `baml.Concrete`'s `type` is a static.
+    let concrete_type = |interface: &InferInterface| {
+        crate::impls::is_concrete_type_member(facts.lang(), &interface.name, name)
+    };
     for root in &roots {
         // Root-wins: the directly-named interface shadows its own closure.
-        if let Some(member) = member_on_interface(db, facts, root, receiver, name, existential) {
+        if !concrete_type(root)
+            && let Some(member) = member_on_interface(db, facts, root, receiver, name, existential)
+        {
             push(&mut declarers, root, member);
             continue;
         }
         for required in crate::impls::direct_requires_closure(db, root, receiver, 8) {
+            if concrete_type(&required) {
+                continue;
+            }
             if let Some(member) =
                 member_on_interface(db, facts, &required, receiver, name, existential)
             {
@@ -317,6 +398,14 @@ pub fn lookup_interface_member<'db>(
             }
         }
     }
+    prefer_explicit_members(
+        db,
+        viewer,
+        facts,
+        receiver,
+        &mut declarers,
+        |(interface, _)| interface.clone(),
+    );
     match declarers.len() {
         0 => {
             // No resolvable declarer - but an existential receiver may
@@ -476,6 +565,9 @@ fn lookup_impl_member<'db>(
             continue;
         }
         let implemented = resolved.implemented();
+        if crate::impls::is_concrete_type_member(facts.lang(), &implemented.name, name) {
+            continue;
+        }
         if let Some(mut member) =
             member_on_interface(db, facts, &implemented, receiver, name, false)
             && !providers.iter().any(|(seen, _)| *seen == implemented)
@@ -514,6 +606,7 @@ fn lookup_impl_member<'db>(
                         .then(|| PendingOwnGenerics {
                             callable,
                             prefix: frame_type_args.clone(),
+                            arms: None,
                         });
                         member.declarer = MemberDeclarer::ImplMethod {
                             block: resolved.block(),
@@ -526,7 +619,11 @@ fn lookup_impl_member<'db>(
                         // `member_on_interface` already IS its signature.
                         // Only the declarer narrows to the matched impl.
                         member.declarer = match member.declarer {
-                            MemberDeclarer::VirtualMethod { interface, method } => {
+                            MemberDeclarer::VirtualMethod {
+                                interface,
+                                realized,
+                                method,
+                            } => {
                                 // Adoption requires a default BODY this
                                 // compilation can reference — a SOURCE block
                                 // adopting a SOURCE default with a body. An
@@ -554,9 +651,11 @@ fn lookup_impl_member<'db>(
                                             frame_type_args,
                                         }
                                     }
-                                    (_, method) => {
-                                        MemberDeclarer::VirtualMethod { interface, method }
-                                    }
+                                    (_, method) => MemberDeclarer::VirtualMethod {
+                                        interface,
+                                        realized,
+                                        method,
+                                    },
                                 }
                             }
                             other => other,
@@ -578,6 +677,17 @@ fn lookup_impl_member<'db>(
                 };
             }
             providers.push((implemented, member));
+        }
+    }
+    if providers.is_empty() && !receiver.has_error() {
+        // Member first: proving a conditional root (`Hash`) can walk the
+        // receiver's whole type graph, and most names are not on it.
+        for interface in crate::impls::structural_interface_candidates(db) {
+            if let Some(member) = member_on_interface(db, facts, &interface, receiver, name, false)
+                && crate::impls::structural_root_applies(db, facts, receiver, &interface)
+            {
+                providers.push((interface, member));
+            }
         }
     }
     // Interface FIELDS on a concrete receiver are projection-only (TIR's
@@ -744,8 +854,24 @@ fn extend_from_impls<'db>(
     self_ty: &baml_type::Ty,
 ) {
     let facts = Facts::new(db);
-    for resolved in impls_of_type(db, viewer, self_ty) {
-        let implemented = resolved.implemented();
+    let mut explicit: Vec<_> = impls_of_type(db, viewer, self_ty)
+        .into_iter()
+        .map(|resolved| resolved.implemented())
+        .collect();
+    // `baml.Concrete` last: a `type` another interface declares keeps the
+    // name, as it does in `determine_concrete`.
+    explicit.sort_by_key(|interface| {
+        crate::impls::is_concrete_type_member(facts.lang(), &interface.name, &Name::new("type"))
+    });
+    for implemented in
+        explicit
+            .into_iter()
+            .chain(crate::impls::applicable_structural_interface_roots(
+                db,
+                &facts,
+                &Ty::from_plain(self_ty),
+            ))
+    {
         for (name, is_method, is_static, decl) in
             interface_member_rows(db, &facts, &implemented, false)
         {
@@ -870,8 +996,14 @@ fn env_proves<'db>(
     actual: &Ty,
     goal: &InferInterface,
 ) -> bool {
+    if crate::impls::is_structural_interface(db, goal) {
+        return true;
+    }
+    if let Some(eligible) = crate::impls::conditional_structural_verdict(db, facts, actual, goal) {
+        return eligible;
+    }
     let InferTy::TypeVar(param) = actual.kind() else {
-        return crate::impls::resolve_impl(db, actual, goal).is_some();
+        return crate::impls::implements_interface(db, actual, goal);
     };
     let eq = crate::impls::AliasOnlyFacts::new(db);
     for bound in baml_type::normalize::TypeContext::type_var_bound(facts, param) {
@@ -933,15 +1065,17 @@ fn substitute_lookup_class_args<'db>(
     match lookup {
         InterfaceMemberLookup::Found(mut member) => {
             member.ty = subst(&member.ty);
-            member.pending_own =
-                member
-                    .pending_own
-                    .map(
-                        |PendingOwnGenerics { callable, prefix }| PendingOwnGenerics {
-                            callable,
-                            prefix: prefix.iter().map(subst).collect(),
-                        },
-                    );
+            member.pending_own = member.pending_own.map(
+                |PendingOwnGenerics {
+                     callable,
+                     prefix,
+                     arms,
+                 }| PendingOwnGenerics {
+                    callable,
+                    prefix: prefix.iter().map(subst).collect(),
+                    arms: arms.map(|arms| arms.iter().map(subst).collect()),
+                },
+            );
             member.declarer = match member.declarer {
                 MemberDeclarer::VirtualField {
                     interface,
@@ -961,8 +1095,16 @@ fn substitute_lookup_class_args<'db>(
                     func,
                     frame_type_args: frame_type_args.iter().map(subst).collect(),
                 },
-                other @ (MemberDeclarer::VirtualMethod { .. }
-                | MemberDeclarer::ImplField { .. }) => other,
+                MemberDeclarer::VirtualMethod {
+                    interface,
+                    realized,
+                    method,
+                } => MemberDeclarer::VirtualMethod {
+                    interface,
+                    realized: subst_ref(&realized),
+                    method,
+                },
+                other @ MemberDeclarer::ImplField { .. } => other,
             };
             InterfaceMemberLookup::Found(member)
         }
@@ -1001,11 +1143,9 @@ pub(crate) fn member_on_interface<'db>(
         let row = extern_interface_row(db, interface);
         let instantiation = interface_instantiation(receiver, target, row.generic_params.len())?;
         if let Some(index) = row.fields.iter().position(|(field, ..)| field == name) {
-            let (_, field_ty, _) = &row.fields[index];
-            let field_ty =
-                crate::lower::substitute_params(&Ty::from_plain(field_ty), &instantiation);
+            let field_ty = declared_interface_field_ty(db, DeclRef::External(interface), index);
             return Some(InterfaceMember {
-                ty: field_ty,
+                ty: crate::lower::substitute_params(&field_ty, &instantiation),
                 is_method: false,
                 pending_own: None,
                 declarer: MemberDeclarer::VirtualField {
@@ -1028,6 +1168,7 @@ pub(crate) fn member_on_interface<'db>(
                     PendingOwnGenerics {
                         callable,
                         prefix: instantiation.clone(),
+                        arms: None,
                     }
                 });
             return Some(InterfaceMember {
@@ -1036,6 +1177,7 @@ pub(crate) fn member_on_interface<'db>(
                 pending_own,
                 declarer: MemberDeclarer::VirtualMethod {
                     interface: DeclRef::External(interface),
+                    realized: target.clone(),
                     method: callable,
                 },
             });
@@ -1050,14 +1192,7 @@ pub(crate) fn member_on_interface<'db>(
 
     // Fields first (mirroring the class path's field-before-method).
     if let Some(index) = data.fields.iter().position(|field| field.name == *name) {
-        let field = &data.fields[index];
-        let frame = interface_frame(interface, db);
-        let ctx = crate::lower::lower_ctx_for_file(db, interface.file(db))
-            .with_frame(frame)
-            .with_bounds(crate::lower::interface_scope_bounds(db, interface));
-        let field_ty = crate::impls::interned_ty(&crate::lower::reject_holes(
-            &ctx.lower_type_ref(&data.type_refs, field.type_ref),
-        ));
+        let field_ty = declared_interface_field_ty(db, DeclRef::Source(interface), index);
         return Some(InterfaceMember {
             ty: crate::lower::substitute_params(&field_ty, &instantiation),
             is_method: false,
@@ -1094,6 +1229,7 @@ pub(crate) fn member_on_interface<'db>(
                 PendingOwnGenerics {
                     callable,
                     prefix: instantiation.clone(),
+                    arms: None,
                 }
             });
         return Some(InterfaceMember {
@@ -1102,12 +1238,37 @@ pub(crate) fn member_on_interface<'db>(
             pending_own,
             declarer: MemberDeclarer::VirtualMethod {
                 interface: DeclRef::Source(interface),
+                realized: target.clone(),
                 method: callable,
             },
         });
     }
 
     None
+}
+
+/// The declared type of the field at `index` in an interface's own field
+/// list, over the interface frame (`Self`, then its generics).
+fn declared_interface_field_ty(
+    db: &dyn baml_compiler2_hir::Db,
+    interface: InterfaceRef<'_>,
+    index: usize,
+) -> Ty {
+    match interface {
+        DeclRef::Source(interface) => {
+            let data = baml_compiler2_hir::item_data::interface_data(db, interface);
+            let ctx = crate::lower::lower_ctx_for_file(db, interface.file(db))
+                .with_frame(interface_frame(interface, db))
+                .with_bounds(crate::lower::interface_scope_bounds(db, interface));
+            crate::impls::interned_ty(&crate::lower::reject_holes(
+                &ctx.lower_type_ref(&data.type_refs, data.fields[index].type_ref),
+            ))
+        }
+        DeclRef::External(interface) => {
+            let (_, field_ty, _) = &extern_interface_row(db, interface).fields[index];
+            Ty::from_plain(field_ty)
+        }
+    }
 }
 
 // ── Enumeration: the completion counterpart of the lookups above ────────────
@@ -1220,7 +1381,7 @@ pub fn member_candidates<'db>(
         && let Some(class) = crate::extern_loc::mounted_class_loc(db, &qtn)
     {
         let row = crate::extern_loc::extern_class_row(db, class);
-        for (index, (name, ..)) in row.fields.iter().enumerate() {
+        for (index, (name, ..)) in row.body.fields().iter().enumerate() {
             push_candidate(
                 &mut out,
                 name.clone(),
@@ -1269,6 +1430,11 @@ pub fn member_candidates<'db>(
                 }
                 let implemented = resolved.implemented();
                 extend_from_interface(db, facts, &mut out, &implemented, false);
+            }
+            for interface in
+                crate::impls::applicable_structural_interface_roots(db, facts, receiver)
+            {
+                extend_from_interface(db, facts, &mut out, &interface, false);
             }
         }
     }
@@ -1432,6 +1598,10 @@ fn extend_from_interface<'db>(
 ) {
     for (name, is_method, is_static, decl) in interface_member_rows(db, facts, target, existential)
     {
+        // A value receiver's members: `baml.Concrete`'s `type` is a static.
+        if crate::impls::is_concrete_type_member(facts.lang(), &target.name, &name) {
+            continue;
+        }
         push_candidate(
             out,
             name,
@@ -1604,6 +1774,13 @@ pub enum UnionMemberLookup<'db> {
     },
     /// No interface shared by every arm declares the member.
     NoCommonInterface,
+    /// The member needs one type at a position where the arms bind an
+    /// associated type differently: a method parameter, or a field (read
+    /// and written). `types` are the arms' types for that position.
+    AssociatedTypeConflict {
+        is_method: bool,
+        types: Vec<Ty>,
+    },
 }
 
 pub fn lookup_union_member<'db>(
@@ -1616,7 +1793,7 @@ pub fn lookup_union_member<'db>(
 ) -> UnionMemberLookup<'db> {
     let mut shared: Option<Vec<InferInterface>> = None;
     for arm in members {
-        let arm_ifaces = union_arm_interfaces(db, viewer, facts, arm, 4);
+        let arm_ifaces = union_arm_interfaces(db, viewer, facts, arm, name, 4);
         shared = Some(match shared {
             None => arm_ifaces,
             Some(mut current) => {
@@ -1630,12 +1807,23 @@ pub fn lookup_union_member<'db>(
     }
     let mut declarers: Vec<(InferInterface, bool)> = Vec::new();
     for iface in shared.unwrap_or_default() {
+        if crate::impls::is_concrete_type_member(facts.lang(), &iface.name, name) {
+            continue;
+        }
         if let Some(is_field) = interface_declares_member(db, &iface, name)
             && !declarers.iter().any(|(seen, _)| *seen == iface)
         {
             declarers.push((iface, is_field));
         }
     }
+    prefer_explicit_members(
+        db,
+        viewer,
+        facts,
+        union_ty,
+        &mut declarers,
+        |(interface, _)| interface.clone(),
+    );
     match declarers.len() {
         0 => UnionMemberLookup::NoCommonInterface,
         1 => {
@@ -1646,7 +1834,7 @@ pub fn lookup_union_member<'db>(
             // the union rather than the erased interface. One-`Self`
             // object safety applies exactly as for an existential.
             match member_on_interface(db, facts, &iface, union_ty, name, true) {
-                Some(member) => UnionMemberLookup::Found(member),
+                Some(member) => type_union_member(db, facts, member, &iface, union_ty, members),
                 None => match declared_method_self_restriction(db, facts, &iface, name) {
                     Some(position) => UnionMemberLookup::SelfRestricted {
                         interface: iface,
@@ -1663,21 +1851,179 @@ pub fn lookup_union_member<'db>(
     }
 }
 
+/// A union member's type, instantiated once per arm. `Self` is the union,
+/// but `Self.X` is whatever the arm holding the value binds, and two values
+/// of one union can bind it differently, so no single type over the whole
+/// union stands for it. What flows OUT (a method's return and throws) is the
+/// union of the arms' types. What flows in (a method's parameters), or both
+/// ways (a field), needs one type every arm agrees on.
+fn type_union_member<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    facts: &Facts<'db>,
+    mut member: InterfaceMember<'db>,
+    interface: &InferInterface,
+    union_ty: &Ty,
+    arms: &[Ty],
+) -> UnionMemberLookup<'db> {
+    // The owner frame only: a method's own generics stay rigid for the call
+    // site, which instantiates per arm again through `pending_own`.
+    let mut instantiation = vec![union_ty.clone()];
+    instantiation.extend(interface.generics.iter().cloned());
+    let typed = match &member.declarer {
+        MemberDeclarer::VirtualMethod { method, .. } => {
+            union_method_signature(db, facts, *method, &instantiation, arms)
+        }
+        MemberDeclarer::VirtualField {
+            interface: declaring,
+            field_index,
+            ..
+        } => {
+            let declared = declared_interface_field_ty(db, *declaring, *field_index as usize);
+            let per_arm = instantiate_per_arm(facts, &declared, &instantiation, arms);
+            agreed(facts, &per_arm).ok_or(per_arm)
+        }
+        MemberDeclarer::ImplMethod { .. } | MemberDeclarer::ImplField { .. } => {
+            return UnionMemberLookup::Found(member);
+        }
+    };
+    match typed {
+        Ok(ty) => {
+            member.ty = ty;
+            if let Some(pending) = &mut member.pending_own {
+                pending.arms = Some(arms.to_vec());
+            }
+            UnionMemberLookup::Found(member)
+        }
+        Err(types) => UnionMemberLookup::AssociatedTypeConflict {
+            is_method: member.is_method,
+            types,
+        },
+    }
+}
+
+/// A callable's signature at `instantiation`, per arm when the receiver is a
+/// union (`arms`): the one instantiation a call site finishes with, whatever
+/// the receiver. A union's parameters were proven to agree when the member
+/// was looked up, so a disagreement here cannot arise and the first arm's
+/// are the answer.
+pub(crate) fn instantiate_member_signature<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    facts: &Facts<'db>,
+    callable: FunctionRef<'db>,
+    instantiation: &[Ty],
+    arms: Option<&[Ty]>,
+) -> Ty {
+    match arms {
+        None => instantiate_callable_signature(db, callable, instantiation),
+        Some(arms) => {
+            let signature = callable_signature(db, callable);
+            let outward = |declared: &baml_type::Ty| {
+                let per_arm =
+                    instantiate_per_arm(facts, &Ty::from_plain(declared), instantiation, arms);
+                agreed(facts, &per_arm)
+                    .unwrap_or_else(|| crate::infer::union_of_tys(facts, &per_arm))
+            };
+            let first_arm = &arms[..1];
+            Ty::intern(InferTy::Function {
+                params: signature
+                    .params
+                    .iter()
+                    .map(|param| baml_type::interned::InferFunctionParamTy {
+                        name: param.name.clone(),
+                        ty: instantiate_per_arm(
+                            facts,
+                            &Ty::from_plain(&param.ty),
+                            instantiation,
+                            first_arm,
+                        )
+                        .remove(0),
+                        mode: param.mode,
+                    })
+                    .collect(),
+                ret: outward(&signature.return_type),
+                throws: outward(crate::callable::callable_throws_of(db, callable)),
+            })
+        }
+    }
+}
+
+/// [`instantiate_member_signature`] for a union, checking that every arm
+/// agrees on each parameter. `Err` carries the arms' types for the first
+/// parameter they disagree on.
+fn union_method_signature<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    facts: &Facts<'db>,
+    callable: FunctionRef<'db>,
+    instantiation: &[Ty],
+    arms: &[Ty],
+) -> Result<Ty, Vec<Ty>> {
+    for param in &callable_signature(db, callable).params {
+        let per_arm = instantiate_per_arm(facts, &Ty::from_plain(&param.ty), instantiation, arms);
+        if agreed(facts, &per_arm).is_none() {
+            return Err(per_arm);
+        }
+    }
+    Ok(instantiate_member_signature(
+        db,
+        facts,
+        callable,
+        instantiation,
+        Some(arms),
+    ))
+}
+
+/// `declared` instantiated once per arm of a union `Self`
+/// (`instantiation[0]`), each arm's projections reduced.
+fn instantiate_per_arm(
+    facts: &Facts<'_>,
+    declared: &Ty,
+    instantiation: &[Ty],
+    arms: &[Ty],
+) -> Vec<Ty> {
+    let mut arm_instantiation = instantiation.to_vec();
+    arms.iter()
+        .map(|arm| {
+            arm_instantiation[0] = arm.clone();
+            let instantiated = crate::lower::substitute_params_through_arm(
+                declared,
+                instantiation,
+                &arm_instantiation,
+            );
+            crate::impls::reduce_closed_projections(
+                facts,
+                &instantiated,
+                crate::infer::PROJECTION_FINALIZE_FUEL,
+            )
+        })
+        .collect()
+}
+
+/// The one type every arm gives, when they all give the same one: identical
+/// spellings, or closed types the oracle proves equivalent.
+fn agreed(facts: &Facts<'_>, per_arm: &[Ty]) -> Option<Ty> {
+    let (first, rest) = per_arm.split_first()?;
+    rest.iter()
+        .all(|other| other == first || crate::impls::eq_admitted(other, first, facts))
+        .then(|| first.clone())
+}
+
 /// The realized interfaces one union arm provides: an interface
 /// existential contributes itself plus its `requires` closure; a bounded
 /// type variable contributes each conjunct's contribution; a concrete arm
 /// contributes its matched impls' realized interfaces.
+/// Structural roots are included only when they declare `name`.
 fn union_arm_interfaces<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     viewer: baml_base::SourceRoot,
     facts: &Facts<'db>,
     arm: &Ty,
+    name: &Name,
     fuel: u32,
 ) -> Vec<InferInterface> {
     if fuel == 0 {
         return Vec::new();
     }
-    match arm.kind() {
+    let mut interfaces = match arm.kind() {
         InferTy::Interface(qtn, args, pins) => {
             let root = InferInterface::new(qtn.clone(), args.clone(), pins.clone());
             let mut out = vec![root.clone()];
@@ -1716,7 +2062,18 @@ fn union_arm_interfaces<'db>(
             }
             out
         }
+    };
+    // Only structural roots declaring `name` can matter to the caller, and
+    // proving a conditional one (`Hash`) can walk the arm's whole type graph.
+    for interface in crate::impls::structural_interface_candidates(db) {
+        if !interfaces.contains(&interface)
+            && interface_declares_member(db, &interface, name).is_some()
+            && crate::impls::structural_root_applies(db, facts, arm, &interface)
+        {
+            interfaces.push(interface);
+        }
     }
+    interfaces
 }
 
 /// Whether the interface declares `name`, and as which kind

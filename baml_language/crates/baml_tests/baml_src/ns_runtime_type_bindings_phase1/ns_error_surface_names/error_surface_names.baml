@@ -1,7 +1,7 @@
 function compiled_messages() -> string {
     let pkg = reflect.Package.compile({ "items.baml": `class Item { value string, count int }` });
-    let item_type = (pkg.get_class("root.Item") ?? throw "missing Item").as_type();
-    type Item = unreflect(item_type)
+    let item_type = pkg.get_class("root.Item").as_type();
+    let type Item = item_type;
 
     let sap = baml.sap.parse<Item>("null") catch (e) {
         baml.errors.ParseError => e.message,
@@ -12,7 +12,7 @@ function compiled_messages() -> string {
     } else {
         "sap accepted a null"
     };
-    let decoded = baml.json.from_string<Item>("[1, 2]") catch (e) {
+    let decoded = baml.json.decode<Item>("[1, 2]") catch (e) {
         baml.json.DecodeError => e.message,
         _ => "not a DecodeError",
     };
@@ -25,10 +25,10 @@ function compiled_messages() -> string {
 }
 
 function minted_messages() -> string {
-    let item_type = reflect.class
-        .new("Item", { "value": reflect.Type.of<string>(), "count": reflect.Type.of<int>() })
+    let item_type = reflect.Class
+        .new("Item", { "value": string.type(), "count": int.type() })
         .as_type();
-    type Item = unreflect(item_type)
+    let type Item = item_type;
 
     let sap = baml.sap.parse<Item>("null") catch (e) {
         baml.errors.ParseError => e.message,
@@ -39,7 +39,7 @@ function minted_messages() -> string {
     } else {
         "sap accepted a null"
     };
-    let decoded = baml.json.from_string<Item>("[1, 2]") catch (e) {
+    let decoded = baml.json.decode<Item>("[1, 2]") catch (e) {
         baml.json.DecodeError => e.message,
         _ => "not a DecodeError",
     };

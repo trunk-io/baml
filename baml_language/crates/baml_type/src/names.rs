@@ -36,7 +36,7 @@
 
 use std::fmt;
 
-use baml_base::{LangPackage, LangRoots, Name, SourceRoot};
+use baml_base::{LangItem, LangPackage, LangRoots, Name, SourceRoot};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{BuiltinTypeName, PrimitiveType};
@@ -234,6 +234,17 @@ impl DeclName {
         Self::qualified(root, namespace, name)
     }
 
+    /// The compile-time head of a language item: its path in the root
+    /// `lang` installs its package at. `None` when that package is not
+    /// installed (a database without the standard library).
+    pub fn of_lang_item(lang: LangRoots, item: LangItem) -> Option<Self> {
+        Some(Self::in_root(
+            lang.get(item.package())?,
+            item.namespace().to_vec(),
+            item.name().clone(),
+        ))
+    }
+
     /// The declaring package.
     pub fn root(&self) -> SourceRoot {
         self.pkg
@@ -285,6 +296,16 @@ impl QualifiedTypeName<Package> {
         }
     }
 
+    /// The wire name of a language item (`baml.media.Image`): a host spells
+    /// a language package by its manifest name.
+    pub fn of_lang_item(item: LangItem) -> Self {
+        Self::new(
+            Name::new(item.package().manifest_name()),
+            item.namespace().to_vec(),
+            item.name().clone(),
+        )
+    }
+
     /// A type at the root namespace of the artifact's own package — a bare
     /// class/enum name.
     pub fn local(name: Name) -> Self {
@@ -302,33 +323,6 @@ impl QualifiedTypeName<Package> {
     /// default spelling.
     pub fn is_local(&self) -> bool {
         matches!(self.pkg, Package::Local)
-    }
-
-    pub fn is_builtin_root_type(&self, name: &str) -> bool {
-        self.package().as_str() == "baml" && self.is_root_item(name)
-    }
-
-    /// [`Self::is_builtin_root_type`] for the `reflect` package's root
-    /// namespace (`reflect.AnyFunction`, `reflect.AnyClass`, …).
-    pub fn is_reflect_root_type(&self, name: &str) -> bool {
-        self.package().as_str() == "reflect" && self.is_root_item(name)
-    }
-
-    /// Returns `true` if this type lives in the `baml.panics` namespace
-    /// (i.e. it is a panic class or the `Panic` type alias).
-    pub fn is_panic_type(&self) -> bool {
-        baml_base::is_panic_namespace(self.package().as_str(), &self.namespace)
-    }
-
-    /// The flat `[package, ...namespace]` path, matching the legacy
-    /// `TypeName::module_path` representation that fused package and namespace
-    /// into one `Vec`. Allocates — prefer [`package`](Self::package) /
-    /// [`namespace`](Self::namespace) on hot paths; kept for call sites that
-    /// build a fully-qualified dotted string.
-    pub fn module_path(&self) -> Vec<Name> {
-        std::iter::once(self.pkg.as_name().clone())
-            .chain(self.namespace.iter().cloned())
-            .collect()
     }
 
     /// The user-facing display name (legacy `TypeName::display_name`): the
@@ -386,13 +380,6 @@ impl QualifiedTypeName<Package> {
             (false, true) => format!("{}.{}", pkg, self.name),
             (false, false) => format!("{}.{namespace}.{}", pkg, self.name),
         }
-    }
-
-    /// User-facing rendering of the qualified name: identical to the canonical
-    /// [`fmt::Display`] except the artifact's own package is elided. Call this
-    /// instead of post-processing the canonical string.
-    pub fn render_user_facing(&self) -> String {
-        self.render_dotted(true)
     }
 
     /// Return the primitive represented by a builtin companion class.
@@ -462,9 +449,9 @@ mod alias_tests {
     #[test]
     fn primitive_alias_class_path_roundtrips() {
         for p in PrimitiveType::ALL {
-            let path = p.builtin_class_path();
+            let path: Vec<&str> = p.builtin_class_path().iter().map(Name::as_str).collect();
             assert_eq!(
-                PrimitiveType::from_builtin_class_path(path),
+                PrimitiveType::from_builtin_class_path(&path),
                 Some(p),
                 "round-trip failed for {p:?} via {path:?}"
             );

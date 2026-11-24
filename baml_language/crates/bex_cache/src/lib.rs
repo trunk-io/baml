@@ -16,6 +16,8 @@
 //! failure path in [`BytecodeCache::load`] returns `None` (recompile) and
 //! [`BytecodeCache::store`] is best-effort.
 
+#![warn(clippy::disallowed_methods)]
+
 use std::{
     fs,
     io::{self, Read, Write},
@@ -175,7 +177,68 @@ use sha2::{Digest, Sha256};
 /// `callable_throws` fragments from their file's; a dependency table is a
 /// list of `Locator`s; and the executable is laid out package-major in
 /// link-set order.
-pub const FORMAT_VERSION: u32 = 18;
+///
+/// Version 19: BEP-079's unit type. `void` is a spelling of `null`, so
+/// `DiagnosticId` lost `VoidInNonReturnPosition` (E0110) from the middle of
+/// the enum, which renumbers the Borsh discriminant of every diagnostic id
+/// declared after it in the manifest's per-file diagnostics rows. The type
+/// family lost `Void` (Borsh discriminant 22, now reserved) with it: a
+/// cached unit carrying the retired discriminant no longer decodes.
+///
+/// Version 20: `Function::source_file` and the name of a file's `$init_test_…`
+/// function are root-relative for every non-stdlib root — a unit no longer
+/// carries the absolute path of the checkout it was compiled from — and a
+/// pooled `Class`, `Enum`, `Interface` and `TypeAlias` carries its path
+/// inside its package (`path`) where it used to carry a package-qualified
+/// name. `Class::has_cleanup` became `Class::cleanup`, the finalizer's
+/// position in the class's method table. A `ProgramPackage` carries its
+/// `PackageKind` (`Language(LangPackage)` or `Ordinary`) and each edge its
+/// `EdgeKind` (`Dependency` or `ReExported`); a dependency table's prelude
+/// entry is `Locator::Prelude(LangPackage)`, bound by identity through no
+/// edge. A pooled `Function` carries a structural `FunctionIdentity` (its
+/// path, body key, closure parent or initializer role) where it carried a
+/// rendered name (`name`, `declared_name`, `is_interface_body` are gone), and
+/// a `ProgramPackage` carries `objects`, the pool range the linker placed it
+/// as, which owns every function in it.
+///
+/// Version 21: `FunctionMeta` gained the appended `ModelInvoke` variant.
+///
+/// Version 22: the `ThrowIfPanic` instruction is gone. A catch's wildcard
+/// arm that does not trap panics is now entered after an `IsType` test
+/// against the `PANIC` pseudo-tag (`baml_type::typetag::PANIC`), so the
+/// discriminants of every opcode declared after `TypeTag` shifted down by
+/// one.
+///
+/// Version 23: `FunctionMeta::Llm` lost its `client` string and marks every
+/// LLM function, including one whose client is an expression.
+///
+/// Version 24: appended `MakeGenericBoundMethod` to the instruction/opcode
+/// sets — a bound method whose frame type arguments the reference site
+/// supplies (`default.m` as a value inside an `implements` block).
+///
+/// Version 25: a `Class` carries its `declared_crossing`, how an instance
+/// crosses the host boundary.
+///
+/// Version 26: appended `ConcatStrings` to the instruction/opcode sets, which
+/// joins a chain of string `+` in one step.
+///
+/// Version 27: a `Class` and each of its fields carry `redact`, whether
+/// telemetry records a redaction in place of the value (`@@trace.redact`,
+/// `@trace.redact`).
+///
+/// Version 28: a package interface opens with the package's claimed identity
+/// and the compiler version, a `PackageRecord` carries the package's
+/// `metadata` (its content hashes and claim, BEP-085), and a
+/// `ProgramPackage` carries it into the executable.
+///
+/// Version 29: classes whose state Rust holds are `@@rust_type` classes. The
+/// `$rust_type` type is gone, so a type no longer encodes the `RustType`
+/// head (its discriminant, 18, is unused), and `ClassCrossing` gained the
+/// appended `HostValue`.
+///
+/// Version 30: a `ProgramPackage` carries the record of the build that
+/// produced it (BEP-088). A cached program names none.
+pub const FORMAT_VERSION: u32 = 30;
 
 const MAGIC: [u8; 4] = *b"BEXC";
 
@@ -188,10 +251,6 @@ const HEADER_LEN: usize = 4 + 4 + 32 + 8 + 32;
 pub struct CacheKey([u8; 32]);
 
 impl CacheKey {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        CacheKey(bytes)
-    }
-
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -346,8 +405,8 @@ pub fn manifest_key(
 
 /// Every input one package's compiled output ([`EmittedPackage`]) is a
 /// function of: the compiler build, the optimization level, the package's own
-/// sources, and the interface digest of every package it reaches, by the edge
-/// name it reaches it under.
+/// sources, the interface digest of every package it reaches, by the edge
+/// name it reaches it under, and what its manifest claims it is.
 ///
 /// Fields are hashed with length-prefixed framing, so concatenation ambiguity
 /// cannot alias two different input sets.
@@ -366,6 +425,10 @@ pub struct PackageKeyInputs<'a> {
     /// by it — so the same package reached under another name is another
     /// output.
     pub dependencies: &'a [(String, [u8; 32])],
+    /// What the package's manifest claims it is. The claim is part of the
+    /// interface the output's package record carries, so it is an input
+    /// like the sources.
+    pub claim: &'a baml_base::ClaimedIdentity,
 }
 
 /// Key for one package's [`EmittedPackage`] entry.
@@ -396,6 +459,15 @@ pub fn package_key(inputs: &PackageKeyInputs<'_>) -> CacheKey {
     for (edge, digest) in dependencies {
         update_framed(&mut h, edge.as_bytes());
         h.update(digest);
+    }
+    let baml_base::ClaimedIdentity {
+        registry,
+        organization,
+        name,
+        version,
+    } = inputs.claim;
+    for part in [registry, organization, name, version] {
+        hash_opt_str(&mut h, part.as_deref());
     }
     CacheKey(h.finalize().into())
 }
@@ -808,20 +880,6 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// SHA-256 of a file's full content. The CLI's manifest writer (`content_hash`
-/// in each [`ManifestFile`]) and the LSP's whole-project-clean seed gate both
-/// hash through here, so a file is compared against the manifest like-for-like
-/// — one definition the two sides cannot drift apart on.
-pub fn content_hash(text: &str) -> [u8; 32] {
-    Sha256::digest(text.as_bytes()).into()
-}
-
-/// Whether environment variable `name` is set to exactly `"1"` — the shared
-/// spelling of every `BAML_*` cache opt-out flag.
-pub fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| value == "1")
-}
-
 /// `path` relative to `root` as a display string, falling back to the full path
 /// when it is not under `root`. Manifests and cache keys store this
 /// project-root-relative form to stay location-independent; the CLI writer and
@@ -932,6 +990,7 @@ mod tests {
             opt_level: 2,
             files: &files,
             dependencies: &dependencies,
+            claim: &baml_base::ClaimedIdentity::default(),
         });
         assert!(
             cache.load_package_shared(&key).is_none(),
@@ -942,6 +1001,7 @@ mod tests {
             unit: baml_linker_types::CompilationUnit::default(),
             record: baml_linker_types::PackageRecord {
                 interface_blob: vec![1, 2, 3, 4],
+                metadata: None,
             },
             tail: None,
         };
@@ -972,6 +1032,7 @@ mod tests {
             opt_level: 2,
             files: &files,
             dependencies: &dependencies,
+            claim: &baml_base::ClaimedIdentity::default(),
         });
         // Order of presentation is not an input.
         let two_files = vec![
@@ -985,12 +1046,14 @@ mod tests {
                 opt_level: 2,
                 files: &two_files,
                 dependencies: &dependencies,
+                claim: &baml_base::ClaimedIdentity::default(),
             }),
             package_key(&PackageKeyInputs {
                 compiler_fingerprint: [1u8; 32],
                 opt_level: 2,
                 files: &two_sorted,
                 dependencies: &dependencies,
+                claim: &baml_base::ClaimedIdentity::default(),
             })
         );
         // Every input moves the key.
@@ -999,12 +1062,14 @@ mod tests {
             opt_level: 2,
             files: &files,
             dependencies: &dependencies,
+            claim: &baml_base::ClaimedIdentity::default(),
         });
         let other_opt = package_key(&PackageKeyInputs {
             compiler_fingerprint: [1u8; 32],
             opt_level: 1,
             files: &files,
             dependencies: &dependencies,
+            claim: &baml_base::ClaimedIdentity::default(),
         });
         let other_digest = vec![("baml".to_string(), [6u8; 32])];
         let other_dependency = package_key(&PackageKeyInputs {
@@ -1012,6 +1077,17 @@ mod tests {
             opt_level: 2,
             files: &files,
             dependencies: &other_digest,
+            claim: &baml_base::ClaimedIdentity::default(),
+        });
+        let other_claim = package_key(&PackageKeyInputs {
+            compiler_fingerprint: [1u8; 32],
+            opt_level: 2,
+            files: &files,
+            dependencies: &dependencies,
+            claim: &baml_base::ClaimedIdentity {
+                version: Some("1.0.0".to_owned()),
+                ..baml_base::ClaimedIdentity::default()
+            },
         });
         let other_edge = vec![("std".to_string(), [5u8; 32])];
         let other_edge_name = package_key(&PackageKeyInputs {
@@ -1019,11 +1095,13 @@ mod tests {
             opt_level: 2,
             files: &files,
             dependencies: &other_edge,
+            claim: &baml_base::ClaimedIdentity::default(),
         });
         for other in [
             other_fingerprint,
             other_opt,
             other_dependency,
+            other_claim,
             other_edge_name,
         ] {
             assert_ne!(base, other);
@@ -1190,8 +1268,8 @@ mod tests {
 /// the cache, developer machines read it. This mirrors Go's `GOCACHEPROG`
 /// split of "cache policy in the tool, storage anywhere".
 ///
-/// Configured via `BAML_CACHE_REMOTE=<base-url>` (entries live at
-/// `<base-url>/<key-hex>`) and optional `BAML_CACHE_REMOTE_TOKEN` (sent as a
+/// Configured via `BAML_BUILD_CACHE_REMOTE=<base-url>` (entries live at
+/// `<base-url>/<key-hex>`) and optional `BAML_BUILD_CACHE_REMOTE_TOKEN` (sent as a
 /// bearer token). Only immutable entries — Program blobs and per-package
 /// outputs — are shared; the per-project manifest is a mutable local-latest
 /// pointer and deliberately stays local.
@@ -1219,10 +1297,10 @@ fn remote_url_allowed(url: &reqwest::Url) -> bool {
 }
 
 impl RemoteCache {
-    /// Build from `BAML_CACHE_REMOTE` / `BAML_CACHE_REMOTE_TOKEN`; `None`
+    /// Build from `BAML_BUILD_CACHE_REMOTE` / `BAML_BUILD_CACHE_REMOTE_TOKEN`; `None`
     /// when unset or the HTTP client cannot be constructed.
     pub fn from_env() -> Option<RemoteCache> {
-        let base_url = std::env::var("BAML_CACHE_REMOTE").ok()?;
+        let base_url = baml_env::raw_var("BAML_BUILD_CACHE_REMOTE")?;
         if base_url.is_empty() {
             return None;
         }
@@ -1230,7 +1308,9 @@ impl RemoteCache {
         if !remote_url_allowed(&parsed) {
             #[allow(clippy::print_stderr)]
             {
-                eprintln!("warning: BAML_CACHE_REMOTE ignored — use https or a loopback http URL");
+                eprintln!(
+                    "warning: BAML_BUILD_CACHE_REMOTE ignored — use https or a loopback http URL"
+                );
             }
             return None;
         }
@@ -1243,7 +1323,7 @@ impl RemoteCache {
             .build()
             .ok()?;
         let base_url = base_url.trim_end_matches('/').to_string();
-        let token = std::env::var("BAML_CACHE_REMOTE_TOKEN").ok();
+        let token = baml_env::raw_var("BAML_BUILD_CACHE_REMOTE_TOKEN");
         Some(RemoteCache {
             base_url,
             token,
@@ -1482,6 +1562,7 @@ mod remote_tests {
             unit: baml_linker_types::CompilationUnit::default(),
             record: baml_linker_types::PackageRecord {
                 interface_blob: vec![4, 3, 2, 1],
+                metadata: None,
             },
             tail: None,
         };
@@ -1490,6 +1571,7 @@ mod remote_tests {
             opt_level: 2,
             files: &files,
             dependencies: &[],
+            claim: &baml_base::ClaimedIdentity::default(),
         });
         cache_a
             .store_package_shared(&package_entry, &package)

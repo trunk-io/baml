@@ -133,15 +133,29 @@ function sit_from(
     taught_off_point: int,
     choices: int,
 ) -> Sat throws never {
-    let served = taken.map((t) -> {
-        t.item
-    });
+    let served = taken.map((t) -> { t.item });
     let standing = root.engine.standing(profile, knobs);
     if (standing.why != root.engine.Why.Continue) {
-        return Sat { profile, standing, served, taken, taught, taught_off_point, choices };
+        return Sat {
+            profile,
+            standing,
+            served,
+            taken,
+            taught,
+            taught_off_point,
+            choices,
+        };
     }
     let next = root.next_prompt(profile, knobs, session, step)
-        ?? return Sat { profile, standing, served, taken, taught, taught_off_point, choices };
+        ?? return Sat {
+            profile,
+            standing,
+            served,
+            taken,
+            taught,
+            taught_off_point,
+            choices,
+        };
     let put = root.put_at(knobs, next.prompt.item, next.prompt.seed);
     let chosen_now = if (put.posed is root.engine.Choice) {
         1
@@ -158,14 +172,19 @@ function sit_from(
         },
         null => 0,
     };
-    let taught_now = if (next.teach != null) {
-        1
-    } else {
-        0
+    let taught_now = if (next.teach != null) { 1 } else { 0 };
+    let given = root.Given {
+        said: learner(put),
+        reasoning: "",
+        mark: "",
+        marked_by: "",
     };
-    let given = root.Given { said: learner(put), reasoning: "", mark: "", marked_by: "" };
     let after = root.observe_answer(profile, knobs, next.prompt.item, next.prompt.seed, given);
-    let kept = root.Taken { item: next.prompt.item, seed: next.prompt.seed, given };
+    let kept = root.Taken {
+        item: next.prompt.item,
+        seed: next.prompt.seed,
+        given,
+    };
     sit_from(
         learner,
         knobs,
@@ -186,7 +205,6 @@ function sit_from(
 ///
 /// Over twelve sittings, not one, and asked as two tests of six. What it
 /// costs varies enormously with the draw — the spread runs from the low
-/// eighties to the budget, and two of the twelve do not finish inside it —
 /// so a single session measures the luck of that session, and the version of
 /// this test that asked one certified by chance. Splitting the twelve is for
 /// the clock rather than the measurement: driving them is the slowest thing
@@ -199,22 +217,18 @@ function sit_from(
 ///   report about nothing.
 function expert_report_over(sessions: int[]) -> string throws never {
     let knobs = root.engine.default_knobs();
-    let sittings = sessions.map((session) -> {
-        sit(expert, knobs, session)
-    });
-    let steps = sittings.map((sat) -> {
-        `${sat.standing.why}:${sat.profile.step}`
-    });
+    let sittings = sessions.map((session) -> { sit(expert, knobs, session) });
+    let steps = sittings.map((sat) -> { `${sat.standing.why}:${sat.profile.step}` });
     let certified = steps
-        .filter((step) -> {
-            step.starts_with("Mastered")
-        })
+        .filter((step) -> { step.starts_with("Mastered") })
         .length();
     // The first sitting of the run, which the map above already sat: reading
     // `withheld` and `suspected` off a thirteenth sitting of the same session
     // cost an eighth of this test for a number it had already worked out.
     let first = sittings.at(0)
-        ?? throw baml.panics.Unreachable { message: "a certification report over no sittings" };
+        ?? throw baml.panics.Unreachable {
+            message: "a certification report over no sittings",
+        };
     `certified=${certified} of ${sessions.length()} steps=${steps} withheld=${first.standing.withheld} suspected=${first.standing.suspected ?? "none"}`
 }
 
@@ -225,7 +239,15 @@ function practice_report() -> string throws never {
     let knobs = root.engine.default_knobs();
     let certified = sit(expert, knobs, 1);
     let count = certified.profile.step + 10;
-    let practised = sit(expert, root.engine.Knobs { ...knobs, practice: true, budget: count }, 1);
+    let practised = sit(
+        expert,
+        root.engine.Knobs {
+            ...knobs,
+            practice: true,
+            budget: count,
+        },
+        1,
+    );
     `certified=${certified.standing.why} practised=${practised.standing.why} asked_all=${practised.profile.step == count}`
 }
 
@@ -254,10 +276,8 @@ function silent_report() -> string throws never {
 function information_report() -> string throws never {
     let profile = root.fresh_profile();
     let knobs = root.engine.default_knobs();
-    let a = profile.skills.at(0)?.rule
-        ?? return "no skills";
-    let b = profile.skills.at(1)?.rule
-        ?? return "one skill";
+    let a = profile.skills.at(0)?.rule ?? return "no skills";
+    let b = profile.skills.at(1)?.rule ?? return "one skill";
     let once = root.engine.information(profile, knobs, [a], 0);
     let twice = root.engine.information(profile, knobs, [a, a], 0);
     let apart = root.engine.information(profile, knobs, [a, b], 0);
@@ -265,7 +285,10 @@ function information_report() -> string throws never {
 }
 
 test "information: a rule met twice is worth more than two rules met once" {
-    assert.equal(information_report(), "once=34 twice=37 apart=28 deeper=true")
+    assert.equal(
+        information_report(),
+        "once=34 twice=37 apart=28 deeper=true",
+    )
 }
 
 /// `x` as hundredths. Through a function: the arithmetic reads a local bound
@@ -277,7 +300,11 @@ function hundredths(x: float) -> int throws never {
 }
 
 function strict_knobs(knobs: root.engine.Knobs) -> root.engine.Knobs throws never {
-    root.engine.Knobs { ...knobs, strict: true, budget: 200 }
+    root.engine.Knobs {
+        ...knobs,
+        strict: true,
+        budget: 200,
+    }
 }
 
 /// A strict sitting asks for every rule; a loose one stops on the overall
@@ -291,8 +318,9 @@ function coverage_report() -> string throws never {
     // cannot pass by certifying an empty set.
     let uncertified = strict.profile.skills
         .filter((skill) -> {
-            root.engine.logistic(root.engine.floor_of(strict.profile, strict_knobs(knobs), skill))
-                < knobs.target
+            root.engine.logistic(
+                root.engine.floor_of(strict.profile, strict_knobs(knobs), skill),
+            ) < knobs.target
         })
         .length();
     `loose_first=${loose.profile.step <= strict.profile.step} loose_done=${loose.standing.why} loose_steps=${loose.profile.step} strict_done=${strict.standing.why} strict_steps=${strict.profile.step} uncertified=${uncertified} rules=${strict.profile.skills.length()}`
@@ -329,7 +357,9 @@ function escalation_of(learner: Learner) -> string throws never {
         (carried, t) -> {
             let put = root.put_at(knobs, t.item, t.seed);
             let rules = root.tracer_rules(put.posed);
-            chances.push(hundredths(root.engine.predict(carried, knobs, rules, put.traps.length())));
+            chances.push(hundredths(
+                root.engine.predict(carried, knobs, rules, put.traps.length()),
+            ));
             depths.push(rules.length());
             root.observe_answer(carried, knobs, t.item, t.seed, t.given)
         },
@@ -362,10 +392,9 @@ function repetition_report() -> string throws never {
     for (let item in sat.served) {
         counts.set(item, (counts.get(item) ?? 0) + 1);
     }
-    let top = counts.keys()
-        .sort_by_key((item) -> {
-            0 - (counts.get(item) ?? 0)
-        })
+    let top = counts
+        .keys()
+        .sort_by_key((item) -> { 0 - (counts.get(item) ?? 0) })
         .slice(0, 5)
         .map((item) -> {
             `${item.replace("flow/", "")}=${counts.get(item) ?? 0}`
@@ -376,7 +405,7 @@ function repetition_report() -> string throws never {
 test "learner: the same item comes round again and again" {
     assert.equal(
         repetition_report(),
-        `steps=110 distinct=39 top=["param_contravariant=6", "array_element=6", "double_contravariance=6", "carried_2=5", "return_covariant=5"]`,
+        `steps=76 distinct=37 top=["carried_2=5", "two_recursions=4", "unknown_holds=4", "carried_3=4", "param_contravariant=4"]`,
     )
 }
 
@@ -385,35 +414,29 @@ function mean_of(values: int[]) -> int throws never {
     if (values.length() == 0) {
         return 0;
     }
-    let total = values.reduce(
-        (acc, v) -> {
-            acc + v
-        },
-        0,
-    );
+    let total = values.reduce((acc, v) -> { acc + v }, 0);
     percent_of(total, values.length())
 }
 
 test "learner: a learner of the axioms is not marched into depth" {
     assert.equal(
         beginner_escalation_report(),
-        `steps=140 depth_first20=130 depth_last20=145 spread=["1:105", "2:23", "3:9", "4:3", "5:0"] chance_last20=6690`,
+        `steps=140 depth_first20=120 depth_last20=160 spread=["1:107", "2:21", "3:7", "4:5", "5:0"] chance_last20=6375`,
     )
 }
 
 test "learner: the questions stop getting harder once the bank runs out of depth" {
     assert.equal(
         escalation_report(),
-        `steps=110 depth_first20=140 depth_last20=150 spread=["1:74", "2:18", "3:11", "4:4", "5:3"] chance_last20=8720`,
+        `steps=76 depth_first20=135 depth_last20=135 spread=["1:54", "2:9", "3:8", "4:4", "5:1"] chance_last20=8650`,
     )
 }
 
 /// Every model's z-score in tenths, highest first.
 function leading(profile: root.engine.Profile) -> string throws never {
-    profile.suspicions.slice(0, profile.suspicions.length())
-        .sort_by_key((s) -> {
-            0.0 - root.engine.suspicion_z(s)
-        })
+    profile.suspicions
+        .slice(0, profile.suspicions.length())
+        .sort_by_key((s) -> { 0.0 - root.engine.suspicion_z(s) })
         .map((s) -> {
             `${s.model}=${tenths(root.engine.suspicion_z(s))}`
         })
@@ -449,33 +472,22 @@ function mean_offset(sat: Sat, variance_rules: bool) -> int throws never {
         .filter((skill) -> {
             skill.rule.starts_with("variance/") == variance_rules
         })
-        .map((skill) -> {
-            skill.offset
-        });
+        .map((skill) -> { skill.offset });
     if (offsets.length() == 0) {
         return 0;
     }
     hundredths(
-        offsets.reduce(
-            (acc, offset) -> {
-                acc + offset
-            },
-            0.0,
-        )
-            / (offsets.length() * 1.0),
+        offsets.reduce((acc, offset) -> { acc + offset }, 0.0) / (offsets.length() * 1.0),
     )
 }
 
 function beginner_report() -> string throws never {
     let sat = sit(beginner, root.engine.default_knobs(), 5);
-    let variance = sat.standing.mastered.filter((rule) -> {
-        rule.starts_with("variance/")
-    });
+    let variance = sat.standing.mastered.filter((rule) -> { rule.starts_with("variance/") });
     `certified=${sat.standing.why == root.engine.Why.Mastered} variance_mastered=${variance.length()} axioms_above_variance=${mean_offset(sat, false) > mean_offset(sat, true)} withheld_some=${sat.standing.withheld > 0.0}`
 }
 
-test "learner: certifying a perfect learner costs 91 to 130 questions over sessions 1 to 6, and one does not finish" {
-    // The two that do not finish across the twelve are the measurement, not a
+test "learner: certifying a perfect learner costs 76 to 132 questions over sessions 1 to 6, and one does not finish" {
     // fluke to be tuned away: at this budget a learner who answers everything
     // right is still sometimes left uncertified, and three models that sat the
     // quiz said independently that it should have had their measure by about
@@ -491,29 +503,35 @@ test "learner: certifying a perfect learner costs 91 to 130 questions over sessi
     // answer them without knowing the wrap was invariant.
     assert.equal(
         expert_report_over([1, 2, 3, 4, 5, 6]),
-        `certified=5 of 6 steps=["Mastered:130", "Mastered:96", "Mastered:110", "Budget:140", "Mastered:91", "Mastered:97"] withheld=0.0 suspected=none`,
+        `certified=5 of 6 steps=["Mastered:132", "Budget:140", "Mastered:76", "Mastered:108", "Mastered:124", "Mastered:115"] withheld=0.0 suspected=none`,
     )
 }
 
-test "learner: certifying a perfect learner costs 81 to 133 questions over sessions 7 to 12, and one does not finish" {
+test "learner: certifying a perfect learner costs 88 to 113 questions over sessions 7 to 12, and two do not finish" {
     assert.equal(
         expert_report_over([7, 8, 9, 10, 11, 12]),
-        `certified=5 of 6 steps=["Mastered:118", "Mastered:81", "Mastered:99", "Budget:140", "Mastered:110", "Mastered:133"] withheld=0.0 suspected=none`,
+        `certified=4 of 6 steps=["Budget:140", "Mastered:113", "Mastered:88", "Mastered:104", "Mastered:103", "Budget:140"] withheld=0.0 suspected=none`,
     )
 }
 
 test "learner: practice asks its count and stops nowhere else" {
-    assert.equal(practice_report(), "certified=Mastered practised=Budget asked_all=true")
+    assert.equal(
+        practice_report(),
+        "certified=Mastered practised=Budget asked_all=true",
+    )
 }
 
 test "learner: a learner who never commits is never certified" {
-    assert.equal(silent_report(), "why=Stalled mastered=0 committed=0 commits_unsure=2")
+    assert.equal(
+        silent_report(),
+        "why=Stalled mastered=0 committed=0 commits_unsure=2",
+    )
 }
 
 test "learner: strict coverage costs no fewer questions than an overall picture" {
     assert.equal(
         coverage_report(),
-        "loose_first=true loose_done=Mastered loose_steps=110 strict_done=Mastered strict_steps=110 uncertified=0 rules=31",
+        "loose_first=true loose_done=Mastered loose_steps=76 strict_done=Mastered strict_steps=76 uncertified=0 rules=33",
     )
 }
 
@@ -531,14 +549,14 @@ function parity_report() -> string throws never {
 test "learner: answering by an unrelated bit is suspected of no model" {
     assert.equal(
         parity_report(),
-        "suspected=none why=Stalled commits_unsure=95 leading=spelling=14,shape=12,bounds=10,covariant=5,typescript=4,structural=0",
+        "suspected=none why=Budget commits_unsure=97 leading=covariant=18,typescript=17,structural=12,spelling=6,shape=5,bounds=-9",
     )
 }
 
 test "learner: reasoning as TypeScript does is found out as TypeScript" {
     assert.equal(
         typescripter_report(),
-        "suspected=typescript leading=typescript=61,bounds=25,covariant=22,structural=0,shape=-16,spelling=-23 taught=true on_point=true both_kinds=true",
+        "suspected=typescript leading=typescript=59,bounds=20,structural=-5,covariant=-6,shape=-17,spelling=-23 taught=true on_point=true both_kinds=true",
     )
 }
 
@@ -554,7 +572,10 @@ test "learner: knowing only the axioms tells the axioms apart from the rest" {
 /// Answering beats abstaining exactly above the bar.
 function points_follow_the_bar() -> bool throws never {
     [0.5, 0.67, 0.75, 0.8].every((bar) -> {
-        let p = root.engine.points(root.engine.Knobs { ...root.engine.default_knobs(), bar });
+        let p = root.engine.points(root.engine.Knobs {
+            ...root.engine.default_knobs(),
+            bar,
+        });
         let below = (bar - 0.05) * p.right * 1.0 + (1.05 - bar) * p.wrong * 1.0;
         let above = (bar + 0.05) * p.right * 1.0 + (0.95 - bar) * p.wrong * 1.0;
         below < p.unsure * 1.0 && above > p.unsure * 1.0
@@ -568,13 +589,20 @@ test "points: answering beats abstaining exactly above the bar" {
 // ─── the profile is a value ──────────────────────────────────────────────────
 
 function profile_round_trip() -> string throws never {
-    let sat = sit(typescripter, root.engine.Knobs { ...root.engine.default_knobs(), budget: 12 }, 6);
-    let text = baml.json.to_string(sat.profile) catch_all (e) {
+    let sat = sit(
+        typescripter,
+        root.engine.Knobs {
+            ...root.engine.default_knobs(),
+            budget: 12,
+        },
+        6,
+    );
+    let text = baml.json.stringify(sat.profile) catch_all (e) {
         baml.json.SerializationError => {
             return "serialize threw";
         },
     };
-    let back = baml.json.from_string<root.engine.Profile>(text) catch_all (e) {
+    let back = baml.json.decode<root.engine.Profile>(text) catch_all (e) {
         baml.json.ParseError => {
             return "parse threw";
         },
@@ -590,7 +618,10 @@ function profile_round_trip() -> string throws never {
 }
 
 function sitting_is_deterministic() -> bool throws never {
-    let knobs = root.engine.Knobs { ...root.engine.default_knobs(), budget: 15 };
+    let knobs = root.engine.Knobs {
+        ...root.engine.default_knobs(),
+        budget: 15,
+    };
     sit(typescripter, knobs, 7).served == sit(typescripter, knobs, 7).served
 }
 
@@ -599,13 +630,23 @@ function sitting_is_deterministic() -> bool throws never {
 /// The profile a sitting ended with is the profile its answers replay to:
 /// nothing is believed about a learner that what they said does not determine.
 function replay_matches() -> bool throws never {
-    let knobs = root.engine.Knobs { ...root.engine.default_knobs(), budget: 12 };
+    let knobs = root.engine.Knobs {
+        ...root.engine.default_knobs(),
+        budget: 12,
+    };
     let sat = sit(typescripter, knobs, 6);
     // A self-mark is kept for the transcript and is not evidence: the page
     // records it after the profile has moved on, and replaying with it must
     // land in the same place.
     let marked = sat.taken.map((t) -> {
-        root.Taken { ...t, given: root.Given { ...t.given, reasoning: "because", mark: "sound" } }
+        root.Taken {
+            ...t,
+            given: root.Given {
+                ...t.given,
+                reasoning: "because",
+                mark: "sound",
+            },
+        }
     });
     root.replay(knobs, sat.taken) == sat.profile && root.replay(knobs, marked) == sat.profile
 }
@@ -629,25 +670,35 @@ function word_for(verdict_correct: bool?) -> string throws never {
 function answered_report() -> string throws never {
     let knobs = root.engine.default_knobs();
     let profile = root.fresh_profile();
-    let next = root.next_prompt(profile, knobs, 8, 0)
-        ?? return "nothing to ask";
+    let next = root.next_prompt(profile, knobs, 8, 0) ?? return "nothing to ask";
     let item = next.prompt.item;
     let seed = next.prompt.seed;
     let put = root.put_at(knobs, item, seed);
     let answers = [
-        root.Given { said: right_word(put), reasoning: "", mark: "", marked_by: "" },
-        root.Given { said: wrong_word(put), reasoning: "", mark: "", marked_by: "" },
-        root.Given { said: "unsure", reasoning: "", mark: "", marked_by: "" },
+        root.Given {
+            said: right_word(put),
+            reasoning: "",
+            mark: "",
+            marked_by: "",
+        },
+        root.Given {
+            said: wrong_word(put),
+            reasoning: "",
+            mark: "",
+            marked_by: "",
+        },
+        root.Given {
+            said: "unsure",
+            reasoning: "",
+            mark: "",
+            marked_by: "",
+        },
     ];
     let answered = answers.map((given) -> {
         root.answer_case(profile, knobs, item, seed, given)
     });
-    let marks = answered.map((a) -> {
-        word_for(a.exchange.judgement.verdict_correct)
-    });
-    let points = answered.map((a) -> {
-        a.points
-    });
+    let marks = answered.map((a) -> { word_for(a.exchange.judgement.verdict_correct) });
+    let points = answered.map((a) -> { a.points });
     let profiles = baml.iter.Range.new(0, answers.length()).every((i) -> {
         answered[i].profile == root.observe_answer(profile, knobs, item, seed, answers[i])
     });
@@ -667,11 +718,15 @@ function adaptive_round_trip() -> string throws never {
     // Every case that can be put as a choice is, so the round trip covers a
     // question of two programs as well as one of a single program: a
     // transcript has always held the second and never the first.
-    let knobs = root.engine.Knobs { ...root.engine.default_knobs(), budget: 12, contrast: 1.0 };
+    let knobs = root.engine.Knobs {
+        ...root.engine.default_knobs(),
+        budget: 12,
+        contrast: 1.0,
+    };
     let sat = sit(typescripter, knobs, 9);
     let expected = root.adaptive_sitting(9, false, knobs, sat.taken, "test-build");
     let text = root.adaptive_json(9, false, knobs, sat.taken, "test-build");
-    let back = baml.json.from_string<root.engine.Transcript>(text) catch_all (e) {
+    let back = baml.json.decode<root.engine.Transcript>(text) catch_all (e) {
         baml.json.ParseError => {
             return "parsing threw";
         },
@@ -722,25 +777,17 @@ test "page: an adaptive sitting downloads, reads back, and reviews with what it 
 /// than by a list here, so a knob added later without a domain fails this
 /// instead of reaching a learner's save unchecked. Booleans have no domain.
 function knob_domains_report() -> string throws never {
-    let declared = reflect.Type.of<root.engine.Knobs>().as_class()
-        ?? return "Knobs is not a class";
-    let boolean = reflect.Type.of<bool>();
-    let numeric = declared.fields()
-        .filter((field) -> {
-            field.type != boolean
-        })
-        .map((field) -> {
-            field.name
-        });
-    let stated = root.engine.knob_domains(root.engine.default_knobs()).map((domain) -> {
-        domain.name
-    });
-    let unstated = numeric.filter((name) -> {
-        !stated.includes(name)
-    });
-    let extra = stated.filter((name) -> {
-        !numeric.includes(name)
-    });
+    let declared = root.engine.Knobs.type().as_class() ?? return "Knobs is not a class";
+    let boolean = bool.type();
+    let numeric = declared
+        .fields()
+        .filter((field) -> { field.type != boolean })
+        .map((field) -> { field.name });
+    let stated = root.engine
+        .knob_domains(root.engine.default_knobs())
+        .map((domain) -> { domain.name });
+    let unstated = numeric.filter((name) -> { !stated.includes(name) });
+    let extra = stated.filter((name) -> { !numeric.includes(name) });
     `unstated=${unstated} extra=${extra} defaults=${root.engine.knobs_fault(root.engine.default_knobs()) ?? "legal"}`
 }
 
@@ -757,9 +804,15 @@ test "knobs: every numeric knob has a domain, and the defaults sit inside them" 
 function hostile_knobs_report() -> string throws never {
     let base = root.engine.default_knobs();
     let slipping = root.engine.knobs_fault(root.engine.Knobs { ...base, slip: 2.0 }) ?? "legal";
-    let endless = root.engine.knobs_fault(root.engine.Knobs { ...base, drift: float.inf() }) ?? "legal";
+    let endless = root.engine.knobs_fault(root.engine.Knobs {
+        ...base,
+        drift: float.inf(),
+    }) ?? "legal";
     let empty = root.engine.knobs_fault(root.engine.Knobs { ...base, budget: 0 }) ?? "legal";
-    let certain = root.engine.knobs_fault(root.engine.Knobs { ...base, target: 1.0 }) ?? "legal";
+    let certain = root.engine.knobs_fault(root.engine.Knobs {
+        ...base,
+        target: 1.0,
+    }) ?? "legal";
     `slip: ${slipping}\ndrift: ${endless}\nbudget: ${empty}\ntarget: ${certain}`
 }
 
@@ -780,35 +833,18 @@ test "profile: the same session seed serves the same cases" {
 
 /// Every rule a verified item can conclude has an order. The two site rules
 /// are not among them — a site is the frame a case stands in rather than
-/// something to master — and neither is the unguarded-cycle rule, since only
-/// the diverging item reaches it, which is the one the count below is short
-/// of. The three carrying variance rules reach five: an axiom under four
-/// wraps, which is as deep as the bank goes today.
 function orders_report() -> string throws never {
     let orders = root.bank.rule_orders(4);
     let counted = [1, 2, 3, 4, 5].map((order) -> {
-        orders
-            .filter((o) -> {
-                o.highest == order
-            })
-            .length()
+        orders.filter((o) -> { o.highest == order }).length()
     });
-    let deepest = orders
-        .filter((o) -> {
-            o.highest >= 4
-        })
-        .map((o) -> {
-            o.rule
-        });
-    let never_alone = orders
-        .filter((o) -> {
-            o.lowest > 1
-        })
-        .length();
-    let servable = root.bank.rules()
-        .filter((rule) -> {
-            !root.bank.is_site_rule(rule.name)
-        })
+    let deepest = orders.filter((o) -> { o.highest >= 4 }).map((o) -> {
+        o.rule
+    });
+    let never_alone = orders.filter((o) -> { o.lowest > 1 }).length();
+    let servable = root.bank
+        .rules()
+        .filter((rule) -> { !root.bank.is_site_rule(rule.name) })
         .length();
     `rules=${orders.length()} of ${servable} by_order=${counted} deepest=${deepest} never_alone=${never_alone}`
 }
@@ -816,7 +852,7 @@ function orders_report() -> string throws never {
 test "orders: every servable rule has one, and only the carrying variance rules reach four or more" {
     assert.equal(
         orders_report(),
-        `rules=31 of 32 by_order=[27, 1, 0, 1, 2] deepest=["variance/function-parameter-contravariant", "variance/function-return-covariant", "variance/function-error-covariant"] never_alone=4`,
+        `rules=33 of 33 by_order=[29, 1, 0, 1, 2] deepest=["variance/function-parameter-contravariant", "variance/function-return-covariant", "variance/function-error-covariant"] never_alone=4`,
     )
 }
 
@@ -852,14 +888,10 @@ function served_surface(knobs: root.engine.Knobs, t: root.Taken) -> Surfaced? th
         let case: root.engine.Case => {
             let shape = root.bank.shapes().find((s) -> {
                 `flow/${s.name}` == t.item
-            })
-                ?? return null;
-            let dealt = root.bank.deal(
-                shape,
-                root.algebra.all_sites(),
-                root.engine.Seed { state: root.state_of(t.seed) },
-            )
-                ?? return null;
+            }) ?? return null;
+            let dealt = root.bank.deal(shape, root.algebra.all_sites(), root.engine.Seed {
+                state: root.state_of(t.seed),
+            }) ?? return null;
             let drawn = dealt.served();
             Surfaced {
                 fact: t.item,
@@ -876,10 +908,12 @@ function served_surface(knobs: root.engine.Knobs, t: root.Taken) -> Surfaced? th
 /// The sitting is stopped at the window, since running each to its own end
 /// would cost several times as much for nothing.
 function opening(learner: Learner, session: int, window: int) -> Surfaced[] throws never {
-    let knobs = root.engine.Knobs { ...root.engine.default_knobs(), practice: true, budget: window };
-    sit(learner, knobs, session).taken.filter_map((t) -> {
-        served_surface(knobs, t)
-    })
+    let knobs = root.engine.Knobs {
+        ...root.engine.default_knobs(),
+        practice: true,
+        budget: window,
+    };
+    sit(learner, knobs, session).taken.filter_map((t) -> { served_surface(knobs, t) })
 }
 
 /// `part` of `whole` as a whole percentage.
@@ -907,14 +941,21 @@ function percent_of(part: int, whole: int) -> int throws never {
 /// four samples than twelve, and one case asked three times reads as a lean.
 function served_leaning_report() -> string throws never {
     let sittings: Sitting[] = [
-        Sitting { learner: expert, sessions: [11, 12, 13, 14] },
-        Sitting { learner: beginner, sessions: [21, 22, 23, 24] },
-        Sitting { learner: typescripter, sessions: [31, 32, 33, 34] },
+        Sitting {
+            learner: expert,
+            sessions: [11, 12, 13, 14],
+        },
+        Sitting {
+            learner: beginner,
+            sessions: [21, 22, 23, 24],
+        },
+        Sitting {
+            learner: typescripter,
+            sessions: [31, 32, 33, 34],
+        },
     ];
     let asked = sittings.flat_map((sitting) -> {
-        sitting.sessions.flat_map((session) -> {
-            opening(sitting.learner, session, 24)
-        })
+        sitting.sessions.flat_map((session) -> { opening(sitting.learner, session, 24) })
     });
     // Pass `true` to see which items carry a lean and how often each was
     // asked, which is where a lean says what it is made of.
@@ -930,15 +971,8 @@ class Sitting {
 test "sitting: nothing well enough seen in a sitting leans more than fifteen points" {
     // WHAT THIS DOES NOT COVER. `served_surface` now reads the whole surface,
     // the same `surface_of` the bank sweep uses, so the pair features are in
-    // the vocabulary here — but 237 questions do not see them often enough to
-    // hold them to anything. Measured with the support floor dropped to one:
     //
-    //   pair:same-spelling          100% of 11
-    //   pair:source-within-target    65% of 23
-    //   kind:literal                 65% of 23
-    //   decl:implements              32% of 19
     //
-    // The first is the bank's recorded debt showing through, and eleven cases
     // is no evidence either way: the standard error at that count is about
     // fifteen points, the width of the whole bar. Lowering the floor would
     // buy noise, not coverage. What would buy coverage is more sittings, and
@@ -947,5 +981,5 @@ test "sitting: nothing well enough seen in a sitting leans more than fifteen poi
     // So this holds the eight or so features a sitting shows often enough to
     // judge, and the BANK sweep is what holds the pair features. Selection
     // over-serving one of them by less than the floor would pass here.
-    assert.equal(served_leaning_report(), `compiles=48% of 237 leaning=[]`)
+    assert.equal(served_leaning_report(), `compiles=54% of 220 leaning=[]`)
 }

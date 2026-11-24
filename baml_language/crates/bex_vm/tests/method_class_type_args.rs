@@ -1,7 +1,7 @@
 //! Unit tests for Phase 8: `Instance::class_type_args` and method-frame seeding.
 //!
 //! These tests exercise:
-//! - `Object::Instance` carrying `class_type_args` (8.1)
+//! - an instance carrying its class type args (8.1)
 //! - `AllocInstance { ntypeargs }` populating `class_type_args` from the stack (8.2)
 //! - A method-like function body reading `TypeArgRef(0)` when the frame has
 //!   been seeded with `[RuntimeTy::int()]` (simulating the 8.5 path) (8.5)
@@ -11,8 +11,8 @@
 
 use std::sync::{Arc, atomic::AtomicBool};
 
-use baml_db::testing::compile_source;
-use baml_type::{Name, RealizedTy, TyTemplate, TypeName};
+use baml_test_support::compile_source;
+use baml_type::{Name, RealizedTy, TyTemplate};
 use bex_vm::{BexVm, VmExecState};
 use bex_vm_types::{
     ConstValue, Instruction, Object, ObjectIndex, Value,
@@ -24,6 +24,15 @@ use bex_vm_types::{
 const STUB_SOURCE: &str = r#"
 function _stub() -> int { 42 }
 "#;
+
+/// The identity of an injected test function named `name`: a free function at
+/// the root namespace (a pooled function's package is its owner, which these
+/// tests never bind).
+fn test_identity(name: &str) -> bex_vm_types::types::FunctionIdentity {
+    bex_vm_types::types::FunctionIdentity::Declared(bex_vm_types::types::FnPath::Free(
+        bex_vm_types::types::LocalName::new(Vec::new(), baml_type::Name::new(name)),
+    ))
+}
 
 /// Add a synthetic bytecode function to an existing `Program`.
 fn inject_function(
@@ -39,10 +48,9 @@ fn inject_function(
         ..Bytecode::default()
     };
     let func = Function {
-        name: fn_name.to_string(),
+        identity: test_identity(fn_name),
         source_file: String::new(),
         docstring: None,
-        declared_name: None,
         arity,
         real_local_count: 0,
         bytecode,
@@ -50,6 +58,8 @@ fn inject_function(
         telemetry_function_id: None,
         telemetry_registration: bex_vm_types::FunctionRegistration::default(),
         telemetry_policy_id: bex_vm_types::TelemetryPolicyId::none(),
+        hotswap_redirect: bex_vm_types::types::HotswapRedirect::default(),
+        compiled_body: None,
         local_names: vec![],
         debug_locals: vec![],
         span: baml_type::Span::fake(),
@@ -64,11 +74,10 @@ fn inject_function(
         display_return_type: "int".to_string(),
         throws_type: baml_type::TyTemplate::Never,
         origin: FunctionOrigin::UserDefined,
-        is_interface_body: false,
         native_key: None,
         body_meta: None,
-
-        runtime_package: bex_vm_types::HeapPtr::null(),
+        trace_passthrough: false,
+        owner: bex_vm_types::HeapPtr::null(),
     };
     let fn_obj_idx = program.add_object(Object::Function(Box::new(func)));
     program.add_global(ConstValue::Object(ObjectIndex::from_raw(fn_obj_idx)));
@@ -93,25 +102,28 @@ fn run_fn(program: Program, function_index: usize) -> (Value, BexVm) {
 // ─── 8.1 + 8.2 ── AllocInstance with ntypeargs stores class_type_args ────────
 
 /// `AllocInstance { class_obj, ntypeargs: 1 }` should pop the top `Object::Type`
-/// and store it in the resulting `Instance::class_type_args`.
+/// and store it as the resulting instance's class type args.
 #[test]
 fn alloc_instance_ntypeargs_stores_class_type_args() {
     let mut program = compile_source(STUB_SOURCE);
 
     // Add a synthetic class to the object pool.
     let class_ptr_idx = program.add_object(Object::Class(Box::new(Class {
-        name: bex_vm_types::DeclarationName::Declared(TypeName::local(Name::new("TestBox"))),
-        fields: vec![],
+        declared_crossing: baml_type::ClassCrossing::Fields,
+        path: bex_vm_types::types::LocalName::new(Vec::new(), Name::new("TestBox")),
+        body: bex_vm_types::ClassBody::Fields(vec![]),
         description: None,
         alias: None,
         docstring: None,
         other: indexmap::IndexMap::new(),
         stream_done: false,
         type_tag: baml_type::typetag::TypeTag::from_i64(100),
-        has_cleanup: false,
+        cleanup: None,
         methods: indexmap::IndexMap::new(),
-        generic_param_count: 0,
+        generic_param_count: 1,
         owner: bex_vm_types::types::Owner::anonymous(),
+        telemetry_definition: bex_vm_types::DefinitionCell::default(),
+        redact: false,
     })));
 
     // Function: push RuntimeTy::int() as a type arg, then AllocInstance with ntypeargs=1.
@@ -138,15 +150,15 @@ fn alloc_instance_ntypeargs_stores_class_type_args() {
     let Some(inst_ptr) = result.as_object_ptr() else {
         panic!("expected Object, got {result:?}");
     };
-    match vm.get_object(inst_ptr) {
-        Object::Instance(inst) => {
+    match vm.get_instance(inst_ptr) {
+        Some(inst) => {
             assert_eq!(
-                inst.class_type_args.to_vec(),
+                inst.type_args().to_vec(),
                 vec![RealizedTy::int()],
-                "Instance::class_type_args should equal [RealizedTy::int()]"
+                "the instance's class type args should equal [RealizedTy::int()]"
             );
         }
-        other => panic!("expected Object::Instance, got {other:?}"),
+        None => panic!("expected an instance, got {:?}", vm.get_object(inst_ptr)),
     }
 }
 
@@ -156,18 +168,21 @@ fn alloc_instance_ntypeargs_zero_gives_empty_class_type_args() {
     let mut program = compile_source(STUB_SOURCE);
 
     let class_ptr_idx = program.add_object(Object::Class(Box::new(Class {
-        name: bex_vm_types::DeclarationName::Declared(TypeName::local(Name::new("MonoClass"))),
-        fields: vec![],
+        declared_crossing: baml_type::ClassCrossing::Fields,
+        path: bex_vm_types::types::LocalName::new(Vec::new(), Name::new("MonoClass")),
+        body: bex_vm_types::ClassBody::Fields(vec![]),
         description: None,
         alias: None,
         docstring: None,
         other: indexmap::IndexMap::new(),
         stream_done: false,
         type_tag: baml_type::typetag::TypeTag::from_i64(101),
-        has_cleanup: false,
+        cleanup: None,
         methods: indexmap::IndexMap::new(),
         generic_param_count: 0,
         owner: bex_vm_types::types::Owner::anonymous(),
+        telemetry_definition: bex_vm_types::DefinitionCell::default(),
+        redact: false,
     })));
 
     let fn_name = "user.test_mono_alloc";
@@ -189,14 +204,14 @@ fn alloc_instance_ntypeargs_zero_gives_empty_class_type_args() {
     let Some(inst_ptr) = result.as_object_ptr() else {
         panic!("expected Object, got {result:?}");
     };
-    match vm.get_object(inst_ptr) {
-        Object::Instance(inst) => {
+    match vm.get_instance(inst_ptr) {
+        Some(inst) => {
             assert!(
-                inst.class_type_args.is_empty(),
-                "monomorphic Instance::class_type_args should be empty"
+                inst.type_args().is_empty(),
+                "a monomorphic instance's class type args should be empty"
             );
         }
-        other => panic!("expected Object::Instance, got {other:?}"),
+        None => panic!("expected an instance, got {:?}", vm.get_object(inst_ptr)),
     }
 }
 
@@ -231,7 +246,7 @@ fn method_frame_type_args_seeded_with_class_type_args() {
         use bex_vm::Frame;
         let frame = vm.frames.last_mut().expect("entry frame");
         if let Frame::Bytecode(bf) = frame {
-            bf.type_args = vec![RealizedTy::int()]; // receiver.class_type_args = [int]
+            bf.type_args = vec![RealizedTy::int()].into(); // receiver.class_type_args = [int]
         } else {
             panic!("entry frame should be Bytecode");
         }
@@ -282,7 +297,7 @@ fn method_frame_type_args_seeded_string() {
         use bex_vm::Frame;
         let frame = vm.frames.last_mut().expect("entry frame");
         if let Frame::Bytecode(bf) = frame {
-            bf.type_args = vec![RealizedTy::string()];
+            bf.type_args = vec![RealizedTy::string()].into();
         }
     }
 
@@ -323,6 +338,7 @@ fn map_result_element_ty_is_closure_return_not_receiver() {
 function f() -> string[] {
     [1, 2].map((x: int) -> string { "s" })
 }
+
 "#,
     );
     let f = program.rendered_callables()["user.f"].object.raw();
@@ -339,4 +355,29 @@ function f() -> string[] {
         ),
         other => panic!("expected Object::Array result, got {other:?}"),
     }
+}
+
+#[test]
+fn explicit_bound_method_specialization_preserves_receiver_and_aliases() {
+    let program = compile_source(
+        r#"
+class Holder<T> {
+    item: T,
+    function check<U>(self, value: U) -> bool {
+        reflect.Type.of<T>() == reflect.Type.of_value(self.item)
+            && reflect.Type.of<U>() == reflect.Type.of_value(value)
+    }
+}
+function f() -> bool {
+    let holder = Holder<int> { item: 3 };
+    let text = holder.check<string>;
+    let alias = text;
+    let number = holder.check<int>;
+    text("value") && number(5) && alias("again")
+}
+"#,
+    );
+    let f = program.rendered_callables()["user.f"].object.raw();
+    let (result, _) = run_fn(program, f);
+    assert_eq!(result.as_bool(), Some(true));
 }

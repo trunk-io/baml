@@ -2,10 +2,10 @@
 
 The BAML fixture declares three functions whose first parameter is a
 typed `Callable`. The Python test passes a normal Python callable; the
-bridge auto-registers it via `register_host_callable` and emits the
+bridge registers it (`host_value::register_callable`) and emits the
 appropriate `Handle{HOST_VALUE_CALLABLE}` wire entry; the engine binds
 it to an `Object::HostClosure`; when BAML invokes it the
-`call_host_value` sysop fires the dispatch FFI; the Python dispatch
+`_call_host_value` sysop fires the dispatch FFI; the Python dispatch
 callback in `bridge_python::host_value` invokes the user function and
 encodes the result back to the engine.
 """
@@ -13,6 +13,7 @@ encodes the result back to the engine.
 from __future__ import annotations
 
 import gc
+import typing
 import weakref
 
 import pytest
@@ -22,20 +23,28 @@ from baml_sdk.baml import BamlError
 from baml_sdk.host_callable_tests import (
     Person,
     ValidationError,
-    call_callback_with_optional_args_all_set,
-    call_callback_with_optional_args_all_unset,
-    call_callback_with_optional_args_partially_set,
-    call_int_callback,
-    call_repeatedly,
-    call_with_callback,
-    call_with_class_callback,
-    call_with_throwing,
-    call_with_two_args,
-    call_with_typed_throws,
-    call_with_typed_throws_propagating,
-    make_adder,
-    make_counter,
-    make_pair_builder,
+    call_callback_with_optional_args_all_set_sync,
+    call_callback_with_optional_args_all_unset_sync,
+    call_callback_with_optional_args_partially_set_sync,
+    call_int_callback_sync,
+    call_repeatedly_sync,
+    call_throwing_void_callback_sync,
+    call_void_callback_sync,
+    call_void_callback_three_args_sync,
+    call_void_callback_two_args_sync,
+    call_with_callback_sync,
+    call_with_class_callback_sync,
+    call_with_throwing_sync,
+    call_with_two_args_sync,
+    call_with_typed_throws_sync,
+    call_with_typed_throws_propagating_sync,
+    hof_sync,
+    make_adder_sync,
+    make_counter_sync,
+    make_pair_builder_sync,
+    make_void_callback_sync,
+    make_void_forwarder_sync,
+    two_cbs_sync,
 )
 
 
@@ -43,7 +52,7 @@ def test_host_callables_simple_sync_callable_returns_string():
     def cb(x: int) -> str:
         return f"got {x}"
 
-    result = call_with_callback(callback=cb, x=5)
+    result = call_with_callback_sync(callback=cb, x=5)
     assert result == "got 5"
 
 
@@ -51,7 +60,7 @@ def test_host_callables_two_arg_callable_unpacks_positional_args():
     def cb(x: int, prefix: str) -> str:
         return f"{prefix}:{x}"
 
-    result = call_with_two_args(callback=cb, x=7, prefix="answer")
+    result = call_with_two_args_sync(callback=cb, x=7, prefix="answer")
     assert result == "answer:7"
 
 
@@ -59,30 +68,101 @@ def test_host_callables_int_return_callable_round_trip():
     def cb(x: int) -> int:
         return x * 2
 
-    result = call_int_callback(callback=cb, x=21)
+    result = call_int_callback_sync(callback=cb, x=21)
     assert result == 42
+
+
+def test_host_callable_two_cbs_callbacks_named_f_and_f_returns_both_run():
+    # Two callback parameters whose names differ by a `_returns` suffix each
+    # keep their own callable: `f(1) + f_returns(2)`.
+    assert two_cbs_sync(f=lambda x: x * 10, f_returns=lambda x: x * 100) == 210
+
+
+def test_host_callable_hof_receives_a_baml_closure():
+    # BAML hands the callback a closure of its own; it arrives as an ordinary
+    # Python callable, calls back into BAML (by position and by name, so
+    # twice), and its result flows back through `hof`.
+    received: list[object] = []
+
+    def cb(f: typing.Any) -> int:
+        received.append(f)
+        assert callable(f)
+        return f.call_sync(41) * 100 + f.call_sync(x=1) * 2
+
+    assert hof_sync(cb=cb) == 4204
+    assert len(received) == 1
 
 
 # SDK_PARITY_LINT(skip): C# covers this canonical behavior in its native integration harness
 def test_baml_closure_is_a_native_callable_with_host_language_arguments():
-    add_ten = make_adder(offset=10)
+    add_ten = make_adder_sync(offset=10)
     assert callable(add_ten)
-    assert add_ten(5) == 15
-    assert add_ten(value=7) == 17
+    assert add_ten.call_sync(5) == 15
+    assert add_ten.call_sync(value=7) == 17
 
 
 # SDK_PARITY_LINT(skip): C# covers this canonical behavior in its native integration harness
 def test_baml_closure_decodes_multiple_args_and_structured_return_values():
-    build = make_pair_builder(base=30)
-    assert build(12, "Ada") == Person(name="Ada", age=42)
-    assert build(delta=5, label="Grace") == Person(name="Grace", age=35)
+    build = make_pair_builder_sync(base=30)
+    assert build.call_sync(12, "Ada") == Person(name="Ada", age=42)
+    assert build.call_sync(delta=5, label="Grace") == Person(name="Grace", age=35)
 
 
 # SDK_PARITY_LINT(skip): C# covers this canonical behavior in its native integration harness
 def test_baml_closure_is_reusable_and_retains_mutable_captures():
-    next_value = make_counter(start=40)
-    assert next_value() == 41
-    assert next_value() == 42
+    next_value = make_counter_sync(start=40)
+    assert next_value.call_sync() == 41
+    assert next_value.call_sync() == 42
+
+
+def test_host_callable_void_signatures():
+    """A unit callable has no result to carry in either direction: a host
+    callback returns `None` whatever its arity, and calling a BAML closure
+    returned to the host yields `None`."""
+    seen: list[tuple[object, ...]] = []
+
+    def one(value: int) -> None:
+        seen.append((value,))
+
+    def two(value: int, label: str) -> None:
+        seen.append((value, label))
+
+    def three(value: int, label: str, flag: bool) -> None:
+        seen.append((value, label, flag))
+
+    assert call_void_callback_sync(callback=one, value=1) == 1
+    assert call_void_callback_two_args_sync(callback=two, value=2, label="two") == 2
+    assert (
+        call_void_callback_three_args_sync(
+            callback=three, value=3, label="three", flag=True
+        )
+        == 3
+    )
+
+    assert call_throwing_void_callback_sync(callback=one, value=4) is None
+    raised = ValueError("void failed")
+
+    def failing(_value: int) -> None:
+        raise raised
+
+    with pytest.raises(ValueError) as exc_info:
+        call_throwing_void_callback_sync(callback=failing, value=4)
+    assert exc_info.value is raised
+
+    assert make_void_callback_sync().call_sync() is None
+
+    forward = make_void_forwarder_sync(callback=two)
+    assert forward.call_sync(5, "five") is None
+    assert forward.call_sync(value=6, label="six") is None
+
+    assert seen == [
+        (1,),
+        (2, "two"),
+        (3, "three", True),
+        (4,),
+        (5, "five"),
+        (6, "six"),
+    ]
 
 
 def test_host_callables_throwing_callable_round_trips_original_python_exception():
@@ -100,7 +180,7 @@ def test_host_callables_throwing_callable_round_trips_original_python_exception(
         raise raised
 
     with pytest.raises(ValueError) as exc_info:
-        call_with_callback(callback=cb, x=1)
+        call_with_callback_sync(callback=cb, x=1)
     assert exc_info.value is raised
     assert str(exc_info.value) == "nope"
 
@@ -116,7 +196,7 @@ def test_host_callables_throwing_callable_keyerror_round_trips_with_identity():
         raise raised
 
     with pytest.raises(KeyError) as exc_info:
-        call_with_callback(callback=cb, x=1)
+        call_with_callback_sync(callback=cb, x=1)
     assert exc_info.value is raised
 
 
@@ -135,7 +215,7 @@ def test_host_callables_throwing_callable_custom_python_exception_round_trips_wi
         raise raised
 
     with pytest.raises(MyDomainError) as exc_info:
-        call_with_callback(callback=cb, x=1)
+        call_with_callback_sync(callback=cb, x=1)
     assert exc_info.value is raised
     assert exc_info.value.code == 42
 
@@ -158,7 +238,7 @@ def test_host_callables_throwing_callable_bamlerror_wrapping_codegenned_class_is
             ),
         )
 
-    result = call_with_typed_throws(callback=cb, x=1)
+    result = call_with_typed_throws_sync(callback=cb, x=1)
     assert result == "caught: bad shape"
 
 
@@ -181,7 +261,7 @@ def test_host_callables_throwing_callable_bamlerror_propagates_back_with_typed_f
         raise raised
 
     with pytest.raises(BamlError) as exc_info:
-        call_with_typed_throws_propagating(callback=cb, x=1)
+        call_with_typed_throws_propagating_sync(callback=cb, x=1)
     decoded = exc_info.value.value
     assert isinstance(decoded, ValidationError)
     assert decoded.code == 7
@@ -199,7 +279,7 @@ def test_host_callables_throwing_async_callable_round_trips_original_python_exce
         raise raised
 
     with pytest.raises(ValueError) as exc_info:
-        call_with_callback(callback=cb, x=1)
+        call_with_callback_sync(callback=cb, x=1)
     assert exc_info.value is raised
 
 
@@ -218,27 +298,29 @@ def test_host_callables_multiple_throws_in_flight_do_not_collide_in_registry():
         raise raised_second
 
     with pytest.raises(ValueError) as ei1:
-        call_with_callback(callback=cb_first, x=1)
+        call_with_callback_sync(callback=cb_first, x=1)
     with pytest.raises(ValueError) as ei2:
-        call_with_callback(callback=cb_second, x=2)
+        call_with_callback_sync(callback=cb_second, x=2)
     assert ei1.value is raised_first
     assert ei2.value is raised_second
     assert ei1.value is not ei2.value
 
 
 @pytest.mark.xfail(
-    reason="host-callable release fires only when the engine GCs the "
-    "Object::HostClosure on its heap; one BAML call rarely triggers "
-    "the GC heuristic, so for now the callable leaks until the engine "
-    "collects.",
+    reason="Python gc.collect() does not collect the BAML engine's heap. "
+    "The engine-owned Object::HostClosure retains the registered Python "
+    "callback until engine GC releases it; this test does not trigger "
+    "engine GC, so immediate callback release is not guaranteed.",
     strict=False,
 )
 def test_host_callables_release_fires_on_drop_of_callable():
-    """After BAML finishes invoking the callable and the engine GCs the
-    `Object::HostClosure` it allocated, the registered release callback
-    removes the Python callable from the bridge's host-value table.
-    Dropping the user's last reference then leaves the object
-    unreachable for the cycle collector.
+    """Probe immediate release after dropping the application's reference.
+
+    This is an expected failure because Python's collector does not trigger
+    engine GC. The bridge registry still owns the Python callback while the
+    engine retains its `Object::HostClosure`. Release follows engine GC, not
+    necessarily completion of this call. This test does not verify eventual
+    release after engine GC.
     """
 
     class CallableObj:
@@ -247,7 +329,7 @@ def test_host_callables_release_fires_on_drop_of_callable():
 
     cb = CallableObj()
     wr = weakref.ref(cb)
-    result = call_with_callback(callback=cb, x=3)
+    result = call_with_callback_sync(callback=cb, x=3)
     assert result == "3"
     del cb
     gc.collect()
@@ -258,7 +340,7 @@ def test_host_callables_lambda_round_trip():
     """Lambdas are callable and not pydantic models, so they hit the
     callable-encoding branch in `_set_inbound_value`.
     """
-    result = call_with_callback(callback=lambda x: f"lambda-{x}", x=99)
+    result = call_with_callback_sync(callback=lambda x: f"lambda-{x}", x=99)
     assert result == "lambda-99"
 
 
@@ -273,7 +355,7 @@ def test_host_callables_async_callable_runs_to_completion():
         await asyncio.sleep(0)
         return f"async-{x}"
 
-    result = call_with_callback(callback=cb, x=4)
+    result = call_with_callback_sync(callback=cb, x=4)
     assert result == "async-4"
 
 
@@ -291,8 +373,8 @@ def test_host_callables_multiple_callable_keys_are_distinct():
         counter["b"] += 1
         return f"b:{x}"
 
-    assert call_with_callback(callback=cb_a, x=1) == "a:1"
-    assert call_with_callback(callback=cb_b, x=2) == "b:2"
+    assert call_with_callback_sync(callback=cb_a, x=1) == "a:1"
+    assert call_with_callback_sync(callback=cb_b, x=2) == "b:2"
     assert counter == {"a": 1, "b": 1}
 
 
@@ -307,7 +389,7 @@ def test_host_callables_class_callback_round_trips_pydantic_model():
         return f"{p.name} is {p.age}"
 
     person = Person(name="Ada", age=37)
-    result = call_with_class_callback(callback=cb, p=person)
+    result = call_with_class_callback_sync(callback=cb, p=person)
     assert result == "Ada is 37"
 
 
@@ -323,7 +405,7 @@ def test_host_callables_call_repeatedly_invokes_callback_n_times():
         invocations.append(x)
         return f"item-{x}"
 
-    results = call_repeatedly(callback=cb, n=5)
+    results = call_repeatedly_sync(callback=cb, n=5)
     assert results == [f"item-{i}" for i in range(5)]
     assert invocations == list(range(5))
 
@@ -339,7 +421,7 @@ def test_host_callables_call_repeatedly_with_zero_n_returns_empty_list():
         invocations.append(x)
         return ""
 
-    results = call_repeatedly(callback=cb, n=0)
+    results = call_repeatedly_sync(callback=cb, n=0)
     assert results == []
     assert invocations == []
 
@@ -365,7 +447,7 @@ def test_host_callables_call_with_throwing_in_baml_catches_host_callable_error()
     def cb(_x: int) -> str:
         raise RuntimeError("boom from host")
 
-    result = call_with_throwing(callback=cb, x=1)
+    result = call_with_throwing_sync(callback=cb, x=1)
     assert result == "caught:RuntimeError"
 
 
@@ -391,7 +473,7 @@ def test_host_callables_optional_args_all_unset_apply_host_defaults():
     """`callback(x)` supplies neither optional. Both are dropped before dispatch,
     so the Python callback runs with only `x` and its own defaults fill `y`/`z`
     (8 and 9), yielding `5*100 + 8*10 + 9 = 589`."""
-    assert call_callback_with_optional_args_all_unset(
+    assert call_callback_with_optional_args_all_unset_sync(
         callback=optional_args_cb, x=5
     ) == [589]
 
@@ -403,7 +485,7 @@ def test_host_callables_optional_args_partially_set_deliver_by_name():
     delivered as a keyword and the omitted one falls back to the host default
     (`y`→8, `z`→9) — including the case where the *leading* optional `y` is
     skipped while `z` is supplied."""
-    assert call_callback_with_optional_args_partially_set(
+    assert call_callback_with_optional_args_partially_set_sync(
         callback=optional_args_cb, x=5
     ) == [529, 583]
 
@@ -411,6 +493,6 @@ def test_host_callables_optional_args_partially_set_deliver_by_name():
 def test_host_callables_optional_args_all_set_deliver_both():
     """`callback(x, y = 2, z = 3)` supplies both optionals; both arrive by name
     and override the host defaults, yielding `500 + 20 + 3 = 523`."""
-    assert call_callback_with_optional_args_all_set(
+    assert call_callback_with_optional_args_all_set_sync(
         callback=optional_args_cb, x=5
     ) == [523]

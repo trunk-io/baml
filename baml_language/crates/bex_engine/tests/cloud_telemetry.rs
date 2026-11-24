@@ -7,9 +7,13 @@ use std::{
     time::Duration,
 };
 
-use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder, TelemetryRecording};
-use btel_bcs::{delivery::DeliveryConfig, proto::CloudUploadEnvelope};
+use bex_engine::{
+    BexEngine, BexExternalValue, EngineConfig, FunctionCallContextBuilder, TelemetryRecording,
+};
+use btel_bcs::delivery::DeliveryConfig;
+use btel_core::upload::envelope::UploadEnvelope;
 use btel_recorder::{RecordingConfig, proto};
+use btel_types::context::{Context, ContextPatch, ContextValue};
 use prost::Message as _;
 use serde_json::{Value, json};
 use sys_native::SysOpsExt;
@@ -28,10 +32,18 @@ const SOURCE: &str =
     include_str!("../../baml_tests/baml_src/ns_cloud_telemetry/cloud_telemetry.baml");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Follow actual BCS upload references under snapshot pressure to verify
+/// automatic process metadata and unchanged per-invocation context delivery.
 async fn baml_context_uses_existing_cloud_recording_and_cas_uploads_under_pressure() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     let base = server.uri();
     Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/uploads:prepare$"))
         .respond_with(move |request: &Request| {
             ResponseTemplate::new(200).set_body_json(cloud_protocol::response(request, &base, &[]))
         })
@@ -41,30 +53,41 @@ async fn baml_context_uses_existing_cloud_recording_and_cas_uploads_under_pressu
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    let program = baml_db::testing::compile_source(trace_context::SOURCE);
+    let program = trace_context::program_with_version(trace_context::SOURCE, "3.4.5+cloud");
+    let launch_context = Context::default().with_patch(&ContextPatch {
+        metadata: [(
+            "root".into(),
+            Some(ContextValue::String("launch-value".into())),
+        )]
+        .into(),
+        distinct_id: Some("launch-user".into()),
+    });
     let engine = Arc::new(
-        BexEngine::new_with_telemetry_recording(
+        BexEngine::new_with_config(
             program,
             Arc::new(sys_native::SysOps::native()),
             vec![],
-            None,
-            btel_clock::ClockMode::Monotonic,
-            TelemetryRecording::cloud(
-                RecordingConfig::default(),
-                btel_bcs::CloudPublisherConfig {
-                    snapshot_target: 1,
-                    max_pending_snapshots: 1,
-                    inline_target_bytes: 1024 * 1024,
-                    ..btel_bcs::CloudPublisherConfig::default()
-                },
-                DeliveryConfig {
-                    max_pending_snapshots: 1,
-                    max_candidates: 1,
-                    max_targets: 2,
-                    max_pending_plans: 1,
-                    ..DeliveryConfig::new(server.uri().parse().unwrap())
-                },
-            ),
+            EngineConfig {
+                launch_context,
+                clock_mode: btel_clock::ClockMode::Monotonic,
+                recording: Some(TelemetryRecording::cloud(
+                    RecordingConfig::default(),
+                    btel_bcs::CloudPublisherConfig {
+                        candidate_target: 1,
+                        max_pending_snapshots: 1,
+                        inline_target_bytes: 1024 * 1024,
+                        ..btel_bcs::CloudPublisherConfig::default()
+                    },
+                    DeliveryConfig {
+                        max_pending_snapshots: 1,
+                        max_candidates: 1,
+                        max_targets: 2,
+                        max_pending_plans: 1,
+                        ..DeliveryConfig::new(server.uri().parse().unwrap())
+                    },
+                )),
+                ..EngineConfig::default()
+            },
         )
         .unwrap(),
     );
@@ -103,19 +126,92 @@ async fn baml_context_uses_existing_cloud_recording_and_cas_uploads_under_pressu
         .iter()
         .filter(|request| request.method == "PUT")
     {
-        let envelope = CloudUploadEnvelope::decode(request.body.as_slice()).unwrap();
+        let envelope = UploadEnvelope::decode(request.body.as_slice()).unwrap();
         if let Some(bytes) = envelope.recording_file {
             files.push(proto::RecordingFile::decode(bytes.as_slice()).unwrap());
         }
-        for object in envelope.cas_objects {
+        for object in envelope.blobs {
             let snapshot =
-                btel_snapshot::decode_blob(&object.blob, &btel_snapshot::DecodeLimits::default())
+                btel_core::cas::decode_blob(&object.blob, &btel_core::cas::DecodeLimits::default())
                     .unwrap();
             assert_eq!(snapshot.id.as_bytes().as_slice(), object.snapshot_id);
             snapshots.insert(*snapshot.id.as_bytes(), snapshot);
         }
     }
-    trace_context::assert_leaf_contexts(&files, &snapshots, 3);
+    // Decode the actual BCS PUT payload and follow its process-context CAS
+    // reference. The caller supplied identity and ordinary metadata, but no
+    // system-populated fields.
+    assert!(!files.is_empty());
+    for file in &files {
+        let header = file.header.as_ref().unwrap();
+        assert!(header.command.is_empty(), "cloud arguments stay private");
+        assert_eq!(
+            header.baml_version.as_deref(),
+            Some(baml_version::CANONICAL_VERSION)
+        );
+        let id = btel_core::recording::cas_id(header.initial_context_cas_id.unwrap());
+        let (identity, metadata) = trace_context::metadata(&snapshots[id.as_bytes()]);
+        assert_eq!(
+            metadata["baml.ctx.baml_version"],
+            &btel_core::cas::DecodedValue::String(baml_version::CANONICAL_VERSION.into())
+        );
+        assert!(
+            !metadata.contains_key("baml.ctx.app_version"),
+            "program version is not process-shared metadata"
+        );
+        assert_eq!(identity, Some("launch-user"));
+        assert_eq!(
+            metadata["root"],
+            &btel_core::cas::DecodedValue::String("launch-value".into())
+        );
+        assert_eq!(
+            metadata["baml.ctx.os"],
+            &btel_core::cas::DecodedValue::String(std::env::consts::OS.into())
+        );
+        assert_eq!(
+            metadata["baml.ctx.architecture"],
+            &btel_core::cas::DecodedValue::String(std::env::consts::ARCH.into())
+        );
+        assert_eq!(
+            metadata["baml.ctx.is_ci"],
+            &btel_core::cas::DecodedValue::Bool(baml_env::raw_var("CI").is_some_and(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                )
+            }))
+        );
+        assert_eq!(
+            metadata.get("baml.ctx.agent_harness").copied(),
+            baml_env::agent::detect()
+                .ok()
+                .flatten()
+                .filter(|agent| {
+                    !agent.trim().is_empty()
+                        && agent.len() <= 128
+                        && !agent.chars().any(char::is_control)
+                })
+                .map(|agent| btel_core::cas::DecodedValue::String(agent.into()))
+                .as_ref()
+        );
+        let allowed = [
+            "baml_version",
+            "app_version",
+            "os",
+            "os_version",
+            "os_distro",
+            "architecture",
+            "is_ci",
+            "agent_harness",
+        ];
+        assert!(metadata.keys().all(|key| {
+            *key == "root"
+                || key
+                    .strip_prefix("baml.ctx.")
+                    .is_some_and(|key| allowed.contains(&key))
+        }));
+    }
+    trace_context::assert_leaf_contexts(&files, &snapshots, 3, Some("3.4.5+cloud"));
 }
 
 fn engine(server: &MockServer, flush_interval_duration: Duration) -> Arc<BexEngine> {
@@ -138,7 +234,8 @@ fn engine(server: &MockServer, flush_interval_duration: Duration) -> Arc<BexEngi
                 retry_delay: Duration::ZERO,
                 ..DeliveryConfig::new(server.uri().parse().unwrap())
             },
-        ),
+        )
+        .with_sources(vec![("cloud_telemetry.baml".to_owned(), SOURCE.to_owned())]),
     )
 }
 
@@ -156,8 +253,14 @@ async fn execute(engine: &Arc<BexEngine>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capture_pressure_cannot_deadlock_vm_or_fail_execution() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     let base = server.uri();
     Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/uploads:prepare$"))
         .respond_with(move |request: &Request| {
             ResponseTemplate::new(200).set_body_json(cloud_protocol::response(request, &base, &[]))
         })
@@ -175,7 +278,7 @@ async fn capture_pressure_cannot_deadlock_vm_or_fail_execution() {
         TelemetryRecording::cloud(
             RecordingConfig::default(),
             btel_bcs::CloudPublisherConfig {
-                snapshot_target: 2,
+                candidate_target: 2,
                 max_pending_snapshots: 4,
                 ..btel_bcs::CloudPublisherConfig::default()
             },
@@ -214,17 +317,23 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-fn snapshot_hex(id: proto::SnapshotId) -> String {
+fn snapshot_hex(id: proto::CasId) -> String {
     hex(&[id.low.to_le_bytes(), id.high.to_le_bytes()].concat())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     let uri = server.uri();
     let skipped_id = Arc::new(Mutex::new(None::<String>));
     let plan_skipped_id = Arc::clone(&skipped_id);
     Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/uploads:prepare$"))
         .respond_with(move |request: &Request| {
             let prepare: Value = serde_json::from_slice(&request.body).unwrap();
             let sequence = prepare["recording"]["recording_file_sequence"]
@@ -300,7 +409,10 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
 
     let requests = server.received_requests().await.unwrap();
     let skipped_id = skipped_id.lock().unwrap().clone().unwrap();
-    let prepares: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+    let prepares: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/uploads:prepare"))
+        .collect();
     let puts: Vec<_> = requests.iter().filter(|r| r.method == "PUT").collect();
     assert!(!prepares.is_empty());
     assert_eq!(prepares.len(), puts.len());
@@ -339,7 +451,7 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
             .unwrap();
         assert!(!put.headers.contains_key("authorization"));
         assert_eq!(put.headers["x-upload-plan"], "required");
-        let envelope = CloudUploadEnvelope::decode(put.body.as_slice()).unwrap();
+        let envelope = UploadEnvelope::decode(put.body.as_slice()).unwrap();
         assert_eq!(envelope.format_version, 1);
         assert_eq!(envelope.plan_id, format!("plan-{sequence}"));
         assert_eq!(envelope.upload_id, format!("recording-{sequence}"));
@@ -347,7 +459,18 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
         assert_eq!(prepare["recording"]["encoded_length"], bytes.len());
         let file = proto::RecordingFile::decode(bytes.as_slice()).unwrap();
         assert_eq!(file.sequence, sequence);
-        assert_eq!(file.header.unwrap().recording_id, recording_id.as_bytes());
+        let header = file.header.unwrap();
+        assert_eq!(header.recording_id, recording_id.as_bytes());
+        assert!(header.source_cas_id.is_none(), "cloud sources stay local");
+        // Cloud files name the program and the process's platform, and no
+        // build when the host describes none.
+        assert!(header.program_id.is_some() && header.build.is_none());
+        assert_eq!(header.os.as_deref(), Some(std::env::consts::OS));
+        assert_eq!(header.arch.as_deref(), Some(std::env::consts::ARCH));
+        assert_eq!(
+            header.format_minor,
+            btel_core::recording::minor::PROCESS_PLATFORM
+        );
         // Normal shutdown settles every run: the last uploaded file ends it.
         assert_eq!(file.end.is_some(), index + 1 == prepares.len());
         for definition in file.definitions.unwrap_or_default().functions {
@@ -355,6 +478,7 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
                 definition.resolution
             {
                 if metadata.fqn == "user.leaf" || metadata.fqn == "user.main" {
+                    assert!(metadata.compilation_unit_hash.is_some());
                     assert!(metadata.argument_layout.as_ref().unwrap().slots.is_empty());
                     named_functions.insert(metadata.fqn);
                 }
@@ -380,18 +504,14 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
             }
         }
         let candidates = prepare["candidates"].as_array().unwrap();
-        let actual: BTreeSet<_> = envelope
-            .cas_objects
-            .iter()
-            .map(|c| hex(&c.snapshot_id))
-            .collect();
+        let actual: BTreeSet<_> = envelope.blobs.iter().map(|c| hex(&c.snapshot_id)).collect();
         let expected: BTreeSet<_> = candidates
             .iter()
             .map(|c| c["snapshot_id"].as_str().unwrap().to_owned())
             .filter(|id| id != &skipped_id)
             .collect();
         assert_eq!(actual, expected);
-        assert_eq!(envelope.cas_objects.len(), expected.len());
+        assert_eq!(envelope.blobs.len(), expected.len());
         if candidates
             .iter()
             .any(|candidate| candidate["snapshot_id"] == skipped_id)
@@ -400,15 +520,18 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
         }
         assert!(!actual.contains(&skipped_id));
         for candidate in candidates {
-            assert_eq!(candidate["snapshot_format_version"], 2);
+            assert_eq!(
+                candidate["snapshot_format_version"],
+                btel_core::cas::VERSION
+            );
             offered.insert(candidate["snapshot_id"].as_str().unwrap().to_owned());
         }
-        for object in envelope.cas_objects {
+        for object in envelope.blobs {
             uploaded += 1;
-            assert_eq!(object.snapshot_format_version, 2);
+            assert_eq!(object.snapshot_format_version, btel_core::cas::VERSION);
             assert_eq!(object.snapshot_id.len(), 16);
             assert_eq!(object.blob_sha256.len(), 32);
-            assert!(object.blob.len() >= 35);
+            assert!(object.blob.len() >= 38);
             assert_eq!(&object.blob[..8], b"BTELCAS\0");
             assert_eq!(&object.blob[12..28], object.snapshot_id);
         }
@@ -434,10 +557,16 @@ async fn cloud_shutdown_drains_recordings_and_respects_cas_plan() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cloud_delivery_failure_does_not_change_execution() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let responding = healthy.clone();
     let base = server.uri();
     Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/uploads:prepare$"))
         .respond_with(move |request: &Request| {
             if responding.load(std::sync::atomic::Ordering::Acquire) {
                 ResponseTemplate::new(200).set_body_json(cloud_protocol::response(

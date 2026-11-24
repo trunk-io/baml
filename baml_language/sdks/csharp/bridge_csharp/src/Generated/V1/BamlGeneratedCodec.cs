@@ -103,30 +103,40 @@ public readonly partial struct BamlGeneratedCodecContext
 
     public BamlGeneratedValue Handle(
         global::Baml.BamlHandle value,
-        string expectedIdentity,
-        ReadOnlySpan<byte> expectedTypeMetadata)
+        string expectedIdentity)
     {
-        RequireHandleType(value, expectedIdentity, expectedTypeMetadata, inbound: true);
+        RequireHandleType(
+            value,
+            expectedIdentity,
+            NamedHandleType(expectedIdentity),
+            inbound: true);
         return BamlGeneratedValue.CreateHandle(value);
     }
 
-    public BamlGeneratedValue Handle(
-        global::Baml.BamlHandle value,
-        string expectedIdentity,
-        IReadOnlyList<BamlGeneratedTypeArgument> expectedTypeArguments) =>
-        Handle(
-            value,
+    /// <summary>
+    /// Encode an instance of a class that crosses by reference: the engine
+    /// reference it holds.
+    /// </summary>
+    public BamlGeneratedValue Opaque(
+        BamlGeneratedOpaque value,
+        string expectedIdentity)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        RequireHandleType(
+            value.Handle,
             expectedIdentity,
-            ResourceTypeMetadata(expectedIdentity, expectedTypeArguments));
+            BamlHandleType.AdtRuntimeValue,
+            inbound: true);
+        return BamlGeneratedValue.CreateHandle(value.Handle);
+    }
 
     public BamlGeneratedValue FunctionSpec<TFinal>(
         global::Baml.BamlFunctionSpec<TFinal> value,
-        string expectedIdentity,
-        ReadOnlySpan<byte> expectedTypeMetadata)
+        string expectedIdentity)
     {
         ArgumentNullException.ThrowIfNull(value);
         value.RequireRegistry(registry);
-        return Handle(value.Handle, expectedIdentity, expectedTypeMetadata);
+        return Handle(value.Handle, expectedIdentity);
     }
 
     public BamlGeneratedValue Resource(
@@ -211,32 +221,60 @@ public readonly partial struct BamlGeneratedCodecContext
 
     public BamlGeneratedHostResult VoidResult() => new(type: null, encode: null);
 
+    /// <summary>
+    /// The declared throws type of a host callable that no BAML error a host
+    /// builds inhabits (<c>never</c>, <c>baml.errors.HostCallable</c>), as its
+    /// canonical serialized <c>BamlTy</c>. The callable can still raise an
+    /// exception of the host's own.
+    /// </summary>
+    public BamlGeneratedHostThrows Throws(ReadOnlySpan<byte> metadata) =>
+        new(metadata.ToArray(), restate: null);
+
+    /// <summary>
+    /// The declared throws type of a host callable, as the type the call binds
+    /// it to. A BAML error the callable throws is read and written back by
+    /// this type's codec, so it crosses stated as the declared type.
+    /// </summary>
+    public BamlGeneratedHostThrows Throws<T>(BamlGeneratedType<T> type)
+    {
+        BamlGeneratedRegistry capturedRegistry = registry;
+        TypeDeclaration<T> declaration = capturedRegistry.RequireType(type);
+        return new(
+            declaration.Metadata,
+            thrown => capturedRegistry.Encode(declaration, capturedRegistry.Decode(declaration, thrown)));
+    }
+
+    /// <summary>
+    /// The throws type of a host callable whose declaration left it open: an
+    /// implicit effect parameter the caller never binds. A host callable may
+    /// throw anything, so it is <c>unknown</c>, and a BAML error crosses as the
+    /// value it is.
+    /// </summary>
+    public BamlGeneratedHostThrows UnknownThrows() =>
+        new(new BamlTy { Unknown = new BamlTyUnknown() }.ToByteArray(), restate: static thrown => thrown);
+
     public BamlGeneratedValue HostCallable(
         Delegate callback,
         IReadOnlyList<BamlGeneratedHostParameter> parameters,
         BamlGeneratedHostResult result,
+        BamlGeneratedHostThrows throws,
         BamlGeneratedHostInvoker invoke)
     {
         ArgumentNullException.ThrowIfNull(callback);
         ArgumentNullException.ThrowIfNull(parameters);
         ArgumentNullException.ThrowIfNull(result);
+        ArgumentNullException.ThrowIfNull(throws);
         ArgumentNullException.ThrowIfNull(invoke);
         return BamlGeneratedValue.CreateHostCallable(
             new BamlGeneratedHostCallable(
                 callback,
-                new BamlGeneratedHostCallableDescriptor(parameters, result, invoke)));
+                new BamlGeneratedHostCallableDescriptor(parameters, result, throws, invoke)));
     }
 
     public BamlGeneratedValue Value(global::Baml.BamlValue value)
     {
         ArgumentNullException.ThrowIfNull(value);
         return value.GeneratedValue;
-    }
-
-    public BamlGeneratedValue List(IEnumerable<BamlGeneratedValue> values)
-    {
-        ArgumentNullException.ThrowIfNull(values);
-        return BamlGeneratedValue.CreateList(SnapshotValues(values, "list"));
     }
 
     public BamlGeneratedValue List(
@@ -256,11 +294,34 @@ public readonly partial struct BamlGeneratedCodecContext
             itemTypeMetadata);
     }
 
-    public BamlGeneratedValue Map(
-        IEnumerable<KeyValuePair<string, BamlGeneratedValue>> entries)
+    /// <summary>
+    /// A tuple stated as its own tuple type: one carrier per slot, in slot
+    /// order. It crosses inbound as a list stating that tuple type.
+    /// </summary>
+    public BamlGeneratedValue Tuple(
+        IEnumerable<BamlGeneratedValue> values,
+        ReadOnlySpan<byte> tupleTypeMetadata)
     {
-        ArgumentNullException.ThrowIfNull(entries);
-        return BamlGeneratedValue.CreateMap(SnapshotEntries(entries, "map"));
+        ArgumentNullException.ThrowIfNull(values);
+        if (tupleTypeMetadata.IsEmpty)
+        {
+            throw new ArgumentException(
+                "Generated tuple type metadata cannot be empty.",
+                nameof(tupleTypeMetadata));
+        }
+
+        IReadOnlyList<BamlGeneratedValue> items = SnapshotValues(values, "tuple");
+        int arity = BamlGeneratedValue.TupleArity(tupleTypeMetadata);
+        if (items.Count != arity)
+        {
+            throw new BamlTypeMappingException(
+                typeof(BamlGeneratedValue),
+                "tuple",
+                "$",
+                $"A tuple of arity {arity} received {items.Count} slots.");
+        }
+
+        return BamlGeneratedValue.CreateTuple(items, tupleTypeMetadata.ToArray());
     }
 
     public BamlGeneratedValue Map(
@@ -406,34 +467,41 @@ public readonly partial struct BamlGeneratedCodecContext
 
     public global::Baml.BamlHandle ReadHandle(
         BamlGeneratedValue value,
-        string expectedIdentity,
-        ReadOnlySpan<byte> expectedTypeMetadata)
+        string expectedIdentity)
     {
         global::Baml.BamlHandle handle = Require(value).ReadHandle();
-        RequireHandleType(handle, expectedIdentity, expectedTypeMetadata, inbound: false);
+        RequireHandleType(
+            handle,
+            expectedIdentity,
+            NamedHandleType(expectedIdentity),
+            inbound: false);
         return handle;
     }
 
-    public global::Baml.BamlHandle ReadHandle(
+    /// <summary>
+    /// Decode an instance of a class that crosses by reference: the engine
+    /// reference the bridge returned for it.
+    /// </summary>
+    public BamlGeneratedOpaque ReadOpaque(
         BamlGeneratedValue value,
-        string expectedIdentity,
-        IReadOnlyList<BamlGeneratedTypeArgument> expectedTypeArguments) =>
-        ReadHandle(
-            value,
+        string expectedIdentity)
+    {
+        global::Baml.BamlHandle handle = Require(value).ReadHandle();
+        RequireHandleType(
+            handle,
             expectedIdentity,
-            ResourceTypeMetadata(expectedIdentity, expectedTypeArguments));
+            BamlHandleType.AdtRuntimeValue,
+            inbound: false);
+        return new BamlGeneratedOpaque(handle);
+    }
 
     public global::Baml.BamlFunctionSpec<TFinal> ReadFunctionSpec<TFinal>(
         BamlGeneratedValue value,
         string expectedIdentity,
-        ReadOnlySpan<byte> expectedTypeMetadata,
         BamlGeneratedType<TFinal> finalType)
     {
         TypeDeclaration<TFinal> final = registry.RequireType(finalType);
-        global::Baml.BamlHandle handle = ReadHandle(
-            value,
-            expectedIdentity,
-            expectedTypeMetadata);
+        global::Baml.BamlHandle handle = ReadHandle(value, expectedIdentity);
         return new global::Baml.BamlFunctionSpec<TFinal>(
             handle,
             registry,
@@ -569,39 +637,36 @@ public readonly partial struct BamlGeneratedCodecContext
             .AsReadOnly();
     }
 
-    private static void RequireHandleType(
-        global::Baml.BamlHandle value,
-        string expectedIdentity,
-        ReadOnlySpan<byte> expectedTypeMetadata,
-        bool inbound)
-    {
-        ArgumentNullException.ThrowIfNull(value);
-        ArgumentException.ThrowIfNullOrWhiteSpace(expectedIdentity);
-        if (expectedTypeMetadata.IsEmpty)
-        {
-            throw new InvalidOperationException(
-                "A generated opaque-resource codec requires exact BAML type metadata.");
-        }
-
-        global::Baml.BamlTypeDescriptor expected =
-            global::Baml.BamlTypeDescriptor.FromMetadata(expectedTypeMetadata.ToArray());
-        bool descriptorMatches = expected.Kind == global::Baml.BamlTypeDescriptorKind.Class
-            && StringComparer.Ordinal.Equals(expected.Fqn, expectedIdentity)
-            && StringComparer.Ordinal.Equals(value.Type.Fqn, expectedIdentity)
-            && value.Type.Arguments.SequenceEqual(expected.Arguments);
-        BamlHandleType expectedHandleType = expectedIdentity switch
+    private static BamlHandleType NamedHandleType(string expectedIdentity) =>
+        expectedIdentity switch
         {
             "baml.llm.PromptAst" => BamlHandleType.AdtPromptAst,
             "ai.FunctionSpec" => BamlHandleType.AdtFunctionSpec,
             _ => BamlHandleType.AdtTaggedHeapHandle,
         };
-        if (descriptorMatches && value.HandleType == expectedHandleType)
+
+    /// <summary>
+    /// Require a handle to name the expected class and be of the expected
+    /// kind. Its type arguments are the engine's statement and are not
+    /// checked: the engine judges the live object whenever the handle comes
+    /// back.
+    /// </summary>
+    private static void RequireHandleType(
+        global::Baml.BamlHandle value,
+        string expectedIdentity,
+        BamlHandleType expectedHandleType,
+        bool inbound)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedIdentity);
+        if (StringComparer.Ordinal.Equals(value.Type.Fqn, expectedIdentity)
+            && value.HandleType == expectedHandleType)
         {
             return;
         }
 
         string diagnostic =
-            $"Expected opaque resource {expectedIdentity} with {expected.Arguments.Count} type arguments and handle kind {expectedHandleType}; received {value.Type} with handle kind {value.HandleType}.";
+            $"Expected opaque resource {expectedIdentity} with handle kind {expectedHandleType}; received {value.Type} with handle kind {value.HandleType}.";
         if (inbound)
         {
             throw new BamlTypeMappingException(
@@ -627,6 +692,42 @@ public readonly partial struct BamlGeneratedCodecContext
             "list item",
             allowCanaryUnknownFallback: true);
         return required.ReadList();
+    }
+
+    /// <summary>
+    /// The slots of a tuple the bridge returned for the tuple type
+    /// <paramref name="expectedTupleType"/>, after checking its arity. A tuple
+    /// that carries its own type must carry exactly that one; one that carries
+    /// none (a plain list taking a requested tuple shape) takes the declared
+    /// type's identity.
+    /// </summary>
+    public IReadOnlyList<BamlGeneratedValue> ReadTuple(
+        BamlGeneratedValue value,
+        ReadOnlySpan<byte> expectedTupleType,
+        int arity)
+    {
+        if (expectedTupleType.IsEmpty)
+        {
+            throw new ArgumentException(
+                "Generated tuple type metadata cannot be empty.",
+                nameof(expectedTupleType));
+        }
+
+        BamlGeneratedValue required = Require(value);
+        IReadOnlyList<BamlGeneratedValue> items = required.ReadTuple();
+        if (required.TupleTypeMetadata is { Length: > 0 } carried)
+        {
+            required.RequireTypeMetadata(expectedTupleType, carried, "tuple");
+        }
+
+        if (items.Count != arity)
+        {
+            throw new BamlProtocolException(
+                "The native bridge returned a tuple of the wrong arity.",
+                $"Expected {arity} tuple slots, received {items.Count}.");
+        }
+
+        return items;
     }
 
     public IReadOnlyDictionary<string, BamlGeneratedValue> ReadMap(
@@ -843,6 +944,8 @@ public readonly partial struct BamlGeneratedCodecContext
         return async (arguments, cancellationToken) =>
         {
             ArgumentNullException.ThrowIfNull(arguments);
+            var baml = BamlInvocationPreparation.CurrentOptions;
+            if (baml is not null) cancellationToken = baml.CancellationToken;
             Baml.Cffi.NativeApi api = Baml.Cffi.NativeApi.Instance;
             Task<byte[]> completion;
             using (Baml.Cffi.BamlSafeHandleLease lease = handle.Lease())
@@ -853,7 +956,7 @@ public readonly partial struct BamlGeneratedCodecContext
                         arguments,
                         callId,
                         api),
-                    cancellationToken);
+                    cancellationToken, baml);
             }
 
             byte[] bytes = await completion.ConfigureAwait(false);
@@ -981,6 +1084,40 @@ public readonly struct BamlGeneratedUnionValue
     public BamlGeneratedValue Value { get; }
 }
 
+/// <summary>
+/// The engine reference an instance of a class that crosses by reference
+/// holds. Equal to another when it is the same engine reference.
+/// </summary>
+[EditorBrowsable(EditorBrowsableState.Never)]
+public sealed class BamlGeneratedOpaque : IDisposable, IEquatable<BamlGeneratedOpaque>
+{
+    internal BamlGeneratedOpaque(global::Baml.BamlHandle handle)
+    {
+        Handle = handle ?? throw new ArgumentNullException(nameof(handle));
+    }
+
+    internal global::Baml.BamlHandle Handle { get; }
+
+    /// <summary>
+    /// The engine reference, for an invocation control that hands the runtime
+    /// the instance itself (a trace selection).
+    /// </summary>
+    public global::Baml.BamlHandle InvocationHandle => Handle;
+
+    public bool IsClosed => Handle.IsClosed;
+
+    public BamlGeneratedOpaque Clone() => new(Handle.Clone());
+
+    public void Dispose() => Handle.Dispose();
+
+    public bool Equals(BamlGeneratedOpaque? other) =>
+        other is not null && Handle.Key == other.Handle.Key;
+
+    public override bool Equals(object? obj) => Equals(obj as BamlGeneratedOpaque);
+
+    public override int GetHashCode() => Handle.Key.GetHashCode();
+}
+
 [EditorBrowsable(EditorBrowsableState.Never)]
 public sealed class BamlGeneratedResource : IDisposable
 {
@@ -1097,6 +1234,10 @@ public sealed class BamlGeneratedValue
 
     internal byte[]? ItemTypeMetadata => itemTypeMetadata;
 
+    /// <summary>A tuple's own type, when it carries one.</summary>
+    internal byte[]? TupleTypeMetadata =>
+        kind == PrimitiveCarrierKind.Tuple ? itemTypeMetadata : null;
+
     internal byte[]? KeyTypeMetadata => keyTypeMetadata;
 
     internal byte[]? ValueTypeMetadata => valueTypeMetadata;
@@ -1154,27 +1295,94 @@ public sealed class BamlGeneratedValue
             bigIntValue: value,
             sourcePath: sourcePath);
 
+    /// <summary>
+    /// A list stated as <c>E[]</c>, <paramref name="itemTypeMetadata"/> being
+    /// <c>E</c>: every list crosses with its statement.
+    /// </summary>
     internal static BamlGeneratedValue CreateList(
         IReadOnlyList<BamlGeneratedValue> values,
-        ReadOnlySpan<byte> itemTypeMetadata = default,
-        string sourcePath = "generated argument") =>
-        new(
+        ReadOnlySpan<byte> itemTypeMetadata,
+        string sourcePath = "generated argument")
+    {
+        RequireStatement(itemTypeMetadata, "list item");
+        return new(
             PrimitiveCarrierKind.List,
             listValue: values,
             itemTypeMetadata: itemTypeMetadata.ToArray(),
             sourcePath: sourcePath);
+    }
 
-    internal static BamlGeneratedValue CreateMap(
-        IReadOnlyList<KeyValuePair<string, BamlGeneratedValue>> entries,
-        ReadOnlySpan<byte> keyTypeMetadata = default,
-        ReadOnlySpan<byte> valueTypeMetadata = default,
+    /// <summary>
+    /// A tuple, one carrier per slot. <paramref name="tupleTypeMetadata"/> is
+    /// the tuple's own type: a tuple a codec built states it, and one the
+    /// engine returned carries its instantiated type (the wire's
+    /// <c>tuple_value.tuple_type</c>). Only a plain list taking a requested
+    /// tuple shape has none; its identity is the type it decodes as.
+    /// </summary>
+    internal static BamlGeneratedValue CreateTuple(
+        IReadOnlyList<BamlGeneratedValue> values,
+        byte[]? tupleTypeMetadata,
         string sourcePath = "generated argument") =>
         new(
+            PrimitiveCarrierKind.Tuple,
+            listValue: values,
+            itemTypeMetadata: tupleTypeMetadata,
+            sourcePath: sourcePath);
+
+    /// <summary>The arity of a serialized tuple type.</summary>
+    internal static int TupleArity(ReadOnlySpan<byte> tupleTypeMetadata)
+    {
+        BamlTy type;
+        try
+        {
+            type = BamlTy.Parser.ParseFrom(tupleTypeMetadata);
+        }
+        catch (InvalidProtocolBufferException error)
+        {
+            throw new BamlProtocolException(
+                "Generated BAML type metadata is malformed.",
+                error.Message);
+        }
+
+        if (type.TyCase != BamlTy.TyOneofCase.Tuple || type.Tuple.Items.Count == 0)
+        {
+            throw new ArgumentException(
+                "Generated tuple type metadata must describe a tuple with at least one slot.",
+                nameof(tupleTypeMetadata));
+        }
+
+        return type.Tuple.Items.Count;
+    }
+
+    /// <summary>
+    /// A map stated as <c>map&lt;K, V&gt;</c>: every map crosses with its
+    /// statement.
+    /// </summary>
+    internal static BamlGeneratedValue CreateMap(
+        IReadOnlyList<KeyValuePair<string, BamlGeneratedValue>> entries,
+        ReadOnlySpan<byte> keyTypeMetadata,
+        ReadOnlySpan<byte> valueTypeMetadata,
+        string sourcePath = "generated argument")
+    {
+        RequireStatement(keyTypeMetadata, "map key");
+        RequireStatement(valueTypeMetadata, "map value");
+        return new(
             PrimitiveCarrierKind.Map,
             entriesValue: entries,
             keyTypeMetadata: keyTypeMetadata.ToArray(),
             valueTypeMetadata: valueTypeMetadata.ToArray(),
             sourcePath: sourcePath);
+    }
+
+    private static void RequireStatement(ReadOnlySpan<byte> metadata, string description)
+    {
+        if (metadata.IsEmpty)
+        {
+            throw new ArgumentException(
+                $"A {description} type must be stated.",
+                nameof(metadata));
+        }
+    }
 
     internal static BamlGeneratedValue CreateClass(
         string identity,
@@ -1437,6 +1645,11 @@ public sealed class BamlGeneratedValue
         {
             declaredItem = structural.List.Item.ToByteArray();
         }
+        else if (kind == PrimitiveCarrierKind.Tuple
+            && structural.TyCase == BamlTy.TyOneofCase.Tuple)
+        {
+            declaredItem = structural.ToByteArray();
+        }
         else if (kind == PrimitiveCarrierKind.Map
             && structural.TyCase == BamlTy.TyOneofCase.Map)
         {
@@ -1513,6 +1726,12 @@ public sealed class BamlGeneratedValue
     internal IReadOnlyList<BamlGeneratedValue> ReadList()
     {
         RequireKind(PrimitiveCarrierKind.List);
+        return listValue!;
+    }
+
+    internal IReadOnlyList<BamlGeneratedValue> ReadTuple()
+    {
+        RequireKind(PrimitiveCarrierKind.Tuple);
         return listValue!;
     }
 
@@ -1854,4 +2073,5 @@ internal enum PrimitiveCarrierKind
     Type,
     Handle,
     HostCallable,
+    Tuple,
 }

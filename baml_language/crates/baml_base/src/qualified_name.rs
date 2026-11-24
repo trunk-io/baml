@@ -22,6 +22,12 @@ pub const BAML_STD_PREFIX: &str = "baml.";
 /// recursion for output-format rendering, SAP streaming, and Python codegen.
 pub const BAML_JSON_JSON: &str = "baml.json.json";
 
+/// FQN of the sys-op a `baml.sync.atomic` call parks on when another task
+/// holds the lock. Exempt from the `$init` io check (E0163): `$init` runs one
+/// VM at a time with no other task alive, so no lock it meets is ever held by
+/// someone else and the wait never runs there.
+pub const BAML_SYNC_WAIT: &str = "baml.sync._wait";
+
 /// Canonical host-facing typed AI stream. Compiler synthesis, engine handle
 /// lifting, and SDK generators must share this identity rather than carrying
 /// independent string literals.
@@ -60,7 +66,7 @@ pub const AI_STREAM_DONE: &str = "ai.stream.Done";
 /// // Builtin method "Array.length"
 /// QualifiedName { namespace: Namespace::Builtin { path: ["Array"] }, name: "length" }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct QualifiedName {
     /// The namespace this item belongs to.
     pub namespace: Namespace,
@@ -71,7 +77,7 @@ pub struct QualifiedName {
 /// The namespace an item belongs to.
 ///
 /// Namespaces organize items by their origin and resolution rules.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum Namespace {
     /// Compiler builtins that are "magic" - the compiler knows about them specially.
     ///

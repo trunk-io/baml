@@ -1,89 +1,96 @@
 /// One field of a class: its name, its declared type, and its schema
 /// metadata.
 ///
-/// A descriptor from `reflect.AnyClass.list_fields` or `get_field` is bound
-/// to the instance it came from, so `value` can read it; one from
-/// `Type.fields()` describes the type only and is ownerless.
+/// A descriptor from `reflect.AnyClass.list_fields`, `get_field` or
+/// `find_field` is bound to the instance it came from, so `value` can read
+/// it; one from `reflect.Class.fields()` describes the type only and is
+/// ownerless.
 class Field {
     name: string,
-    type: reflect.Type?,
-    meta: reflect.Meta,
-    /// Present only for handles returned from `reflect.AnyClass.list_fields` or
-    /// `get_field`. Type-side descriptors returned by `Type.fields()` are
-    /// intentionally ownerless.
+    type: root.Type,
+    meta: root.Meta,
+    /// Present only for handles returned from `reflect.AnyClass.list_fields`,
+    /// `get_field` or `find_field`. Type-side descriptors returned by
+    /// `reflect.Class.fields()` are intentionally ownerless.
     _owner: unknown?,
 
     /// This field's schema metadata. Same value as the `meta` field.
-    function metadata(self) -> reflect.Meta throws never {
+    function metadata(self) -> root.Meta throws never {
         self.meta
     }
 
     /// Read this field from its bound owner. An ownerless type-side descriptor
     /// returns `null`.
-    function value<T>(self) -> T? throws reflect.errors.TypeMismatch {
-        let owner: reflect.AnyClass = self._owner else {
+    function value<T>(self) -> T? throws root.errors.TypeMismatch {
+        let owner: root.AnyClass = self._owner else {
             return null;
         };
-        reflect.class.get_field<T>(owner, self.name) catch (e) {
-            reflect.errors.CompilationError { message } => {
-                throw reflect.errors.TypeMismatch { message: message }
-            }
+        root.Class.get_field<T>(owner, self.name) catch (e) {
+            root.errors.CompilationError { message } => {
+                throw root.errors.TypeMismatch { message: message };
+            },
         }
     }
 }
 
-/// Construct a closed runtime class. Map iteration order is definition order.
-function new(
-    name: string,
-    fields: map<string, reflect.Type | reflect.WithMeta<reflect.Type>>,
-    implementations: reflect.interface.Implementation[] = [],
-) -> Type throws reflect.errors.CompilationError {
-    // Native functions receive the omitted-argument sentinel instead of
-    // evaluating BAML default expressions. Keep the public API as the BEP
-    // specifies and resolve the default in this BAML wrapper before crossing
-    // the native boundary.
-    _new(name, fields, implementations)
+/// (internal) A `Builder`'s state: the class it is defining, field by field.
+class _BuilderState {
+    @@rust_type("ClassBuilder")
 }
 
-/// (internal) Internal native backing `new`; all arguments have been materialized.
-//baml:mut_vm
-function _new(
-    name: string,
-    fields: map<string, reflect.Type | reflect.WithMeta<reflect.Type>>,
-    implementations: reflect.interface.Implementation[],
-) -> Type throws reflect.errors.CompilationError {
-    $rust_function
-}
-
-/// Start an incrementally-defined runtime class. Builders are required when
-/// one or more fields recursively refer to the class being defined.
-//baml:mut_vm
-function builder(name: string) -> Builder throws never {
-    $rust_function
+/// (internal) How a `PendingType` is built from its roots.
+enum _PendingOp {
+    Direct,
+    Array,
+    Optional,
+    Union,
 }
 
 /// A mutable runtime-class definition. Calling `build` freezes every builder
 /// connected through a pending field type as one atomic recursive group.
 class Builder {
-    _handle: $rust_type,
+    _state: _BuilderState,
     _roots: unknown[],
     _neighbors: Builder[],
-    _resolved: reflect.Type?,
+    _resolved: root.Type?,
 
     /// Append one field in definition order.
     ///
     /// A recursive field carries metadata the same way a resolved one does:
     /// `PendingType.meta(...)` produces the `WithMeta<PendingType>` row, and the
     /// metadata survives the atomic group build.
-    //baml:mut_vm
     function field(
         self,
         name: string,
-        ty: reflect.Type
-            | reflect.WithMeta<reflect.Type>
-            | PendingType
-            | reflect.WithMeta<PendingType>,
-    ) -> Builder throws reflect.errors.CompilationError {
+        ty: root.TypeView | root.WithMeta<root.Type> | PendingType | root.WithMeta<PendingType>,
+    ) -> Builder throws root.errors.CompilationError {
+        let row = match (ty) {
+            let view: root.TypeView => view.as_type(),
+            let other => other,
+        };
+        self._field(name, row)
+    }
+
+    /// (internal) Internal native backing `field`; a field type that is not
+    /// pending is a `type` value.
+    //baml:mut_vm
+    function _field(
+        self,
+        name: string,
+        ty: root.Type | root.WithMeta<root.Type> | PendingType | root.WithMeta<PendingType>,
+    ) -> Builder throws root.errors.CompilationError {
+        $rust_function
+    }
+
+    /// Append every field of `some_class`, in declaration order, with all of
+    /// its metadata: alias, description, docstring, other and skip.
+    ///
+    /// Only the fields are copied. The new class gets neither `some_class`'s
+    /// own metadata nor its interfaces; it implements what `build` is given.
+    //baml:mut_vm
+    function fields_from(self, some_class: root.Class) -> Builder
+        throws root.errors.CompilationError
+    {
         $rust_function
     }
 
@@ -94,19 +101,17 @@ class Builder {
     }
 
     /// Validate and freeze this builder's complete connected recursive group.
-    function build(
-        self,
-        implementations: reflect.interface.Implementation[] = [],
-    ) -> Type throws reflect.errors.CompilationError {
+    function build(self, implementations: root.interface.Implementation[] = []) -> root.Class
+        throws root.errors.CompilationError
+    {
         self._build(implementations)
     }
 
     /// (internal) Internal native backing `build`; all arguments have been materialized.
     //baml:mut_vm
-    function _build(
-        self,
-        implementations: reflect.interface.Implementation[],
-    ) -> Type throws reflect.errors.CompilationError {
+    function _build(self, implementations: root.interface.Implementation[]) -> root.Class
+        throws root.errors.CompilationError
+    {
         $rust_function
     }
 }
@@ -114,9 +119,9 @@ class Builder {
 /// A reference to a not-yet-frozen builder type. It is deliberately not a
 /// subtype of the built-in `type`; only Builder.field accepts it directly.
 class PendingType {
-    _handle: $rust_type,
+    _op: _PendingOp,
     _roots: unknown[],
-    _resolved: reflect.Type?,
+    _resolved: root.Type?,
 
     /// Construct an array over this pending type.
     //baml:mut_vm
@@ -131,14 +136,28 @@ class PendingType {
     }
 
     /// Construct a union containing this pending type and `others`.
+    function union(self, others: (root.TypeView | PendingType)[]) -> PendingType throws never {
+        let members: (root.Type | PendingType)[] = [];
+        // NOTE: an index loop, not `for ... in`; see `reflect.AnyClass.get_field`.
+        for (let i = 0; i < others.length(); i += 1) {
+            members.push(match (others[i]) {
+                let view: root.TypeView => view.as_type(),
+                let pending => pending,
+            });
+        }
+        self._union(members)
+    }
+
+    /// (internal) Internal native backing `union`; a member that is not
+    /// pending is a `type` value.
     //baml:mut_vm
-    function union(self, others: (reflect.Type | PendingType)[]) -> PendingType throws never {
+    function _union(self, others: (root.Type | PendingType)[]) -> PendingType throws never {
         $rust_function
     }
 
     /// Return the frozen type, or null while any referenced builder is pending.
     //baml:mut_vm
-    function resolved(self) -> reflect.Type? throws never {
+    function resolved(self) -> root.Type? throws never {
         $rust_function
     }
 
@@ -151,42 +170,7 @@ class PendingType {
         description: string? = null,
         docstring: string? = null,
         other: map<string, string>? = null,
-    ) -> reflect.WithMeta<PendingType> throws never {
-        $rust_function
-    }
-}
-
-/// Assert-read a named field from a runtime-shaped class instance.
-//baml:mut_vm
-function get_field<T>(value: unknown, name: string) -> T throws reflect.errors.CompilationError {
-    $rust_function
-}
-
-/// A class-kind view of a `type` value. Users never construct this class.
-class Type {
-    /// The wrapped `type` value. Private by invariant: reflection natives are
-    /// its only readers, and each kind method panics if the held type no longer
-    /// classifies as this view's kind.
-    _ty: reflect.Type,
-
-    implements reflect.TypeView {
-        //baml:vm
-        //baml:fallible
-        function as_type(self) -> reflect.Type throws never {
-            $rust_function
-        }
-    }
-    /// The class's fields, in declaration order. Ownerless: these describe
-    /// the type, so `Field.value` on them returns `null`.
-    //baml:mut_vm
-    //baml:fallible
-    function fields(self) -> Field[] throws never {
-        $rust_function
-    }
-    /// The class declaration's own schema metadata.
-    //baml:mut_vm
-    //baml:fallible
-    function meta(self) -> reflect.Meta throws never {
+    ) -> root.WithMeta<PendingType> throws never {
         $rust_function
     }
 }

@@ -40,8 +40,8 @@ use crate::{
     callable::{ExternalCallTarget, FunctionSignatureTy},
     impls::{MountedImplFacts, ResolvedImplFacts},
     package_interface::{
-        ExportedAssociatedType, ExportedFieldAttrs, ExportedFunction, ExportedImpl, ExportedType,
-        package_interface,
+        ExportedAssociatedType, ExportedClassBody, ExportedFieldAttrs, ExportedFunction,
+        ExportedImpl, ExportedType, package_interface,
     },
     render::{Spell, Viewpoint},
 };
@@ -58,6 +58,9 @@ pub type InterfaceRef<'db> = DeclRef<InterfaceLoc<'db>, ExternInterfaceLoc<'db>>
 /// name is a spelling device, never an identity — `TYPE_SYSTEM.md`), so the
 /// ref identifies the DECLARATION for enumeration and value reads only.
 pub type AliasRef<'db> = DeclRef<TypeAliasLoc<'db>, ExternTypeAliasLoc<'db>>;
+/// A top-level binding (a global variable or a client), wherever it is
+/// declared: in a package checked here, or in one served from its interface.
+pub type GlobalRef<'db> = DeclRef<baml_compiler2_hir::loc::LetLoc<'db>, ExternLetLoc<'db>>;
 /// An `implements` block, wherever it is declared.
 pub type ImplRef<'db> = DeclRef<ImplLoc<'db>, ExternImplLoc<'db>>;
 
@@ -182,6 +185,55 @@ pub struct ExternTypeAliasLoc<'db> {
     pub head: DeclName,
 }
 
+/// The identity of an exported top-level binding row: a global variable or a
+/// client of a package served from its interface.
+#[salsa::interned]
+pub struct ExternLetLoc<'db> {
+    #[returns(ref)]
+    pub head: DeclName,
+}
+
+impl std::fmt::Debug for ExternLetLoc<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ExternLetLoc(..)")
+    }
+}
+
+/// The top-level binding `namespace.name` of a package served from its
+/// interface, if the package exports one there.
+pub fn mounted_let_named<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    root: SourceRoot,
+    namespace: &[Name],
+    name: &Name,
+) -> Option<ExternLetLoc<'db>> {
+    if !served(db, root) {
+        return None;
+    }
+    package_interface(db, root).lookup_value(namespace, name)?;
+    Some(ExternLetLoc::new(
+        db,
+        DeclName::in_root(root, namespace.to_vec(), name.clone()),
+    ))
+}
+
+/// The exported row an [`ExternLetLoc`] was minted from.
+pub fn extern_let_row<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    binding: ExternLetLoc<'db>,
+) -> &'db crate::package_interface::ExportedValue {
+    let head = binding.head(db);
+    package_interface(db, head.root())
+        .lookup_value(head.namespace(), head.name())
+        .unwrap_or_else(|| {
+            panic!(
+                "internal error: no exported value row for `{}`; an `ExternLetLoc` is minted \
+                 only from a row in the current revision's package interface",
+                head.name()
+            )
+        })
+}
+
 impl std::fmt::Debug for ExternClassLoc<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ExternClassLoc(..)")
@@ -211,10 +263,28 @@ impl std::fmt::Debug for ExternTypeAliasLoc<'_> {
 /// the blob controls.
 #[derive(Clone, Copy)]
 pub struct ClassRow<'db> {
-    pub fields: &'db [(Name, baml_type::Ty, ExportedFieldAttrs)],
+    pub body: ClassRowBody<'db>,
     pub methods: &'db [ExportedFunction],
     pub generic_params: &'db [ParamTy],
     pub generic_param_bounds: &'db [Vec<baml_type::Interface>],
+}
+
+/// What an extern class holds: its fields, or the `@@rust_type` kind of the
+/// Rust-owned state in their place.
+#[derive(Clone, Copy)]
+pub enum ClassRowBody<'db> {
+    Fields(&'db [(Name, baml_type::Ty, ExportedFieldAttrs)]),
+    RustType(baml_base::RustPayloadKind),
+}
+
+impl<'db> ClassRowBody<'db> {
+    /// The fields, of which a `@@rust_type` class has none.
+    pub fn fields(self) -> &'db [(Name, baml_type::Ty, ExportedFieldAttrs)] {
+        match self {
+            Self::Fields(fields) => fields,
+            Self::RustType(_) => &[],
+        }
+    }
 }
 
 /// An exported enum row, borrowed whole from the package interface. Data
@@ -255,12 +325,15 @@ pub fn extern_class_row<'db>(
     match type_row_at(db, head) {
         Some(ExportedType::Class {
             qtn: _,
-            fields,
+            body,
             methods,
             generic_params,
             generic_param_bounds,
         }) => ClassRow {
-            fields,
+            body: match body {
+                ExportedClassBody::Fields(fields) => ClassRowBody::Fields(fields),
+                ExportedClassBody::RustType(kind) => ClassRowBody::RustType(*kind),
+            },
             methods,
             generic_params,
             generic_param_bounds,
@@ -441,7 +514,7 @@ pub fn mounted_alias_loc<'db>(
 /// admissibility, and an impl header cannot carry one (`implement I<X = T>
 /// for …` is E0001; asserted where the identity is built) — while the pins
 /// inside a bound-side interface ride along, as inputs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ImplIdentity {
     /// The implemented interface's head.
     pub interface: DeclName,
@@ -536,6 +609,7 @@ fn canonical_closed_interface(interface: &ClosedInterface) -> ClosedInterface {
 /// while [`ImplIdentity`] is what coherence guarantees unique per package.
 #[salsa::interned]
 pub struct ExternImplLoc<'db> {
+    #[returns(clone)]
     pub package: SourceRoot,
     #[returns(ref)]
     pub identity: ImplIdentity,
@@ -741,10 +815,11 @@ fn spell_impl(
     package: SourceRoot,
     identity: &ImplIdentity,
 ) -> String {
+    let viewpoint = Viewpoint::canonical(db);
     format!(
         "{} in package `{}`",
-        spell_impl_identity(identity, &Viewpoint::canonical(db)),
-        baml_compiler2_hir::package::spelling(db).of(package),
+        spell_impl_identity(identity, &viewpoint),
+        viewpoint.display_package(package),
     )
 }
 
@@ -775,11 +850,12 @@ fn package_impl_index(
         let row = u32::try_from(row).expect("impl row count fits in u32");
         let identity = exported_impl_identity(exported);
         if let Some(earlier) = index.insert(identity.clone(), row) {
+            let viewpoint = Viewpoint::canonical(db);
             unreachable!(
                 "package `{}` was mounted with two impl rows of one identity ({}; rows {earlier} \
                  and {row}), which `import_interface` refuses",
-                baml_compiler2_hir::package::spelling(db).of(package),
-                spell_impl_identity(&identity, &Viewpoint::canonical(db)),
+                viewpoint.display_package(package),
+                spell_impl_identity(&identity, &viewpoint),
             );
         }
     }

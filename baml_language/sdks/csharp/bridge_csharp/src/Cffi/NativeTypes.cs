@@ -46,8 +46,8 @@ internal unsafe struct BamlApiV1
     internal delegate* unmanaged[Cdecl]<ulong> NewFunctionCall;
     internal delegate* unmanaged[Cdecl]<ulong, int> CancelFunctionCall;
     internal delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<ulong, uint, byte*, nuint, void>, void> RegisterHostDispatchCallback;
-    internal delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<ulong, void>, void> RegisterHostReleaseCallback;
-    internal delegate* unmanaged[Cdecl]<uint, int, byte*, nuint, void> CompleteHostCall;
+    internal delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<ulong, ulong, void>, void> RegisterHostReleaseCallback;
+    internal delegate* unmanaged[Cdecl]<uint, byte*, nuint, void> CompleteHostCall;
     internal delegate* unmanaged[Cdecl]<ulong, ulong*, BamlCffiStatus> HandleClone;
     internal delegate* unmanaged[Cdecl]<ulong, BamlCffiStatus> HandleRelease;
     internal delegate* unmanaged[Cdecl]<int, byte*, byte*, ulong*, int*, BamlCffiStatus> MediaFromUrl;
@@ -61,11 +61,20 @@ internal unsafe struct BamlApiV1
     internal delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<sbyte*, nuint, int, void>, void> RegisterUnhandledSpawnErrorCallback;
     internal delegate* unmanaged[Cdecl]<BamlBuffer> ShutdownRuntime;
     internal delegate* unmanaged[Cdecl]<byte*, nuint, byte*, BamlBuffer> InitializeRuntimeFromBlobWithMetadata;
+    internal delegate* unmanaged[Cdecl]<uint> InvocationProtocolVersion;
+    internal delegate* unmanaged[Cdecl]<ulong, ulong*, BamlCffiStatus> InvocationClockNs;
+    internal delegate* unmanaged[Cdecl]<ulong, int> ReleaseFunctionCall;
+    internal delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<byte*, nuint, void>, void> RegisterHostDispatchV2;
+    internal delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<uint, void>, void> RegisterHostCancelCallback;
+    internal delegate* unmanaged[Cdecl]<ulong, ulong, BamlBuffer*, ulong*, BamlCffiStatus> TraceSelection;
+    internal delegate* unmanaged[Cdecl]<ulong, BamlBuffer*, BamlCffiStatus> InvocationContext;
+    internal delegate* unmanaged[Cdecl]<ulong, int, BamlBuffer*, BamlCffiStatus> MediaName;
+    internal delegate* unmanaged[Cdecl]<int, byte*, byte*, byte*, ulong*, int*, BamlCffiStatus> MediaFromFileContent;
 }
 
 internal static unsafe class BamlApiV1Layout
 {
-    internal static readonly nuint RequiredPrefixSize = EndOf(nameof(BamlApiV1.InitializeRuntimeFromBlobWithMetadata));
+    internal static readonly nuint RequiredPrefixSize = EndOf(nameof(BamlApiV1.MediaFromFileContent));
 
     private static nuint EndOf(string field) =>
         checked((nuint)Marshal.OffsetOf<BamlApiV1>(field) + (nuint)IntPtr.Size);

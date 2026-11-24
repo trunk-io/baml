@@ -7,11 +7,19 @@
 //! results delivered through the registered callback and correlated by
 //! the completion registry in [`crate::completion`].
 
-use std::{collections::HashMap, ffi::CString};
+use std::{
+    collections::HashMap,
+    ffi::CString,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use prost::Message as _;
 
-use crate::{BamlValue, Error, SdkError, capi, completion, decode, wire};
+use crate::{
+    BamlValue, Error, SdkError, capi, completion, decode,
+    encode::{ArgumentError, Arguments},
+    wire,
+};
 
 /// Initialize (or replace) the process-global runtime from the
 /// borsh-encoded bytecode a generated SDK embeds.
@@ -48,6 +56,66 @@ pub fn initialize_from_bytecode_with_metadata(
     api.take_status(status).map_err(SdkError::new)
 }
 
+/// Shut down the process-global runtime: wait for in-flight calls and
+/// spawned work to finish (with no timeout), complete telemetry delivery
+/// (sealing the recording), and release the runtime.
+///
+/// The bridge already runs this when the process exits normally (`main`
+/// returns, `std::process::exit` on Unix, a test binary finishes), so a call
+/// still running at exit keeps the process alive until it finishes. Call it
+/// yourself where exit handlers do not run (a signal, `std::process::abort`,
+/// `panic = "abort"`, `std::process::exit` on Windows) or to flush before
+/// exiting.
+///
+/// Blocks the calling thread until shutdown completes; from async code, run
+/// it with `tokio::task::spawn_blocking` rather than stalling an executor
+/// thread. Repeated calls return `Ok(())`, as does a call when the engine
+/// never loaded (it is not loaded just to be shut down). Calls made after
+/// shutdown fail until a runtime is initialized again, which a generated
+/// SDK does not do on its own.
+pub fn shutdown() -> Result<(), SdkError> {
+    let Some(api) = capi::loaded_api() else {
+        return Ok(());
+    };
+    // SAFETY: the engine returns an owned status buffer that `take_status`
+    // reads and frees exactly once.
+    #[expect(unsafe_code)]
+    let status = unsafe { (api.shutdown_runtime)() };
+    api.take_status(status).map_err(SdkError::new)
+}
+
+/// The process that registered the exit hook.
+static EXIT_HOOK_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Run [`shutdown`] when the process exits normally, as the Python, C++ and
+/// Swift bridges do with `atexit`. Like theirs, it waits for in-flight calls
+/// and spawned work without a time limit. Called once, when the engine
+/// library loads.
+pub(crate) fn shutdown_at_exit() {
+    EXIT_HOOK_PID.store(std::process::id(), Ordering::Relaxed);
+    // SAFETY: `atexit` only records the function pointer, and
+    // `shutdown_on_exit` lives as long as the process.
+    #[expect(unsafe_code)]
+    let status = unsafe { libc::atexit(shutdown_on_exit) };
+    if status != 0 {
+        log::warn!(
+            "could not register the BAML runtime shutdown for process exit; \
+             call baml_bridge::runtime::shutdown() before exiting",
+        );
+    }
+}
+
+extern "C" fn shutdown_on_exit() {
+    // A forked child inherits the hook, but neither the engine's threads
+    // nor the parent's recording.
+    if std::process::id() != EXIT_HOOK_PID.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Err(error) = shutdown() {
+        log::warn!("BAML runtime shutdown at process exit failed: {error}");
+    }
+}
+
 /// Initialize (or replace) the process-global runtime by compiling BAML
 /// source files (`file name → content`, names relative to `root_path`).
 pub fn initialize_from_files(
@@ -78,24 +146,14 @@ pub fn initialize_from_files(
 /// Execute a BAML function call, blocking until it completes.
 ///
 /// Refuses to run inside an async runtime (parking an executor thread on
-/// the completion would stall it): generated sync functions return
-/// [`Error::CalledSyncFromAsync`] and callers switch to the `_async`
-/// sibling.
+/// the completion would stall it): generated `_sync` functions return
+/// [`Error::CalledSyncFromAsync`] and callers switch to the async binding
+/// (the plain name).
 pub fn invoke_sync<R: BamlValue, E: BamlValue>(
     fqn: &str,
-    kwargs: Vec<wire::InboundMapEntry>,
-    type_args: Vec<wire::BamlTyArg>,
+    encode: impl FnOnce(&mut Arguments) -> Result<Vec<wire::BamlTyArg>, ArgumentError>,
 ) -> Result<R, Error<E>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(Error::CalledSyncFromAsync);
-    }
-    let receiver = dispatch(fqn, kwargs, type_args).map_err(Error::Sdk)?;
-    // Blocks until the engine delivers the result envelope via the callback.
-    // There is no timeout: the engine is contracted to complete every call
-    // (success, thrown error, or panic). A caller-facing timeout/cancellation
-    // path lands with the cancellation feature (`cancel_function_call`).
-    let bytes = receiver.wait_blocking();
-    decode::decode_result(&bytes)
+    invoke_sync_with_options(fqn, encode, crate::invocation::InvocationOptions::default())
 }
 
 /// Execute a BAML function call asynchronously.
@@ -105,96 +163,160 @@ pub fn invoke_sync<R: BamlValue, E: BamlValue>(
 /// executor-agnostic.
 pub async fn invoke<R: BamlValue, E: BamlValue>(
     fqn: &str,
-    kwargs: Vec<wire::InboundMapEntry>,
-    type_args: Vec<wire::BamlTyArg>,
+    encode: impl FnOnce(&mut Arguments) -> Result<Vec<wire::BamlTyArg>, ArgumentError>,
 ) -> Result<R, Error<E>> {
-    let receiver = dispatch(fqn, kwargs, type_args).map_err(Error::Sdk)?;
-    let bytes = receiver.wait().await;
-    decode::decode_result(&bytes)
+    invoke_with_options(fqn, encode, crate::invocation::InvocationOptions::default()).await
 }
 
-pub fn invoke_handle_sync<R: BamlValue, E: BamlValue>(
-    handle_key: u64,
-    kwargs: Vec<wire::InboundMapEntry>,
+/// An allocated call the engine has not yet been handed: released if it
+/// never is.
+struct CallAllocation<'a> {
+    api: &'a capi::Api,
+    id: u64,
+}
+
+impl<'a> CallAllocation<'a> {
+    fn new(api: &'a capi::Api) -> Result<Self, SdkError> {
+        // SAFETY: the validated revision-3 table allocates and checks its own ID.
+        #[expect(unsafe_code)]
+        let id = unsafe { (api.new_function_call)() };
+        if id == 0 {
+            return Err(SdkError::new("runtime call allocation failed"));
+        }
+        let allocation = Self { api, id };
+        let mut now = 0;
+        #[expect(unsafe_code)]
+        let status = unsafe { (api.invocation_clock_ns)(id, &raw mut now) };
+        if status != 0 {
+            return Err(SdkError::new("runtime invocation clock is unavailable"));
+        }
+        Ok(allocation)
+    }
+    fn submitted(&mut self) {
+        self.id = 0;
+    }
+}
+
+impl Drop for CallAllocation<'_> {
+    fn drop(&mut self) {
+        if self.id != 0 {
+            // SAFETY: only this guard owns the unsubmitted allocation.
+            #[expect(unsafe_code)]
+            unsafe {
+                (self.api.release_function_call)(self.id);
+            }
+        }
+    }
+}
+
+/// Canonical controlled entry. The deadline is fixed before the argument
+/// encoder runs. Async callers execute this on their first poll.
+#[doc(hidden)]
+pub fn invoke_sync_with_options<R: BamlValue, E: BamlValue>(
+    fqn: &str,
+    encode: impl FnOnce(&mut Arguments) -> Result<Vec<wire::BamlTyArg>, ArgumentError>,
+    options: crate::invocation::InvocationOptions,
 ) -> Result<R, Error<E>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
+    if tokio::runtime::Handle::try_current().is_ok() && !crate::host_value::in_blocking_dispatch() {
         return Err(Error::CalledSyncFromAsync);
     }
-    let receiver = dispatch_handle(handle_key, kwargs).map_err(Error::Sdk)?;
+    let receiver = dispatch_controlled(
+        wire::call_function_args::CallTarget::FunctionName(fqn.to_string()),
+        encode,
+        options,
+    )?;
     decode::decode_result(&receiver.wait_blocking())
 }
-
-pub async fn invoke_handle<R: BamlValue, E: BamlValue>(
-    handle_key: u64,
-    kwargs: Vec<wire::InboundMapEntry>,
+#[doc(hidden)]
+pub async fn invoke_with_options<R: BamlValue, E: BamlValue>(
+    fqn: &str,
+    encode: impl FnOnce(&mut Arguments) -> Result<Vec<wire::BamlTyArg>, ArgumentError>,
+    options: crate::invocation::InvocationOptions,
 ) -> Result<R, Error<E>> {
-    let receiver = dispatch_handle(handle_key, kwargs).map_err(Error::Sdk)?;
+    let receiver = dispatch_controlled(
+        wire::call_function_args::CallTarget::FunctionName(fqn.to_string()),
+        encode,
+        options,
+    )?;
     decode::decode_result(&receiver.wait().await)
+}
+#[doc(hidden)]
+pub fn invoke_handle_sync_with_options<R: BamlValue, E: BamlValue>(
+    handle: u64,
+    encode: impl FnOnce(&mut Arguments) -> Result<(), ArgumentError>,
+    options: crate::invocation::InvocationOptions,
+) -> Result<R, Error<E>> {
+    if tokio::runtime::Handle::try_current().is_ok() && !crate::host_value::in_blocking_dispatch() {
+        return Err(Error::CalledSyncFromAsync);
+    }
+    let receiver = dispatch_controlled(
+        handle_target(handle)?,
+        |arguments| encode(arguments).map(|()| Vec::new()),
+        options,
+    )?;
+    decode::decode_result(&receiver.wait_blocking())
+}
+#[doc(hidden)]
+pub async fn invoke_handle_with_options<R: BamlValue, E: BamlValue>(
+    handle: u64,
+    encode: impl FnOnce(&mut Arguments) -> Result<(), ArgumentError>,
+    options: crate::invocation::InvocationOptions,
+) -> Result<R, Error<E>> {
+    let receiver = dispatch_controlled(
+        handle_target(handle)?,
+        |arguments| encode(arguments).map(|()| Vec::new()),
+        options,
+    )?;
+    decode::decode_result(&receiver.wait().await)
+}
+
+/// The call target of a BAML function handle. Key 0 names no handle.
+fn handle_target(handle: u64) -> Result<wire::call_function_args::CallTarget, SdkError> {
+    if handle == 0 {
+        return Err(SdkError::new("cannot invoke a zero BAML function handle"));
+    }
+    Ok(wire::call_function_args::CallTarget::FunctionHandle(handle))
 }
 
 /// Encode the call and fire it through the C ABI. The registered
 /// completion is returned to be waited on; pre-call failures inside the
 /// engine also arrive through it as error envelopes (one result channel).
-fn dispatch(
-    fqn: &str,
-    kwargs: Vec<wire::InboundMapEntry>,
-    type_args: Vec<wire::BamlTyArg>,
-) -> Result<completion::Receiver, SdkError> {
+/// An argument the bridge cannot encode fails the call before anything is
+/// sent, and what its encoding created is released.
+pub(crate) fn dispatch_controlled<E>(
+    target: wire::call_function_args::CallTarget,
+    encode: impl FnOnce(&mut Arguments) -> Result<Vec<wire::BamlTyArg>, ArgumentError>,
+    options: crate::invocation::InvocationOptions,
+) -> Result<completion::Receiver, Error<E>> {
     let api = capi::api()?;
-    let receiver = completion::register(api);
     // Host-callable dispatch must be installed before the engine can hold
     // a callable handle; every handle rides a call that passes through
     // here first.
     crate::host_value::ensure_callbacks_registered(api);
-    // SAFETY: takes no arguments; allocates an id inside the engine.
-    #[expect(unsafe_code)]
-    let call_id = unsafe { (api.new_function_call)() };
+    let mut allocation = CallAllocation::new(api)?;
+    let call_id = allocation.id;
+    let mut arguments = Arguments::new();
+    let prepared = options.prepare(call_id, arguments.encoder())?;
+    let type_args = encode(&mut arguments)?;
+    let (kwargs, encoder) = arguments.into_parts();
     let args = wire::CallFunctionArgs {
         kwargs,
-        call_id,
         type_args,
-        call_target: Some(wire::call_function_args::CallTarget::FunctionName(
-            fqn.to_string(),
-        )),
-    }
-    .encode_to_vec();
-    // SAFETY: `args` outlives the call; the engine copies it before returning.
-    #[expect(unsafe_code)]
-    unsafe {
-        (api.call_function)(args.as_ptr(), args.len(), receiver.dispatch_id());
-    }
-    Ok(receiver)
-}
-
-fn dispatch_handle(
-    handle_key: u64,
-    kwargs: Vec<wire::InboundMapEntry>,
-) -> Result<completion::Receiver, SdkError> {
-    if handle_key == 0 {
-        return Err(SdkError::new("cannot invoke a zero BAML function handle"));
-    }
-    let api = capi::api()?;
-    let receiver = completion::register(api);
-    crate::host_value::ensure_callbacks_registered(api);
-    // SAFETY: this ABI function takes no arguments and returns a fresh engine
-    // call id; the loaded API table was layout-checked during initialization.
-    #[expect(unsafe_code)]
-    let call_id = unsafe { (api.new_function_call)() };
-    let args = wire::CallFunctionArgs {
-        kwargs,
         call_id,
-        type_args: Vec::new(),
-        call_target: Some(wire::call_function_args::CallTarget::FunctionHandle(
-            handle_key,
-        )),
+        invocation: Some(prepared.wire),
+        call_target: Some(target),
     }
     .encode_to_vec();
-    // SAFETY: `args` remains alive for the synchronous ABI call, which copies
-    // the protobuf bytes before returning; `receiver` owns the dispatch id.
+    let mut receiver = completion::register(api);
+    receiver.bind_call_id(call_id);
+    // SAFETY: input bytes remain live through synchronous preparation.
     #[expect(unsafe_code)]
     unsafe {
         (api.call_function)(args.as_ptr(), args.len(), receiver.dispatch_id());
     }
+    allocation.submitted();
+    // The engine took over every reference the request carries.
+    encoder.commit();
     Ok(receiver)
 }
 
@@ -202,7 +324,7 @@ fn dispatch_handle(
 mod tests {
     #[test]
     fn zero_function_handle_fails_before_loading_the_c_api() {
-        let Err(error) = super::dispatch_handle(0, Vec::new()) else {
+        let Err(error) = super::handle_target(0) else {
             panic!("a zero function handle must fail before dispatch")
         };
         assert_eq!(

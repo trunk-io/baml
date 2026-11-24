@@ -1,0 +1,1343 @@
+//! Publisher-owned recording policy carried by packed binaries and generated bridges.
+//!
+//! Each producer reads its own manifest table. The engine reads the explicitly
+//! permitted recording variable at startup. New artifacts bind the standard
+//! variable by default; legacy policies still permit an off-only veto.
+//!
+//! ```toml
+//! [pack]
+//! on_initial_telemetry_failure = "warn"
+//! initial_telemetry_warning_message = "Telemetry unavailable; continuing."
+//! http_bodies = false
+//! [pack.env_var_names]
+//! BAML_TELEMETRY = "ACME_TELEMETRY"
+//! ```
+use std::{ffi::OsString, fmt, fmt::Write as _};
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
+
+use crate::mode::AutoTelemetryLevel;
+
+/// Recording defaults for functions whose telemetry policy is automatic.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingLevel {
+    Off,
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl RecordingLevel {
+    pub fn auto_level(self) -> Option<AutoTelemetryLevel> {
+        match self {
+            Self::Off => None,
+            Self::Low => Some(AutoTelemetryLevel::Low),
+            Self::Medium => Some(AutoTelemetryLevel::Medium),
+            Self::High => Some(AutoTelemetryLevel::High),
+        }
+    }
+
+    /// Case-insensitive. A boolean that enables recording keeps `default`.
+    fn parse(value: &str, default: Self) -> Option<Self> {
+        match baml_env::parse_bool(value) {
+            Some(true) => Some(default),
+            Some(false) => Some(Self::Off),
+            None => baml_env::parse_choice(
+                value,
+                &[
+                    ("low", Self::Low),
+                    ("medium", Self::Medium),
+                    ("high", Self::High),
+                ],
+            ),
+        }
+    }
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialFailureAction {
+    Abort,
+    #[default]
+    Warn,
+    Ignore,
+}
+
+/// This policy applies until the first successful ingestion authorization only.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct InitialFailurePolicy {
+    pub action: InitialFailureAction,
+    pub warning_message: Option<String>,
+}
+
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactTelemetry {
+    pub recording_level: RecordingLevel,
+    /// Named controls can change detail. None retains the stored level and permits
+    /// only the standard off veto unless a destination owns that name.
+    pub recording_level_envvar: Option<String>,
+    pub initial_failure: InitialFailurePolicy,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub api_url: Option<String>,
+    #[serde(default)]
+    pub destination_overrides: DestinationOverrides,
+    #[serde(default)]
+    pub embedded: Option<Box<EmbeddedIngestion>>,
+    /// Set by `http_bodies = false`: network spans record no request or
+    /// response bodies, at any level.
+    #[serde(default)]
+    pub omit_http_bodies: bool,
+    /// Set by `upload_source = false` under `[boundary]`: a build the
+    /// artifact's runtime makes registers with BCS without its source text.
+    #[serde(default)]
+    pub omit_source: bool,
+}
+
+/// An omitted binding follows credential-dependent defaults: embedded credentials
+/// are fixed, while ordinary artifacts accept the standard Boundary variables.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestinationOverrides {
+    #[default]
+    Default,
+    /// Retained only for reading older serialized policies; manifests cannot disable bindings.
+    Disabled,
+    Named {
+        project: String,
+        api_key: String,
+    },
+}
+
+/// API key embedded by the publisher. Debug output redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(transparent)]
+pub struct EmbeddedCredential(String);
+impl EmbeddedCredential {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Debug for EmbeddedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EmbeddedIngestion {
+    pub api_key: EmbeddedCredential,
+}
+
+/// The embedded key is never reused when the caller selects a destination.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IngestionSelection<'a> {
+    Embedded(&'a EmbeddedIngestion),
+    Caller {
+        project: Option<String>,
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ArtifactKind {
+    Pack,
+    Bridge,
+}
+
+impl ArtifactKind {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Pack => "pack",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct PolicyError(pub String);
+
+const PRODUCER_FIELDS: &[&str] = &[
+    "on_initial_telemetry_failure",
+    "initial_telemetry_warning_message",
+    "http_bodies",
+    "env_var_names",
+    "build",
+];
+const BUILD_FIELDS: &[&str] = &[
+    "embed_telemetry_api_key_from_env_var",
+    "embed_telemetry_env",
+];
+
+/// Build inputs are separate from the runtime policy serialized into artifacts.
+#[derive(Debug, Default)]
+pub struct BuildTelemetry {
+    pub api_key_from_env_var: Option<String>,
+    pub expected_environment: Option<String>,
+}
+
+impl BuildTelemetry {
+    pub fn from_manifest(manifest: &toml::Value, kind: ArtifactKind) -> Result<Self, PolicyError> {
+        let table = kind.table();
+        let namespace = format!("{table}.build");
+        let Some(producer) = manifest.get(table) else {
+            return Ok(Self::default());
+        };
+        let producer = producer
+            .as_table()
+            .ok_or_else(|| PolicyError(format!("[{table}] must be a table.")))?;
+        let Some(build) = producer.get("build") else {
+            return Ok(Self::default());
+        };
+        let build = build
+            .as_table()
+            .ok_or_else(|| PolicyError(format!("[{namespace}] must be a table.")))?;
+        validate_fields(build, &namespace, BUILD_FIELDS)?;
+        let key_setting = "embed_telemetry_api_key_from_env_var";
+        let api_key_from_env_var = build
+            .get(key_setting)
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|name| valid_envvar(name))
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        PolicyError(format!(
+                            "{namespace}.{key_setting} must be a valid environment-variable name."
+                        ))
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            api_key_from_env_var,
+            expected_environment: build
+                .get("embed_telemetry_env")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            PolicyError(format!(
+                                "{namespace}.embed_telemetry_env must be a non-empty string."
+                            ))
+                        })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// `[pack]` also takes `[pack.gc]`, the heap's collection policy, which
+/// `baml_exec::PackGc` parses; generated SDKs read it from the environment.
+const PACK_FIELDS: &[&str] = &[
+    "on_initial_telemetry_failure",
+    "initial_telemetry_warning_message",
+    "http_bodies",
+    "env_var_names",
+    "build",
+    "gc",
+];
+const ENVVAR_FIELDS: &[&str] = &["BAML_TELEMETRY", "BOUNDARY_PROJECT", "BOUNDARY_API_KEY"];
+/// Packed programs may also rename the GC variables (see `PackGc`).
+const PACK_ENVVAR_FIELDS: &[&str] = &[
+    "BAML_TELEMETRY",
+    "BOUNDARY_PROJECT",
+    "BOUNDARY_API_KEY",
+    "BAML_GC_GROWTH",
+    "BAML_GC_MIN_GROWTH",
+];
+
+/// Validate publisher-owned namespaces before building artifacts.
+/// Other manifest tables (package, generators, etc.) have their own parsers.
+fn validate_manifest_settings(manifest: &toml::Value) -> Result<(), PolicyError> {
+    if manifest
+        .get("bridge")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|bridge| bridge.contains_key("gc"))
+    {
+        return Err(PolicyError(
+            "[bridge.gc] is not supported: generated SDKs take their GC settings from the BAML_GC_GROWTH and BAML_GC_MIN_GROWTH environment variables. [pack.gc] sets them for packed programs.".into(),
+        ));
+    }
+    for (name, fields, envvar_fields) in [
+        (
+            "boundary",
+            &["project", "api_url", "upload_source"][..],
+            ENVVAR_FIELDS,
+        ),
+        ("pack", PACK_FIELDS, PACK_ENVVAR_FIELDS),
+        ("bridge", PRODUCER_FIELDS, ENVVAR_FIELDS),
+    ] {
+        let Some(value) = manifest.get(name) else {
+            continue;
+        };
+        let table = value
+            .as_table()
+            .ok_or_else(|| PolicyError(format!("[{name}] must be a table.")))?;
+        if name != "boundary" && table.contains_key("telemetry_environment") {
+            return Err(PolicyError(format!(
+                "`{name}.telemetry_environment` has moved to `{name}.build.embed_telemetry_env`. Set `embed_telemetry_env` in the [{name}.build] table in baml.toml."
+            )));
+        }
+        validate_fields(table, name, fields)?;
+        if name != "boundary" {
+            if let Some(names) = table.get("env_var_names") {
+                let name = format!("{name}.env_var_names");
+                let table = names
+                    .as_table()
+                    .ok_or_else(|| PolicyError(format!("[{name}] must be a table.")))?;
+                validate_fields(table, &name, envvar_fields)?;
+                if name == "bridge.env_var_names" {
+                    reject_bridge_gc_collisions(table)?;
+                }
+            }
+        }
+    }
+    for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+        BuildTelemetry::from_manifest(manifest, kind)?;
+    }
+    Ok(())
+}
+
+/// Generated SDKs always read the standard GC variables (`baml_exec::PackGc`
+/// renames them for packed programs only), so a bridge binding renamed to one
+/// would read the same variable as two settings. Compared ignoring case: a
+/// bridge generated on a case-sensitive host may be loaded on Windows.
+fn reject_bridge_gc_collisions(names: &toml::Table) -> Result<(), PolicyError> {
+    for (key, value) in names {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        if let Some(gc) = ["BAML_GC_GROWTH", "BAML_GC_MIN_GROWTH"]
+            .into_iter()
+            .find(|gc| gc.eq_ignore_ascii_case(value))
+        {
+            return Err(PolicyError(format!(
+                "bridge.env_var_names.{key}: `{value}` is the {gc} variable, which generated SDKs read for the heap's collection policy; use another name."
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fields(table: &toml::Table, name: &str, fields: &[&str]) -> Result<(), PolicyError> {
+    for field in table.keys() {
+        if fields.contains(&field.as_str()) {
+            continue;
+        }
+        let mut message = format!("Unknown setting `{name}.{field}` in baml.toml.\n");
+        if let Some((distance, suggestion)) = fields
+            .iter()
+            .map(|candidate| (strsim::levenshtein(field, candidate), candidate))
+            .min_by_key(|(distance, _)| *distance)
+            && distance <= 2
+        {
+            writeln!(message, "\n  Did you mean `{name}.{suggestion}`?")
+                .expect("writing to a String cannot fail");
+        }
+        write!(message, "\n  Valid [{name}] settings:").expect("writing to a String cannot fail");
+        for field in fields {
+            write!(message, "\n    {field}").expect("writing to a String cannot fail");
+        }
+        return Err(PolicyError(message));
+    }
+    Ok(())
+}
+
+impl ArtifactTelemetry {
+    /// Resolve only publisher settings; ambient runtime values are never baked in.
+    pub fn from_manifest(manifest: &toml::Value, kind: ArtifactKind) -> Result<Self, PolicyError> {
+        validate_manifest_settings(manifest)?;
+        let name = kind.table();
+        let mut policy = Self {
+            recording_level_envvar: Some(crate::mode::ENV_VAR.into()),
+            ..Self::default()
+        };
+        if let Some(boundary) = manifest.get("boundary") {
+            if !boundary.is_table() {
+                return Err(PolicyError("[boundary] must be a table.".into()));
+            }
+            for (field, output) in [
+                ("project", &mut policy.project),
+                ("api_url", &mut policy.api_url),
+            ] {
+                if let Some(value) = boundary.get(field) {
+                    *output = Some(
+                        value
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                PolicyError(format!("boundary.{field} must be a non-empty string."))
+                            })?
+                            .to_owned(),
+                    );
+                }
+            }
+            if let Some(value) = boundary.get("upload_source") {
+                policy.omit_source = !value.as_bool().ok_or_else(|| {
+                    PolicyError("boundary.upload_source must be true or false.".into())
+                })?;
+            }
+        }
+        let Some(value) = manifest.get(name) else {
+            return Ok(policy);
+        };
+        let table = value
+            .as_table()
+            .ok_or_else(|| PolicyError(format!("[{name}] must be a table.")))?;
+        if let Some(value) = table.get("on_initial_telemetry_failure") {
+            policy.initial_failure.action = match value.as_str() {
+                Some("abort") => InitialFailureAction::Abort,
+                Some("warn") => InitialFailureAction::Warn,
+                Some("ignore") => InitialFailureAction::Ignore,
+                _ => {
+                    return Err(PolicyError(format!(
+                        "{name}.on_initial_telemetry_failure must be abort, warn, or ignore."
+                    )));
+                }
+            };
+        }
+        if let Some(value) = table.get("initial_telemetry_warning_message") {
+            policy.initial_failure.warning_message = Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        PolicyError(format!(
+                            "{name}.initial_telemetry_warning_message must be a string."
+                        ))
+                    })?
+                    .to_owned(),
+            );
+        }
+        if let Some(value) = table.get("http_bodies") {
+            policy.omit_http_bodies = !value
+                .as_bool()
+                .ok_or_else(|| PolicyError(format!("{name}.http_bodies must be true or false.")))?;
+        }
+        if let Some(names) = table.get("env_var_names") {
+            let names = names
+                .as_table()
+                .ok_or_else(|| PolicyError(format!("[{name}.env_var_names] must be a table.")))?;
+            policy.destination_overrides = match (
+                names.get("BOUNDARY_PROJECT"),
+                names.get("BOUNDARY_API_KEY"),
+            ) {
+                (None, None) => DestinationOverrides::Default,
+                (Some(toml::Value::String(project)), Some(toml::Value::String(api_key)))
+                    if valid_envvar(project)
+                        && valid_envvar(api_key)
+                        && project != api_key
+                        && project != "BOUNDARY_API_URL"
+                        && api_key != "BOUNDARY_API_URL" =>
+                {
+                    DestinationOverrides::Named {
+                        project: project.clone(),
+                        api_key: api_key.clone(),
+                    }
+                }
+                _ => {
+                    return Err(PolicyError(format!(
+                        "{name}.env_var_names.BOUNDARY_PROJECT and BOUNDARY_API_KEY must be distinct valid environment-variable names, specified together."
+                    )));
+                }
+            };
+            if let Some(value) = names.get("BAML_TELEMETRY") {
+                policy.recording_level_envvar = match value {
+                    toml::Value::String(envvar) if valid_envvar(envvar) => Some(envvar.clone()),
+                    _ => {
+                        return Err(PolicyError(format!(
+                            "{name}.env_var_names.BAML_TELEMETRY must be a valid environment-variable name (for example, \"ACME_TELEMETRY\"); omit this setting to use BAML_TELEMETRY."
+                        )));
+                    }
+                };
+            }
+        }
+        // Destination bindings own their names. Omission must not turn a
+        // publisher's API key or project into an implicit recording switch.
+        let explicit_level = table
+            .get("env_var_names")
+            .and_then(|names| names.get("BAML_TELEMETRY"))
+            .is_some();
+        if !explicit_level && policy.destination_uses(crate::mode::ENV_VAR) {
+            policy.recording_level_envvar = None;
+        }
+        if let Some(level) = &policy.recording_level_envvar {
+            if same_envvar(level, "BOUNDARY_API_URL")
+                || matches!(&policy.destination_overrides, DestinationOverrides::Named { project, api_key } if same_envvar(level, project) || same_envvar(level, api_key))
+            {
+                return Err(PolicyError(format!(
+                    "{name}.env_var_names.BAML_TELEMETRY must use a name distinct from the destination bindings and BOUNDARY_API_URL."
+                )));
+            }
+        }
+        Ok(policy)
+    }
+
+    pub fn select_ingestion_with(
+        &self,
+        mut read: impl FnMut(&str) -> Option<OsString>,
+    ) -> Result<IngestionSelection<'_>, PolicyError> {
+        let names = match &self.destination_overrides {
+            DestinationOverrides::Default if self.embedded.is_none() => {
+                Some(("BOUNDARY_PROJECT", "BOUNDARY_API_KEY"))
+            }
+            DestinationOverrides::Named { project, api_key } => {
+                Some((project.as_str(), api_key.as_str()))
+            }
+            DestinationOverrides::Default | DestinationOverrides::Disabled => None,
+        };
+        // Empty means unset, as it does for BOUNDARY_API_URL.
+        let read_value = |read: &mut dyn FnMut(&str) -> Option<OsString>, name: &str| {
+            baml_env::string_from(name, read(name)).map_err(|error| PolicyError(error.to_string()))
+        };
+        let (project, api_key) = if let Some((project, api_key)) = names {
+            (
+                read_value(&mut read, project)?,
+                read_value(&mut read, api_key)?,
+            )
+        } else {
+            (None, None)
+        };
+        if project.is_none()
+            && api_key.is_none()
+            && let Some(embedded) = &self.embedded
+        {
+            return Ok(IngestionSelection::Embedded(embedded));
+        }
+        // A supplied key owns its destination; an omitted project can be inferred
+        // from its fixed ingestion scope instead of borrowing the publisher's target.
+        let project = project.or_else(|| {
+            if api_key.is_none() {
+                self.project.clone()
+            } else {
+                None
+            }
+        });
+        Ok(IngestionSelection::Caller { project, api_key })
+    }
+
+    pub fn resolve_level(&self) -> Option<AutoTelemetryLevel> {
+        self.resolve_level_with(baml_env::os_var)
+    }
+
+    /// The effective end-user off control, including legacy opt-out.
+    /// A destination binding owns its name and cannot also control recording.
+    pub fn recording_control_envvar(&self) -> Option<&str> {
+        let name = self
+            .recording_level_envvar
+            .as_deref()
+            .unwrap_or(crate::mode::ENV_VAR);
+        (valid_envvar(name)
+            && !same_envvar(name, "BOUNDARY_API_URL")
+            && !self.destination_uses(name))
+        .then_some(name)
+    }
+
+    /// Credential and destination variables cannot double as recording controls.
+    fn destination_uses(&self, name: &str) -> bool {
+        match &self.destination_overrides {
+            DestinationOverrides::Named { project, api_key } => {
+                same_envvar(name, project) || same_envvar(name, api_key)
+            }
+            DestinationOverrides::Default if self.embedded.is_none() => {
+                same_envvar(name, "BOUNDARY_PROJECT") || same_envvar(name, "BOUNDARY_API_KEY")
+            }
+            DestinationOverrides::Default | DestinationOverrides::Disabled => false,
+        }
+    }
+
+    /// Inject the environment for tests and hosts; no process-wide mutation is needed.
+    /// Never fails, so a control cannot stop the program. Bound variables treat
+    /// empty as unset and malformed values as off. Legacy unbound policies accept
+    /// only a supported off alias; other values leave their stored level unchanged.
+    pub fn resolve_level_with(
+        &self,
+        mut read: impl FnMut(&str) -> Option<OsString>,
+    ) -> Option<AutoTelemetryLevel> {
+        let Some(name) = &self.recording_level_envvar else {
+            // None remains for older artifacts and destination-owned standard
+            // names. Keep the stored level, but allow explicit off when that name
+            // is free. New manifests reject false recording bindings.
+            if let Some(name) = self.recording_control_envvar()
+                && baml_env::bool_from(name, read(name)).ok() == Some(Some(false))
+            {
+                return None;
+            }
+            return self.recording_level.auto_level();
+        };
+        // A bridge generated on a case-sensitive host may be loaded on Windows,
+        // where differently cased names alias. Destination ownership still wins
+        // over the newly serialized implicit standard binding in that case.
+        if same_envvar(name, crate::mode::ENV_VAR) && self.destination_uses(name) {
+            return self.recording_level.auto_level();
+        }
+        // Deserialized metadata can bypass manifest validation. Fail closed
+        // without interpreting a destination/key as a recording level.
+        self.recording_control_envvar()?;
+        let level = match baml_env::string_from(name, read(name)) {
+            Ok(None) => Some(self.recording_level),
+            Ok(Some(value)) => RecordingLevel::parse(&value, self.recording_level),
+            Err(_) => None,
+        };
+        level
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    "{name} is not off, low, medium, high or a boolean; recording is off"
+                );
+                RecordingLevel::Off
+            })
+            .auto_level()
+    }
+}
+
+fn same_envvar(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn valid_envvar(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_variable_names_are_validated_without_changing_runtime_policy() {
+        for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+            let setting = "embed_telemetry_api_key_from_env_var";
+            for value in ["false", "\"\"", "\"1KEY\"", "\"KEY=value\""] {
+                let manifest: toml::Value =
+                    format!("[{}.build]\n{setting} = {value}", kind.table())
+                        .parse()
+                        .unwrap();
+                assert!(ArtifactTelemetry::from_manifest(&manifest, kind).is_err());
+            }
+            let manifest: toml::Value =
+                format!("[{}.build]\n{setting} = \"BUILD_KEY\"", kind.table())
+                    .parse()
+                    .unwrap();
+            assert_eq!(
+                BuildTelemetry::from_manifest(&manifest, kind)
+                    .unwrap()
+                    .api_key_from_env_var
+                    .as_deref(),
+                Some("BUILD_KEY")
+            );
+            assert_eq!(
+                ArtifactTelemetry::from_manifest(&manifest, kind).unwrap(),
+                ArtifactTelemetry {
+                    recording_level_envvar: Some(crate::mode::ENV_VAR.into()),
+                    ..Default::default()
+                }
+            );
+        }
+        let manifest: toml::Value = "[pack.build]\nembed_telemetry_api_key_from_env_var = \"PACK_KEY\"\n[bridge.build]\nembed_telemetry_api_key_from_env_var = \"BRIDGE_KEY\"".parse().unwrap();
+        assert_eq!(
+            BuildTelemetry::from_manifest(&manifest, ArtifactKind::Pack)
+                .unwrap()
+                .api_key_from_env_var
+                .as_deref(),
+            Some("PACK_KEY")
+        );
+        assert_eq!(
+            BuildTelemetry::from_manifest(&manifest, ArtifactKind::Bridge)
+                .unwrap()
+                .api_key_from_env_var
+                .as_deref(),
+            Some("BRIDGE_KEY")
+        );
+    }
+
+    #[test]
+    fn build_settings_share_one_contract_and_keep_producers_independent() {
+        let manifest: toml::Value = r#"
+[pack.build]
+embed_telemetry_api_key_from_env_var = "PACK_KEY"
+embed_telemetry_env = "Pack environment"
+[bridge.build]
+embed_telemetry_api_key_from_env_var = "BRIDGE_KEY"
+embed_telemetry_env = "Bridge environment"
+"#
+        .parse()
+        .unwrap();
+        for (kind, key, environment) in [
+            (ArtifactKind::Pack, "PACK_KEY", "Pack environment"),
+            (ArtifactKind::Bridge, "BRIDGE_KEY", "Bridge environment"),
+        ] {
+            let build = BuildTelemetry::from_manifest(&manifest, kind).unwrap();
+            assert_eq!(build.api_key_from_env_var.as_deref(), Some(key));
+            assert_eq!(build.expected_environment.as_deref(), Some(environment));
+            assert_eq!(
+                ArtifactTelemetry::from_manifest(&manifest, kind).unwrap(),
+                ArtifactTelemetry {
+                    recording_level_envvar: Some(crate::mode::ENV_VAR.into()),
+                    ..Default::default()
+                }
+            );
+
+            for value in ["false", "123", "\"\"", "\"  \""] {
+                let invalid: toml::Value =
+                    format!("[{}.build]\nembed_telemetry_env = {value}", kind.table())
+                        .parse()
+                        .unwrap();
+                assert_eq!(
+                    BuildTelemetry::from_manifest(&invalid, kind)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "{}.build.embed_telemetry_env must be a non-empty string.",
+                        kind.table()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_publisher_settings_fail_with_exact_actionable_messages() {
+        for (input, expected) in [
+            (
+                "[pack]\ntelemetry_environment = \"staging\"",
+                "`pack.telemetry_environment` has moved to `pack.build.embed_telemetry_env`. Set `embed_telemetry_env` in the [pack.build] table in baml.toml.",
+            ),
+            (
+                "[bridge.gc]\ngrowth = 2",
+                "[bridge.gc] is not supported: generated SDKs take their GC settings from the BAML_GC_GROWTH and BAML_GC_MIN_GROWTH environment variables. [pack.gc] sets them for packed programs.",
+            ),
+            (
+                "[bridge.env_var_names]\nBAML_TELEMETRY = \"BAML_GC_GROWTH\"",
+                "bridge.env_var_names.BAML_TELEMETRY: `BAML_GC_GROWTH` is the BAML_GC_GROWTH variable, which generated SDKs read for the heap's collection policy; use another name.",
+            ),
+            (
+                "[bridge.env_var_names]\nBOUNDARY_PROJECT = \"baml_gc_min_growth\"\nBOUNDARY_API_KEY = \"ACME_KEY\"",
+                "bridge.env_var_names.BOUNDARY_PROJECT: `baml_gc_min_growth` is the BAML_GC_MIN_GROWTH variable, which generated SDKs read for the heap's collection policy; use another name.",
+            ),
+            (
+                "[bridge.env_var_names]\nBAML_GC_GROWTH = \"ACME\"",
+                "Unknown setting `bridge.env_var_names.BAML_GC_GROWTH` in baml.toml.\n\n  Valid [bridge.env_var_names] settings:\n    BAML_TELEMETRY\n    BOUNDARY_PROJECT\n    BOUNDARY_API_KEY",
+            ),
+            (
+                "[bridge]\ntelemetry_environment = \"staging\"",
+                "`bridge.telemetry_environment` has moved to `bridge.build.embed_telemetry_env`. Set `embed_telemetry_env` in the [bridge.build] table in baml.toml.",
+            ),
+            (
+                r#"[pack]
+on_inital_telemetry_failure = "ignore""#,
+                r#"Unknown setting `pack.on_inital_telemetry_failure` in baml.toml.
+
+  Did you mean `pack.on_initial_telemetry_failure`?
+
+  Valid [pack] settings:
+    on_initial_telemetry_failure
+    initial_telemetry_warning_message
+    http_bodies
+    env_var_names
+    build
+    gc"#,
+            ),
+            (
+                r#"[bridge]
+extra = true"#,
+                r#"Unknown setting `bridge.extra` in baml.toml.
+
+  Valid [bridge] settings:
+    on_initial_telemetry_failure
+    initial_telemetry_warning_message
+    http_bodies
+    env_var_names
+    build"#,
+            ),
+            (
+                r#"[pack.env_var_names]
+BOUNDARY_API_KE = "CUSTOM_KEY""#,
+                r#"Unknown setting `pack.env_var_names.BOUNDARY_API_KE` in baml.toml.
+
+  Did you mean `pack.env_var_names.BOUNDARY_API_KEY`?
+
+  Valid [pack.env_var_names] settings:
+    BAML_TELEMETRY
+    BOUNDARY_PROJECT
+    BOUNDARY_API_KEY
+    BAML_GC_GROWTH
+    BAML_GC_MIN_GROWTH"#,
+            ),
+            (
+                r#"[boundary]
+api_ur = "https://api.cloud.boundaryml.com""#,
+                r#"Unknown setting `boundary.api_ur` in baml.toml.
+
+  Did you mean `boundary.api_url`?
+
+  Valid [boundary] settings:
+    project
+    api_url
+    upload_source"#,
+            ),
+        ] {
+            let manifest: toml::Value = input.parse().unwrap();
+            // Both producers reject malformed publisher settings before building.
+            for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+                assert_eq!(
+                    ArtifactTelemetry::from_manifest(&manifest, kind)
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+            }
+        }
+    }
+
+    /// Both producers expose the standard control without baking ambient values.
+    #[test]
+    fn omitted_bindings_use_the_standard_control_for_both_producers() {
+        for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+            let policy =
+                ArtifactTelemetry::from_manifest(&toml::Table::new().into(), kind).unwrap();
+            assert_eq!(
+                policy.recording_level_envvar.as_deref(),
+                Some(crate::mode::ENV_VAR)
+            );
+            for (value, level) in [
+                ("off", None),
+                ("high", Some(AutoTelemetryLevel::High)),
+                ("", Some(AutoTelemetryLevel::Medium)),
+            ] {
+                assert_eq!(
+                    policy.resolve_level_with(|name| {
+                        assert_eq!(name, crate::mode::ENV_VAR);
+                        Some(value.into())
+                    }),
+                    level
+                );
+            }
+        }
+    }
+
+    /// Legacy unbound policies retain their wire format and an off-only veto.
+    #[test]
+    fn legacy_policies_allow_opt_out_without_changing_stored_detail() {
+        // v1 TOML and the original Borsh layout carry no binding provenance.
+        let legacy: ArtifactTelemetry = toml::from_str(
+            r#"
+recording_level = "medium"
+[initial_failure]
+action = "warn"
+"#,
+        )
+        .unwrap();
+        let original_borsh = [2, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let legacy_borsh: ArtifactTelemetry = borsh::from_slice(&original_borsh).unwrap();
+        assert_eq!(borsh::to_vec(&legacy).unwrap(), original_borsh);
+        for policy in [legacy, legacy_borsh] {
+            assert_eq!(policy.recording_level_envvar, None);
+            for value in ["off", "false", "0", "no", "OFF", " False ", " NO "] {
+                assert_eq!(
+                    policy.resolve_level_with(|name| {
+                        assert_eq!(name, crate::mode::ENV_VAR);
+                        Some(value.into())
+                    }),
+                    None,
+                    "{value}"
+                );
+            }
+            for value in ["", "  ", "high", "low", "1", "true", "yes", "on", "invalid"] {
+                assert_eq!(
+                    policy.resolve_level_with(|_| Some(value.into())),
+                    Some(AutoTelemetryLevel::Medium),
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                policy.resolve_level_with(|_| None),
+                Some(AutoTelemetryLevel::Medium)
+            );
+        }
+    }
+
+    /// A destination owns its name, but a distinct declared recording control works.
+    #[test]
+    fn destination_ownership_prevents_implicit_recording_controls() {
+        for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+            for (project, key) in [
+                ("BAML_TELEMETRY", "ACME_KEY"),
+                ("ACME_PROJECT", "BAML_TELEMETRY"),
+            ] {
+                let input = format!(
+                    "[{}.env_var_names]\nBOUNDARY_PROJECT = {project:?}\nBOUNDARY_API_KEY = {key:?}",
+                    kind.table()
+                );
+                let manifest: toml::Value = input.parse().unwrap();
+                let policy = ArtifactTelemetry::from_manifest(&manifest, kind).unwrap();
+                assert_eq!(policy.recording_level_envvar, None);
+                assert_eq!(
+                    policy.resolve_level_with(|_| panic!(
+                        "destination must not be read as a recording level"
+                    )),
+                    Some(AutoTelemetryLevel::Medium)
+                );
+                let manifest: toml::Value = format!("{input}\nBAML_TELEMETRY = \"ACME_TELEMETRY\"")
+                    .parse()
+                    .unwrap();
+                let policy = ArtifactTelemetry::from_manifest(&manifest, kind).unwrap();
+                assert_eq!(
+                    policy.resolve_level_with(|name| {
+                        assert_eq!(name, "ACME_TELEMETRY");
+                        Some("off".into())
+                    }),
+                    None
+                );
+            }
+            let manifest: toml::Value = format!(
+                "[{}.env_var_names]\nBAML_TELEMETRY = \"BOUNDARY_API_URL\"",
+                kind.table()
+            )
+            .parse()
+            .unwrap();
+            assert!(ArtifactTelemetry::from_manifest(&manifest, kind).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_names_read_only_the_selected_variable_and_keep_unset_defaults() {
+        for name in ["BAML_TELEMETRY", "ACME_TELEMETRY"] {
+            let policy = ArtifactTelemetry {
+                recording_level_envvar: Some(name.into()),
+                ..Default::default()
+            };
+            for (value, level) in [
+                ("off", None),
+                ("low", Some(AutoTelemetryLevel::Low)),
+                ("medium", Some(AutoTelemetryLevel::Medium)),
+                ("high", Some(AutoTelemetryLevel::High)),
+            ] {
+                assert_eq!(
+                    policy.resolve_level_with(|read_name| {
+                        assert_eq!(read_name, name);
+                        Some(value.into())
+                    }),
+                    level
+                );
+            }
+            assert_eq!(
+                policy.resolve_level_with(|_| None),
+                Some(AutoTelemetryLevel::Medium)
+            );
+        }
+    }
+
+    /// Generated bridge metadata can cross hosts with different env-name rules.
+    #[test]
+    fn standard_destination_ownership_survives_cross_platform_metadata() {
+        for destination_name in ["BAML_TELEMETRY", "baml_telemetry"] {
+            let policy = ArtifactTelemetry {
+                recording_level_envvar: Some(crate::mode::ENV_VAR.into()),
+                destination_overrides: DestinationOverrides::Named {
+                    project: "ACME_PROJECT".into(),
+                    api_key: destination_name.into(),
+                },
+                ..Default::default()
+            };
+            let policy: ArtifactTelemetry =
+                toml::from_str(&toml::to_string(&policy).unwrap()).unwrap();
+            let owns_name = destination_name == crate::mode::ENV_VAR || cfg!(windows);
+            assert_eq!(
+                policy.resolve_level_with(|name| {
+                    assert!(!owns_name, "destination must not be interpreted as a level");
+                    assert_eq!(name, crate::mode::ENV_VAR);
+                    Some("off".into())
+                }),
+                if owns_name {
+                    Some(AutoTelemetryLevel::Medium)
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    /// Serialized metadata is untrusted even when it bypasses manifest validation.
+    #[test]
+    fn invalid_deserialized_bindings_disable_without_reading_credentials() {
+        for name in [
+            "",
+            "KEY=bad",
+            "1KEY",
+            "BOUNDARY_API_KEY",
+            "BOUNDARY_PROJECT",
+            "BOUNDARY_API_URL",
+        ] {
+            let policy = ArtifactTelemetry {
+                recording_level_envvar: Some(name.into()),
+                ..Default::default()
+            };
+            let policy: ArtifactTelemetry =
+                toml::from_str(&toml::to_string(&policy).unwrap()).unwrap();
+            assert_eq!(
+                policy.resolve_level_with(|_| panic!("invalid binding must not read environment")),
+                None
+            );
+        }
+    }
+
+    /// Default caller bindings are active only without embedded credentials.
+    /// An embedded artifact may explicitly repurpose an otherwise unused name.
+    #[test]
+    fn recording_names_respect_the_effective_destination_not_unused_defaults() {
+        for name in ["BOUNDARY_PROJECT", "BOUNDARY_API_KEY"] {
+            let manifest: toml::Value =
+                format!("[bridge.env_var_names]\nBAML_TELEMETRY = {name:?}")
+                    .parse()
+                    .unwrap();
+            let mut policy =
+                ArtifactTelemetry::from_manifest(&manifest, ArtifactKind::Bridge).unwrap();
+            assert_eq!(
+                policy.resolve_level_with(|_| panic!("caller destination owns the name")),
+                None
+            );
+            policy.embedded = Some(Box::new(EmbeddedIngestion {
+                api_key: EmbeddedCredential::new("bdry_secret_fixture".into()),
+            }));
+            assert_eq!(
+                policy.resolve_level_with(|actual| {
+                    assert_eq!(actual, name);
+                    Some("high".into())
+                }),
+                Some(AutoTelemetryLevel::High)
+            );
+            assert_eq!(policy.resolve_level_with(|_| Some("off".into())), None);
+        }
+    }
+
+    #[test]
+    fn runtime_values_never_fail_and_unrecognized_values_record_nothing() {
+        let policy = ArtifactTelemetry {
+            recording_level: RecordingLevel::High,
+            recording_level_envvar: Some("ACME_TELEMETRY".into()),
+            ..Default::default()
+        };
+        // Empty and enabling booleans keep the level an unset variable gives.
+        let unset = Some(AutoTelemetryLevel::High);
+        for (values, level) in [
+            (&["", "  ", "true", "1", "yes", "on", " On "][..], unset),
+            (&["off", "false", "0", "no", "OFF", " False "], None),
+            (&["low", " LOW "], Some(AutoTelemetryLevel::Low)),
+            (&["medium", "Medium"], Some(AutoTelemetryLevel::Medium)),
+            (&["hgih", "auto", "local", "cloud", "2"], None),
+        ] {
+            for value in values {
+                assert_eq!(
+                    policy.resolve_level_with(|_| Some(value.into())),
+                    level,
+                    "{value:?}"
+                );
+            }
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            policy.resolve_level_with(|_| Some(std::os::unix::ffi::OsStringExt::from_vec(vec![
+                0xff
+            ]))),
+            None
+        );
+    }
+
+    #[test]
+    fn pack_and_bridge_configuration_are_independent() {
+        for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+            let manifest = toml::Value::Table(toml::Table::new());
+            let policy = ArtifactTelemetry::from_manifest(&manifest, kind).unwrap();
+            assert_eq!(policy.initial_failure.action, InitialFailureAction::Warn);
+        }
+        let manifest: toml::Value = toml::from_str(
+            r#"
+[pack]
+on_initial_telemetry_failure = "warn"
+initial_telemetry_warning_message = "Telemetry unavailable; continuing."
+[pack.env_var_names]
+BAML_TELEMETRY = "ACME_TELEMETRY"
+[bridge]
+on_initial_telemetry_failure = "ignore"
+"#,
+        )
+        .unwrap();
+        let pack = ArtifactTelemetry::from_manifest(&manifest, ArtifactKind::Pack).unwrap();
+        assert_eq!(pack.initial_failure.action, InitialFailureAction::Warn);
+        assert_eq!(
+            pack.initial_failure.warning_message.as_deref(),
+            Some("Telemetry unavailable; continuing.")
+        );
+        assert_eq!(
+            pack.recording_level_envvar.as_deref(),
+            Some("ACME_TELEMETRY")
+        );
+        let bridge = ArtifactTelemetry::from_manifest(&manifest, ArtifactKind::Bridge).unwrap();
+        assert_eq!(bridge.initial_failure.action, InitialFailureAction::Ignore);
+        assert_eq!(
+            bridge.recording_level_envvar.as_deref(),
+            Some(crate::mode::ENV_VAR)
+        );
+        assert_eq!(bridge.initial_failure.warning_message, None);
+    }
+
+    #[test]
+    fn invalid_bindings_and_failure_actions_are_actionable() {
+        for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+            for value in ["false", "true", "\"\"", "\"A=B\"", "\"1VAR\"", "42"] {
+                let manifest: toml::Value = toml::from_str(&format!(
+                    "[{}.env_var_names]\nBAML_TELEMETRY = {value}",
+                    kind.table()
+                ))
+                .unwrap();
+                assert_eq!(
+                    ArtifactTelemetry::from_manifest(&manifest, kind)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        r#"{}.env_var_names.BAML_TELEMETRY must be a valid environment-variable name (for example, "ACME_TELEMETRY"); omit this setting to use BAML_TELEMETRY."#,
+                        kind.table()
+                    )
+                );
+            }
+        }
+        let manifest: toml::Value = toml::from_str(
+            r#"[bridge]
+on_initial_telemetry_failure = "required""#,
+        )
+        .unwrap();
+        assert_eq!(
+            ArtifactTelemetry::from_manifest(&manifest, ArtifactKind::Bridge)
+                .unwrap_err()
+                .to_string(),
+            r#"bridge.on_initial_telemetry_failure must be abort, warn, or ignore."#
+        );
+    }
+
+    #[test]
+    fn http_bodies_is_a_boolean_that_defaults_to_recording_bodies() {
+        for kind in [ArtifactKind::Pack, ArtifactKind::Bridge] {
+            let name = kind.table();
+            for (input, omitted) in [
+                (String::new(), false),
+                (format!("[{name}]\nhttp_bodies = true"), false),
+                (format!("[{name}]\nhttp_bodies = false"), true),
+            ] {
+                let manifest: toml::Value = toml::from_str(&input).unwrap();
+                let policy = ArtifactTelemetry::from_manifest(&manifest, kind).unwrap();
+                assert_eq!(policy.omit_http_bodies, omitted, "{input}");
+            }
+            for value in ["\"false\"", "0", "{}"] {
+                let manifest: toml::Value =
+                    toml::from_str(&format!("[{name}]\nhttp_bodies = {value}")).unwrap();
+                assert_eq!(
+                    ArtifactTelemetry::from_manifest(&manifest, kind)
+                        .unwrap_err()
+                        .to_string(),
+                    format!("{name}.http_bodies must be true or false.")
+                );
+            }
+        }
+        // Each producer reads only its own table.
+        let manifest: toml::Value = toml::from_str("[pack]\nhttp_bodies = false").unwrap();
+        let bridge = ArtifactTelemetry::from_manifest(&manifest, ArtifactKind::Bridge).unwrap();
+        assert!(!bridge.omit_http_bodies);
+        // A policy baked before the setting existed still loads, recording bodies.
+        let mut baked = toml::Value::try_from(ArtifactTelemetry::default()).unwrap();
+        baked.as_table_mut().unwrap().remove("omit_http_bodies");
+        assert_eq!(
+            baked.try_into::<ArtifactTelemetry>().unwrap(),
+            ArtifactTelemetry::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod ingestion_tests {
+    use super::*;
+    fn embedded() -> EmbeddedIngestion {
+        EmbeddedIngestion {
+            api_key: EmbeddedCredential::new("bdry_secret_embedded".into()),
+        }
+    }
+    #[test]
+    fn embedded_defaults_and_legacy_disabled_bindings_do_not_read_ambient_destination() {
+        for overrides in [
+            DestinationOverrides::Default,
+            DestinationOverrides::Disabled,
+        ] {
+            let mut policy = ArtifactTelemetry {
+                destination_overrides: overrides,
+                ..Default::default()
+            };
+            policy.embedded = Some(Box::new(embedded()));
+            assert_eq!(
+                policy
+                    .select_ingestion_with(|_| panic!("publisher credentials are fixed"))
+                    .unwrap(),
+                IngestionSelection::Embedded(policy.embedded.as_deref().unwrap())
+            );
+        }
+    }
+    #[test]
+    fn explicit_bindings_select_caller_credentials_without_reusing_embedded_key() {
+        let mut policy = ArtifactTelemetry {
+            project: Some("publisher/app".into()),
+            destination_overrides: DestinationOverrides::Named {
+                project: "ACME_PROJECT".into(),
+                api_key: "ACME_KEY".into(),
+            },
+            ..Default::default()
+        };
+        policy.embedded = Some(Box::new(embedded()));
+        for (project, key, expected_project) in [
+            (
+                Some("customer/app"),
+                Some("bdry_secret_customer"),
+                Some("customer/app"),
+            ),
+            (Some("customer/app"), None, Some("customer/app")),
+            (None, Some("bdry_secret_customer"), None),
+            (None, Some("local"), None),
+        ] {
+            assert_eq!(
+                policy
+                    .select_ingestion_with(|name| match name {
+                        "ACME_PROJECT" => project.map(Into::into),
+                        "ACME_KEY" => key.map(Into::into),
+                        _ => panic!("unpermitted variable {name}"),
+                    })
+                    .unwrap(),
+                IngestionSelection::Caller {
+                    project: expected_project.map(Into::into),
+                    api_key: key.map(Into::into)
+                }
+            );
+        }
+        assert_eq!(
+            policy.select_ingestion_with(|_| None).unwrap(),
+            IngestionSelection::Embedded(policy.embedded.as_deref().unwrap())
+        );
+    }
+    #[test]
+    fn ordinary_artifacts_use_standard_bindings_and_manifest_project() {
+        let policy = ArtifactTelemetry {
+            project: Some("org/app".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.select_ingestion_with(|_| None).unwrap(),
+            IngestionSelection::Caller {
+                project: Some("org/app".into()),
+                api_key: None
+            }
+        );
+        assert_eq!(
+            policy
+                .select_ingestion_with(
+                    |name| (name == "BOUNDARY_API_KEY").then(|| "bdry_secret_customer".into())
+                )
+                .unwrap(),
+            IngestionSelection::Caller {
+                project: None,
+                api_key: Some("bdry_secret_customer".into())
+            }
+        );
+    }
+    #[test]
+    fn destination_bindings_are_a_pair_and_errors_are_actionable() {
+        for table in ["pack", "bridge"] {
+            let kind = if table == "pack" {
+                ArtifactKind::Pack
+            } else {
+                ArtifactKind::Bridge
+            };
+            for bindings in [
+                "BOUNDARY_PROJECT = \"CUSTOM_PROJECT\"",
+                "BOUNDARY_PROJECT = false\nBOUNDARY_API_KEY = false",
+                "BOUNDARY_PROJECT = false\nBOUNDARY_API_KEY = \"CUSTOM_KEY\"",
+                "BOUNDARY_PROJECT = \"CUSTOM_PROJECT\"\nBOUNDARY_API_KEY = false",
+                "BOUNDARY_PROJECT = true\nBOUNDARY_API_KEY = true",
+                "BOUNDARY_PROJECT = 1\nBOUNDARY_API_KEY = 2",
+                "BOUNDARY_PROJECT = [\"CUSTOM_PROJECT\"]\nBOUNDARY_API_KEY = [\"CUSTOM_KEY\"]",
+                "BOUNDARY_PROJECT = \"CUSTOM\"\nBOUNDARY_API_KEY = \"CUSTOM\"",
+                "BOUNDARY_PROJECT = \"A=B\"\nBOUNDARY_API_KEY = \"CUSTOM_KEY\"",
+            ] {
+                let manifest: toml::Value = format!("[{table}.env_var_names]\n{bindings}")
+                    .parse()
+                    .unwrap();
+                assert_eq!(
+                    ArtifactTelemetry::from_manifest(&manifest, kind)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "{table}.env_var_names.BOUNDARY_PROJECT and BOUNDARY_API_KEY must be distinct valid environment-variable names, specified together."
+                    )
+                );
+            }
+        }
+    }
+    #[test]
+    fn empty_destination_values_mean_unset() {
+        let policy = ArtifactTelemetry {
+            project: Some("org/app".into()),
+            ..Default::default()
+        };
+        for value in ["", "  "] {
+            assert_eq!(
+                policy
+                    .select_ingestion_with(|_| Some(value.into()))
+                    .unwrap(),
+                IngestionSelection::Caller {
+                    project: Some("org/app".into()),
+                    api_key: None
+                }
+            );
+        }
+    }
+}

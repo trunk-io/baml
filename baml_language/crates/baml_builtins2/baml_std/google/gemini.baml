@@ -21,7 +21,10 @@ class SafetySetting {
     /// Creates a safety setting pairing a harm `category` with a blocking
     /// `threshold`. Both strings go on the wire verbatim.
     function new(category: string, threshold: string) -> SafetySetting {
-        SafetySetting { category: category, threshold: threshold }
+        SafetySetting {
+            category: category,
+            threshold: threshold,
+        }
     }
 }
 
@@ -68,7 +71,7 @@ class GeminiClient {
     // Sent as `safetySettings`.
     safety_settings: SafetySetting[]?,
 
-    // Record request/response bodies (and raw SSE events) on the LLMCall wire
+    // Record request/response bodies (and raw SSE events) on the ModelCall wire
     // records delivered through on_event. Status, headers, and timing are
     // always recorded; this flag only gates the bodies.
     capture_wire: bool,
@@ -131,7 +134,7 @@ class GeminiClient {
             status_code: null,
             detail: `google needs an API key: pass api_key (a literal or env.NAME), or set one of the variables it consulted — ${ai.wire.credential_sources(self.api_key, "GOOGLE_API_KEY")}`,
             raw_body: null,
-        }
+        };
     }
 
     /// The request-time base URL, or null for the provider default.
@@ -140,12 +143,16 @@ class GeminiClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `google/${self.model}`
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "google"
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            google.internal.preview(self, input) catch_all (e) {
+            root.internal.preview(self, input) catch_all (e) {
                 _ => throw ai.errors.normalize(e),
             }
         }

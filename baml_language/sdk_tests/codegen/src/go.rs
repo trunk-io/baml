@@ -7,7 +7,7 @@
 //! `baml_src`: it is built from a hand-constructed [`SymbolPool`] below,
 //! because the collisions it exercises are not expressible in BAML source.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{env, path::Path};
 
 use baml_base::{Literal, Name as BaseName};
 use baml_sdkgen_types::{
@@ -83,16 +83,64 @@ pub fn run_all(ctx: &CodegenCtx) {
             "baml.local/sdk/baml_sdk",
         );
         stage_output(&ctx.crate_dir, fixture, output);
+        if *fixture == RENAMED_FIXTURE {
+            stage_renamed_sdk(&ctx.crate_dir, &loaded.pool, &loaded.baml_bytecode);
+        }
     }
     stage_package_edges(&ctx.crate_dir);
 }
 
-fn stage_output(crate_dir: &std::path::Path, fixture: &str, output: HashMap<PathBuf, String>) {
+/// This fixture is also generated a second time with `package_name` set,
+/// beside its `baml_sdk/`, so `go test ./...` compiles a renamed SDK and the
+/// fixture's `package_name_test.go` consumes it.
+const RENAMED_FIXTURE: &str = "docstrings_etc";
+const RENAMED_PACKAGE: &str = "docs_sdk";
+
+fn stage_renamed_sdk(crate_dir: &Path, pool: &SymbolPool, baml_bytecode: &[u8]) {
+    let sdk_import_path = format!("baml.local/sdk/{RENAMED_PACKAGE}");
+    let output = sdkgen_go::try_to_source_code_with_bytecode_and_options(
+        pool,
+        baml_bytecode,
+        &sdkgen_go::GoGenOptions {
+            naming_convention: NamingConvention::Language,
+            sdk_import_path: &sdk_import_path,
+            package_name: RENAMED_PACKAGE,
+            max_typed_union_arity: sdkgen_go::DEFAULT_MAX_TYPED_UNION_ARITY,
+        },
+    )
+    .unwrap_or_else(|error| panic!("fixture `{RENAMED_FIXTURE}`: {error}"));
+    write_codegen_output(
+        &crate_dir
+            .join(RENAMED_FIXTURE)
+            .join("generated")
+            .join(RENAMED_PACKAGE),
+        output.files,
+        RENAMED_FIXTURE,
+    );
+}
+
+fn stage_output(crate_dir: &Path, fixture: &str, output: sdkgen_go::Generated) {
+    // Skipped symbols are expected while Go's type coverage grows (stdlib
+    // pools alone skip hundreds), so summarize like the Rust harness does.
+    if !output.warnings.is_empty() {
+        eprintln!(
+            "warning: sdkgen_go skipped {} unsupported symbol(s) in fixture `{fixture}`",
+            output.warnings.len()
+        );
+        // The same debugging switch the Rust harness reads.
+        #[allow(clippy::disallowed_methods)]
+        let list_reasons = env::var_os("SDKGEN_SKIP_REASONS").is_some();
+        if list_reasons {
+            for warning in &output.warnings {
+                eprintln!("  skip {}: {}", warning.fqn, warning.reason);
+            }
+        }
+    }
     let fixture_root = crate_dir.join(fixture);
     let customizable = fixture_root.join("customizable");
     let generated = fixture_root.join("generated");
     let sdk = generated.join("baml_sdk");
-    write_codegen_output(&sdk, output, fixture);
+    write_codegen_output(&sdk, output.files, fixture);
 
     let mut overlay = Overlay::new(&fixture_root);
     // Copied (not symlinked): Go resolves modules by path, and a symlink out of
@@ -106,7 +154,7 @@ fn stage_output(crate_dir: &std::path::Path, fixture: &str, output: HashMap<Path
     overlay.install();
 }
 
-fn stage_package_edges(crate_dir: &std::path::Path) {
+fn stage_package_edges(crate_dir: &Path) {
     let context = Name::new(BaseName::new("context"), vec![], BaseName::new("Thing"));
     let dashed = Name::new(BaseName::new("foo-bar"), vec![], BaseName::new("Thing"));
     let snake = Name::new(BaseName::new("foo_bar"), vec![], BaseName::new("Thing"));
@@ -175,6 +223,12 @@ fn stage_package_edges(crate_dir: &std::path::Path) {
         BaseName::new("user"),
         vec![],
         BaseName::new("StaticFactory"),
+    );
+    let session = Name::new(BaseName::new("reflect"), vec![], BaseName::new("Session"));
+    let round_trip_session = Name::new(
+        BaseName::new("user"),
+        vec![],
+        BaseName::new("round_trip_session"),
     );
     let static_methods = vec![
         synthetic_method(
@@ -384,6 +438,52 @@ fn stage_package_edges(crate_dir: &std::path::Path) {
             true,
         ),
         synthetic_class_with_methods(static_factory, vec![], static_methods),
+        // A real pool declares the capability classes the companions return;
+        // the generator decides how they cross from the declaration.
+        synthetic_capability_class(
+            Name::new(BaseName::new("ai"), vec![], BaseName::new("FunctionSpec")),
+            baml_sdkgen_types::ClassCrossing::FunctionSpec,
+        ),
+        // An opaque class crosses as the engine's reference: a function over
+        // one is generated over the class's reference wrapper.
+        (session.clone(), {
+            let (_, symbol) = synthetic_class_with_methods(session.clone(), vec![], vec![]);
+            let Symbol::Class(mut class) = symbol else {
+                unreachable!("synthetic_class_with_methods builds a class")
+            };
+            class.crossing = baml_sdkgen_types::ClassCrossing::Opaque;
+            Symbol::Class(class)
+        }),
+        (
+            round_trip_session.clone(),
+            Symbol::Function(Function {
+                name: BaseName::new("round_trip_session"),
+                generic_params: vec![],
+                docstring: None,
+                arguments: vec![FunctionArgument {
+                    injected: false,
+                    name: BaseName::new("sessions"),
+                    docstring: None,
+                    ty: Ty::List(Box::new(ty_class(session.clone(), vec![]))),
+                    default: None,
+                }],
+                return_type: ty_union(vec![ty_class(session, vec![]), Ty::Null]),
+                throws: None,
+                watchers: vec![],
+                origin: Origin {
+                    source_file_path: "synthetic.baml".to_string(),
+                    span_start: 0,
+                },
+            }),
+        ),
+        synthetic_capability_class(
+            Name::new(
+                BaseName::new("ai"),
+                vec![BaseName::new("stream")],
+                BaseName::new("Stream"),
+            ),
+            baml_sdkgen_types::ClassCrossing::Stream,
+        ),
     ]);
     let output = sdkgen_go::to_source_code_with_bytecode(
         &pool,
@@ -423,7 +523,7 @@ fn synthetic_defaulted_extract(
             injected: true,
             name: BaseName::new("on_event"),
             docstring: None,
-            ty: ty_union(vec![ty_callable(vec![ty_string()], Ty::Void), Ty::Null]),
+            ty: ty_union(vec![ty_callable(vec![ty_string()], Ty::Null), Ty::Null]),
             default: Some(FunctionArgumentDefault::Null),
         });
     }
@@ -453,6 +553,7 @@ fn synthetic_class_with_methods(
     static_methods: Vec<Function>,
 ) -> (Name, Symbol) {
     let class = Class {
+        crossing: baml_sdkgen_types::ClassCrossing::Fields,
         name: name.clone(),
         generic_params: vec![],
         docstring: None,
@@ -462,6 +563,9 @@ fn synthetic_class_with_methods(
                 name: BaseName::new(name),
                 docstring: None,
                 ty,
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
             })
             .collect(),
         static_methods,
@@ -470,7 +574,23 @@ fn synthetic_class_with_methods(
             source_file_path: "synthetic.baml".to_string(),
             span_start: 0,
         },
+        json_omit_nulls: false,
     };
+    (name, Symbol::Class(class))
+}
+
+/// A generic standard-library class whose crossing is its own: it has no
+/// fields a host reads.
+fn synthetic_capability_class(
+    name: Name,
+    crossing: baml_sdkgen_types::ClassCrossing,
+) -> (Name, Symbol) {
+    let (name, symbol) = synthetic_class_with_methods(name, vec![], vec![]);
+    let Symbol::Class(mut class) = symbol else {
+        unreachable!("synthetic_class_with_methods builds a class")
+    };
+    class.crossing = crossing;
+    class.generic_params = vec![BaseName::new("T")];
     (name, Symbol::Class(class))
 }
 
@@ -511,6 +631,7 @@ fn synthetic_enum(name: Name, variants: &[&str]) -> (Name, Symbol) {
                 name: BaseName::new(*variant),
                 docstring: None,
                 value: (*variant).to_string(),
+                json_rename: None,
             })
             .collect(),
         origin: Origin {

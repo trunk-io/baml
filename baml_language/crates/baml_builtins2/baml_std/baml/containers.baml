@@ -1,7 +1,7 @@
 /// An ordered, growable sequence of `T`.
 ///
 /// `Array<T>` and the `T[]` shorthand are the same type. Values come from an
-/// array literal (`[1, 2, 3]`) or from the `Array.filled` / `Array.generate`
+/// array literal (`[1, 2, 3]`) or from the `baml.Array.filled` / `baml.Array.generate`
 /// constructors below.
 ///
 /// Arrays are heap objects with reference semantics: binding one to a second
@@ -32,7 +32,7 @@ class Array<T> {
     ///
     /// Every slot holds that one `value`, so for a reference type all slots
     /// alias the same object and mutating one slot mutates them all. Use
-    /// `Array.generate` for an independent value per slot.
+    /// `baml.Array.generate` for an independent value per slot.
     ///
     /// # Parameters
     /// - `length`: how many elements to create. Zero or negative produces an
@@ -41,11 +41,11 @@ class Array<T> {
     ///
     /// # Examples
     /// ```baml
-    /// Array.filled(3, 0)     // [0, 0, 0]
-    /// Array.filled(-1, 0)    // []
+    /// baml.Array.filled(3, 0)     // [0, 0, 0]
+    /// baml.Array.filled(-1, 0)    // []
     ///
     /// let shared: int[] = [];
-    /// let rows = Array.filled(3, shared);   // every slot is `shared` itself
+    /// let rows = baml.Array.filled(3, shared);   // every slot is `shared` itself
     /// rows[0].push(1);                      // rows is now [[1], [1], [1]]
     /// ```
     function filled(length: int, value: T) -> T[] throws never {
@@ -54,7 +54,7 @@ class Array<T> {
 
     /// Returns an array of `length` elements, where element `i` is `f(i)`.
     ///
-    /// Unlike `Array.filled`, which reuses one shared value, every slot gets an
+    /// Unlike `baml.Array.filled`, which reuses one shared value, every slot gets an
     /// independent value — the alias-free way to build runtime-sized buffers of
     /// reference types, such as the rows of a grid. This is JavaScript's
     /// [`Array.from({ length }, f)`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/from)
@@ -68,9 +68,9 @@ class Array<T> {
     ///
     /// # Examples
     /// ```baml
-    /// Array.generate(3, (i: int) -> int { i * i })      // [0, 1, 4]
+    /// baml.Array.generate(3, (i: int) -> int { i * i })      // [0, 1, 4]
     /// // A 2D grid whose rows can be mutated independently:
-    /// Array.generate(rows, (r: int) -> int[] { Array.filled(cols, 0) })
+    /// baml.Array.generate(rows, (r: int) -> int[] { baml.Array.filled(cols, 0) })
     /// ```
     function generate<E>(length: int, f: (int) -> T throws E) -> T[] throws E {
         let out: T[] = [];
@@ -84,6 +84,7 @@ class Array<T> {
 
     /// Returns the number of elements. `O(1)` — the length is stored, not
     /// counted.
+    //baml:local_twin
     function length(self) -> int throws never {
         $rust_function
     }
@@ -105,6 +106,7 @@ class Array<T> {
     /// [10, 20, 30].at(-1)   // 30
     /// [10, 20, 30].at(99)   // null
     /// ```
+    //baml:local_twin
     function at(self, index: int) -> T? throws never {
         $rust_function
     }
@@ -112,6 +114,7 @@ class Array<T> {
     /// Appends `item` to the end of the array and returns the new length.
     /// Amortized `O(1)`.
     //baml:mut_self
+    //baml:local_twin
     function push(self, item: T) -> int throws never {
         $rust_function
     }
@@ -123,6 +126,7 @@ class Array<T> {
     /// last element was `null`". Drive a drain loop off `length()` in that
     /// case.
     //baml:mut_self
+    //baml:local_twin
     function pop(self) -> T? throws never {
         $rust_function
     }
@@ -141,17 +145,19 @@ class Array<T> {
     /// xs.remove_at(99)  // null
     /// ```
     //baml:mut_self
+    //baml:local_twin
     function remove_at(self, index: int) -> T? throws never {
         $rust_function
     }
 
     /// Returns the elements of `self` followed by the elements of `other`.
     /// Neither input is mutated.
+    //baml:local_twin
     function concat(self, other: T[]) -> T[] throws never {
         $rust_function
     }
 
-    /// Calls `fn` once for each element, left to right, discarding its result.
+    /// Calls `fn` once for each element, left to right.
     function for_each<E>(self, fn: (T) -> void throws E) -> void throws E {
         for (let x in self.slice(0, self.length())) {
             fn(x);
@@ -201,6 +207,7 @@ class Array<T> {
     /// let reversed = arr.reverse();
     /// assert.equal(reversed, [3, 2, 1]);
     /// ```
+    //baml:local_twin
     function reverse(self) -> T[] throws never {
         $rust_function
     }
@@ -238,7 +245,7 @@ class Array<T> {
     //baml:mut_vm
     //baml:may_yield
     //baml:mut_self
-    function sort_by<E>(self, compare: (T, T) -> baml.ops.Ordering throws E) -> T[] throws E {
+    function sort_by<E>(self, compare: (T, T) -> root.ops.Ordering throws E) -> T[] throws E {
         $rust_function
     }
 
@@ -258,10 +265,9 @@ class Array<T> {
     /// The key type must implement `baml.ops.Compare`, whose ordering is total
     /// and `throws never`, so the only error is the key callback's own `E`.
     //baml:mut_self
-    function sort_by_key<U extends baml.ops.Compare, E>(
-        self,
-        key: (T) -> U throws E,
-    ) -> T[] throws E {
+    function sort_by_key<U extends root.ops.Compare, E>(self, key: (T) -> U throws E) -> T[]
+        throws E
+    {
         let n = self.length();
         if (n <= 1) {
             return self;
@@ -280,11 +286,11 @@ class Array<T> {
             order.push(p);
             p += 1;
         }
-        order.sort_by((i: int, j: int) -> baml.ops.Ordering throws never {
+        order.sort_by((i: int, j: int) -> root.ops.Ordering throws never {
             match (keys.at(i)) {
-                null => baml.ops.Ordering.Equal,
+                null => root.ops.Ordering.Equal,
                 let ki: U => match (keys.at(j)) {
-                    null => baml.ops.Ordering.Equal,
+                    null => root.ops.Ordering.Equal,
                     let kj: U => ki.cmp(kj),
                 },
             }
@@ -322,6 +328,7 @@ class Array<T> {
     /// [1, 2, 3].slice(-2, 3)     // [2, 3]
     /// [1, 2, 3].slice(2, 1)      // []
     /// ```
+    //baml:local_twin
     function slice(self, start: int, end: int) -> T[] throws never {
         $rust_function
     }
@@ -340,17 +347,10 @@ class Array<T> {
     /// [1, 2, 3].join(",")  // "1,2,3"
     /// [true, false, true].join("||")  // "true||false||true"
     /// ```
+    //baml:mut_vm
+    //baml:may_yield
     function join(self, separator: string) -> string throws never {
-        match (self) {
-            [] => "",
-            [let first, ..let rest] => {
-                let joined = string.from(first);
-                for (let item in rest) {
-                    joined = joined + separator + string.from(item);
-                }
-                joined
-            },
-        }
+        $rust_function
     }
 
     /// Applies `f` to each element and returns the results, in order.
@@ -479,52 +479,42 @@ class Array<T> {
     /// Returns `true` if the array contains an element equal to `item`. Scans
     /// left to right, stopping at the first match; `O(n)`.
     ///
-    /// Equality here is a fixed built-in test, *not* the `==` operator. `int`,
-    /// `bool` and `null` compare by value; `float` by IEEE equality, so a `NaN`
-    /// element never matches and `0.0` matches `-0.0`; `string` and
-    /// `uint8array` by content; enum variants by variant identity. Everything
-    /// else — `bigint`, arrays, maps, class instances, `type` values — compares
-    /// by *reference*, so a structurally identical but separately constructed
-    /// value is not found. For `==`'s deep, override-aware comparison, spell it
-    /// out: `self.some((x: T) -> bool { x == item })`.
-    ///
-    /// JavaScript's
-    /// [`includes`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/includes)
-    /// matches `NaN` against itself; this does not.
     ///
     /// # Examples
     /// ```baml
-    /// [1, 2, 3].includes(2)     // true
-    /// ["a", "b"].includes("b")  // true
-    /// [[1]].includes([1])       // false — by reference, though [1] == [1]
     /// ```
-    //baml:vm
     function includes(self, item: T) -> bool throws never {
-        $rust_function
+        for (let element in self) {
+            if (element == item) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Returns the index of the first element equal to `item`, or `null` if
     /// there is none. `O(n)`.
     ///
-    /// Equality is the built-in test described on `includes` — notably *not*
-    /// the `==` operator for `bigint` or for container and class-instance
-    /// elements. JavaScript's `indexOf`, but a miss is `null` rather than `-1`.
     ///
     /// # Examples
     /// ```baml
     /// [10, 20, 30].index_of(20)   // 1
     /// [10, 20].index_of(99)       // null
     /// ```
-    //baml:vm
     function index_of(self, item: T) -> int? throws never {
-        $rust_function
+        let index = 0;
+        for (let element in self) {
+            if (element == item) {
+                return index;
+            }
+            index += 1;
+        }
+        null
     }
 
     /// Returns the index of the last element equal to `item`, or `null` if
     /// there is none.
     ///
-    /// Equality is the built-in test described on `includes`. Scans right to
-    /// left, so it stops early on a match near the end but is `O(n)` in the
     /// worst case.
     ///
     /// # Examples
@@ -532,9 +522,15 @@ class Array<T> {
     /// [10, 20, 10].last_index_of(10)   // 2
     /// [10, 20].last_index_of(99)       // null
     /// ```
-    //baml:vm
     function last_index_of(self, item: T) -> int? throws never {
-        $rust_function
+        let index = self.length() - 1;
+        while (index >= 0) {
+            if (index < self.length() && self[index] == item) {
+                return index;
+            }
+            index -= 1;
+        }
+        null
     }
 
     /// Folds the array into a single value, starting from `initial`.
@@ -583,6 +579,7 @@ class Array<T> {
     /// it observes the empty array too. Rebind to a fresh `[]` to leave the
     /// original alone.
     //baml:mut_self
+    //baml:local_twin
     function clear(self) -> null throws never {
         $rust_function
     }
@@ -601,6 +598,7 @@ class Array<T> {
     /// [].shift()      // null
     /// ```
     //baml:mut_self
+    //baml:local_twin
     function shift(self) -> T? throws never {
         $rust_function
     }
@@ -617,6 +615,7 @@ class Array<T> {
     /// xs              // [1, 2, 3]
     /// ```
     //baml:mut_self
+    //baml:local_twin
     function unshift(self, item: T) -> int throws never {
         $rust_function
     }
@@ -642,6 +641,7 @@ class Array<T> {
     /// xs.insert(0, 100)      // throws — idx beyond length
     /// ```
     //baml:mut_self
+    //baml:local_twin
     function insert(self, item: T, idx: int) -> int throws root.errors.InvalidArgument {
         $rust_function
     }
@@ -676,21 +676,19 @@ class Array<T> {
     /// xs.splice(99, 0, [])         // throws — start out of range
     /// ```
     //baml:mut_self
-    function splice(
-        self,
-        start: int,
-        count: int,
-        replace: T[],
-    ) -> null throws root.errors.InvalidArgument {
+    function splice(self, start: int, count: int, replace: T[]) -> null
+        throws root.errors.InvalidArgument
+    {
         $rust_function
     }
 }
 
 /// An insertion-ordered collection of key-value pairs.
 ///
-/// `Map<K, V>` is spelled `map<K, V>` in type position. `K` must be `string` —
-/// the compiler rejects any other key type — so the type parameter exists for
-/// uniformity rather than choice; convert other keys with `.to_string()` first.
+/// `Map<K, V>` is spelled `map<K, V>` in type position. Keys must implement
+/// `baml.Hash` and `baml.ops.Equals`. Equal keys must hash equally,
+/// and their hash and equality must stay stable while stored in the map.
+/// JSON and SDK boundaries still require string-keyed maps.
 ///
 /// Iteration order is the order in which keys were *first* inserted: `keys()`
 /// and `values()` follow it, `set` on an existing key keeps that key's original
@@ -710,8 +708,9 @@ class Array<T> {
 /// When `V` is nullable, a `null` returned by `get`, `set` or `delete` is
 /// ambiguous between "no such key" and "the key's value is `null`". `has` is
 /// the way to tell the two apart.
-class Map<K, V> {
+class Map<K extends root.Hash & root.ops.Equals, V> {
     /// Returns the number of entries. `O(1)`.
+    //baml:local_twin
     function length(self) -> int throws never {
         $rust_function
     }
@@ -720,7 +719,9 @@ class Map<K, V> {
     ///
     /// Prefer this to `get(key) != null`: a key mapped to `null` is present,
     /// but `get` cannot say so.
-    //baml:vm
+    //baml:mut_vm
+    //baml:may_yield
+    //baml:local_twin
     function has(self, key: K) -> bool throws never {
         $rust_function
     }
@@ -731,6 +732,7 @@ class Map<K, V> {
     /// do not change it, and mutating it does not change the map. Iterating it
     /// while mutating the map is therefore safe.
     //baml:mut_vm
+    //baml:local_twin
     function keys(self) -> K[] throws never {
         $rust_function
     }
@@ -741,6 +743,7 @@ class Map<K, V> {
     /// The array is a snapshot, but the values are not copied: a reference type
     /// is shared with the map, so mutating a value obtained here also mutates
     /// the one the map holds.
+    //baml:local_twin
     function values(self) -> V[] throws never {
         $rust_function
     }
@@ -758,7 +761,10 @@ class Map<K, V> {
     /// m.set("a", 1)         // null  (was absent)
     /// m.set("a", 2)         // 1     (returns the old value)
     /// ```
+    //baml:mut_vm
+    //baml:may_yield
     //baml:mut_self
+    //baml:local_twin
     function set(self, key: K, value: V) -> V? throws never {
         $rust_function
     }
@@ -774,8 +780,18 @@ class Map<K, V> {
     /// m.get("a")     // 1
     /// m.get("b")     // null
     /// ```
-    //baml:vm
+    //baml:mut_vm
+    //baml:may_yield
+    //baml:local_twin
     function get(self, key: K) -> V? throws never {
+        $rust_function
+    }
+
+    /// Reads `key`, raising `baml.panics.MapKeyNotFound` if it is absent.
+    //baml:mut_vm
+    //baml:may_yield
+    //baml:local_twin
+    function index(self, key: K) -> V throws never {
         $rust_function
     }
 
@@ -793,7 +809,10 @@ class Map<K, V> {
     /// m.delete("a")     // 1
     /// m.delete("a")     // null  (already gone)
     /// ```
+    //baml:mut_vm
+    //baml:may_yield
     //baml:mut_self
+    //baml:local_twin
     function delete(self, key: K) -> V? throws never {
         $rust_function
     }
@@ -815,7 +834,10 @@ class Map<K, V> {
     /// m.get_or_insert("k", 10)   // 10  (inserted)
     /// m.get_or_insert("k", 99)   // 10  (existing — `99` ignored)
     /// ```
+    //baml:mut_vm
+    //baml:may_yield
     //baml:mut_self
+    //baml:local_twin
     function get_or_insert(self, key: K, default: V) -> V throws never {
         $rust_function
     }
@@ -826,6 +848,7 @@ class Map<K, V> {
     /// observes the empty map too. Rebind to a fresh `{}` to leave the original
     /// alone.
     //baml:mut_self
+    //baml:local_twin
     function clear(self) -> null throws never {
         $rust_function
     }
@@ -853,52 +876,52 @@ interface Summable {
     function sum(self) -> Self.Sum throws never;
 }
 
-implements Summable for int[] {
-  type Sum = int
+implement Summable for int[] {
+    type Sum = int;
 
-  /// Adds every element left to right starting from `0`, so an empty array
-  /// sums to `0`.
-  ///
-  /// The running total is range-checked at every step, exactly as repeated `+`
-  /// is, so a partial sum that leaves the `int` range panics even when the
-  /// final total would have landed back inside it. Fold with a `bigint`
-  /// accumulator, or map to `float`, when the intermediate values can grow past
-  /// `int`.
-  ///
-  /// # Panics
-  /// - `baml.panics.IntegerOverflow` when a running total leaves the `int`
-  ///   range.
-  ///
-  /// # Examples
-  /// ```baml
-  /// [1, 2, 3].sum()   // 6
-  /// [].sum()          // 0
-  /// ```
-  function sum(self) -> int throws never {
-    root._sum_int(self)
-  }
+    /// Adds every element left to right starting from `0`, so an empty array
+    /// sums to `0`.
+    ///
+    /// The running total is range-checked at every step, exactly as repeated `+`
+    /// is, so a partial sum that leaves the `int` range panics even when the
+    /// final total would have landed back inside it. Fold with a `bigint`
+    /// accumulator, or map to `float`, when the intermediate values can grow past
+    /// `int`.
+    ///
+    /// # Panics
+    /// - `baml.panics.IntegerOverflow` when a running total leaves the `int`
+    ///   range.
+    ///
+    /// # Examples
+    /// ```baml
+    /// [1, 2, 3].sum()   // 6
+    /// [].sum()          // 0
+    /// ```
+    function sum(self) -> int throws never {
+        root._sum_int(self)
+    }
 }
 
-implements Summable for float[] {
-  type Sum = float
+implement Summable for float[] {
+    type Sum = float;
 
-  /// Adds every element left to right starting from `0.0`, so an empty array
-  /// sums to `0.0`.
-  ///
-  /// Plain sequential IEEE 754 addition with no compensation: the result
-  /// depends on the element order, and a `NaN` or infinity anywhere in the
-  /// array propagates to the total. Unlike `int[].sum()` there is no range to
-  /// leave — a total too large to represent becomes an infinity rather than
-  /// panicking.
-  ///
-  /// # Examples
-  /// ```baml
-  /// [1.0, 2.0, 3.0].sum()   // 6.0
-  /// [].sum()                // 0.0
-  /// ```
-  function sum(self) -> float throws never {
-    root._sum_float(self)
-  }
+    /// Adds every element left to right starting from `0.0`, so an empty array
+    /// sums to `0.0`.
+    ///
+    /// Plain sequential IEEE 754 addition with no compensation: the result
+    /// depends on the element order, and a `NaN` or infinity anywhere in the
+    /// array propagates to the total. Unlike `int[].sum()` there is no range to
+    /// leave — a total too large to represent becomes an infinity rather than
+    /// panicking.
+    ///
+    /// # Examples
+    /// ```baml
+    /// [1.0, 2.0, 3.0].sum()   // 6.0
+    /// [].sum()                // 0.0
+    /// ```
+    function sum(self) -> float throws never {
+        root._sum_float(self)
+    }
 }
 
 /// Statistical reductions for `float[]`.
@@ -924,7 +947,7 @@ interface FloatStats {
     function median(self) -> float throws root.errors.InvalidArgument;
 }
 
-implements FloatStats for float[] {
+implement FloatStats for float[] {
     /// Returns the arithmetic mean (average) of `self`.
     ///
     /// Computed as `self.sum() / self.length()` — one sequential IEEE 754 pass
@@ -943,7 +966,9 @@ implements FloatStats for float[] {
     /// ```
     function mean(self) -> float throws root.errors.InvalidArgument {
         if (self.length() == 0) {
-            throw root.errors.InvalidArgument { message: "float[].mean: cannot take the mean of an empty array" };
+            throw root.errors.InvalidArgument {
+                message: "float[].mean: cannot take the mean of an empty array",
+            };
         }
         Summable.sum(self) / self.length()
     }

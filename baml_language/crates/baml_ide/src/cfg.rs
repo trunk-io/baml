@@ -99,7 +99,7 @@ fn ast_test_control_flow_graph_impl(
             let Item::Function(init_function) = item else {
                 continue;
             };
-            if !init_function.name.as_str().starts_with("$init_test") {
+            if !baml_compiler2_ast::is_init_test_function(&init_function.name) {
                 continue;
             }
             let Some(FunctionBodyDef::Expr(registration_body, registration_source_map)) =
@@ -407,11 +407,9 @@ fn expand_user_function_calls_in_graph<'db>(
     }
 }
 
-/// Find the `//#` header comment immediately above a function declaration,
-/// if any. Blank lines and regular `//` comments between the header and
-/// the declaration are skipped; any other code stops the search. If multiple
-/// same-named declarations have different headers, do not guess which one a
-/// name-only call resolved to.
+/// The `//#` title of the function `function_name` names, read from its
+/// item data. If several same-named declarations carry different titles,
+/// do not guess which one a name-only call resolved to.
 fn function_header_title(
     db: &dyn baml_compiler2_hir::Db,
     files: &[SourceFile],
@@ -429,14 +427,11 @@ fn function_header_title(
             ) {
                 continue;
             }
-            let func_span = baml_compiler2_hir::item_data::function_source_map(db, func_loc).span;
-            let text = source_file.text(db);
-            let start = usize::from(func_span.start()).min(text.len());
-            if let Some(title) = header_title_above(&text[..start]) {
+            if let Some(title) = &func_data.header_title {
                 match &unique_title {
-                    Some(existing) if existing != &title => return None,
+                    Some(existing) if existing != title => return None,
                     Some(_) => {}
-                    None => unique_title = Some(title),
+                    None => unique_title = Some(title.clone()),
                 }
             }
         }
@@ -448,11 +443,9 @@ fn function_header_title_for_loc(
     db: &dyn baml_compiler2_hir::Db,
     func_loc: baml_compiler2_hir::loc::FunctionLoc<'_>,
 ) -> Option<String> {
-    let source_file = func_loc.file(db);
-    let func_span = baml_compiler2_hir::item_data::function_source_map(db, func_loc).span;
-    let text = source_file.text(db);
-    let start = usize::from(func_span.start()).min(text.len());
-    header_title_above(&text[..start])
+    baml_compiler2_hir::item_data::function_data(db, func_loc)
+        .header_title
+        .clone()
 }
 
 fn find_function_loc<'db>(
@@ -493,8 +486,8 @@ fn function_display_name(
             format!("{}.{}", iface.name, data.name)
         }
         Some(MethodOwner::Impl(block)) => {
-            // Same owner rendering as hover (`info.rs`): the impl's
-            // for-target is the subject a reader knows the method by.
+            // The impl's for-target is the subject a reader knows the method
+            // by, spelled canonically: a playground name has no reader.
             match baml_compiler2_hir_ty::impls::impl_facts(db, block)
                 .resolved()
                 .map(|facts| crate::render::display_owner_ty(db, &facts.for_ty_pattern.to_plain()))
@@ -644,13 +637,7 @@ fn resolved_call_function<'db>(
     use baml_compiler2_hir::loc::DeclRef;
     use baml_compiler2_hir_ty::infer::{MemberResolution, MethodCallee};
 
-    let resolution = inference.member_resolutions.get(&callee).or_else(|| {
-        inference
-            .path_resolutions
-            .get(&callee)
-            .and_then(|path| path.segments.last())
-            .and_then(|segment| segment.resolution.as_ref())
-    });
+    let resolution = inference.callee_resolution(callee);
 
     match resolution {
         Some(
@@ -672,6 +659,7 @@ fn resolved_call_function<'db>(
                 MethodCallee::Virtual {
                     interface: DeclRef::Source(interface),
                     method,
+                    ..
                 },
             ..
         }) => {
@@ -732,15 +720,7 @@ fn dispatch_bindings_for_call(
         Expr::Call { callee, .. } | Expr::OptionalCall { callee, .. } => Some(*callee),
         _ => None,
     };
-    let resolution = callee_expr.and_then(|callee_expr| {
-        inference.member_resolutions.get(&callee_expr).or_else(|| {
-            inference
-                .path_resolutions
-                .get(&callee_expr)
-                .and_then(|path| path.segments.last())
-                .and_then(|segment| segment.resolution.as_ref())
-        })
-    });
+    let resolution = callee_expr.and_then(|callee_expr| inference.callee_resolution(callee_expr));
     // Call plans index only the arguments provided by the caller. A BOUND
     // access's declared `self` parameter is implicit, so shift those
     // indices back into the declaration's full parameter list; an unbound
@@ -985,7 +965,7 @@ fn source_span_for_range(
     }
     let end_offset: u32 = range.end().into();
     let end_offset = end_offset.min(len);
-    let line_index = crate::line_index::LineIndex::new(text);
+    let line_index = baml_base::line_index::LineIndex::new(text);
     let (line, column) = line_index.offset_to_position(start_offset)?;
     let (end_line, end_column) = line_index
         .offset_to_position(end_offset)
@@ -1001,32 +981,6 @@ fn source_span_for_range(
         end_line,
         end_column,
     })
-}
-
-/// Scan backwards through the source text that precedes a declaration and
-/// return the title of the nearest `//#` header comment, if it is separated
-/// from the declaration only by blank lines and regular `//` comments.
-fn header_title_above(before: &str) -> Option<String> {
-    for line in before.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix("//") else {
-            // Reached code — no header directly above the declaration.
-            return None;
-        };
-        if let Some(title) = rest.strip_prefix('#') {
-            let title = title.trim_start_matches('#').trim();
-            if title.is_empty() {
-                return None;
-            }
-            return Some(title.to_string());
-        }
-        // Regular `//` or `///` comment between the header and the
-        // declaration — keep scanning upwards.
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1776,7 +1730,7 @@ prompt: `Summarize ${input}`
             std::path::Path::new("/cfg-test/ns_workflows/workflow.baml"),
             r#"
 function Workflow(input: string) -> string {
-prompts.Summarize(input)
+root.workflows.prompts.Summarize(input)
 }
 "#,
         );
@@ -1786,7 +1740,7 @@ prompts.Summarize(input)
         let call_node = graph
             .nodes
             .values()
-            .find(|node| node.label == "prompts.Summarize(input)")
+            .find(|node| node.label == "root.workflows.prompts.Summarize(input)")
             .expect("caller graph should contain the cross-namespace LLM call node");
         assert!(
             matches!(call_node.node_type, NodeType::LlmFunction),
@@ -2102,30 +2056,6 @@ test "renders workflow" {
             graph.nodes,
             prepared.nodes
         );
-    }
-
-    #[test]
-    fn test_header_title_above() {
-        assert_eq!(
-            header_title_above("//# process stuff\n"),
-            Some("process stuff".to_string())
-        );
-        assert_eq!(
-            header_title_above("//# process stuff\n\n// note\n/// docs\n"),
-            Some("process stuff".to_string()),
-            "blank lines and comments between header and declaration are skipped"
-        );
-        assert_eq!(
-            header_title_above("//## nested level\n"),
-            Some("nested level".to_string())
-        );
-        assert_eq!(
-            header_title_above("//# old header\n}\n"),
-            None,
-            "code between the header and the declaration stops the search"
-        );
-        assert_eq!(header_title_above("// just a comment\n"), None);
-        assert_eq!(header_title_above(""), None);
     }
 
     #[test]

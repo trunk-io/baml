@@ -25,18 +25,22 @@
 //! backend; it only appears in the S15 differential sweep.
 
 pub mod callable;
+pub mod cleanup;
 pub mod coherence;
 pub mod defaults;
 pub mod diagnostics;
 pub mod exhaustiveness;
 pub mod extern_loc;
 pub mod facts;
+pub mod globals;
 pub mod ide;
 pub mod impls;
 pub mod infer;
 pub mod init_io;
 pub mod interfaces;
+pub mod json_attrs;
 pub mod layout;
+pub mod llm_output;
 pub mod lower;
 pub mod method_resolution;
 pub mod ops;

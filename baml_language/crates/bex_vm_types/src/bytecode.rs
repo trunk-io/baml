@@ -1,6 +1,9 @@
 //! Instruction set and bytecode representation.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use baml_base::Span;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -664,9 +667,10 @@ pub enum Instruction {
     /// function. Arguments are popped from the eval stack (arity from
     /// the callee's metadata, same as `ScheduleFuture`).
     ///
-    /// Yields `VmExecState::SysOp { operation, args }`. The engine runs
-    /// the operation, races it against the active cancel token, and
-    /// pushes the resulting value back on the stack before resuming.
+    /// Yields `VmExecState::SysOp { operation, args, return_type }`. The
+    /// engine runs the operation, races it against the active cancel token,
+    /// admits the result to the op's declared return type, and pushes it
+    /// back on the stack before resuming.
     /// No `Object::Future` is allocated and no `FutureManager` entry is
     /// created — sys-ops are not user-observable futures in BAML, so
     /// the schedule + await pair is pure overhead.
@@ -686,8 +690,10 @@ pub enum Instruction {
     /// Like `Await`, the VM yields `VmExecState::AwaitAny(ids)` to the engine
     /// when none of the inputs have settled yet; the engine parks until the
     /// first wakes, then re-executes this opcode, which now finds a settled
-    /// future and pushes its index. The combinators (`race`, `any`) are pure
-    /// BAML built on top of this.
+    /// future. Before pushing its index the VM yields
+    /// `VmExecState::Checkpoint` once, so the thread's own cancellation is
+    /// delivered here even when an input settled first. The combinators
+    /// (`race`, `any`) are pure BAML built on top of this.
     AwaitAny,
 
     /// Call a statically-known global function.
@@ -824,7 +830,10 @@ pub enum Instruction {
 
     /// Pops and tests the top value, stores it in `destination` on success,
     /// and pushes the `Bool` result.
-    NarrowBind { ty: usize, destination: usize },
+    NarrowBind {
+        ty: usize,
+        destination: usize,
+    },
 
     /// Materialise a `Ty` from a constant-pool `TyTemplate`, substituting
     /// any `TypeArgRef(n)` leaves with `frame.type_args[n]`.
@@ -852,16 +861,6 @@ pub enum Instruction {
     ///
     /// Memory per switch scales with K (arms), not N (total classes).
     DenseTag(usize),
-
-    /// If the caught value is a panic instance (`baml.panics.*`), re-throw it
-    /// with the `baml.errors.Context` it was caught with. Otherwise pop both and
-    /// continue to the next instruction.
-    ///
-    /// Stack: `[value, context]` -> `[]` (continues) or unwinds (throws)
-    ///
-    /// Used in catch handlers before wildcard arms to prevent them from
-    /// swallowing panics the programmer didn't explicitly name.
-    ThrowIfPanic,
 
     /// Halt execution with an unreachable code error.
     ///
@@ -1067,6 +1066,155 @@ pub enum Instruction {
     /// cancel tokens, its cancellation parent, and the future's types, so
     /// nothing else travels with the request.
     Spawn,
+    /// Direct call to a declaration with a trace hook; same operands as Call.
+    CallHooked {
+        callee: GlobalIndex,
+        ntypeargs: u16,
+    },
+    /// Enter hook evaluation; false avoids allocating a Settings snapshot.
+    BeginTraceHook(bool),
+    /// Apply the returned options and start target recording.
+    EndTraceHook,
+    TraceHookHidden,
+    TraceHookTiming,
+    TraceHookSpan,
+    /// Legacy opcode retained so existing serialized bytecode keeps its meaning.
+    TraceHookRich,
+    TraceHookEmptySpan,
+
+    /// Whether a type satisfies an interface bound, the check a
+    /// `let type T extends I = …` statement makes. Pops the bound (an
+    /// `Object::Type` of the interface constraint: its head, its type
+    /// arguments, and only the associated types the bound pins), then the
+    /// type, and pushes a bool. Pinned associated types must match; the
+    /// others are free. As for a generic parameter's bound, only a concrete
+    /// type can satisfy it.
+    SatisfiesBound,
+
+    /// Create a bound method from a global function index and a receiver,
+    /// with the callee's frame type arguments supplied by the reference site
+    /// instead of curried from the receiver: pops the receiver, then
+    /// `ntypeargs` `Object::Type` values, and pushes an `Object::BoundMethod`
+    /// whose `type_args` are exactly those types. The form that binds an
+    /// interface's default body to `self` inside an `implements` block
+    /// (`default.m` as a value), whose `[Self, interface args..]` frame the
+    /// receiver's class arguments cannot express.
+    ///
+    /// Stack: `[type_args..., receiver]` -> `[bound_method]`
+    MakeGenericBoundMethod {
+        /// Global index of the function.
+        function: GlobalIndex,
+        /// Number of `Object::Type` values on the stack (below the receiver)
+        /// to pop into `type_args`.
+        ntypeargs: u16,
+    },
+
+    /// Joins `n` strings into one, left to right: pops them and pushes the
+    /// result, in one step rather than `n - 1` `+`s.
+    ///
+    /// Stack: `[s1, ..., sn]` -> `[s1 + ... + sn]`
+    ConcatStrings(usize),
+
+    /// [`Self::LoadArrayElement`] on an array escape analysis proved no
+    /// other thread can reach: reads without the container's lock.
+    LoadArrayElementLocal,
+    /// [`Self::StoreArrayElement`] on a thread-local array, without the lock.
+    StoreArrayElementLocal,
+    /// [`Self::ContainerLen`] on a thread-local container, without the lock.
+    ContainerLenLocal,
+    /// [`Self::Call`] of a builtin whose receiver escape analysis proved
+    /// thread-local: takes the builtin's lock-free twin when it has one.
+    CallLocal {
+        callee: GlobalIndex,
+        ntypeargs: u16,
+    },
+    /// [`Self::LoadField`] of an instance escape analysis proved no other
+    /// thread can reach: a relaxed load, which needs no barrier.
+    LoadFieldLocal(usize),
+    /// [`Self::StoreField`] into a thread-local instance: a relaxed store.
+    StoreFieldLocal(usize),
+    /// One step of `for` over an array, compiled as an index walk: with the
+    /// array in local `iterator` and the next index in local `index`, push
+    /// the element and advance, or push a `baml.iter.Done` at the end. The
+    /// length is re-read each step, as `ArrayIterator.next` does.
+    ArrayIterNext {
+        iterator: usize,
+        index: usize,
+    },
+    /// [`Self::ArrayIterNext`] over a thread-local array, without its lock.
+    ArrayIterNextLocal {
+        iterator: usize,
+        index: usize,
+    },
+    /// `x == null`: pops a value and pushes whether it is `null`. `null` is
+    /// the one value of its kind and never equal to anything else, so this is
+    /// the whole of `baml.ops.equals_equals(x, null)`.
+    ///
+    /// Stack: `[value]` -> `[bool]`
+    IsNull,
+    /// `x != null`: [`Self::IsNull`], negated.
+    ///
+    /// Stack: `[value]` -> `[bool]`
+    IsNotNull,
+    /// `a == b` through `callee`, the `baml.ops.equals_equals` driver, with
+    /// the pairs that need no driver decided in place: identical values,
+    /// primitives, strings, floats, operands of different kinds, and two
+    /// variants of an enum whose equality is the structural default. Every
+    /// other pair calls `callee` exactly as [`Self::Call`] would, with the
+    /// same two value arguments and no type arguments.
+    ///
+    /// Stack: `[a, b]` -> `[bool]`
+    CallEquals(GlobalIndex),
+
+    // ── Local-operand superinstructions ───────────────────────────────────
+    // Fused at emit time, within one basic block, from the shapes the
+    // speedtest workloads execute most. Each behaves exactly like the
+    // sequence it replaces, raising the same errors. Declared last: this
+    // enum is Borsh-serialized by variant ordinal, so new variants append.
+    /// Fused `LoadVar(src); LoadIntSmall(value); AddInt; StoreVar(dst)`:
+    /// `local[dst] = local[src] + value`, with `AddInt`'s overflow check.
+    /// The shape of `i += 1`.
+    AddLocalSmall(usize, usize, i8),
+    /// Fused `LoadVar(slot); LoadField(field)`: push field `field` of the
+    /// instance in `local[slot]`.
+    LoadVarField(usize, usize),
+    /// Fused `LoadVar(slot); LoadFieldLocal(field)`.
+    LoadVarFieldLocal(usize, usize),
+    /// Fused `LoadVar2(a, b); CmpIntOp(cmp); PopJumpIfTrue(offset)`: jump by
+    /// `offset` when the int comparison `local[a] cmp local[b]` holds. A
+    /// fused `PopJumpIfFalse` stores the negated comparison, which for ints
+    /// is exact. Ticks the early-yield counter like the branch it replaces.
+    /// The shape of a loop or `if` test on two locals.
+    JumpIfLocalsCmp {
+        cmp: CmpOp,
+        a: usize,
+        b: usize,
+        offset: isize,
+    },
+    /// Fused `LoadVar(a); LoadConst(constant); CmpIntOp(cmp); PopJumpIf*`:
+    /// as [`Instruction::JumpIfLocalsCmp`], against an int constant.
+    JumpIfLocalConstCmp {
+        cmp: CmpOp,
+        a: usize,
+        constant: usize,
+        offset: isize,
+    },
+
+    AllocTuple(usize),
+
+    LoadTupleField(usize),
+
+    /// `Status.X`: pushes variant `variant` of the enum at object index
+    /// `enum_obj`, in one step rather than `LoadConst` of the variant index
+    /// followed by [`Self::AllocVariant`]. A compile-time enum hands out its
+    /// shared variant object (`Enum::shared_variants`); an enum created at
+    /// runtime has none and allocates one, exactly as `AllocVariant` does.
+    ///
+    /// Stack: `[]` -> `[variant]`
+    LoadVariant {
+        enum_obj: ObjectIndex,
+        variant: usize,
+    },
 }
 
 /// Compact bytecode opcodes.
@@ -1088,7 +1236,6 @@ pub enum OpCode {
     CallIndirect,
     Discriminant,
     TypeTag,
-    ThrowIfPanic,
     Unreachable,
     MakeCell,
     SendEvent,
@@ -1266,18 +1413,92 @@ pub enum OpCode {
     JumpIfNotNullOrPop,
 
     /// Load-time specialization of `Call` for a plain bytecode function whose
-    /// arguments already match its parameters, with no type arguments. Uses
-    /// the same u32 global + u16 zero operands as `Call`, preserving every PC.
+    /// arguments already match its parameters and that receives every type
+    /// argument it declares. Uses the same u32 global + u16 type-argument
+    /// count operands as `Call`, preserving every PC. A type operand that is
+    /// not a plain static type falls back to the general `Call` path at run
+    /// time.
     /// This opcode is never emitted into serialized `Instruction` streams.
     CallExactArgs,
     SetCallTrace,
 
     // The plan-taking spawn, appended to preserve serialized discriminants.
     Spawn,
+    CallHooked,
+    BeginTraceHook,
+    EndTraceHook,
+    TraceHookHidden,
+    TraceHookTiming,
+    TraceHookSpan,
+    // Preserve the legacy discriminant; new compilers select Span or EmptySpan.
+    TraceHookRich,
+    TraceHookEmptySpan,
+    // The `let type` bound check, appended to preserve serialized
+    // discriminants.
+    SatisfiesBound,
+    // Bound method over an explicit frame (u32 function global + u16
+    // ntypeargs), appended to preserve serialized discriminants.
+    MakeGenericBoundMethod,
+    // N-ary string concatenation (u32 count), appended to preserve serialized
+    // discriminants.
+    ConcatStrings,
+
+    /// Resume a compiled body through a stub appended at load time, never serialized.
+    ResumeCompiled,
+
+    // Lock-free container access for thread-local containers, appended to
+    // preserve discriminants.
+    LoadArrayElementLocal,
+    StoreArrayElementLocal,
+    ContainerLenLocal,
+    // u32 callee + u16 ntypeargs, like `Call`.
+    CallLocal,
+    // u32 field index, like `LoadField` / `StoreField`.
+    LoadFieldLocal,
+    StoreFieldLocal,
+    // u32 iterator slot + u32 index slot; appended to preserve discriminants.
+    ArrayIterNext,
+    ArrayIterNextLocal,
+    // `== null` / `!= null`, no operands; appended to preserve discriminants.
+    IsNull,
+    IsNotNull,
+    // `==` with inline fast paths: u32 driver global, like `SysOp`.
+    CallEquals,
+    // Local-operand superinstructions, appended to preserve discriminants.
+    // u32 destination slot + u32 source slot + i8 addend.
+    AddLocalSmall,
+    // u32 local slot + u32 field index.
+    LoadVarField,
+    LoadVarFieldLocal,
+    // u8 `CmpInt*` opcode + u32 local slot + u32 local slot / constant index
+    // + i32 offset from the end of the instruction.
+    JumpIfLocalsCmp,
+    JumpIfLocalConstCmp,
+
+    /// Appended last to keep every earlier opcode byte stable.
+    AllocTuple,
+    LoadTupleField,
+    // `Status.X` in one step: u32 enum object index + u32 variant index.
+    // Appended to preserve discriminants.
+    LoadVariant,
 }
 
 impl OpCode {
     /// Total encoded size in bytes (opcode + operands).
+    /// Whether the instruction ends with a [`FieldSites`] index.
+    #[must_use]
+    pub const fn has_field_site(self) -> bool {
+        matches!(
+            self,
+            Self::LoadField
+                | Self::StoreField
+                | Self::LoadFieldLocal
+                | Self::StoreFieldLocal
+                | Self::LoadVarField
+                | Self::LoadVarFieldLocal
+        )
+    }
+
     pub const fn encoded_size(self) -> usize {
         match self {
             // Unit ops + expanded arith/cmp/unary + LoadNull/LoadTrue/LoadFalse
@@ -1293,7 +1514,6 @@ impl OpCode {
             | Self::SetCallTrace
             | Self::Discriminant
             | Self::TypeTag
-            | Self::ThrowIfPanic
             | Self::Unreachable
             | Self::MakeCell
             | Self::SendEvent
@@ -1370,13 +1590,14 @@ impl OpCode {
             | Self::StoreVarLoadVar
             | Self::LoadGlobal
             | Self::StoreGlobal
-            | Self::LoadField
-            | Self::StoreField
             | Self::InitField
             | Self::InitSpread
             | Self::Pop
             | Self::Copy
             | Self::AllocArray
+            | Self::ConcatStrings
+            | Self::AllocTuple
+            | Self::LoadTupleField
             | Self::AllocMap
             | Self::InitInstance
             | Self::AllocVariant
@@ -1399,7 +1620,8 @@ impl OpCode {
             | Self::JumpIfTrueOrPop
             | Self::JumpIfNotNullOrPop
             | Self::VirtualLoadField
-            | Self::VirtualStoreField => 5,
+            | Self::VirtualStoreField
+            | Self::CallEquals => 5,
 
             // 7-byte: opcode + u16 nargs + u16 ntypeargs + u16 self_arg
             Self::VirtualCall => 7,
@@ -1412,7 +1634,26 @@ impl OpCode {
             | Self::MakeVirtualFunction => 3,
 
             // 7-byte: opcode + u32 + u16 (type-arg threading)
-            Self::AllocInstance | Self::Call | Self::CallExactArgs | Self::MakeGenericFunction => 7,
+            Self::CallHooked | Self::CallLocal => 7,
+            Self::BeginTraceHook => 2,
+            Self::EndTraceHook
+            | Self::TraceHookHidden
+            | Self::TraceHookTiming
+            | Self::TraceHookSpan
+            | Self::TraceHookRich
+            | Self::TraceHookEmptySpan
+            | Self::SatisfiesBound
+            | Self::ResumeCompiled
+            | Self::LoadArrayElementLocal
+            | Self::StoreArrayElementLocal
+            | Self::ContainerLenLocal
+            | Self::IsNull
+            | Self::IsNotNull => 1,
+            Self::AllocInstance
+            | Self::Call
+            | Self::CallExactArgs
+            | Self::MakeGenericFunction
+            | Self::MakeGenericBoundMethod => 7,
 
             // 9-byte: opcode + u32 + u16 + u16 (closure with capture+typearg counts)
             Self::MakeClosure => 9,
@@ -1421,7 +1662,24 @@ impl OpCode {
             Self::JumpTable => 9,
 
             // 9-byte: opcode + u32 + u32 (operand-movement superinstructions)
-            Self::LoadVar2 | Self::StoreVar2 | Self::NarrowBind => 9,
+            Self::LoadVar2
+            | Self::StoreVar2
+            | Self::NarrowBind
+            | Self::ArrayIterNext
+            | Self::ArrayIterNextLocal
+            | Self::LoadVariant => 9,
+
+            // 7-byte: opcode + u32 field + u16 field site
+            Self::LoadField | Self::StoreField | Self::LoadFieldLocal | Self::StoreFieldLocal => 7,
+
+            // 11-byte: opcode + u32 slot + u32 field + u16 field site
+            Self::LoadVarField | Self::LoadVarFieldLocal => 11,
+
+            // 10-byte: opcode + u32 + u32 + i8
+            Self::AddLocalSmall => 10,
+
+            // 14-byte: opcode + u8 comparison + u32 + u32 + i32 offset
+            Self::JumpIfLocalsCmp | Self::JumpIfLocalConstCmp => 14,
         }
     }
 }
@@ -1447,7 +1705,6 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Discriminant as u8 => Ok(Self::Discriminant),
             x if x == Self::TypeTag as u8 => Ok(Self::TypeTag),
             x if x == Self::LoadCurrentPackage as u8 => Ok(Self::LoadCurrentPackage),
-            x if x == Self::ThrowIfPanic as u8 => Ok(Self::ThrowIfPanic),
             x if x == Self::Unreachable as u8 => Ok(Self::Unreachable),
             x if x == Self::MakeCell as u8 => Ok(Self::MakeCell),
             x if x == Self::SendEvent as u8 => Ok(Self::SendEvent),
@@ -1524,6 +1781,7 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Pop as u8 => Ok(Self::Pop),
             x if x == Self::Copy as u8 => Ok(Self::Copy),
             x if x == Self::AllocArray as u8 => Ok(Self::AllocArray),
+            x if x == Self::ConcatStrings as u8 => Ok(Self::ConcatStrings),
             x if x == Self::AllocMap as u8 => Ok(Self::AllocMap),
             x if x == Self::AllocInstance as u8 => Ok(Self::AllocInstance),
             x if x == Self::InitInstance as u8 => Ok(Self::InitInstance),
@@ -1563,8 +1821,39 @@ impl TryFrom<u8> for OpCode {
 
             x if x == Self::NarrowBind as u8 => Ok(Self::NarrowBind),
             x if x == Self::Truthy as u8 => Ok(Self::Truthy),
+            x if x == Self::CallHooked as u8 => Ok(Self::CallHooked),
+            x if x == Self::BeginTraceHook as u8 => Ok(Self::BeginTraceHook),
+            x if x == Self::EndTraceHook as u8 => Ok(Self::EndTraceHook),
+            x if x == Self::TraceHookHidden as u8 => Ok(Self::TraceHookHidden),
+            x if x == Self::TraceHookTiming as u8 => Ok(Self::TraceHookTiming),
+            x if x == Self::TraceHookSpan as u8 => Ok(Self::TraceHookSpan),
+            x if x == Self::TraceHookRich as u8 => Ok(Self::TraceHookRich),
+            x if x == Self::TraceHookEmptySpan as u8 => Ok(Self::TraceHookEmptySpan),
+            x if x == Self::SatisfiesBound as u8 => Ok(Self::SatisfiesBound),
+            x if x == Self::MakeGenericBoundMethod as u8 => Ok(Self::MakeGenericBoundMethod),
+            x if x == Self::ResumeCompiled as u8 => Ok(Self::ResumeCompiled),
+            x if x == Self::LoadArrayElementLocal as u8 => Ok(Self::LoadArrayElementLocal),
+            x if x == Self::StoreArrayElementLocal as u8 => Ok(Self::StoreArrayElementLocal),
+            x if x == Self::ContainerLenLocal as u8 => Ok(Self::ContainerLenLocal),
+            x if x == Self::CallLocal as u8 => Ok(Self::CallLocal),
+            x if x == Self::LoadFieldLocal as u8 => Ok(Self::LoadFieldLocal),
+            x if x == Self::ArrayIterNext as u8 => Ok(Self::ArrayIterNext),
+            x if x == Self::ArrayIterNextLocal as u8 => Ok(Self::ArrayIterNextLocal),
+            x if x == Self::AddLocalSmall as u8 => Ok(Self::AddLocalSmall),
+            x if x == Self::LoadVarField as u8 => Ok(Self::LoadVarField),
+            x if x == Self::LoadVarFieldLocal as u8 => Ok(Self::LoadVarFieldLocal),
+            x if x == Self::JumpIfLocalsCmp as u8 => Ok(Self::JumpIfLocalsCmp),
+            x if x == Self::JumpIfLocalConstCmp as u8 => Ok(Self::JumpIfLocalConstCmp),
+            x if x == Self::StoreFieldLocal as u8 => Ok(Self::StoreFieldLocal),
+            x if x == Self::IsNull as u8 => Ok(Self::IsNull),
+            x if x == Self::IsNotNull as u8 => Ok(Self::IsNotNull),
+            x if x == Self::CallEquals as u8 => Ok(Self::CallEquals),
+
             x if x == Self::CallExactArgs as u8 => Ok(Self::CallExactArgs),
             x if x == Self::SetCallTrace as u8 => Ok(Self::SetCallTrace),
+            x if x == Self::AllocTuple as u8 => Ok(Self::AllocTuple),
+            x if x == Self::LoadTupleField as u8 => Ok(Self::LoadTupleField),
+            x if x == Self::LoadVariant as u8 => Ok(Self::LoadVariant),
             _ => Err(byte),
         }
     }
@@ -1573,6 +1862,33 @@ impl TryFrom<u8> for OpCode {
 impl std::fmt::Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::CallHooked => "CALL_HOOKED",
+            Self::BeginTraceHook => "BEGIN_TRACE_HOOK",
+            Self::EndTraceHook => "END_TRACE_HOOK",
+            Self::TraceHookHidden => "TRACE_HOOK_HIDDEN",
+            Self::TraceHookTiming => "TRACE_HOOK_TIMING",
+            Self::TraceHookSpan => "TRACE_HOOK_SPAN",
+            Self::TraceHookRich => "TRACE_HOOK_RICH",
+            Self::TraceHookEmptySpan => "TRACE_HOOK_EMPTY_SPAN",
+            Self::SatisfiesBound => "SATISFIES_BOUND",
+            Self::ResumeCompiled => "RESUME_COMPILED",
+            Self::LoadArrayElementLocal => "LOAD_ARRAY_ELEMENT_LOCAL",
+            Self::StoreArrayElementLocal => "STORE_ARRAY_ELEMENT_LOCAL",
+            Self::ContainerLenLocal => "CONTAINER_LEN_LOCAL",
+            Self::CallLocal => "CALL_LOCAL",
+            Self::LoadFieldLocal => "LOAD_FIELD_LOCAL",
+            Self::ArrayIterNext => "ARRAY_ITER_NEXT",
+            Self::ArrayIterNextLocal => "ARRAY_ITER_NEXT_LOCAL",
+            Self::AddLocalSmall => "ADD_LOCAL_SMALL",
+            Self::LoadVarField => "LOAD_VAR_FIELD",
+            Self::LoadVarFieldLocal => "LOAD_VAR_FIELD_LOCAL",
+            Self::JumpIfLocalsCmp => "JUMP_IF_LOCALS_CMP",
+            Self::JumpIfLocalConstCmp => "JUMP_IF_LOCAL_CONST_CMP",
+            Self::StoreFieldLocal => "STORE_FIELD_LOCAL",
+            Self::IsNull => "IS_NULL",
+            Self::IsNotNull => "IS_NOT_NULL",
+            Self::CallEquals => "CALL_EQUALS",
+
             Self::Return => "RETURN",
             Self::Await => "AWAIT",
             Self::AwaitAny => "AWAIT_ANY",
@@ -1595,7 +1911,6 @@ impl std::fmt::Display for OpCode {
             Self::TypeTag => "TYPE_TAG",
             Self::LoadCurrentPackage => "LOAD_CURRENT_PACKAGE",
             Self::Truthy => "TRUTHY",
-            Self::ThrowIfPanic => "THROW_IF_PANIC",
             Self::Unreachable => "UNREACHABLE",
             Self::MakeCell => "MAKE_CELL",
             Self::SendEvent => "SEND_EVENT",
@@ -1672,10 +1987,14 @@ impl std::fmt::Display for OpCode {
             Self::Pop => "POP",
             Self::Copy => "COPY",
             Self::AllocArray => "ALLOC_ARRAY",
+            Self::ConcatStrings => "CONCAT_STRINGS",
+            Self::AllocTuple => "ALLOC_TUPLE",
+            Self::LoadTupleField => "LOAD_TUPLE_FIELD",
             Self::AllocMap => "ALLOC_MAP",
             Self::AllocInstance => "ALLOC_INSTANCE",
             Self::InitInstance => "INIT_INSTANCE",
             Self::AllocVariant => "ALLOC_VARIANT",
+            Self::LoadVariant => "LOAD_VARIANT",
             Self::SysOp => "SYS_OP",
 
             Self::Spawn => "SPAWN",
@@ -1702,6 +2021,7 @@ impl std::fmt::Display for OpCode {
             Self::JumpTable => "JUMP_TABLE",
             Self::MakeClosure => "MAKE_CLOSURE",
             Self::MakeGenericFunction => "MAKE_GENERIC_FUNCTION",
+            Self::MakeGenericBoundMethod => "MAKE_GENERIC_BOUND_METHOD",
             Self::MakeGenericFunctionFromValue => "MAKE_GENERIC_FUNCTION_FROM_VALUE",
             Self::LoadVar2 => "LOAD_VAR2",
             Self::StoreVar2 => "STORE_VAR2",
@@ -1793,6 +2113,33 @@ impl std::fmt::Display for BinOp {
     }
 }
 
+impl CmpOp {
+    /// The comparison that holds exactly when this one does not, for ints.
+    #[must_use]
+    pub const fn negated_int(self) -> Self {
+        match self {
+            Self::Eq => Self::NotEq,
+            Self::NotEq => Self::Eq,
+            Self::Lt => Self::GtEq,
+            Self::LtEq => Self::Gt,
+            Self::Gt => Self::LtEq,
+            Self::GtEq => Self::Lt,
+        }
+    }
+
+    /// The `CmpInt*` opcode that applies this comparison to two ints.
+    pub const fn int_opcode(self) -> OpCode {
+        match self {
+            Self::Eq => OpCode::CmpIntEq,
+            Self::NotEq => OpCode::CmpIntNotEq,
+            Self::Lt => OpCode::CmpIntLt,
+            Self::LtEq => OpCode::CmpIntLtEq,
+            Self::Gt => OpCode::CmpIntGt,
+            Self::GtEq => OpCode::CmpIntGtEq,
+        }
+    }
+}
+
 impl std::fmt::Display for CmpOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -1829,6 +2176,8 @@ impl std::fmt::Display for Instruction {
             Instruction::VirtualLoadField(i) => write!(f, "VIRTUAL_LOAD_FIELD {i}"),
             Instruction::VirtualStoreField(i) => write!(f, "VIRTUAL_STORE_FIELD {i}"),
             Instruction::StoreField(i) => write!(f, "STORE_FIELD {i}"),
+            Instruction::LoadFieldLocal(i) => write!(f, "LOAD_FIELD_LOCAL {i}"),
+            Instruction::StoreFieldLocal(i) => write!(f, "STORE_FIELD_LOCAL {i}"),
             Instruction::InitField(i) => write!(f, "INIT_FIELD {i}"),
             Instruction::InitSpread(i) => write!(f, "INIT_SPREAD {i}"),
             Instruction::Pop(n) => write!(f, "POP {n}"),
@@ -1866,6 +2215,9 @@ impl std::fmt::Display for Instruction {
             Instruction::CmpBigintOp(op) => write!(f, "CMP_BIGINT_OP {op}"),
             Instruction::UnaryOp(op) => write!(f, "UNARY_OP {op}"),
             Instruction::AllocArray(n) => write!(f, "ALLOC_ARRAY {n}"),
+            Instruction::ConcatStrings(n) => write!(f, "CONCAT_STRINGS {n}"),
+            Instruction::AllocTuple(n) => write!(f, "ALLOC_TUPLE {n}"),
+            Instruction::LoadTupleField(i) => write!(f, "LOAD_TUPLE_FIELD {i}"),
             Instruction::LoadArrayElement => f.write_str("LOAD_ARRAY_ELEMENT"),
             Instruction::LoadMapElement => f.write_str("LOAD_MAP_ELEMENT"),
             Instruction::StoreArrayElement => f.write_str("STORE_ARRAY_ELEMENT"),
@@ -1878,20 +2230,46 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::InitInstance(i) => write!(f, "INIT_INSTANCE {i}"),
             Instruction::AllocVariant(i) => write!(f, "ALLOC_VARIANT {i}"),
+            Instruction::LoadVariant { enum_obj, variant } => {
+                write!(f, "LOAD_VARIANT {enum_obj} {variant}")
+            }
             Instruction::SysOp(callee) => write!(f, "SYS_OP {callee}"),
 
             Instruction::Spawn => write!(f, "SPAWN"),
             Instruction::Await => f.write_str("AWAIT"),
             Instruction::AwaitAny => f.write_str("AWAIT_ANY"),
+            Instruction::BeginTraceHook(settings) => write!(f, "BEGIN_TRACE_HOOK {settings}"),
+            Instruction::EndTraceHook => f.write_str("END_TRACE_HOOK"),
+            Instruction::TraceHookHidden => f.write_str("TRACE_HOOK_HIDDEN"),
+            Instruction::TraceHookTiming => f.write_str("TRACE_HOOK_TIMING"),
+            Instruction::TraceHookSpan => f.write_str("TRACE_HOOK_SPAN"),
+            Instruction::TraceHookRich => f.write_str("TRACE_HOOK_RICH"),
+            Instruction::TraceHookEmptySpan => f.write_str("TRACE_HOOK_EMPTY_SPAN"),
+            Instruction::SatisfiesBound => f.write_str("SATISFIES_BOUND"),
+
+            Instruction::CallHooked { callee, ntypeargs } => {
+                write!(f, "CALL_HOOKED {callee} {ntypeargs}")
+            }
             Instruction::Call { callee, ntypeargs } => {
                 write!(f, "CALL {callee} ntypeargs={ntypeargs}")
             }
-
+            Instruction::CallLocal { callee, ntypeargs } => {
+                write!(f, "CALL_LOCAL {callee} ntypeargs={ntypeargs}")
+            }
             Instruction::MakeGenericFunction {
                 function,
                 ntypeargs,
             } => {
                 write!(f, "MAKE_GENERIC_FUNCTION {function} ntypeargs={ntypeargs}")
+            }
+            Instruction::MakeGenericBoundMethod {
+                function,
+                ntypeargs,
+            } => {
+                write!(
+                    f,
+                    "MAKE_GENERIC_BOUND_METHOD {function} ntypeargs={ntypeargs}"
+                )
             }
             Instruction::MakeGenericFunctionFromValue { ntypeargs } => {
                 write!(f, "MAKE_GENERIC_FUNCTION_FROM_VALUE ntypeargs={ntypeargs}")
@@ -1934,7 +2312,6 @@ impl std::fmt::Display for Instruction {
             Instruction::LoadType(i) => write!(f, "LOAD_TYPE {i}"),
             Instruction::BindType(i) => write!(f, "BIND_TYPE {i}"),
             Instruction::DenseTag(i) => write!(f, "DENSE_TAG {i}"),
-            Instruction::ThrowIfPanic => f.write_str("THROW_IF_PANIC"),
             Instruction::Unreachable => f.write_str("UNREACHABLE"),
             Instruction::MakeClosure {
                 obj_idx,
@@ -1964,8 +2341,39 @@ impl std::fmt::Display for Instruction {
             Instruction::CaptureRef(idx) => write!(f, "CAPTURE_REF {idx}"),
             Instruction::SendEvent => f.write_str("SEND_EVENT"),
             Instruction::ContainerLen => f.write_str("CONTAINER_LEN"),
+            Instruction::LoadArrayElementLocal => f.write_str("LOAD_ARRAY_ELEMENT_LOCAL"),
+            Instruction::StoreArrayElementLocal => f.write_str("STORE_ARRAY_ELEMENT_LOCAL"),
+            Instruction::ContainerLenLocal => f.write_str("CONTAINER_LEN_LOCAL"),
             Instruction::LoadVar2(a, b) => write!(f, "LOAD_VAR2 {a} {b}"),
+            Instruction::ArrayIterNext { iterator, index } => {
+                write!(f, "ARRAY_ITER_NEXT {iterator} {index}")
+            }
+            Instruction::ArrayIterNextLocal { iterator, index } => {
+                write!(f, "ARRAY_ITER_NEXT_LOCAL {iterator} {index}")
+            }
             Instruction::StoreVar2(a, b) => write!(f, "STORE_VAR2 {a} {b}"),
+            Instruction::IsNull => f.write_str("IS_NULL"),
+            Instruction::IsNotNull => f.write_str("IS_NOT_NULL"),
+            Instruction::CallEquals(callee) => write!(f, "CALL_EQUALS {callee}"),
+            Instruction::AddLocalSmall(dst, src, value) => {
+                write!(f, "ADD_LOCAL_SMALL {dst} {src} {value}")
+            }
+            Instruction::LoadVarField(slot, field) => write!(f, "LOAD_VAR_FIELD {slot} {field}"),
+            Instruction::LoadVarFieldLocal(slot, field) => {
+                write!(f, "LOAD_VAR_FIELD_LOCAL {slot} {field}")
+            }
+            Instruction::JumpIfLocalsCmp { cmp, a, b, offset } => {
+                write!(f, "JUMP_IF_LOCALS_CMP {a} {cmp} {b} {offset:+}")
+            }
+            Instruction::JumpIfLocalConstCmp {
+                cmp,
+                a,
+                constant,
+                offset,
+            } => write!(
+                f,
+                "JUMP_IF_LOCAL_CONST_CMP {a} {cmp} const {constant} {offset:+}"
+            ),
         }
     }
 }
@@ -1985,6 +2393,7 @@ pub enum OperandMeta {
     /// `LoadGlobal`, `StoreGlobal` — display value.
     Global(String),
     /// `AllocInstance`, `AllocVariant` — class/enum name.
+    /// `LoadVariant` carries [`Self::Const`] with `Enum.Variant` instead.
     Object(String),
     /// `LoadConst` — display value.
     Const(String),
@@ -2048,17 +2457,22 @@ pub struct DebugLocalScope {
 /// transfers control to `handler_pc`, with the exception value stored
 /// in the frame-local slot `error_slot`.
 ///
+/// Each catch clause has its own handler PC, including clauses written in a
+/// chain. The first clause's handler body is protected by the next clause's
+/// handler, just as for explicitly nested catches. A function's table stores
+/// the distinct clauses' entries together; they are never flattened into one
+/// dispatch handler.
+///
 /// One catch region contributes one entry per coalesced run of its protected
 /// blocks (block layout can fragment a region across non-contiguous PCs), so
-/// several entries may share a `handler_pc`. Entries are stably sorted by
-/// `start_pc`; the VM picks the innermost covering entry by largest
-/// `start_pc`, then smallest `end_pc`, then latest table order (identical
-/// ranges are emitted outer-region-first).
+/// several entries may share a `handler_pc`. Each emitted block records its
+/// innermost unwind target, giving disjoint ranges sorted by `start_pc`.
+/// Adjacent ranges coalesce only when they name the same handler.
 ///
 /// All exceptions (user-thrown values and VM panics) are routed to the
-/// handler. The handler bytecode is responsible for filtering: a
-/// `ThrowIfPanic` instruction before wildcard arms rethrows panics the
-/// programmer didn't explicitly name.
+/// handler. The handler bytecode is responsible for filtering: a wildcard arm
+/// that does not trap panics is entered only after an `IsType` test against
+/// the `PANIC` pseudo-tag, and a value no arm takes is `Rethrow`n.
 #[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ExceptionTableEntry {
     /// First protected instruction (inclusive).
@@ -2087,6 +2501,17 @@ pub struct ShieldRange {
     pub start_pc: usize,
     /// Exclusive.
     pub end_pc: usize,
+}
+
+/// Instruction indices for a MIR block, with `None` for positions that emit no instruction.
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct BlockPcs {
+    /// Each statement's final instruction, at its use site for deferred computations.
+    pub statements: Vec<Option<usize>>,
+    /// The terminator's instruction, if it calls, suspends, raises or returns.
+    pub terminator: Option<usize>,
+    /// The block's first instruction.
+    pub start: Option<usize>,
 }
 
 /// Whether `pc` lies in one of `ranges` (sorted, non-overlapping).
@@ -2148,6 +2573,56 @@ impl CompactJumpTable {
     }
 }
 
+/// One word per field instruction of a function, remembering the class of
+/// the instance it last read or wrote and how that field is stored: the
+/// class's bits with the field's two-bit kind code above the valid bit 0.
+/// Only classes that never move are remembered, so an entry never names a
+/// different class. Zero is empty.
+#[derive(Debug, Default)]
+pub struct FieldSites(Box<[AtomicU64]>);
+
+impl FieldSites {
+    /// The site index of an instruction past the last one a function can
+    /// remember.
+    pub const NONE: u16 = u16::MAX;
+
+    fn new(len: usize) -> Self {
+        Self((0..len).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// The entry for site `site`, if it has one.
+    #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub fn get(&self, site: usize) -> Option<&AtomicU64> {
+        self.0.get(site)
+    }
+
+    /// The kind code site `entry` holds for an instance of class `class`.
+    #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub fn hit(entry: u64, class: u64) -> Option<u64> {
+        (entry & !0b111 == class).then_some((entry >> 1) & 0b11)
+    }
+
+    /// The entry remembering `kind_code` for instances of class `class`.
+    #[must_use]
+    pub fn entry(class: u64, kind_code: u64) -> u64 {
+        class | kind_code << 1 | 1
+    }
+
+    pub fn remember(entry: &AtomicU64, class: u64, kind_code: u64) {
+        entry.store(Self::entry(class, kind_code), Ordering::Relaxed);
+    }
+}
+
+impl Clone for FieldSites {
+    fn clone(&self) -> Self {
+        Self::new(self.0.len())
+    }
+}
+
 /// Compact bytecode encoding.
 ///
 /// A re-encoding of `Vec<Instruction>` as `Vec<u8>` with 1-byte opcodes and
@@ -2155,6 +2630,8 @@ impl CompactJumpTable {
 /// load time. The line table and exception table are translated to byte-offset PCs.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct CompactCode {
+    /// Hook decision boundary (fallback continuation for callable hooks), loaded once.
+    pub trace_hook_finish_pc: Option<usize>,
     /// The encoded instruction stream.
     pub code: Vec<u8>,
     /// `Bytecode::call_layouts` keyed by byte-offset PC.
@@ -2172,9 +2649,34 @@ pub struct CompactCode {
     /// Jump tables with offsets translated to byte offsets.
     /// Parallel to `Bytecode::jump_tables`.
     pub jump_tables: Vec<CompactJumpTable>,
+    /// Instruction byte offsets retained by [`Bytecode::lower_to_compact_with_offsets`].
+    pub instruction_offsets: Vec<usize>,
+    /// The most operand values a frame running this code holds above its
+    /// locals, proven by [`Bytecode::verify_stack`]; a frame reserves that
+    /// many slots on entry. Code not lowered by [`Bytecode::lower_verified`]
+    /// carries [`crate::stack_effect::UNVERIFIED_MAX_STACK`], which fails
+    /// that reservation.
+    pub max_stack: usize,
+    /// The slots a frame running this code reserves past its arguments: its
+    /// locals plus [`Self::max_stack`], kept as one field for the call path.
+    /// Unverified code carries [`crate::stack_effect::UNVERIFIED_MAX_STACK`].
+    pub frame_slots: usize,
+    /// Debug builds: the verified operand depth before the instruction at
+    /// each byte offset ([`crate::stack_effect::NO_DEPTH`] elsewhere), which
+    /// the dispatch loop asserts against the live stack.
+    #[cfg(debug_assertions)]
+    pub operand_depths: Vec<u32>,
+    /// The field sites the encoded field instructions name.
+    #[borsh(skip)]
+    pub field_sites: FieldSites,
 }
 
 impl CompactCode {
+    /// The byte-offset PC of instruction `index`, when the offsets were kept.
+    pub fn offset_of(&self, index: usize) -> Option<usize> {
+        self.instruction_offsets.get(index).copied()
+    }
+
     /// Get the source mapping entry for a byte-offset PC.
     pub fn line_entry_for_pc(&self, pc: usize) -> Option<&LineTableEntry> {
         if self.line_table.is_empty() {
@@ -2195,23 +2697,6 @@ impl CompactCode {
         pc: usize,
     ) -> impl Iterator<Item = &ExceptionTableEntry> {
         self.exception_table
-            .iter()
-            .filter(move |e| pc >= e.start_pc && pc < e.end_pc)
-    }
-
-    /// The innermost handler-body range (byte-offset) covering `pc`, or `None`.
-    /// BEP-042 cause-chain pre-walk: a throw here is "during handling of" the
-    /// error whose `baml.errors.Context` lives in the entry's `context_slot`.
-    /// Innermost = largest `handler_pc` among covering ranges.
-    pub fn handler_context_for_pc(&self, pc: usize) -> Option<&HandlerContextEntry> {
-        self.handler_contexts_for_pc(pc)
-            .max_by_key(|e| e.handler_pc)
-    }
-
-    /// Every handler whose body covers `pc`: the handlers active there,
-    /// innermost and enclosing alike.
-    pub fn handler_contexts_for_pc(&self, pc: usize) -> impl Iterator<Item = &HandlerContextEntry> {
-        self.handler_context_table
             .iter()
             .filter(move |e| pc >= e.start_pc && pc < e.end_pc)
     }
@@ -2286,6 +2771,10 @@ pub struct Bytecode {
     /// Sorted by `start_pc`, non-overlapping. See [`ShieldRange`].
     pub shield_table: Vec<ShieldRange>,
 
+    /// Compile-time instruction positions indexed by MIR `BlockId`, empty after deserialization.
+    #[borsh(skip)]
+    pub block_pcs: Vec<BlockPcs>,
+
     /// Compact bytecode encoding. Populated at engine load time by
     /// `lower_to_compact()`. `None` until lowering runs.
     #[borsh(skip)]
@@ -2313,6 +2802,7 @@ impl Bytecode {
             meta: Vec::new(),
             exception_table: Vec::new(),
             shield_table: Vec::new(),
+            block_pcs: Vec::new(),
             handler_context_table: Vec::new(),
             compact: None,
         }
@@ -2346,23 +2836,6 @@ impl Bytecode {
             .filter(move |e| pc >= e.start_pc && pc < e.end_pc)
     }
 
-    /// The innermost handler-body range covering `pc`, or `None`.
-    /// BEP-042 cause-chain pre-walk: a throw here is "during handling of" the
-    /// error whose `baml.errors.Context` lives in the entry's `context_slot`.
-    /// Innermost = largest `handler_pc` among covering ranges.
-    pub fn handler_context_for_pc(&self, pc: usize) -> Option<&HandlerContextEntry> {
-        self.handler_contexts_for_pc(pc)
-            .max_by_key(|e| e.handler_pc)
-    }
-
-    /// Every handler whose body covers `pc`: the handlers active there,
-    /// innermost and enclosing alike.
-    pub fn handler_contexts_for_pc(&self, pc: usize) -> impl Iterator<Item = &HandlerContextEntry> {
-        self.handler_context_table
-            .iter()
-            .filter(move |e| pc >= e.start_pc && pc < e.end_pc)
-    }
-
     /// Whether the instruction at index `pc` runs shielded from cancellation.
     pub fn pc_is_shielded(&self, pc: usize) -> bool {
         pc_in_ranges(&self.shield_table, pc)
@@ -2377,13 +2850,25 @@ impl Bytecode {
     ///    from instruction-index-relative to byte-offset-relative.
     ///
     /// Also translates `line_table` and `exception_table` PCs to byte offsets.
+    pub fn lower_to_compact(&self) -> CompactCode {
+        self.lower_with_layout(false).0
+    }
+
+    /// Lower to compact bytecode and retain [`CompactCode::instruction_offsets`].
+    pub fn lower_to_compact_with_offsets(&self) -> CompactCode {
+        self.lower_with_layout(true).0
+    }
+
     #[allow(
         clippy::cast_possible_wrap,
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation,
         clippy::cast_lossless
     )]
-    pub fn lower_to_compact(&self) -> CompactCode {
+    /// Lower to compact code, also returning each instruction's byte offset
+    /// (with the end of the code as a last entry). The code's `max_stack` is
+    /// unverified; see [`Self::lower_verified`].
+    pub(crate) fn lower_with_layout(&self, keep_offsets: bool) -> (CompactCode, Vec<usize>) {
         let n = self.instructions.len();
         // index_to_offset[i] = byte offset of instruction i
         // index_to_offset[n] = total byte count (sentinel for end-of-code)
@@ -2403,6 +2888,7 @@ impl Bytecode {
 
         // ── Pass 2: emit bytes ───────────────────────────────────────
         let mut code: Vec<u8> = Vec::with_capacity(byte_offset);
+        let mut field_sites: usize = 0;
 
         for (i, instr) in self.instructions.iter().enumerate() {
             let op = opcodes[i];
@@ -2410,7 +2896,14 @@ impl Bytecode {
 
             match instr {
                 // ── Unit ops: no operands ────────────────────────────
-                Instruction::Return
+                Instruction::SatisfiesBound
+                | Instruction::EndTraceHook
+                | Instruction::TraceHookHidden
+                | Instruction::TraceHookTiming
+                | Instruction::TraceHookSpan
+                | Instruction::TraceHookRich
+                | Instruction::TraceHookEmptySpan
+                | Instruction::Return
                 | Instruction::Await
                 | Instruction::Throw
                 | Instruction::Rethrow
@@ -2422,11 +2915,15 @@ impl Bytecode {
                 | Instruction::SetCallTrace
                 | Instruction::Discriminant
                 | Instruction::TypeTag
-                | Instruction::ThrowIfPanic
                 | Instruction::Unreachable
                 | Instruction::MakeCell
                 | Instruction::SendEvent
                 | Instruction::ContainerLen
+                | Instruction::LoadArrayElementLocal
+                | Instruction::StoreArrayElementLocal
+                | Instruction::ContainerLenLocal
+                | Instruction::IsNull
+                | Instruction::IsNotNull
                 | Instruction::Spawn
                 | Instruction::AwaitAny => {}
 
@@ -2490,12 +2987,17 @@ impl Bytecode {
                 | Instruction::VirtualLoadField(v)
                 | Instruction::VirtualStoreField(v)
                 | Instruction::StoreField(v)
+                | Instruction::LoadFieldLocal(v)
+                | Instruction::StoreFieldLocal(v)
                 | Instruction::InitField(v)
                 | Instruction::InitSpread(v)
                 | Instruction::InitInstance(v)
                 | Instruction::Pop(v)
                 | Instruction::Copy(v)
                 | Instruction::AllocArray(v)
+                | Instruction::ConcatStrings(v)
+                | Instruction::AllocTuple(v)
+                | Instruction::LoadTupleField(v)
                 | Instruction::AllocMap(v)
                 | Instruction::IsType(v)
                 | Instruction::DenseTag(v)
@@ -2516,6 +3018,7 @@ impl Bytecode {
                 Instruction::LoadGlobal(g)
                 | Instruction::StoreGlobal(g)
                 | Instruction::SysOp(g)
+                | Instruction::CallEquals(g)
                 | Instruction::MakeBoundMethod(g) => {
                     code.extend_from_slice(
                         &u32::try_from(g.into_raw())
@@ -2525,7 +3028,10 @@ impl Bytecode {
                 }
 
                 // ── Call: u32 callee + u16 ntypeargs ─────────────────
-                Instruction::Call { callee, ntypeargs } => {
+                Instruction::BeginTraceHook(settings) => code.push(u8::from(*settings)),
+                Instruction::CallHooked { callee, ntypeargs }
+                | Instruction::Call { callee, ntypeargs }
+                | Instruction::CallLocal { callee, ntypeargs } => {
                     code.extend_from_slice(
                         &u32::try_from(callee.into_raw())
                             .expect("global index fits u32")
@@ -2534,8 +3040,13 @@ impl Bytecode {
                     code.extend_from_slice(&ntypeargs.to_le_bytes());
                 }
 
-                // ── MakeGenericFunction: u32 function + u16 ntypeargs ─
+                // ── MakeGenericFunction / MakeGenericBoundMethod: u32
+                // function + u16 ntypeargs ─
                 Instruction::MakeGenericFunction {
+                    function,
+                    ntypeargs,
+                }
+                | Instruction::MakeGenericBoundMethod {
                     function,
                     ntypeargs,
                 } => {
@@ -2578,6 +3089,20 @@ impl Bytecode {
                     );
                 }
 
+                // ── LoadVariant: u32 enum object + u32 variant ──────
+                Instruction::LoadVariant { enum_obj, variant } => {
+                    code.extend_from_slice(
+                        &u32::try_from(enum_obj.into_raw())
+                            .expect("object index fits u32")
+                            .to_le_bytes(),
+                    );
+                    code.extend_from_slice(
+                        &u32::try_from(*variant)
+                            .expect("variant index fits u32")
+                            .to_le_bytes(),
+                    );
+                }
+
                 // ── AllocInstance: u32 class_obj + u16 ntypeargs ────
                 Instruction::AllocInstance {
                     class_obj,
@@ -2608,6 +3133,34 @@ impl Bytecode {
                     let target_byte = index_to_offset[target_instr];
                     // In compact bytecode, offset is relative to the end of
                     // this instruction (after all operand bytes are read).
+                    let instr_end = index_to_offset[i] + op.encoded_size();
+                    let byte_delta = target_byte as i64 - instr_end as i64;
+                    code.extend_from_slice(&(byte_delta as i32).to_le_bytes());
+                }
+
+                // ── Compare-and-branch superinstructions ────────────
+                Instruction::JumpIfLocalsCmp {
+                    cmp,
+                    a,
+                    b: rhs,
+                    offset,
+                }
+                | Instruction::JumpIfLocalConstCmp {
+                    cmp,
+                    a,
+                    constant: rhs,
+                    offset,
+                } => {
+                    code.push(cmp.int_opcode() as u8);
+                    code.extend_from_slice(
+                        &u32::try_from(*a).expect("operand fits u32").to_le_bytes(),
+                    );
+                    code.extend_from_slice(
+                        &u32::try_from(*rhs).expect("operand fits u32").to_le_bytes(),
+                    );
+                    // As for the plain jumps: the instruction offset is from
+                    // this instruction, the byte offset from its end.
+                    let target_byte = index_to_offset[(i as isize + offset) as usize];
                     let instr_end = index_to_offset[i] + op.encoded_size();
                     let byte_delta = target_byte as i64 - instr_end as i64;
                     code.extend_from_slice(&(byte_delta as i32).to_le_bytes());
@@ -2653,13 +3206,33 @@ impl Bytecode {
                 }
 
                 // ── Operand-movement superinstructions: two u32 operands ──
-                Instruction::LoadVar2(a, b) | Instruction::StoreVar2(a, b) => {
+                Instruction::LoadVar2(a, b)
+                | Instruction::StoreVar2(a, b)
+                | Instruction::LoadVarField(a, b)
+                | Instruction::LoadVarFieldLocal(a, b)
+                | Instruction::ArrayIterNext {
+                    iterator: a,
+                    index: b,
+                }
+                | Instruction::ArrayIterNextLocal {
+                    iterator: a,
+                    index: b,
+                } => {
                     code.extend_from_slice(
                         &u32::try_from(*a).expect("operand fits u32").to_le_bytes(),
                     );
                     code.extend_from_slice(
                         &u32::try_from(*b).expect("operand fits u32").to_le_bytes(),
                     );
+                }
+                Instruction::AddLocalSmall(dst, src, value) => {
+                    code.extend_from_slice(
+                        &u32::try_from(*dst).expect("operand fits u32").to_le_bytes(),
+                    );
+                    code.extend_from_slice(
+                        &u32::try_from(*src).expect("operand fits u32").to_le_bytes(),
+                    );
+                    code.extend_from_slice(&value.to_le_bytes());
                 }
                 Instruction::NarrowBind { ty, destination } => {
                     code.extend_from_slice(
@@ -2673,6 +3246,14 @@ impl Bytecode {
                             .to_le_bytes(),
                     );
                 }
+            }
+            if op.has_field_site() {
+                let site = u16::try_from(field_sites)
+                    .ok()
+                    .filter(|&site| site != FieldSites::NONE)
+                    .unwrap_or(FieldSites::NONE);
+                code.extend_from_slice(&site.to_le_bytes());
+                field_sites += 1;
             }
         }
 
@@ -2781,7 +3362,22 @@ impl Bytecode {
             })
             .collect();
 
-        CompactCode {
+        let compact = CompactCode {
+            trace_hook_finish_pc: self
+                .instructions
+                .iter()
+                .position(|instruction| {
+                    matches!(
+                        instruction,
+                        Instruction::EndTraceHook
+                            | Instruction::TraceHookHidden
+                            | Instruction::TraceHookTiming
+                            | Instruction::TraceHookSpan
+                            | Instruction::TraceHookRich
+                            | Instruction::TraceHookEmptySpan
+                    )
+                })
+                .map(|index| index_to_offset[index]),
             code,
             call_layouts: self
                 .call_layouts
@@ -2793,7 +3389,18 @@ impl Bytecode {
             handler_context_table,
             shield_table,
             jump_tables,
-        }
+            field_sites: FieldSites::new(field_sites.min(usize::from(FieldSites::NONE))),
+            instruction_offsets: if keep_offsets {
+                index_to_offset.clone()
+            } else {
+                Vec::new()
+            },
+            max_stack: crate::stack_effect::UNVERIFIED_MAX_STACK,
+            frame_slots: crate::stack_effect::UNVERIFIED_MAX_STACK,
+            #[cfg(debug_assertions)]
+            operand_depths: Vec::new(),
+        };
+        (compact, index_to_offset)
     }
 
     /// Determine the compact opcode for an instruction.
@@ -2819,11 +3426,23 @@ impl Bytecode {
 
             Instruction::Discriminant => OpCode::Discriminant,
             Instruction::TypeTag => OpCode::TypeTag,
-            Instruction::ThrowIfPanic => OpCode::ThrowIfPanic,
             Instruction::Unreachable => OpCode::Unreachable,
             Instruction::MakeCell => OpCode::MakeCell,
             Instruction::SendEvent => OpCode::SendEvent,
             Instruction::ContainerLen => OpCode::ContainerLen,
+            Instruction::LoadArrayElementLocal => OpCode::LoadArrayElementLocal,
+            Instruction::StoreArrayElementLocal => OpCode::StoreArrayElementLocal,
+            Instruction::ContainerLenLocal => OpCode::ContainerLenLocal,
+            Instruction::CallLocal { .. } => OpCode::CallLocal,
+            Instruction::LoadFieldLocal(_) => OpCode::LoadFieldLocal,
+            Instruction::ArrayIterNext { .. } => OpCode::ArrayIterNext,
+            Instruction::ArrayIterNextLocal { .. } => OpCode::ArrayIterNextLocal,
+            Instruction::AddLocalSmall(..) => OpCode::AddLocalSmall,
+            Instruction::LoadVarField(..) => OpCode::LoadVarField,
+            Instruction::LoadVarFieldLocal(..) => OpCode::LoadVarFieldLocal,
+            Instruction::JumpIfLocalsCmp { .. } => OpCode::JumpIfLocalsCmp,
+            Instruction::JumpIfLocalConstCmp { .. } => OpCode::JumpIfLocalConstCmp,
+            Instruction::StoreFieldLocal(_) => OpCode::StoreFieldLocal,
             Instruction::LoadVar2(..) => OpCode::LoadVar2,
             Instruction::StoreVar2(..) => OpCode::StoreVar2,
 
@@ -2878,13 +3497,30 @@ impl Bytecode {
             Instruction::Pop(_) => OpCode::Pop,
             Instruction::Copy(_) => OpCode::Copy,
             Instruction::AllocArray(_) => OpCode::AllocArray,
+            Instruction::ConcatStrings(_) => OpCode::ConcatStrings,
+            Instruction::AllocTuple(_) => OpCode::AllocTuple,
+            Instruction::LoadTupleField(_) => OpCode::LoadTupleField,
             Instruction::AllocMap(_) => OpCode::AllocMap,
             Instruction::AllocInstance { .. } => OpCode::AllocInstance,
             Instruction::InitInstance(_) => OpCode::InitInstance,
             Instruction::AllocVariant(_) => OpCode::AllocVariant,
+            Instruction::LoadVariant { .. } => OpCode::LoadVariant,
             Instruction::SysOp(_) => OpCode::SysOp,
+            Instruction::IsNull => OpCode::IsNull,
+            Instruction::IsNotNull => OpCode::IsNotNull,
+            Instruction::CallEquals(_) => OpCode::CallEquals,
 
             Instruction::Spawn => OpCode::Spawn,
+            Instruction::CallHooked { .. } => OpCode::CallHooked,
+            Instruction::BeginTraceHook(_) => OpCode::BeginTraceHook,
+            Instruction::EndTraceHook => OpCode::EndTraceHook,
+            Instruction::TraceHookHidden => OpCode::TraceHookHidden,
+            Instruction::TraceHookTiming => OpCode::TraceHookTiming,
+            Instruction::TraceHookSpan => OpCode::TraceHookSpan,
+            Instruction::TraceHookRich => OpCode::TraceHookRich,
+            Instruction::TraceHookEmptySpan => OpCode::TraceHookEmptySpan,
+            Instruction::SatisfiesBound => OpCode::SatisfiesBound,
+
             Instruction::Call { .. } => OpCode::Call,
 
             Instruction::IsType(_) => OpCode::IsType,
@@ -2920,14 +3556,7 @@ impl Bytecode {
             Instruction::BitXorBigint => OpCode::BitXorBigint,
             Instruction::ShlBigint => OpCode::ShlBigint,
             Instruction::ShrBigint => OpCode::ShrBigint,
-            Instruction::CmpIntOp(op) => match op {
-                CmpOp::Eq => OpCode::CmpIntEq,
-                CmpOp::NotEq => OpCode::CmpIntNotEq,
-                CmpOp::Lt => OpCode::CmpIntLt,
-                CmpOp::LtEq => OpCode::CmpIntLtEq,
-                CmpOp::Gt => OpCode::CmpIntGt,
-                CmpOp::GtEq => OpCode::CmpIntGtEq,
-            },
+            Instruction::CmpIntOp(op) => op.int_opcode(),
             Instruction::CmpFloatOp(op) => match op {
                 CmpOp::Eq => OpCode::CmpFloatEq,
                 CmpOp::NotEq => OpCode::CmpFloatNotEq,
@@ -2958,6 +3587,7 @@ impl Bytecode {
             Instruction::JumpTable(_) => OpCode::JumpTable,
             Instruction::MakeClosure { .. } => OpCode::MakeClosure,
             Instruction::MakeGenericFunction { .. } => OpCode::MakeGenericFunction,
+            Instruction::MakeGenericBoundMethod { .. } => OpCode::MakeGenericBoundMethod,
             Instruction::MakeGenericFunctionFromValue { .. } => {
                 OpCode::MakeGenericFunctionFromValue
             }
@@ -2997,6 +3627,7 @@ mod compact_tests {
             meta,
             exception_table: Vec::new(),
             shield_table: Vec::new(),
+            block_pcs: Vec::new(),
             handler_context_table: Vec::new(),
             compact: None,
         }
@@ -3207,6 +3838,26 @@ mod compact_tests {
     }
 
     #[test]
+    fn block_pcs_are_compile_time_only() {
+        let mut bytecode = make_bytecode(vec![Instruction::Return], vec![]);
+        let without_positions = borsh::to_vec(&bytecode).unwrap();
+        bytecode.block_pcs.push(BlockPcs {
+            statements: vec![Some(0)],
+            terminator: Some(0),
+            start: Some(0),
+        });
+        let serialized = borsh::to_vec(&bytecode).unwrap();
+        assert_eq!(serialized, without_positions);
+        let restored: Bytecode = borsh::from_slice(&serialized).unwrap();
+        assert!(restored.block_pcs.is_empty());
+        assert_eq!(restored.instructions, bytecode.instructions);
+        assert_eq!(
+            restored.lower_to_compact_with_offsets().instruction_offsets,
+            vec![0, 1]
+        );
+    }
+
+    #[test]
     fn trace_call_prefix_survives_serialization() {
         let bytecode = make_bytecode(
             vec![
@@ -3331,10 +3982,25 @@ mod compact_tests {
         assert_eq!(compact.code[10], OpCode::Return as u8);
     }
 
-    /// A wrong `encoded_size` silently desynchronizes the instruction stream: the
-    /// decoder reads the next opcode from the middle of an operand. The offset
-    /// table is built from `encoded_size` while the bytes are written by
-    /// `lower_to_compact`, so the two must agree for every opcode.
+    #[test]
+    fn encode_tuple_field_read() {
+        let bc = make_bytecode(
+            vec![Instruction::LoadTupleField(258), Instruction::Return],
+            Vec::new(),
+        );
+        let compact = bc.lower_to_compact();
+        assert_eq!(compact.code.len(), 6);
+        assert_eq!(compact.code[0], OpCode::LoadTupleField as u8);
+        assert_eq!(
+            u32::from_le_bytes(compact.code[1..5].try_into().unwrap()),
+            258
+        );
+        assert_eq!(compact.code[5], OpCode::Return as u8);
+        let encoded = borsh::to_vec(&bc.instructions).unwrap();
+        let decoded: Vec<Instruction> = borsh::from_slice(&encoded).unwrap();
+        assert_eq!(format!("{decoded:?}"), format!("{:?}", bc.instructions));
+    }
+
     #[test]
     fn encoded_size_matches_emitted_bytes_for_every_opcode() {
         for (instruction, expected) in [
@@ -3343,6 +4009,77 @@ mod compact_tests {
             (Instruction::VirtualStoreField(1), OpCode::VirtualStoreField),
             (Instruction::LoadField(1), OpCode::LoadField),
             (Instruction::StoreField(1), OpCode::StoreField),
+            (Instruction::LoadFieldLocal(1), OpCode::LoadFieldLocal),
+            (
+                Instruction::ArrayIterNext {
+                    iterator: 2,
+                    index: 3,
+                },
+                OpCode::ArrayIterNext,
+            ),
+            (
+                Instruction::ArrayIterNextLocal {
+                    iterator: 2,
+                    index: 3,
+                },
+                OpCode::ArrayIterNextLocal,
+            ),
+            (Instruction::StoreFieldLocal(1), OpCode::StoreFieldLocal),
+            (Instruction::AddLocalSmall(1, 2, -3), OpCode::AddLocalSmall),
+            (Instruction::LoadVarField(1, 2), OpCode::LoadVarField),
+            (
+                Instruction::LoadVarFieldLocal(1, 2),
+                OpCode::LoadVarFieldLocal,
+            ),
+            (
+                Instruction::JumpIfLocalsCmp {
+                    cmp: CmpOp::Lt,
+                    a: 1,
+                    b: 2,
+                    offset: 0,
+                },
+                OpCode::JumpIfLocalsCmp,
+            ),
+            (
+                Instruction::JumpIfLocalConstCmp {
+                    cmp: CmpOp::GtEq,
+                    a: 1,
+                    constant: 0,
+                    offset: 1,
+                },
+                OpCode::JumpIfLocalConstCmp,
+            ),
+            (
+                Instruction::LoadArrayElementLocal,
+                OpCode::LoadArrayElementLocal,
+            ),
+            (
+                Instruction::StoreArrayElementLocal,
+                OpCode::StoreArrayElementLocal,
+            ),
+            (Instruction::ContainerLenLocal, OpCode::ContainerLenLocal),
+            (
+                Instruction::CallLocal {
+                    callee: GlobalIndex::from_raw(3),
+                    ntypeargs: 1,
+                },
+                OpCode::CallLocal,
+            ),
+            (Instruction::IsNull, OpCode::IsNull),
+            (Instruction::IsNotNull, OpCode::IsNotNull),
+            (
+                Instruction::CallEquals(GlobalIndex::from_raw(3)),
+                OpCode::CallEquals,
+            ),
+            (Instruction::AllocTuple(2), OpCode::AllocTuple),
+            (Instruction::LoadTupleField(1), OpCode::LoadTupleField),
+            (
+                Instruction::LoadVariant {
+                    enum_obj: ObjectIndex::from_raw(3),
+                    variant: 2,
+                },
+                OpCode::LoadVariant,
+            ),
         ] {
             let bc = make_bytecode(vec![instruction], Vec::new());
             let op = bc.instruction_to_opcode(&instruction);
@@ -3532,6 +4269,7 @@ mod compact_tests {
             meta: vec![InstructionMeta { operand: None }; 2],
             exception_table: Vec::new(),
             shield_table: Vec::new(),
+            block_pcs: Vec::new(),
             handler_context_table: Vec::new(),
             compact: None,
         };
@@ -3565,6 +4303,7 @@ mod compact_tests {
                 context_slot: 1,
             }],
             shield_table: Vec::new(),
+            block_pcs: Vec::new(),
             handler_context_table: vec![HandlerContextEntry {
                 start_pc: 2,
                 end_pc: 3, // one past the last instruction → mapped to total byte length

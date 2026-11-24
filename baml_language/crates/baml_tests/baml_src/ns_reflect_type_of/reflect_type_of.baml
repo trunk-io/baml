@@ -20,7 +20,7 @@
 class User { name string }
 class Container<T> { value T }
 // Renamed from Color to RgbColor to avoid collision with ns_json_to_from_string.Color,
-// which causes baml.json.from_string<Color> to become ambiguous across namespaces.
+// which causes baml.json.decode<Color> to become ambiguous across namespaces.
 enum RgbColor { Red, Green, Blue }
 
 // ─── Basic to_string tests ───────────────────────────────────────────────────
@@ -179,7 +179,7 @@ test "of_value_of_a_type_value_is_the_carrier" {
     // A type value's concrete type is the `reflect.Type` metatype itself; the
     // kind views are ordinary wrapper classes reached through `kind()`/`as_*`.
     assert.is_true(reflect.Type.of_value(reflect.Type.of<User>()) == reflect.Type.of<reflect.Type>())
-    assert.is_true(reflect.Type.of_value(reflect.Type.of<User>().as_class()) == reflect.Type.of<reflect.class.Type>())
+    assert.is_true(reflect.Type.of_value(reflect.Type.of<User>().as_class()) == reflect.Type.of<reflect.Class>())
 }
 
 test "of_value_widened_unknown_slot" {

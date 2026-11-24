@@ -19,17 +19,17 @@
 
 use std::time::Duration;
 
-use baml_bridge::Map;
+use baml_sdk::baml_bridge::Map;
 // SPECULATIVE: the low-level bridge surface mirrors python's `baml_bridge`
 // (`get_runtime`, `call_function`, `BamlCallContext`); provisional until the
 // Rust bridge pins it.
-use baml_bridge::runtime::{BamlCallContext, call_function, get_runtime};
-use baml_sdk::baml::json;
+use baml_sdk::baml::json_sync;
+use baml_sdk::baml_bridge::runtime::{BamlCallContext, call_function, get_runtime};
 // SPECULATIVE: `LoadDocError`, the generated error type for the union
 // `throws ParseError | TimeoutError` contract, is a provisional name — the
 // generator's naming for throws-union enums is not pinned yet.
-use baml_sdk::raises_test::{LoadDoc, LoadDocError, ParseError, Reparse};
-use baml_sdk::throws_test::{DoPanic, MyError, ParseJson, ThrowMyError};
+use baml_sdk::raises_test::{LoadDoc_sync, LoadDocError, ParseError, Reparse_sync};
+use baml_sdk::throws_test::{DoPanic, MyError, ParseJson_sync, ThrowMyError_sync};
 
 // stdlib native builtins (`baml.json.parse`, `baml.sys.*`) can't be called as
 // top-level entry points, so the fixture wraps each in a bytecode function
@@ -42,8 +42,8 @@ const _BAD_JSON: &str = "{not valid json";
 // surface structured, independent of any `throws` clause.
 #[test]
 fn test_errors_stdlib_error_surfaces_as_baml_error() {
-    match ParseJson(_BAD_JSON.to_string()) {
-        Err(baml_bridge::Error::Thrown { value, .. }) => {
+    match ParseJson_sync(_BAD_JSON.to_string()) {
+        Err(baml_sdk::baml_bridge::Error::Thrown { value, .. }) => {
             // `isinstance(..., json::ParseError)` is the static type of `value`.
             let _: json::ParseError = value;
         }
@@ -56,8 +56,8 @@ fn test_errors_stdlib_error_surfaces_as_baml_error() {
 // the declared user error instance itself (not a `.code` sub-field).
 #[test]
 fn test_errors_user_throw_surfaces_declared_instance() {
-    match ThrowMyError() {
-        Err(baml_bridge::Error::Thrown { value, .. }) => {
+    match ThrowMyError_sync() {
+        Err(baml_sdk::baml_bridge::Error::Thrown { value, .. }) => {
             let _: MyError = value;
         }
         Err(other) => panic!("expected Error::Thrown, got {other:?}"),
@@ -83,16 +83,16 @@ fn test_errors_union_throws_preserves_class_name() {
     // itself; the union-throws value decodes to the generated throws-union
     // enum, whose variant is the class identity. Both arms naming
     // `ParseError` is the `class_name` agreement.
-    match Reparse("x".to_string()) {
-        Err(baml_bridge::Error::Thrown { value, .. }) => {
+    match Reparse_sync("x".to_string()) {
+        Err(baml_sdk::baml_bridge::Error::Thrown { value, .. }) => {
             let _: ParseError = value;
         }
         Err(other) => panic!("expected Error::Thrown, got {other:?}"),
         Ok(_) => panic!("expected Error::Thrown, got Ok"),
     }
-    match LoadDoc("x".to_string()) {
+    match LoadDoc_sync("x".to_string()) {
         // SPECULATIVE: the throws-union enum's variant shape is provisional.
-        Err(baml_bridge::Error::Thrown {
+        Err(baml_sdk::baml_bridge::Error::Thrown {
             value: LoadDocError::ParseError(value),
             ..
         }) => {
@@ -123,7 +123,10 @@ fn test_errors_user_panic_surfaces_as_baml_panic() {
     // trace — the `UserPanic`-vs-`SdkPanic` class routing is not decodable
     // host-side, so the arm match is the assertion.
     let result = DoPanic("user-initiated boom".to_string());
-    assert!(matches!(result, Err(baml_bridge::Error::Panic { .. })));
+    assert!(matches!(
+        result,
+        Err(baml_sdk::baml_bridge::Error::Panic { .. })
+    ));
 }
 
 // Async cancellation: python maps it to `asyncio.CancelledError` with a BAML
@@ -150,14 +153,17 @@ async fn test_errors_cancellation_surfaces_as_baml_panic() {
         ),
         _abort_soon
     );
-    assert!(matches!(result, Err(baml_bridge::Error::Panic { .. })));
+    assert!(matches!(
+        result,
+        Err(baml_sdk::baml_bridge::Error::Panic { .. })
+    ));
 }
 
 // `str(e)` is non-empty — guards the `@trace` / telemetry path, which
 // records `str(e)`.
 #[test]
 fn test_errors_str_is_non_empty() {
-    let err = match ParseJson(_BAD_JSON.to_string()) {
+    let err = match ParseJson_sync(_BAD_JSON.to_string()) {
         Err(err) => err,
         Ok(_) => panic!("expected ParseJson to fail"),
     };
@@ -207,8 +213,8 @@ fn _python_traceback_line(line: &str) -> String {
 // as `.baml_trace`).
 #[test]
 fn test_errors_baml_error_carries_baml_trace() {
-    let trace = match ThrowMyError() {
-        Err(baml_bridge::Error::Thrown { trace, .. }) => trace,
+    let trace = match ThrowMyError_sync() {
+        Err(baml_sdk::baml_bridge::Error::Thrown { trace, .. }) => trace,
         Err(other) => panic!("expected Error::Thrown, got {other:?}"),
         Ok(_) => panic!("expected Error::Thrown, got Ok"),
     };
@@ -234,13 +240,13 @@ fn test_errors_baml_trace_spliced_into_python_traceback() {
     // DIVERGENCE(rust): there is no host traceback to splice into. The
     // closest surface is the error's `Display` rendering, so this asserts
     // every wire trace line is rendered there inline.
-    let err = match ParseJson(_BAD_JSON.to_string()) {
+    let err = match ParseJson_sync(_BAD_JSON.to_string()) {
         Err(err) => err,
         Ok(_) => panic!("ParseJson did not raise BamlError"),
     };
     let rendered = err.to_string();
     let wire_trace = match err {
-        baml_bridge::Error::Thrown { trace, .. } => trace,
+        baml_sdk::baml_bridge::Error::Thrown { trace, .. } => trace,
         other => panic!("expected Error::Thrown, got {other:?}"),
     };
 

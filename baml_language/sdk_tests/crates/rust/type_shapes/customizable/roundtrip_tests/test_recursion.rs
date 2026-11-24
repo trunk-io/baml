@@ -6,9 +6,9 @@
 //! `Some(Box::new(…))`.
 
 use baml_sdk::recursion::{
-    A, B, IntBinaryTree, T1, T2, T3, T4, T5, T6, round_trip_a, round_trip_b,
-    round_trip_int_binary_tree, round_trip_t1, round_trip_t2, round_trip_t3, round_trip_t4,
-    round_trip_t5, round_trip_t6,
+    A, B, IntBinaryTree, T1, T2, T3, T4, T5, T6, round_trip_a_sync, round_trip_b_sync,
+    round_trip_int_binary_tree_sync, round_trip_t1_sync, round_trip_t2_sync, round_trip_t3_sync,
+    round_trip_t4_sync, round_trip_t5_sync, round_trip_t6_sync,
 };
 
 #[test]
@@ -22,7 +22,46 @@ fn test_recursion_round_trip_int_binary_tree() {
         })),
         right: None,
     };
-    assert_eq!(round_trip_int_binary_tree(t.clone()).unwrap(), t);
+    assert_eq!(round_trip_int_binary_tree_sync(t.clone()).unwrap(), t);
+}
+
+/// A chain of `nodes` trees, each the left child of the one above.
+fn left_chain(nodes: usize) -> IntBinaryTree {
+    let leaf = IntBinaryTree {
+        value: 0,
+        left: None,
+        right: None,
+    };
+    (1..nodes).fold(leaf, |child, value| IntBinaryTree {
+        value: i64::try_from(value).expect("a small chain"),
+        left: Some(Box::new(child)),
+        right: None,
+    })
+}
+
+#[test]
+fn test_recursion_int_binary_tree_deeper_than_the_wire_is_refused() {
+    // A class level costs the wire three of the 100 nested messages it
+    // carries (the class, its field's entry, the field's value), and an
+    // argument sits two messages below the call: a chain of 32 trees crosses.
+    let at_the_limit = left_chain(32);
+    assert_eq!(
+        round_trip_int_binary_tree_sync(at_the_limit.clone()).unwrap(),
+        at_the_limit
+    );
+    // One more, or far more, is refused before the call as the argument's
+    // own error, never a panic and never the engine's refusal.
+    for nodes in [33, 1000] {
+        match round_trip_int_binary_tree_sync(left_chain(nodes)) {
+            Err(baml_sdk::baml_bridge::Error::Argument(baml_sdk::baml_bridge::ArgumentError {
+                name,
+                error: baml_sdk::baml_bridge::EncodeError::TooDeep { limit: 100 },
+            })) => assert_eq!(name, "t", "{nodes}-deep tree"),
+            other => {
+                panic!("{nodes}-deep tree: expected the argument's own refusal, got {other:?}")
+            }
+        }
+    }
 }
 
 #[test]
@@ -33,8 +72,8 @@ fn test_recursion_round_trip_mutual_recursion() {
     let b = B {
         a: Some(Box::new(A { b: None })),
     };
-    assert_eq!(round_trip_a(a.clone()).unwrap(), a);
-    assert_eq!(round_trip_b(b.clone()).unwrap(), b);
+    assert_eq!(round_trip_a_sync(a.clone()).unwrap(), a);
+    assert_eq!(round_trip_b_sync(b.clone()).unwrap(), b);
 }
 
 #[test]
@@ -57,9 +96,9 @@ fn test_recursion_round_trip_scc_t1_t2_t3() {
         via1: None,
         via2: None,
     };
-    assert_eq!(round_trip_t1(t1.clone()).unwrap(), t1);
-    assert_eq!(round_trip_t2(t2.clone()).unwrap(), t2);
-    assert_eq!(round_trip_t3(t3.clone()).unwrap(), t3);
+    assert_eq!(round_trip_t1_sync(t1.clone()).unwrap(), t1);
+    assert_eq!(round_trip_t2_sync(t2.clone()).unwrap(), t2);
+    assert_eq!(round_trip_t3_sync(t3.clone()).unwrap(), t3);
 }
 
 #[test]
@@ -82,7 +121,7 @@ fn test_recursion_round_trip_scc_t4_t5_t6() {
         via4: None,
         via5: None,
     };
-    assert_eq!(round_trip_t4(t4.clone()).unwrap(), t4);
-    assert_eq!(round_trip_t5(t5.clone()).unwrap(), t5);
-    assert_eq!(round_trip_t6(t6.clone()).unwrap(), t6);
+    assert_eq!(round_trip_t4_sync(t4.clone()).unwrap(), t4);
+    assert_eq!(round_trip_t5_sync(t5.clone()).unwrap(), t5);
+    assert_eq!(round_trip_t6_sync(t6.clone()).unwrap(), t6);
 }

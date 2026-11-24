@@ -102,29 +102,38 @@ async fn telemetry_performance_child() {
         .disable_request_recording()
         .start()
         .await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     let prepares = Arc::new(AtomicUsize::new(0));
     let candidates = Arc::new(AtomicUsize::new(0));
     let puts = Arc::new(AtomicUsize::new(0));
     let upload_bytes = Arc::new(AtomicUsize::new(0));
-    let prepare_count = Arc::clone(&prepares);
-    let candidate_count = Arc::clone(&candidates);
-    let base = server.uri();
-    Mock::given(method("POST"))
-        .respond_with(move |request: &Request| {
-            prepare_count.fetch_add(1, Ordering::Relaxed);
-            let response = cloud_protocol::response(request, &base, &[]);
-            candidate_count.fetch_add(response.cas.len(), Ordering::Relaxed);
-            ResponseTemplate::new(200).set_body_json(response)
-        })
-        .mount(&server)
-        .await;
-    let put_count = Arc::clone(&puts);
-    let byte_count = Arc::clone(&upload_bytes);
     let delay = if mode == "cloud-slow" {
         Duration::from_millis(50)
     } else {
         Duration::ZERO
     };
+    let prepare_count = Arc::clone(&prepares);
+    let candidate_count = Arc::clone(&candidates);
+    let base = server.uri();
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/uploads:prepare$"))
+        .respond_with(move |request: &Request| {
+            prepare_count.fetch_add(1, Ordering::Relaxed);
+            let response = cloud_protocol::response(request, &base, &[]);
+            candidate_count.fetch_add(response.cas.len(), Ordering::Relaxed);
+            // A slow server is slow to plan as well as to store.
+            ResponseTemplate::new(200)
+                .set_body_json(response)
+                .set_delay(delay)
+        })
+        .mount(&server)
+        .await;
+    let put_count = Arc::clone(&puts);
+    let byte_count = Arc::clone(&upload_bytes);
     let status = if mode == "cloud-fail" { 503 } else { 200 };
     Mock::given(method("PUT"))
         .respond_with(move |request: &Request| {

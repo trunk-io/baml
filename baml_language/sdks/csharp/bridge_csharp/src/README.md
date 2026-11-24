@@ -53,8 +53,8 @@ The consumer project should use the product baseline:
 
 Free BAML functions are static members of a namespace-local `Functions`
 class. The unsuffixed method is synchronous; the `Async` method returns a
-`Task<T>`. Both use the same native operation and accept a final cancellation
-token:
+`Task<T>`. Both use the same native operation and accept final `BamlOptions`
+through the `baml` argument:
 
 ```csharp
 using CsharpBasicCalls;
@@ -65,14 +65,14 @@ string result = Functions.BasicCalls(
     ratio: 1.25,
     text: "hello",
     nullable: null,
-    cancellationToken);
+    baml: new BamlOptions { CancellationToken = cancellationToken });
 string asyncResult = await Functions.BasicCallsAsync(
     flag: false,
     count: -17,
     ratio: -2.5,
     text: "hello",
     nullable: "present",
-    cancellationToken);
+    baml: new BamlOptions { CancellationToken = cancellationToken });
 ```
 
 Generated classes are sealed partial classes with required init-only
@@ -119,28 +119,31 @@ case rather than inferring it from the payload type.
 
 ## Callbacks
 
-A BAML callable argument is a `Func<...,CancellationToken,Task<TResult>>` (or
-the `Task` form for `void`). The injected token is always last. Optional BAML
-callback parameters are declaration-ordered `BamlOptional<T>` arguments:
+A BAML callable argument is a `Func<...,Task<TResult>>` (or the `Task` form for
+a unit return, `void` or `null`). Its parameters are the BAML arguments; cancellation is available from
+`Invocation.Current` during dispatch. Optional BAML callback parameters are
+declaration-ordered `BamlOptional<T>` arguments:
 
 ```csharp
-Func<long, CancellationToken, Task<long>> callback =
-    async (value, cancellationToken) =>
+Func<long, Task<long>> callback =
+    async value =>
     {
         await Task.Yield();
+        CancellationToken cancellationToken =
+            Invocation.Current?.CancellationToken ?? CancellationToken.None;
         cancellationToken.ThrowIfCancellationRequested();
         return checked(value * 2);
     };
 
-long result = await callback(21, cancellationToken);
+long result = await callback(21);
 ```
 
 Pass that delegate to the corresponding generated callable parameter; the
 generated signature supplies its exact argument types.
 
-For a tokenless synchronous callback, use `BamlCallback.FromSync`. It accepts
+For a synchronous callback, use `BamlCallback.FromSync`. It accepts
 value-returning `Func` and BAML-`void` `Action` callbacks with zero through
-fifteen BAML parameters and returns the same canonical Task-based delegate:
+sixteen BAML parameters and returns the same canonical Task-based delegate:
 
 ```csharp
 long result = Functions.InvokeDeferred(
@@ -148,16 +151,42 @@ long result = Functions.InvokeDeferred(
     21);
 ```
 
-Constructing the adapter does not run the callback. The injected token is
-ignored by this tokenless parity form; callbacks that need cancellation should
-use the canonical asynchronous delegate directly. Synchronous exceptions use
-the same exact managed-exception restoration path.
+Constructing the adapter does not run the callback. Synchronous callbacks can
+also read `Invocation.Current.CancellationToken` during dispatch. Synchronous
+exceptions use the same exact managed-exception restoration path.
 
-Callbacks may suspend. The runtime restores the captured execution context,
-does not run application code inline on the native callback stack, and returns
-the exact original managed exception (including its preserved stack) when a
-callback fails. A cancellation using the supplied linked token is classified
-as cancellation; an unrelated `OperationCanceledException` remains a fault.
+Callbacks may suspend. The runtime restores the captured execution context
+and does not run application code inline on the native callback stack.
+
+How a callback ends decides what its BAML caller sees:
+
+- It returns: the value is held to the callback's declared return type. A
+  value that type does not hold (`null` for a non-nullable result) is the
+  callback's broken contract, a `baml.panics.HostContractViolation`.
+- It throws a `BamlErrorException`: the exception's `ThrownValue` is the BAML
+  error the caller receives, held to the declared throws type the same way.
+  Construct one to throw the callback's declared error; one a BAML call made
+  inside the callback threw passes through unchanged:
+
+  ```csharp
+  throw new BamlErrorException(
+      BamlValue.From(new ValidationError { Code = 400, Message = "bad input" }));
+  ```
+
+- It lets a `BamlPanicException`, or the engine's cancellation, through: the
+  caller panics with the same panic, whatever the callback declares.
+- It throws any other exception: BAML receives a `baml.errors.HostCallable`,
+  and when that error reaches C# again the exact original exception (with its
+  preserved stack) is rethrown. A cancellation using the current invocation
+  token is classified as cancellation; an unrelated
+  `OperationCanceledException` remains a fault.
+
+A value nested deeper than the wire carries cannot cross: the wire nests at
+most 100 protobuf messages, a list level costing two and a map or class level
+three (an argument of 48 levels of lists, or 32 of maps or classes, still
+fits). As a callback's result such a value fails the call as
+`baml.panics.SdkPanic`; as an argument it is refused with
+`BamlTypeMappingException` before the call starts.
 
 ## Streams and semantic partials
 
@@ -263,7 +292,8 @@ Catch the narrowest useful type:
 try
 {
     _ = await Functions.BasicCallsAsync(
-        true, 1, 1.0, text, null, cancellationToken);
+        true, 1, 1.0, text, null,
+        baml: new BamlOptions { CancellationToken = cancellationToken });
 }
 catch (BamlTypeMismatchException error)
 {
@@ -322,7 +352,7 @@ public sealed class PrimitiveService : IPrimitiveService
             ratio: 1.0,
             text,
             nullable: null,
-            cancellationToken);
+            baml: new BamlOptions { CancellationToken = cancellationToken });
 }
 ```
 

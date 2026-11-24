@@ -15,12 +15,18 @@ use std::{
 
 use async_trait::async_trait;
 // Re-export BexExternalValue and BexValue for ops
-pub use bex_external_types::{AsBexExternalValue, BexExternalValue, Handle};
+pub use bex_external_types::{
+    AsBexExternalValue, BexExternalValue, Handle, HostCallCompletion, HostException, HostOutcome,
+};
 pub use bex_heap::BexHeap;
 // Re-export SysOp for convenience
-pub use bex_vm_types::SysOp;
+pub use bex_vm_types::{
+    BexRustData, Meter, MeteredMutex, OpOutput, RetainedBytes, RetainedFootprint, RustDataArc,
+    SysOp, TestRustData, http, resource,
+};
 pub use tokio_util::sync::CancellationToken;
 
+pub mod http_readers;
 pub mod network;
 pub mod sse;
 
@@ -103,7 +109,10 @@ pub mod generated {
     pub use bex_heap::{AccessError, BexClass, BexValue, BuiltinClass, PermitProof};
     pub use bex_vm_types::{self, SysOp};
 
-    pub use crate::{BexHeap, CallId, OpError, SysOpContext, SysOpFn, SysOpOutput, SysOpResult};
+    pub use crate::{
+        BexHeap, CallId, FromOpValue, OpError, OpValue, SysOpContext, SysOpFn, SysOpOutput,
+        SysOpResult,
+    };
 
     include!(concat!(env!("OUT_DIR"), "/io_generated.rs"));
 }
@@ -142,7 +151,11 @@ impl CallId {
     /// bridges (e.g. Python) when multiple overlapping calls can occur.
     #[inline]
     pub fn next() -> Self {
-        CallId(NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed))
+        CallId(
+            NEXT_CALL_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .unwrap_or(0),
+        )
     }
 }
 
@@ -158,44 +171,44 @@ impl std::fmt::Display for CallId {
 
 /// Errors that can occur during external operation execution. Every error
 /// is tied to the operation (`fn_name`) that was being called; the inner
-/// `payload` is either a normal VM error (treated like a `$rust_function`
-/// error or `throw` opcode and delivered through the VM's exception-
-/// unwinding path) or a *host throw* — a decoded `BexExternalValue` that
-/// the engine runs through `materialize_host_throw` for the
-/// declared-throws contract check against the surrounding callable's `E`.
+/// `payload` says who produced it, which decides how the engine lands it and
+/// whom a mismatch with the declared throws type blames.
 #[derive(Debug, PartialEq, Clone)]
 pub struct OpError {
     pub fn_name: SysOp,
     pub payload: OpErrorPayload,
 }
 
-/// Payload of an [`OpError`] — exactly one of:
-/// - [`Self::Vm`]: a normal sysop error (catchable `BamlError`, panic,
-///   internal fault, or pre-built thrown value).
-/// - [`Self::HostThrown`]: the bridge invoked a host callable and the
-///   callable raised something the bridge decoded to a `BexExternalValue`.
-///   The engine's `materialize_host_throw` reads this and either re-injects
-///   the value as a catchable throw (on-contract for `E`) or escalates to
-///   `baml.panics.HostContractViolation` (off-contract). The rehydration
-///   handle, when set, lives on the value itself as the `_handle` field
-///   of a `baml.errors.HostCallable` Instance.
+/// Payload of an [`OpError`], by producer:
+/// - [`Self::Vm`]: a typed error of a runtime op (catchable `BamlError`,
+///   panic, internal fault, or pre-built thrown value), delivered through the
+///   VM's exception-unwinding path.
+/// - [`Self::Engine`]: an error value a runtime op built as external data
+///   (the reflect compile ops' diagnostics). Hydrated as the op's own value;
+///   one outside the op's declared throws type is the op's fault.
+/// - [`Self::Host`]: what a host callback completed with, decoded from the
+///   one completion channel. The engine judges it against the callable's
+///   declared throws type; a miss is the callable's breach of contract,
+///   `baml.panics.HostContractViolation`.
 #[derive(Debug, PartialEq, Clone)]
 pub enum OpErrorPayload {
     Vm(bex_vm_types::errors::VmRustFnError),
-    /// Boxed because `BexExternalValue` is ~3x the size of
-    /// `VmRustFnError`; keeping it inline would bloat every `OpError` on
-    /// the hot success path. The host-thrown payload is rare and the
-    /// extra indirection only fires on the throw branch.
-    HostThrown(Box<BexExternalValue>),
+    /// Boxed because `BexExternalValue` is ~3x the size of `VmRustFnError`;
+    /// keeping it inline would bloat every `OpError` on the hot success path.
+    Engine(Box<BexExternalValue>),
+    Host(HostOutcome),
 }
 
 impl OpErrorPayload {
     /// Short, human-facing summary for `Display`. The engine reads the
     /// payload structurally — this is purely for diagnostic output.
     fn display_summary(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Vm(e) => std::fmt::Display::fmt(e, f),
-            Self::HostThrown(boxed) => match boxed.as_ref() {
+        fn thrown(
+            f: &mut std::fmt::Formatter<'_>,
+            who: &str,
+            value: &BexExternalValue,
+        ) -> std::fmt::Result {
+            match value {
                 BexExternalValue::Instance {
                     class_name, fields, ..
                 } => {
@@ -204,12 +217,22 @@ impl OpErrorPayload {
                         _ => None,
                     });
                     match message {
-                        Some(m) => write!(f, "host thrown {class_name}: {m}"),
-                        None => write!(f, "host thrown {class_name}"),
+                        Some(m) => write!(f, "{who} thrown {class_name}: {m}"),
+                        None => write!(f, "{who} thrown {class_name}"),
                     }
                 }
-                other => write!(f, "host thrown {other:?}"),
-            },
+                other => write!(f, "{who} thrown {other:?}"),
+            }
+        }
+        match self {
+            Self::Vm(e) => std::fmt::Display::fmt(e, f),
+            Self::Engine(value) => thrown(f, "engine", value),
+            Self::Host(HostOutcome::Thrown(value)) => thrown(f, "host", value),
+            Self::Host(HostOutcome::Raised(exception)) => write!(
+                f,
+                "host raised {} ({}): {}",
+                exception.class_name, exception.language, exception.message
+            ),
         }
     }
 }
@@ -225,7 +248,7 @@ impl std::error::Error for OpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.payload {
             OpErrorPayload::Vm(e) => e.source(),
-            OpErrorPayload::HostThrown(_) => None,
+            OpErrorPayload::Engine(_) | OpErrorPayload::Host(_) => None,
         }
     }
 }
@@ -251,14 +274,48 @@ impl OpError {
         }
     }
 
-    /// Construct an `OpError` carrying a host-throw payload — the host
-    /// language invoked a callable and the callable raised something the
-    /// bridge decoded to `value`. The engine routes this through
-    /// `materialize_host_throw`.
-    pub fn host_thrown_value(fn_name: SysOp, value: BexExternalValue) -> Self {
+    /// An error value a runtime op built as external data; the engine lands
+    /// it as the op's own and holds it to the op's declared throws type.
+    pub fn engine_thrown(fn_name: SysOp, value: BexExternalValue) -> Self {
         Self {
             fn_name,
-            payload: OpErrorPayload::HostThrown(Box::new(value)),
+            payload: OpErrorPayload::Engine(Box::new(value)),
+        }
+    }
+
+    /// What a host callback completed with, for the engine to judge against
+    /// the callable's declared throws type. Only a decoder of the completion
+    /// channel calls this.
+    pub fn host_outcome(fn_name: SysOp, outcome: HostOutcome) -> Self {
+        Self {
+            fn_name,
+            payload: OpErrorPayload::Host(outcome),
+        }
+    }
+
+    /// How a decoded completion ends the host-call op: the returned value, or
+    /// the error the op fails with. A host's outcome is the engine's to judge;
+    /// a contract the host found broken is the callable's panic; a bridge
+    /// failure is fatal, as every fault of the bridge's own is.
+    pub fn from_completion(
+        fn_name: SysOp,
+        completion: HostCallCompletion,
+    ) -> Result<BexExternalValue, Self> {
+        match completion {
+            HostCallCompletion::Returned(value) => Ok(*value),
+            HostCallCompletion::Host(outcome) => Err(Self::host_outcome(fn_name, outcome)),
+            HostCallCompletion::ContractViolation(message) => Err(Self::new(
+                fn_name,
+                bex_vm_types::errors::VmPanic::HostContractViolation {
+                    message,
+                    class_name: None,
+                    language: None,
+                },
+            )),
+            HostCallCompletion::BridgeFailure(message) => Err(Self::new(
+                fn_name,
+                bex_vm_types::errors::VmInternalError::BridgeFailure { message },
+            )),
         }
     }
 }
@@ -322,63 +379,6 @@ impl From<OpError> for OpErrorBody {
 }
 
 // ============================================================================
-// Contract Enforcement
-// ============================================================================
-
-/// A `sys_op` returned an error category not declared in its `#[throws(...)]` contract.
-#[derive(Debug)]
-pub struct ContractViolation {
-    pub op: SysOp,
-    pub actual_category: SysOpErrorCategory,
-}
-
-impl std::fmt::Display for ContractViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "sys_op contract violation: `{}` returned error category `{}` \
-             which is not in its declared #[throws(...)] contract (allowed: {:?})",
-            self.op,
-            self.actual_category,
-            self.op.allowed_error_categories()
-        )
-    }
-}
-
-/// Validate that a `sys_op` error conforms to its declared contract.
-///
-/// Returns `Ok(())` if the error category is in the allowed set, or
-/// `Err(ContractViolation)` with details for the implementer.
-///
-/// Only the [`VmRustFnError::BamlError`] variant has a contract-level
-/// category to check. [`VmRustFnError::Panic`] is governed by the parallel
-/// `#[panics(...)]` contract (not enforced here yet);
-/// [`VmRustFnError::Thrown`] carries a pre-built host-provided exception
-/// `Value` whose type is checked against the callable's `E` in the engine,
-/// not against a sysop category; and [`VmRustFnError::InternalError`] is a
-/// fatal VM/engine fault outside the contract surface.
-pub fn validate_sys_op_error(op: SysOp, err: &VmRustFnError) -> Result<(), ContractViolation> {
-    let baml_err = match err {
-        VmRustFnError::BamlError(b) => b,
-        VmRustFnError::Panic(_)
-        | VmRustFnError::Thrown { .. }
-        | VmRustFnError::InternalError(_) => {
-            return Ok(());
-        }
-    };
-    let category = baml_err.category();
-    let allowed = op.allowed_error_categories();
-    if allowed.is_empty() || allowed.contains(&category) {
-        Ok(())
-    } else {
-        Err(ContractViolation {
-            op,
-            actual_category: category,
-        })
-    }
-}
-
-// ============================================================================
 // Operation Results
 // ============================================================================
 
@@ -387,13 +387,65 @@ pub fn validate_sys_op_error(op: SysOp, err: &VmRustFnError) -> Result<(), Contr
 /// originating [`SysOp`] for engine-side attribution. The body itself
 /// works with the bare `VmRustFnError`; the `SysOp` is attached at the
 /// `into_result` glue boundary (see [`SysOpOutput::into_result`]).
-pub type OpFuture = Pin<Box<dyn Future<Output = Result<BexExternalValue, OpError>> + Send>>;
+pub type OpFuture = Pin<Box<dyn Future<Output = Result<OpValue, OpError>> + Send>>;
+
+/// What a system operation settles with.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the external arm is nearly every result; boxing it would allocate for each one"
+)]
+pub enum OpValue {
+    /// A value the engine builds from its external form and checks against
+    /// the operation's declared return type.
+    External(BexExternalValue),
+    /// A new instance of a `@@rust_type` class: the class, and the state the
+    /// instance is built around. An instance has no external form, so this is
+    /// the one way an operation hands one back, and no host can build one.
+    RustInstance {
+        class: baml_base::LangItem,
+        payload: bex_vm_types::RustPayload,
+    },
+    /// A new instance of a class holding one of these: its fields, in
+    /// declaration order. The engine lands each against its field's type.
+    Instance {
+        class: baml_base::LangItem,
+        fields: Vec<OpValue>,
+    },
+}
+
+impl From<BexExternalValue> for OpValue {
+    fn from(value: BexExternalValue) -> Self {
+        Self::External(value)
+    }
+}
+
+impl OpValue {
+    /// What the value is, for a message that refuses it.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::External(value) => value.type_name().to_string(),
+            Self::RustInstance { class, .. } | Self::Instance { class, .. } => class.to_string(),
+        }
+    }
+}
+
+/// A runtime type read back from the runtime's own form of a value: what a
+/// sys-op gets from a BAML callback it ran (`VmSpawner`), whose result may
+/// hold the runtime's tagged instances. Generated for every class the
+/// runtime builds (a `@@rust_type` class's state, and a class holding one).
+pub trait FromOpValue: Sized {
+    /// # Errors
+    ///
+    /// `value` is not an instance of this type.
+    fn from_op_value(value: OpValue) -> Result<Self, bex_heap::AccessError>;
+}
 
 /// Result of a system operation - either immediate or async.
 #[allow(clippy::large_enum_variant)]
 pub enum SysOpResult {
     /// Operation completed synchronously with this result.
-    Ready(Result<BexExternalValue, OpError>),
+    Ready(Result<OpValue, OpError>),
     /// Operation is async and needs to be awaited.
     Async(OpFuture),
 }
@@ -416,15 +468,15 @@ pub enum SysOpOutput<T = BexExternalValue> {
     Ready(Result<T, bex_vm_types::errors::VmRustFnError>),
     /// Operation is async. The future yields an [`OpErrorBody`] on failure
     /// so that bodies awaiting an inner [`SysOpResult::Async`] (whose
-    /// error type is [`OpError`]) can propagate fields beyond `kind`
-    /// — notably `host_thrown`, set by
-    /// `sys_native::host_dispatch::complete_with_throw` — through `?`
+    /// error type is [`OpError`]) can propagate every payload — notably
+    /// a host outcome, set by
+    /// `sys_native::host_dispatch::complete_with_outcome` — through `?`
     /// without going through a lossy intermediate type.
     ///
     /// Most sysop bodies just `?` from `VmBamlError`/`VmRustFnError`,
-    /// which auto-convert via [`OpErrorBody`]'s blanket `From` impl with
-    /// `host_thrown = None`. The host-callable sysop is the one site
-    /// that actively threads a non-`None` `host_thrown`.
+    /// which auto-convert via [`OpErrorBody`]'s blanket `From` impl into a
+    /// `Vm` payload. The host-callable sysop is the one site that carries a
+    /// host's completion outcome instead.
     Async(Pin<Box<dyn Future<Output = Result<T, OpErrorBody>> + Send>>),
 }
 
@@ -470,11 +522,10 @@ impl<T: Send + 'static> SysOpOutput<T> {
         ))
     }
 
-    /// Async constructor for bodies that need to thread a non-`None`
-    /// `host_thrown` through to the engine. Only the host-callable sysop
-    /// uses this; every other sysop calls [`Self::async_op`] and lets the
-    /// blanket `VmRustFnError → OpErrorBody` conversion fill `host_thrown`
-    /// with `None`.
+    /// Async constructor for the one body that carries a host's completion
+    /// outcome to the engine, the host-callable sysop; every other sysop
+    /// calls [`Self::async_op`] and lets the blanket `VmRustFnError →
+    /// OpErrorBody` conversion build a `Vm` payload.
     pub fn async_op_with_throw(
         fut: impl Future<Output = Result<T, OpErrorBody>> + Send + 'static,
     ) -> Self {
@@ -489,11 +540,11 @@ impl<T: AsBexExternalValue + Send + 'static> SysOpOutput<T> {
     /// This is called by generated glue code — implementors don't use this directly.
     pub fn into_result(self, op: SysOp) -> SysOpResult {
         match self {
-            Self::Ready(Ok(v)) => SysOpResult::Ready(Ok(v.into_bex_external_value())),
+            Self::Ready(Ok(v)) => SysOpResult::Ready(Ok(v.into_bex_external_value().into())),
             Self::Ready(Err(err)) => SysOpResult::Ready(Err(OpError::new(op, err))),
             Self::Async(fut) => SysOpResult::Async(Box::pin(async move {
                 fut.await
-                    .map(AsBexExternalValue::into_bex_external_value)
+                    .map(|v| v.into_bex_external_value().into())
                     .map_err(|body| body.into_op_error(op))
             })),
         }
@@ -504,18 +555,35 @@ impl<T: Send + 'static> SysOpOutput<T> {
     /// Convert to [`SysOpResult`] using a custom value mapping function.
     ///
     /// Used by generated glue code for return types that don't implement
-    /// [`AsBexExternalValue`] directly (e.g. `Vec<ClassName>`).
-    pub fn into_result_mapped(
+    /// [`AsBexExternalValue`] directly (e.g. `Vec<ClassName>`), and for a
+    /// new instance the runtime builds, which no external value can be.
+    pub fn into_result_mapped<V: Into<OpValue>>(
         self,
         op: SysOp,
-        f: impl Fn(T) -> BexExternalValue + Send + 'static,
+        f: impl Fn(T) -> V + Send + 'static,
     ) -> SysOpResult {
         match self {
-            Self::Ready(Ok(v)) => SysOpResult::Ready(Ok(f(v))),
+            Self::Ready(Ok(v)) => SysOpResult::Ready(Ok(f(v).into())),
             Self::Ready(Err(err)) => SysOpResult::Ready(Err(OpError::new(op, err))),
             Self::Async(fut) => SysOpResult::Async(Box::pin(async move {
-                fut.await.map(f).map_err(|body| body.into_op_error(op))
+                fut.await
+                    .map(|v| f(v).into())
+                    .map_err(|body| body.into_op_error(op))
             })),
+        }
+    }
+}
+
+/// A resource operation's outcome, as the sys-op it is the body of.
+impl<T: Send + 'static> From<bex_vm_types::OpOutput<T>> for SysOpOutput<T> {
+    fn from(output: bex_vm_types::OpOutput<T>) -> Self {
+        match output {
+            bex_vm_types::OpOutput::Ready(result) => Self::Ready(result),
+            bex_vm_types::OpOutput::Async(future) => {
+                Self::Async(Box::pin(
+                    async move { future.await.map_err(OpErrorBody::from) },
+                ))
+            }
         }
     }
 }
@@ -564,15 +632,25 @@ pub type SysOpFn = Arc<
 pub trait VmSpawner<E: Send + Sync + 'static = Box<dyn Send + Sync + 'static>>:
     Send + Sync
 {
-    /// Spawn a a new VM with the given function name and arguments.
+    /// Engine-owned callback frame. Transport layers may downcast it through
+    /// the runtime facade; application SDK packages never participate here.
+    fn capture_invocation(&self) -> Option<Arc<dyn BexRustData>> {
+        None
+    }
+    /// Spawn a new VM that calls the function named `function_name` with
+    /// `args`, and return its result.
     ///
-    /// Generally just calls `BexEngine::call_function`.
+    /// The arguments and the result are the runtime's own values: an
+    /// argument is built on the callee's heap as an op's result is, and the
+    /// result comes back in the same form, so either may hold the runtime's
+    /// tagged instances, which no external value can. Read a result of a
+    /// class the runtime builds with [`FromOpValue`].
     async fn spawn_with_function(
         self: Arc<Self>,
         function_name: String,
-        args: Vec<BexExternalValue>,
+        args: Vec<OpValue>,
         cancel: CancellationToken,
-    ) -> Result<BexExternalValue, E>;
+    ) -> Result<OpValue, E>;
 
     /// Spawn a new VM that invokes a callable BAML value — a raw function,
     /// closure, or bound method — referenced by a [`bex_external_types::Handle`]
@@ -581,13 +659,14 @@ pub trait VmSpawner<E: Send + Sync + 'static = Box<dyn Send + Sync + 'static>>:
     ///
     /// Unlike [`Self::spawn_with_function`], the callee need not be a named
     /// global — this is how a sys-op invokes a BAML callback (e.g. an HTTP
-    /// server `handler`). Generally just calls `BexEngine::call_callable`.
+    /// server `handler`). Its arguments and result are the runtime's own
+    /// values, as [`Self::spawn_with_function`]'s are.
     async fn spawn_with_callable(
         self: Arc<Self>,
         callable: bex_external_types::Handle,
-        args: Vec<BexExternalValue>,
+        args: Vec<OpValue>,
         cancel: CancellationToken,
-    ) -> Result<BexExternalValue, E>;
+    ) -> Result<OpValue, E>;
 }
 
 /// Context available to `sys_ops` that need engine-level information.
@@ -627,6 +706,13 @@ pub struct SysOpContext<E: Send + Sync + 'static = Box<dyn Send + Sync + 'static
     /// Maps alias identity → target type.
     pub type_alias_definitions: Arc<indexmap::IndexMap<DefKey, SapTy>>,
 
+    /// What a model writes in place of each class instantiation or enum that
+    /// implements `baml.FromLlmOutput`: its `Shape`. Keyed by the class type
+    /// (its arguments with each union flat) or the enum type. Filled per call
+    /// for the types the call's type arguments reach, so the output format
+    /// and `baml.json.schema` describe what the parser reads.
+    pub llm_shapes: Arc<indexmap::IndexMap<SapTy, SapTy>>,
+
     /// Can be used to spawn new VMs.
     pub spawner: Arc<dyn VmSpawner<E>>,
 
@@ -637,6 +723,8 @@ pub struct SysOpContext<E: Send + Sync + 'static = Box<dyn Send + Sync + 'static
     /// The span of the request this call makes. `None` unless telemetry is
     /// on and the op sends an HTTP request.
     pub network: Option<network::NetworkContext>,
+    /// Native client body readers, joined before the engine recorder closes.
+    pub http_readers: Arc<http_readers::HttpReaders>,
 }
 
 impl<E: Send + Sync + 'static> Clone for SysOpContext<E> {
@@ -647,9 +735,11 @@ impl<E: Send + Sync + 'static> Clone for SysOpContext<E> {
             class_definitions: self.class_definitions.clone(),
             enum_definitions: self.enum_definitions.clone(),
             type_alias_definitions: self.type_alias_definitions.clone(),
+            llm_shapes: self.llm_shapes.clone(),
             spawner: self.spawner.clone(),
             runtime_io: self.runtime_io.clone(),
             network: self.network.clone(),
+            http_readers: self.http_readers.clone(),
         }
     }
 }
@@ -658,6 +748,7 @@ impl<E: Send + Sync + 'static> Clone for SysOpContext<E> {
 /// When passing to a sys op, convert to [`SysOpContext`] with `to_op_context`.
 #[derive(Clone)]
 pub struct EngineSysOpContext {
+    pub http_readers: Arc<http_readers::HttpReaders>,
     /// Pre-extracted LLM function metadata, keyed by function name.
     /// Used by LLM ops that need to look up function prompt templates, client names, etc.
     pub llm_functions: Arc<std::collections::HashMap<String, LlmFunctionInfo>>,
@@ -684,8 +775,6 @@ pub struct EngineSysOpContext {
 /// This is built during engine construction by reading function objects from the heap,
 /// so that LLM `sys_ops` don't need to access raw heap pointers.
 pub struct LlmFunctionInfo {
-    /// The client name (e.g., `"MyClient"`) declared in the function.
-    pub client_name: String,
     /// The expected return type, used for response parsing.
     pub return_type: SapTy,
 }
@@ -719,12 +808,24 @@ pub struct ClassDefinition {
     pub description: Option<String>,
     pub docstring: Option<String>,
     pub alias: Option<String>,
-    pub fields: Vec<ClassFieldDefinition>,
+    pub body: ClassDefinitionBody,
     /// `@@stream.done`: no partial parse until the whole object is complete.
     pub stream_done: bool,
 }
 
+/// What a [`ClassDefinition`]'s values are made of.
+#[derive(Clone, Debug)]
+pub enum ClassDefinitionBody {
+    /// Its fields, `@skip` ones included, in declaration order.
+    Fields(Vec<ClassFieldDefinition>),
+    /// State that is the runtime's own (a `@@rust_type` class, a capability
+    /// such as `reflect.Package`): no value has a JSON form.
+    RuntimeOwned,
+}
+
 /// A field in a pre-extracted class definition.
+// Each bool is one flag attribute of the declaration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub struct ClassFieldDefinition {
     pub name: String,
@@ -740,6 +841,12 @@ pub struct ClassFieldDefinition {
     pub docstring: Option<String>,
     pub alias: Option<String>,
     pub skip: bool,
+    /// `@json.rename`: the field's JSON key, under every naming.
+    pub json_rename: Option<String>,
+    /// `@json.flatten`: the field holds every key no other field took.
+    pub json_flatten: bool,
+    /// `@json.fallback`: the field holds the whole object.
+    pub json_fallback: bool,
     /// `@stream.done`: the field holds its default until its value is complete.
     pub stream_done: bool,
     /// `@stream.must_exist`: the field has no default, so its class has no
@@ -754,7 +861,19 @@ pub struct EnumDefinition {
     pub description: Option<String>,
     pub docstring: Option<String>,
     pub alias: Option<String>,
-    pub variants: Vec<EnumVariantDefinition>,
+    /// Every variant in declaration order, `@skip` ones included. Most readers
+    /// want [`Self::variants`], which a model can be shown.
+    pub declared_variants: Vec<EnumVariantDefinition>,
+}
+
+impl EnumDefinition {
+    /// The variants a model can be shown and answer with: every variant but
+    /// the `@skip` ones, in declaration order.
+    pub fn variants(&self) -> impl Iterator<Item = &EnumVariantDefinition> {
+        self.declared_variants
+            .iter()
+            .filter(|variant| !variant.skip)
+    }
 }
 
 /// A variant in a pre-extracted enum definition.
@@ -764,7 +883,12 @@ pub struct EnumVariantDefinition {
     pub description: Option<String>,
     pub docstring: Option<String>,
     pub alias: Option<String>,
+    pub skip: bool,
+    /// `@json.rename`: the variant's JSON string, under every naming.
+    pub json_rename: Option<String>,
 }
+
+pub use baml_type::json_inhabit::JsonNaming;
 
 impl EnumVariantDefinition {
     /// The description the output format shows for this variant; see
@@ -803,9 +927,9 @@ impl SysOpContext {
             async fn spawn_with_function(
                 self: Arc<Self>,
                 _function_name: String,
-                _args: Vec<BexExternalValue>,
+                _args: Vec<OpValue>,
                 _cancel: CancellationToken,
-            ) -> Result<BexExternalValue, Box<dyn Send + Sync + 'static>> {
+            ) -> Result<OpValue, Box<dyn Send + Sync + 'static>> {
                 Err(Box::new(
                     "VmSpawner::spawn_with_function called on NeverSpawner (empty/test context)",
                 ))
@@ -814,9 +938,9 @@ impl SysOpContext {
             async fn spawn_with_callable(
                 self: Arc<Self>,
                 _callable: bex_external_types::Handle,
-                _args: Vec<BexExternalValue>,
+                _args: Vec<OpValue>,
                 _cancel: CancellationToken,
-            ) -> Result<BexExternalValue, Box<dyn Send + Sync + 'static>> {
+            ) -> Result<OpValue, Box<dyn Send + Sync + 'static>> {
                 Err(Box::new(
                     "VmSpawner::spawn_with_callable called on NeverSpawner (empty/test context)",
                 ))
@@ -828,9 +952,11 @@ impl SysOpContext {
             class_definitions: Arc::new(indexmap::IndexMap::<DefKey, ClassDefinition>::new()),
             enum_definitions: Arc::new(indexmap::IndexMap::<DefKey, EnumDefinition>::new()),
             type_alias_definitions: Arc::new(indexmap::IndexMap::<DefKey, SapTy>::new()),
+            llm_shapes: Arc::new(indexmap::IndexMap::new()),
             spawner: Arc::new(NeverSpawner),
             runtime_io: Arc::new(runtime_io::NoopRuntimeIo),
             network: None,
+            http_readers: Arc::default(),
         }
     }
 }
@@ -848,45 +974,15 @@ impl EngineSysOpContext {
             class_definitions: self.class_definitions.clone(),
             enum_definitions: self.enum_definitions.clone(),
             type_alias_definitions: self.type_alias_definitions.clone(),
+            llm_shapes: Arc::new(indexmap::IndexMap::new()),
             spawner,
             runtime_io: self.runtime_io.clone(),
             network: None,
+            http_readers: self.http_readers.clone(),
         }
     }
 }
 
-// ============================================================================
-// FunctionRef<T> -- Typed wrapper for VM function references
-// ============================================================================
-
-/// Typed wrapper for VM function references.
-///
-/// The phantom type parameter `T` represents the return type of the referenced
-/// function. It provides no runtime checking, but ensures the impl author
-/// declares what kind of function they're returning — preventing accidental
-/// misuse of the `BexExternalValue` escape hatch.
-pub struct FunctionRef<T> {
-    /// The global index into the VM's globals array.
-    pub global_index: usize,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-impl<T> FunctionRef<T> {
-    /// Create a new function reference with the given global index.
-    pub fn new(global_index: usize) -> Self {
-        Self {
-            global_index,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    /// Convert to `BexExternalValue::FunctionRef`.
-    pub fn into_external(self) -> BexExternalValue {
-        BexExternalValue::FunctionRef {
-            global_index: self.global_index,
-        }
-    }
-}
 // ============================================================================
 // Async Completion Utilities
 // ============================================================================
@@ -919,6 +1015,21 @@ impl CompletionHandle {
     }
 }
 
+/// What a host completes an operation with through its [`CompletionHandle`]:
+/// a value it built, or the error it completed with.
+pub type HostCompletion = Pin<Box<dyn Future<Output = Result<BexExternalValue, OpError>> + Send>>;
+
+impl CompletionHandle {
+    /// A completion a host settles later: the future, and the handle that
+    /// settles it. Dropping the handle unsettled cancels `operation`.
+    pub fn pending(operation: SysOp) -> (HostCompletion, Self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let future =
+            Box::pin(async move { rx.await.unwrap_or(Err(OpError::cancelled(operation))) });
+        (future, Self(tx))
+    }
+}
+
 impl SysOpResult {
     /// Create a pending async result that can be completed externally.
     ///
@@ -928,10 +1039,9 @@ impl SysOpResult {
     ///
     /// The future will resolve when `handle.complete()` is called.
     pub fn pending(operation: SysOp) -> (Self, CompletionHandle) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let future =
-            Box::pin(async move { rx.await.unwrap_or(Err(OpError::cancelled(operation))) });
-        (SysOpResult::Async(future), CompletionHandle(tx))
+        let (completion, handle) = CompletionHandle::pending(operation);
+        let future = Box::pin(async move { completion.await.map(OpValue::External) });
+        (SysOpResult::Async(future), handle)
     }
 }
 
@@ -959,7 +1069,7 @@ mod tests {
 
     #[test]
     fn resolve_name_user_prefix_fallback() {
-        let m = map(&[("user.main", 2), ("baml.json.serialize", 3)]);
+        let m = map(&[("user.main", 2), ("baml.json.stringify", 3)]);
         match resolve_name(&m, "main") {
             ResolveOutcome::Found(k, v) => {
                 assert_eq!(k, "user.main");
@@ -972,7 +1082,7 @@ mod tests {
     #[test]
     fn resolve_name_suffix_scan_unique() {
         // Namespaced function — bare lookup falls through to suffix scan.
-        let m = map(&[("user.lorem.Summarize", 7), ("baml.json.serialize", 3)]);
+        let m = map(&[("user.lorem.Summarize", 7), ("baml.json.stringify", 3)]);
         match resolve_name(&m, "Summarize") {
             ResolveOutcome::Found(k, v) => {
                 assert_eq!(k, "user.lorem.Summarize");
@@ -997,16 +1107,16 @@ mod tests {
     /// Exact match must win over a suffix collision elsewhere in the map,
     /// so a fully qualified call can't be diverted by an unrelated `.{name}`
     /// key. Regression: this is the property `BexEngine::lookup_function`
-    /// relies on for stdlib calls like `baml.json.serialize`.
+    /// relies on for stdlib calls like `baml.json.stringify`.
     #[test]
     fn resolve_name_exact_beats_suffix() {
-        let m = map(&[("baml.json.serialize", 1), ("user.lorem.serialize", 2)]);
-        match resolve_name(&m, "baml.json.serialize") {
+        let m = map(&[("baml.json.stringify", 1), ("user.lorem.stringify", 2)]);
+        match resolve_name(&m, "baml.json.stringify") {
             ResolveOutcome::Found(k, v) => {
-                assert_eq!(k, "baml.json.serialize");
+                assert_eq!(k, "baml.json.stringify");
                 assert_eq!(*v, 1);
             }
-            _ => panic!("expected Found(baml.json.serialize, 1)"),
+            _ => panic!("expected Found(baml.json.stringify, 1)"),
         }
     }
 
@@ -1031,92 +1141,11 @@ mod tests {
         match result {
             SysOpResult::Async(fut) => {
                 let value = fut.await.unwrap();
-                assert!(matches!(value, BexExternalValue::String(s) if s.as_str() == "done"));
+                assert!(
+                    matches!(value, OpValue::External(BexExternalValue::String(s)) if s.as_str() == "done")
+                );
             }
             SysOpResult::Ready(_) => panic!("Expected Async result"),
-        }
-    }
-
-    // ========================================================================
-    // Contract enforcement tests
-    // ========================================================================
-
-    #[test]
-    fn contract_allows_declared_category() {
-        // `baml.http.fetch` is a thin BAML wrapper; the sys-op (which carries
-        // the `throws Io | Timeout` contract) is `baml.http._fetch`.
-        let op = bex_vm_types::sys_op_for_path("baml.http._fetch").unwrap();
-        let err: bex_vm_types::errors::VmRustFnError = bex_vm_types::errors::VmBamlError::Timeout {
-            message: "timed out".into(),
-            duration: Some(std::time::Duration::from_secs(30)),
-            timeout_type: "timeout".into(),
-        }
-        .into();
-        assert!(validate_sys_op_error(op, &err).is_ok());
-    }
-
-    #[test]
-    fn contract_rejects_undeclared_category() {
-        let op = bex_vm_types::sys_op_for_path("baml.env.get").unwrap();
-        let err: bex_vm_types::errors::VmRustFnError =
-            bex_vm_types::errors::VmBamlError::LlmClient {
-                message: "bad".into(),
-            }
-            .into();
-        let result = validate_sys_op_error(op, &err);
-        assert!(result.is_err());
-        let violation = result.unwrap_err();
-        assert_eq!(violation.actual_category, SysOpErrorCategory::LlmClient);
-    }
-
-    /// `Panic` / `Thrown` / `InternalError` variants of `VmRustFnError` are
-    /// outside the `#[throws(...)]` contract surface; validation must let
-    /// them pass even on an op that declares no throws categories.
-    #[test]
-    fn contract_skips_non_baml_error_variants() {
-        let op = bex_vm_types::sys_op_for_path("baml.env.get").unwrap();
-        for err in [
-            bex_vm_types::errors::VmRustFnError::Panic(bex_vm_types::errors::VmPanic::Cancelled),
-            bex_vm_types::errors::VmRustFnError::thrown_fresh(bex_vm_types::Value::NULL),
-            bex_vm_types::errors::VmRustFnError::InternalError(
-                bex_vm_types::errors::VmInternalError::UnexpectedEmptyStack,
-            ),
-        ] {
-            assert!(
-                validate_sys_op_error(op, &err).is_ok(),
-                "non-BamlError variants must skip contract validation"
-            );
-        }
-    }
-
-    /// An empty `allowed_error_categories` list means "accept any category".
-    /// `call_host_value`'s codegen relies on this (it emits `&[]` when the
-    /// `throws` contains a generic param like `E` — see
-    /// `codegen_io::error_cat_arms`). Anchor that semantics here so a
-    /// reviewer who reads `validate_sys_op_error` in isolation sees the
-    /// contract is intentional, not a missing check.
-    #[test]
-    fn contract_empty_allow_list_accepts_any_category() {
-        let op = bex_vm_types::sys_op_for_path("baml.host.call_host_value").unwrap();
-        // `call_host_value` declares `throws E` (generic only), so codegen
-        // emits an empty allow-list.
-        assert!(op.allowed_error_categories().is_empty());
-        for err in [
-            bex_vm_types::errors::VmBamlError::Io {
-                message: "io".into(),
-            },
-            bex_vm_types::errors::VmBamlError::LlmClient {
-                message: "llm".into(),
-            },
-            bex_vm_types::errors::VmBamlError::Unsupported {
-                message: "u".into(),
-            },
-        ] {
-            let rust_err: bex_vm_types::errors::VmRustFnError = err.into();
-            assert!(
-                validate_sys_op_error(op, &rust_err).is_ok(),
-                "empty allow-list must accept every BAML-error category"
-            );
         }
     }
 
@@ -1135,8 +1164,8 @@ mod tests {
     }
 
     /// Every `VmBamlError` variant must map to some `SysOpErrorCategory`
-    /// (used by `validate_sys_op_error` for the `#[throws(...)]` contract
-    /// check). Exercises each variant once; the assertion is just that
+    /// (the generated `#[throws(...)]` contract tables are keyed by it).
+    /// Exercises each variant once; the assertion is just that
     /// `category()` doesn't panic on any branch.
     #[test]
     fn category_mapping_covers_all_variants() {
@@ -1174,7 +1203,7 @@ mod tests {
                 traceback: None,
                 language: None,
                 handle: bex_external_types::HostValueArc::new(
-                    1,
+                    bex_external_types::HostKey::new(1).expect("nonzero"),
                     bex_external_types::HostValueKind::Opaque,
                 ),
             },

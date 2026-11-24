@@ -12,16 +12,18 @@ pub struct EnumVariant {
     pub docstring: Option<String>,
     pub other: IndexMap<String, String>,
     pub skip: bool,
+    /// `@json.rename`: the variant's JSON string, under every naming.
+    pub json_rename: Option<String>,
 }
 
 /// Runtime enum representation.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct Enum {
-    /// How this declaration is named: package-qualified for a compiled enum,
-    /// a bare item name for a runtime-created one. Display and boundary
-    /// spelling only — identity is `type_tag` and the declaration object
-    /// itself. Use `name.display_name()` for the display string.
-    pub name: crate::DeclarationName,
+    /// Where this enum is declared inside its package: its namespace path
+    /// and item name (an enum minted through `reflect` has only the item
+    /// name). All of its name it carries — see [`Self::name`]. Never an
+    /// identity: that is `type_tag` and the declaration object itself.
+    pub path: super::LocalName,
 
     /// This enum's head identity — assigned by the linker (`CLASS_BASE +` its
     /// object index in the image) or minted fresh by the grafter; in a unit,
@@ -50,15 +52,43 @@ pub struct Enum {
     /// What this declaration belongs to; see `Class::owner`.
     #[borsh(skip)]
     pub owner: super::Owner,
+
+    /// The definition telemetry recorded for this enum; see
+    /// `Class::telemetry_definition`.
+    #[borsh(skip)]
+    pub telemetry_definition: btel_types::DefinitionCell,
+
+    /// One permanent `Object::Variant` per variant, by index, which every
+    /// evaluation of a variant constant (`Status.Todo`) returns instead of
+    /// allocating. The heap creates them for each compile-time enum when it
+    /// is built; an enum created at runtime has none and allocates. A
+    /// variant has no state beyond its enum and index and is never mutated,
+    /// so sharing one changes no answer: equality compares enum and index,
+    /// and its one identity test, `==` taking a value as equal to itself,
+    /// is what the `Equals` contract (reflexivity) promises anyway. Every
+    /// pointer here is into the compile-time space, so a collection never
+    /// visits them.
+    #[borsh(skip)]
+    pub shared_variants: Box<[HeapPtr]>,
+}
+
+impl Enum {
+    /// How this enum is named: its path under its package's display name, or
+    /// the bare path for one no package owns. Display and boundary spelling
+    /// only — see [`declaration_name`](super::declaration_name).
+    #[must_use]
+    pub fn name(&self) -> crate::DeclarationName {
+        self.owner.name_of(&self.path)
+    }
 }
 
 impl std::fmt::Display for Enum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<enum {}>", self.name)
+        write!(f, "<enum {}>", self.name())
     }
 }
 
-/// Same as [`crate::Instance`] but for enums.
+/// A value of an enum: the enum it belongs to and the variant's index.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct Variant {
     /// Pointer to the enum object in the heap.

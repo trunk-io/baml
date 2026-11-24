@@ -62,13 +62,33 @@ inline std::shared_ptr<capability_state> decode_capability(
                                             expected);
 }
 
+// An instance of a standard-library class whose fields are the runtime's own
+// (`reflect.Package`, `reflect.Session`, `reflect.CompileArtifact`): the
+// engine's instance, held by reference. The engine sends the handle with a
+// `ty` naming the class, which keeps union alternatives of distinct such
+// classes apart; one that names no class, or another, is not this one.
+inline std::shared_ptr<capability_state> decode_runtime_value(
+    const pb::BamlOutboundValue& raw, const char* fqn) {
+  const pb::BamlOutboundValue& value = unwrap(raw);
+  if (value.value_case() != pb::BamlOutboundValue::kHandleValue ||
+      value.handle_value().key() == 0 ||
+      value.handle_value().handle_type() != pb::ADT_RUNTIME_VALUE ||
+      !value.handle_value().has_ty() ||
+      value.handle_value().ty().ty_case() != pb::BamlTy::kClassTy ||
+      value.handle_value().ty().class_ty().name() != fqn) {
+    kind_mismatch(fqn, value);
+  }
+  return std::make_shared<capability_state>(value.handle_value().key(),
+                                            pb::ADT_RUNTIME_VALUE);
+}
+
 inline void encode_capability(pb::InboundValue& target,
                               const capability_state& state) {
   uint64_t cloned = 0;
   const uint32_t status = api().handle_clone(state.key, &cloned);
   if (status != 0 || cloned == 0) {
-    throw error("BAML handle clone failed with status " +
-                std::to_string(status));
+    throw bridge_error("BAML handle clone failed with status " +
+                       std::to_string(status));
   }
   pb::BamlHandle* handle = target.mutable_handle();
   handle->set_key(cloned);
@@ -88,8 +108,9 @@ inline bool prompt_media_equal(const pb::BamlValueMedia& lhs,
       return lhs.url() == rhs.url();
     case pb::BamlValueMedia::kBase64:
       return lhs.base64() == rhs.base64();
-    case pb::BamlValueMedia::kFile:
-      return lhs.file() == rhs.file();
+    case pb::BamlValueMedia::kFileContent:
+      return lhs.file_content().name() == rhs.file_content().name() &&
+             lhs.file_content().base64() == rhs.file_content().base64();
     case pb::BamlValueMedia::VALUE_NOT_SET:
       return true;
   }
@@ -212,20 +233,21 @@ class function_spec {
     return !(lhs == rhs);
   }
 
-  Out call() const {
-    detail::args_encoder args;
+  Out call(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<Out>("ai.FunctionSpec.call", std::move(args));
   }
 
-  future<Out> call_async() const {
-    detail::args_encoder args;
+  future<Out> call_async(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::start_call<Out>("ai.FunctionSpec.call", std::move(args));
   }
 
-  Out parse(const std::string& json) const {
-    detail::args_encoder args;
+  Out parse(const std::string& json,
+            const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     args.add_arg("json", [&](detail::pb::InboundValue& target) {
       codec<std::string>::encode(target, json);
@@ -233,8 +255,9 @@ class function_spec {
     return detail::call_sync<Out>("ai.FunctionSpec.parse", std::move(args));
   }
 
-  future<Out> parse_async(const std::string& json) const {
-    detail::args_encoder args;
+  future<Out> parse_async(const std::string& json,
+                          const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     args.add_arg("json", [&](detail::pb::InboundValue& target) {
       codec<std::string>::encode(target, json);
@@ -242,34 +265,36 @@ class function_spec {
     return detail::start_call<Out>("ai.FunctionSpec.parse", std::move(args));
   }
 
-  ::baml::prompt prompt() const;
-  future<::baml::prompt> prompt_async() const;
+  ::baml::prompt prompt(const invocation_options& baml = {}) const;
+  future<::baml::prompt> prompt_async(
+      const invocation_options& baml = {}) const;
 
   template <typename Request>
-  Request build_request() const {
-    detail::args_encoder args;
+  Request build_request(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<Request>("ai.FunctionSpec.build_request",
                                       std::move(args));
   }
 
   template <typename Request>
-  future<Request> build_request_async() const {
-    detail::args_encoder args;
+  future<Request> build_request_async(
+      const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::start_call<Request>("ai.FunctionSpec.build_request",
                                        std::move(args));
   }
 
-  std::string name() const {
-    detail::args_encoder args;
+  std::string name(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<std::string>("ai.FunctionSpec.name",
                                           std::move(args));
   }
 
-  future<std::string> name_async() const {
-    detail::args_encoder args;
+  future<std::string> name_async(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::start_call<std::string>("ai.FunctionSpec.name",
                                            std::move(args));
@@ -308,28 +333,28 @@ class stream {
     return !(lhs == rhs);
   }
 
-  stream_item<T> next() const {
-    detail::args_encoder args;
+  stream_item<T> next(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<stream_item<T>>("ai.stream.Stream.next",
                                              std::move(args));
   }
 
-  future<stream_item<T>> next_async() const {
-    detail::args_encoder args;
+  future<stream_item<T>> next_async(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::start_call<stream_item<T>>("ai.stream.Stream.next",
                                               std::move(args));
   }
 
-  T final_() const {
-    detail::args_encoder args;
+  T final_(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<T>("ai.stream.Stream.final", std::move(args));
   }
 
-  future<T> final_async() const {
-    detail::args_encoder args;
+  future<T> final_async(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::start_call<T>("ai.stream.Stream.final", std::move(args));
   }
@@ -362,21 +387,21 @@ class prompt {
     return !(lhs == rhs);
   }
 
-  std::string text() const {
-    detail::args_encoder args;
+  std::string text(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<std::string>("ai.Prompt.text", std::move(args));
   }
 
-  future<std::string> text_async() const {
-    detail::args_encoder args;
+  future<std::string> text_async(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::start_call<std::string>("ai.Prompt.text", std::move(args));
   }
 
   template <typename Messages>
-  Messages messages() const {
-    detail::args_encoder args;
+  Messages messages(const invocation_options& baml = {}) const {
+    detail::args_encoder args(baml);
     add_self(args);
     return detail::call_sync<Messages>("ai.Prompt.messages", std::move(args));
   }
@@ -385,11 +410,15 @@ class prompt {
   explicit prompt(detail::pb::BamlValuePromptAst value)
       : value_(std::move(value)) {}
 
+  // A prompt_ast_value implies its own type, so it states none: the engine
+  // refuses a prompt node that carries a value_type.
+  void encode_into(detail::pb::InboundValue& target) const {
+    target.mutable_prompt_ast_value()->CopyFrom(value_);
+  }
+
   void add_self(detail::args_encoder& args) const {
-    args.add_arg("self", [&](detail::pb::InboundValue& target) {
-      target.mutable_prompt_ast_value()->CopyFrom(value_);
-      target.mutable_value_type()->mutable_prompt_ast();
-    });
+    args.add_arg(
+        "self", [&](detail::pb::InboundValue& target) { encode_into(target); });
   }
 
   detail::pb::BamlValuePromptAst value_;
@@ -398,16 +427,18 @@ class prompt {
 };
 
 template <typename Out>
-::baml::prompt function_spec<Out>::prompt() const {
-  detail::args_encoder args;
+::baml::prompt function_spec<Out>::prompt(
+    const invocation_options& baml) const {
+  detail::args_encoder args(baml);
   add_self(args);
   return detail::call_sync<::baml::prompt>("ai.FunctionSpec.prompt",
                                            std::move(args));
 }
 
 template <typename Out>
-future<::baml::prompt> function_spec<Out>::prompt_async() const {
-  detail::args_encoder args;
+future<::baml::prompt> function_spec<Out>::prompt_async(
+    const invocation_options& baml) const {
+  detail::args_encoder args(baml);
   add_self(args);
   return detail::start_call<::baml::prompt>("ai.FunctionSpec.prompt",
                                             std::move(args));
@@ -488,8 +519,7 @@ struct codec<prompt> {
   }
 
   static void encode(detail::pb::InboundValue& target, const prompt& value) {
-    target.mutable_prompt_ast_value()->CopyFrom(value.value_);
-    target.mutable_value_type()->CopyFrom(baml_ty());
+    value.encode_into(target);
   }
 
   static prompt decode(const detail::pb::BamlOutboundValue& raw) {

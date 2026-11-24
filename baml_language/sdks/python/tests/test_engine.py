@@ -10,6 +10,7 @@ Run with:
     uv run pytest tests/ -v
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -18,14 +19,18 @@ import sys
 import pytest
 
 from baml_bridge import (
+    BamlClassInstance,
+    BamlError,
+    BamlPanic,
     BamlRuntime,
     FunctionResult,
-    HostSpanManager,
+    default_unhandled_spawn_error_handler,
     get_bridge_runtime_version,
     get_toolchain_version,
     get_version,
     call_function,
     call_function_sync,
+    set_unhandled_spawn_error_handler,
 )
 
 
@@ -135,6 +140,212 @@ raise SystemExit(42)
     assert "boom" in result.stderr
 
 
+# A host chooses what an unobserved spawn error does to its process
+# (`set_unhandled_spawn_error_handler`). The state is process-wide and the
+# default ends the process, so each case runs in a child process: `main` leaves
+# a failed task unobserved, `cancelled_main` cancels a task whose cleanup then
+# fails, and `cancelled_after_failure_main` cancels a task that has already
+# failed. A child that survives exits with status 42.
+UNHANDLED_SPAWN_SCRIPT = """\
+import json
+import sys
+import threading
+import traceback
+
+import baml_bridge
+from baml_bridge import BamlRuntime, call_function_sync, shutdown_runtime
+
+source = '''
+function bad() -> int throws string { throw "boom" }
+function main() -> int {
+    spawn { bad() };
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(50n));
+    1
+}
+function failing_cleanup() -> int {
+    defer { throw "cleanup boom" }
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(60000n));
+    1
+}
+function cancelled_main() -> int {
+    let pending = spawn { failing_cleanup() };
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(20n));
+    pending.cancel();
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(50n));
+    1
+}
+function cancelled_after_failure_main() -> int {
+    let failed = spawn { bad() };
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(50n));
+    failed.cancel();
+    1
+}
+'''
+
+seen = []
+
+
+def record(error, cancelled):
+    seen.append(
+        {
+            "type": type(error).__name__,
+            "text": str(error),
+            "cancelled": cancelled,
+            "baml_frames": "main.baml" in "".join(traceback.format_exception(error)),
+        }
+    )
+
+
+def run(entry):
+    runtime = BamlRuntime.initialize_runtime(".", {"main.baml": source})
+    assert call_function_sync(runtime, entry, {}).result() == 1
+    shutdown_runtime()
+    print(json.dumps(seen))
+    raise SystemExit(42)
+
+
+"""
+
+
+def run_unhandled_spawn_script(body: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-c", UNHANDLED_SPAWN_SCRIPT + body],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_unhandled_spawn_error_handler_replaces_the_default():
+    result = run_unhandled_spawn_script(
+        """\
+previous = baml_bridge.set_unhandled_spawn_error_handler(record)
+assert previous is baml_bridge.default_unhandled_spawn_error_handler
+run("main")
+"""
+    )
+
+    # The process went on to its own exit, and the handler was the only report.
+    assert result.returncode == 42, result.stderr
+    assert "boom" not in result.stderr
+    assert json.loads(result.stdout) == [
+        {
+            "type": "BamlError",
+            "text": "str: 'boom'",
+            "cancelled": False,
+            "baml_frames": True,
+        }
+    ]
+
+
+def test_unhandled_spawn_error_handler_none_restores_the_default():
+    result = run_unhandled_spawn_script(
+        """\
+baml_bridge.set_unhandled_spawn_error_handler(record)
+assert baml_bridge.set_unhandled_spawn_error_handler(None) is record
+run("main")
+"""
+    )
+
+    expected_returncode = signal.SIGTERM if os.name == "nt" else 1
+    assert result.returncode == expected_returncode
+    assert "boom" in result.stderr
+
+
+def test_unhandled_spawn_error_handler_can_keep_the_default_for_some_errors():
+    result = run_unhandled_spawn_script(
+        """\
+def fatal_unless_cancelled(error, cancelled):
+    record(error, cancelled)
+    baml_bridge.default_unhandled_spawn_error_handler(error, cancelled)
+
+baml_bridge.set_unhandled_spawn_error_handler(fatal_unless_cancelled)
+run("main")
+"""
+    )
+
+    expected_returncode = signal.SIGTERM if os.name == "nt" else 1
+    assert result.returncode == expected_returncode
+    assert "boom" in result.stderr
+
+
+def test_unhandled_spawn_error_handler_that_raises_is_reported_and_the_process_continues():
+    result = run_unhandled_spawn_script(
+        """\
+def broken(error, cancelled):
+    raise ValueError("the handler has a defect")
+
+baml_bridge.set_unhandled_spawn_error_handler(broken)
+run("main")
+"""
+    )
+
+    assert result.returncode == 42, result.stderr
+    # `sys.unraisablehook` reports the handler's exception, and with it the
+    # error of the spawned task that the handler did not report.
+    assert "the handler has a defect" in result.stderr
+    assert "boom" in result.stderr
+
+
+def test_unhandled_spawn_error_handler_is_told_when_the_task_was_cancelled():
+    result = run_unhandled_spawn_script(
+        """\
+baml_bridge.set_unhandled_spawn_error_handler(record)
+run("cancelled_main")
+"""
+    )
+
+    assert result.returncode == 42, result.stderr
+    [seen] = json.loads(result.stdout)
+    assert seen["cancelled"] is True
+    assert seen["text"] == "str: 'cleanup boom'"
+
+
+def test_unhandled_spawn_error_handler_is_told_of_a_cancel_after_the_failure():
+    result = run_unhandled_spawn_script(
+        """\
+baml_bridge.set_unhandled_spawn_error_handler(record)
+run("cancelled_after_failure_main")
+"""
+    )
+
+    # The task had failed before anything cancelled it, and the flag is still
+    # set: it says that the task was cancelled, not that the cancel came first.
+    assert result.returncode == 42, result.stderr
+    [seen] = json.loads(result.stdout)
+    assert seen["cancelled"] is True
+    assert seen["text"] == "str: 'boom'"
+
+
+def test_unhandled_spawn_error_default_prints_a_cancelled_task_and_continues():
+    result = run_unhandled_spawn_script(
+        """\
+run("cancelled_main")
+"""
+    )
+
+    assert result.returncode == 42, result.stderr
+    assert "cleanup boom" in result.stderr
+
+
+def test_set_unhandled_spawn_error_handler_returns_the_handler_it_replaces():
+    def first(error: BaseException, cancelled: bool) -> None:
+        pass
+
+    def second(error: BaseException, cancelled: bool) -> None:
+        pass
+
+    original = set_unhandled_spawn_error_handler(first)
+    try:
+        assert original is default_unhandled_spawn_error_handler
+        assert set_unhandled_spawn_error_handler(second) is first
+        assert set_unhandled_spawn_error_handler(None) is second
+        assert set_unhandled_spawn_error_handler(None) is default_unhandled_spawn_error_handler
+    finally:
+        set_unhandled_spawn_error_handler(original)
+
+
 # A call whose cleanup outlasts it: cancelled, it unwinds into a `defer` that
 # runs shielded for a minute.
 SLOW_CLEANUP_SCRIPT = """\
@@ -214,6 +425,52 @@ def test_exit_wait_ends_on_ctrl_c():
     assert "KeyboardInterrupt" in stderr, stderr
 
 
+SLOW_SYNC_CALL_SCRIPT = """\
+import time
+from baml_bridge import BamlRuntime, call_function_sync
+
+source = '''
+function slow() -> int {
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(60000n));
+    0
+}
+'''
+runtime = BamlRuntime.initialize_runtime(".", {"main.baml": source})
+print("calling", flush=True)
+started = time.monotonic()
+try:
+    call_function_sync(runtime, "slow", {})
+except KeyboardInterrupt:
+    print(f"interrupted after {time.monotonic() - started:.1f}s", flush=True)
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGINT delivery to a child is POSIX-only")
+def test_ctrl_c_interrupts_a_sync_call():
+    # Ctrl+C during a sync call raises promptly, and it cancels the call: exit
+    # waits for in-flight calls, so a call left running would hold the process
+    # for the full minute.
+    import time
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", SLOW_SYNC_CALL_SCRIPT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "calling"
+        time.sleep(0.5)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=20)
+    finally:
+        process.kill()
+    assert "interrupted after" in stdout, stderr
+    took = float(stdout.split("interrupted after ")[1].strip().removesuffix("s"))
+    assert took < 5, stdout
+
+
 # ============================================================================
 # TEST: Basics — initialization and version
 # ============================================================================
@@ -276,7 +533,7 @@ version = "{generated_toolchain}"
             "expects baml_sdk to be generated using BAML toolchain "
             f"{get_toolchain_version()}" in message
         )
-        assert f"`baml toolchain pin {get_toolchain_version()}`" in message
+        assert f"`baml toolchain use {get_toolchain_version()}`" in message
         assert "install `baml-bridge` (the Python package)" in message
         assert "then re-run `baml generate`" in message
         assert "Failed to deserialize BAML bytecode" not in message
@@ -346,41 +603,48 @@ class TestCallFunctionSync:
         result = call_function_sync(rt,"ReturnFloat", {"f": 3.14})
         assert abs(result.result() - 3.14) < 0.001
 
-    def test_raw_empty_list_uses_dynamic_union_default(self):
-        """A raw Python [] selects the first matching list arm."""
+    def test_raw_list_is_judged_by_the_type_it_states(self):
+        """This process has no generated SDK, so the bridge knows no declared
+        types and a raw Python list states the type its elements give it:
+        `[1]` is an `int[]` and takes that arm."""
         rt = make_runtime(EXPR_FUNCS_BAML)
-        result = call_function_sync(rt, "ClassifyAmbiguousEmptyList", {"value": []})
+        result = call_function_sync(rt, "ClassifyAmbiguousEmptyList", {"value": [1]})
         assert result.result() == "ints"
 
     def test_returned_closure_accepts_args_and_decodes_results(self):
         rt = make_runtime(EXPR_FUNCS_BAML)
         add_ten = call_function_sync(rt, "MakeAdder", {"offset": 10}).result()
         assert callable(add_ten)
-        assert add_ten(5) == 15
-        assert add_ten(value=7) == 17
+        assert add_ten.call_sync(5) == 15
+        assert add_ten.call_sync(value=7) == 17
 
     def test_returned_closure_is_reusable_and_retains_captures(self):
         rt = make_runtime(EXPR_FUNCS_BAML)
         next_value = call_function_sync(rt, "MakeCounter", {"start": 40}).result()
-        assert next_value() == 41
-        assert next_value() == 42
+        assert next_value.call_sync() == 41
+        assert next_value.call_sync() == 42
 
     def test_missing_argument_raises(self):
-        """Missing required argument raises an error.
-
-        The engine reports this as ``Invalid argument: <name>`` rather than
-        ``Missing argument``; the test only asserts that *an* argument-
-        related error surfaces so it survives that phrasing tweak.
-        """
+        """A missing required argument is the error the engine threw. This
+        process has no generated SDK, so the thrown value is of a class with
+        no Python class."""
         rt = make_runtime(EXPR_FUNCS_BAML)
-        with pytest.raises(Exception, match="argument"):
+        with pytest.raises(BamlError, match="argument") as exc_info:
             call_function_sync(rt,"ReturnNumber", {})
+        assert exc_info.value.class_name == "baml.errors.InvalidArgument"
+        thrown = exc_info.value.value
+        assert isinstance(thrown, BamlClassInstance)
+        assert thrown.class_name == "baml.errors.InvalidArgument"
+        assert "argument" in thrown.fields["message"]
 
-    def test_function_not_found_raises(self):
-        """Calling a nonexistent function raises an error."""
+    def test_function_not_found_is_a_panic(self):
+        """The program has no such function: no BAML code ran that could catch
+        it."""
         rt = make_runtime(EXPR_FUNCS_BAML)
-        with pytest.raises(Exception, match="not found"):
+        with pytest.raises(BamlPanic, match="not found") as exc_info:
             call_function_sync(rt,"NoSuchFunction", {})
+        assert exc_info.value.class_name == "baml.panics.SdkPanic"
+        assert isinstance(exc_info.value.value, BamlClassInstance)
 
 
 # ============================================================================
@@ -405,27 +669,14 @@ class TestCallFunctionAsync:
         assert result.result() == 300
 
     @pytest.mark.asyncio
+    async def test_returned_closure_is_awaited_async(self):
+        rt = make_runtime(EXPR_FUNCS_BAML)
+        add_ten = (await call_function(rt, "MakeAdder", {"offset": 10})).result()
+        assert await add_ten(5) == 15
+        assert await add_ten(value=7) == 17
+
+    @pytest.mark.asyncio
     async def test_identity_string_async(self):
         rt = make_runtime(EXPR_FUNCS_BAML)
         result = await call_function(rt,"Identity", {"s": "async hello"})
         assert result.result() == "async hello"
-
-
-# ============================================================================
-# TEST: HostSpanManager (stub — all should pass since they're no-ops)
-# ============================================================================
-
-
-class TestHostSpanManager:
-    def test_create_host_span_manager(self):
-        hsm = HostSpanManager()
-        assert isinstance(hsm, HostSpanManager)
-
-    def test_deep_clone(self):
-        hsm = HostSpanManager()
-        cloned = hsm.deep_clone()
-        assert isinstance(cloned, HostSpanManager)
-
-    def test_context_depth_is_zero(self):
-        hsm = HostSpanManager()
-        assert hsm.context_depth() == 0

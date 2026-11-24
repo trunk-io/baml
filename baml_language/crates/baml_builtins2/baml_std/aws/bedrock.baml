@@ -10,6 +10,11 @@
 /// so declaring a client is always safe; the AWS provider chain (environment,
 /// shared config/credentials files, `credential_process`, SSO cache, container
 /// endpoint, EC2 IMDS) runs when a request is signed.
+///
+/// Every credential and endpoint option is a literal or `env.NAME`, read when
+/// a request is built. A variable that is unset, or any blank value, counts as
+/// not set. Prefer `env.NAME` for the secret options, so the client value never
+/// holds them.
 class BedrockClient {
     /// A foundation-model id (`anthropic.claude-3-5-haiku-20241022-v1:0`), a
     /// cross-region inference-profile id (`us.anthropic.claude-haiku-4-5-…`),
@@ -25,17 +30,22 @@ class BedrockClient {
     /// those produce one, the request fails with a message naming all of them
     /// (unless `endpoint_url` is set, which needs no region for the URL —
     /// signing still scopes to the resolved region).
-    region: string?,
+    region: ai.Credential?,
     /// Named profile in the shared config/credentials files. `null` uses
     /// `AWS_PROFILE`, else `default`.
-    profile: string?,
-    /// Explicit static credentials. Both `access_key_id` and
-    /// `secret_access_key` must be set to short-circuit the provider chain; a
-    /// lone key id falls through rather than signing with half an identity.
-    access_key_id: string?,
-    secret_access_key: string?,
-    /// Session token for temporary (STS/SSO) credentials.
-    session_token: string?,
+    profile: ai.Credential?,
+    /// Explicit static credentials, which replace the provider chain. They are
+    /// all-or-nothing: when any of `access_key_id`, `secret_access_key` and
+    /// `session_token` reads a value, the key pair must both read one, or the
+    /// request fails naming what is missing rather than signing as another
+    /// identity. When none reads a value (`env.NAME` options whose variables
+    /// are all unset, as on a host with an instance role), the provider chain
+    /// runs.
+    access_key_id: ai.Credential?,
+    secret_access_key: ai.Credential?,
+    /// Session token for temporary (STS/SSO) credentials. Long-lived keys
+    /// have none, so one that reads nothing is left out.
+    session_token: ai.Credential?,
     /// Replaces `https://bedrock-runtime.<region>.amazonaws.com` — a VPC
     /// endpoint, a LocalStack instance, or a test server. A trailing slash is
     /// tolerated. Setting it bypasses region resolution for the URL.
@@ -66,8 +76,8 @@ class BedrockClient {
 
     // --- prompt caching -----------------------------------------------------
     /// Append a `cachePoint` after the system content, making the system
-    /// prompt reusable across calls. Per-message checkpoints come from the
-    /// `cache_point` key of `ai.PromptMessage.metadata` instead.
+    /// prompt reusable across calls. A checkpoint anywhere else is written in
+    /// the prompt, as `${cache()}`.
     cache_system_prompt: bool,
     /// Append a `cachePoint` after the tool list, making the tool definitions
     /// reusable across calls.
@@ -90,7 +100,7 @@ class BedrockClient {
     headers: map<string, string>?,
     /// Extra query parameters, appended (and percent-encoded) BEFORE signing.
     query_params: map<string, string>?,
-    /// Record request/response bodies on the LLMCall wire records delivered
+    /// Record request/response bodies on the ModelCall wire records delivered
     /// through on_event. Status, headers, and timing are always recorded; this
     /// flag only gates the bodies.
     capture_wire: bool,
@@ -105,11 +115,11 @@ class BedrockClient {
     /// request is built.
     function new(
         model: string,
-        region: string? = null,
-        profile: string? = null,
-        access_key_id: string? = null,
-        secret_access_key: string? = null,
-        session_token: string? = null,
+        region: ai.Credential? = null,
+        profile: ai.Credential? = null,
+        access_key_id: ai.Credential? = null,
+        secret_access_key: ai.Credential? = null,
+        session_token: ai.Credential? = null,
         endpoint_url: ai.Credential? = null,
         max_tokens: int? = null,
         temperature: float? = null,
@@ -157,14 +167,30 @@ class BedrockClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `bedrock/${self.model}`
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "aws-bedrock"
+        }
+
+        /// What a `${cache()}` sends as a `cachePoint` block: a checkpoint
+        /// with the default 5-minute lifetime, for a Claude or Nova model.
+        /// Null for every other model, where Converse rejects a checkpoint;
+        /// a `${cache()}` sends nothing there.
+        function default_cache_args(self) -> baml.json.json {
+            if (root.internal._supports_cache_point(self.model)) {
+                { "type": "default" }
+            } else {
+                null
+            }
         }
 
         /// This is deliberately the unsigned Converse request. Signing is an
         /// invocation concern and would read credentials during a snapshot.
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            aws.internal.build_request(self, input, preview = true) catch_all (e) {
+            root.internal.build_request(self, input, preview = true) catch_all (e) {
                 _ => throw ai.errors.normalize(e),
             }
         }

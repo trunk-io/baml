@@ -29,13 +29,21 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import baml_bridge.BamlCancelledError;
 import baml_bridge.BamlError;
+import baml_bridge.BamlPanic;
+import baml_bridge.HostCalls;
+import baml_sdk.baml.panics.Cancelled;
+import baml_sdk.baml.panics.UserPanic;
 import baml_sdk.host_callable_tests.Fns;
 import baml_sdk.host_callable_tests.IntOptCallback;
+import baml_sdk.host_callable_tests.IntStringBooleanCallback;
 import baml_sdk.host_callable_tests.Person;
 import baml_sdk.host_callable_tests.ValidationError;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.CompletableFuture;
@@ -43,9 +51,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -88,23 +97,81 @@ class TestHostCallables {
 
     @Test
     void test_baml_closure_is_a_native_callable_with_host_language_arguments() {
-        Function<Long, Long> addTen = Fns.make_adder(10L);
+        var addTen = Fns.make_adder(10L);
         assertEquals(15L, addTen.apply(5L));
         assertEquals(17L, addTen.apply(7L));
     }
 
     @Test
     void test_baml_closure_decodes_multiple_args_and_structured_return_values() {
-        BiFunction<Long, String, Person> build = Fns.make_pair_builder(30L);
+        var build = Fns.make_pair_builder(30L);
         assertEquals(new Person("Ada", 42L), build.apply(12L, "Ada"));
         assertEquals(new Person("Grace", 35L), build.apply(5L, "Grace"));
     }
 
     @Test
     void test_baml_closure_is_reusable_and_retains_mutable_captures() {
-        java.util.function.Supplier<Long> nextValue = Fns.make_counter(40L);
-        assertEquals(41L, nextValue.get());
-        assertEquals(42L, nextValue.get());
+        var nextValue = Fns.make_counter(40L);
+        assertEquals(41L, nextValue.call());
+        assertEquals(42L, nextValue.call());
+    }
+
+    @Test
+    void test_host_callable_hof_receives_a_baml_closure() {
+        // BAML hands the callback a closure of its own; it arrives as the
+        // callback's declared parameter type, calls back into BAML (twice),
+        // and its result flows back through `hof`.
+        List<Function<Long, Long>> received = new ArrayList<>();
+        Function<Function<Long, Long>, Long> cb = f -> {
+            received.add(f);
+            return f.apply(41L) * 100 + f.andThen(y -> y * 2).apply(1L);
+        };
+        assertEquals(4204L, Fns.hof(cb));
+        assertEquals(1, received.size());
+    }
+
+    @Test
+    void test_host_callable_two_cbs_callbacks_named_f_and_f_returns_both_run() {
+        // Two callback parameters whose names differ by a `_returns` suffix
+        // each keep their own callable: `f(1) + f_returns(2)`.
+        Function<Long, Long> f = x -> x * 10;
+        Function<Long, Long> fReturns = x -> x * 100;
+        assertEquals(210L, Fns.two_cbs(f, fReturns));
+    }
+
+    @Test
+    void test_host_callable_void_signatures() {
+        // A unit callable has no result to carry in either direction: a host
+        // callback is a `void` method whatever its arity, and so is a BAML
+        // closure returned to the host.
+        List<String> seen = Collections.synchronizedList(new ArrayList<>());
+        Consumer<Long> one = value -> seen.add(String.valueOf(value));
+        BiConsumer<Long, String> two = (value, label) -> seen.add(value + ":" + label);
+        IntStringBooleanCallback three =
+                (value, label, flag) -> seen.add(value + ":" + label + ":" + flag);
+
+        assertEquals(1L, Fns.call_void_callback(one, 1L));
+        assertEquals(2L, Fns.call_void_callback_two_args(two, 2L, "two"));
+        assertEquals(3L, Fns.call_void_callback_three_args(three, 3L, "three", true));
+
+        Fns.call_throwing_void_callback(one, 4L);
+        RuntimeException raised = new RuntimeException("void failed");
+        Consumer<Long> failing = value -> {
+            throw raised;
+        };
+        RuntimeException caught =
+                assertThrows(
+                        RuntimeException.class,
+                        () -> Fns.call_throwing_void_callback(failing, 4L));
+        assertSame(raised, caught);
+
+        Fns.make_void_callback().apply();
+
+        var forward = Fns.make_void_forwarder(two);
+        forward.apply(5L, "five");
+        forward.apply(6L, "six");
+
+        assertEquals(List.of("1", "2:two", "3:three:true", "4", "5:five", "6:six"), seen);
     }
 
     @Test
@@ -189,6 +256,63 @@ class TestHostCallables {
         assertEquals(7L, decoded.code());
         assertEquals("propagated through", decoded.message());
         assertEquals(List.of("x", "y"), decoded.fields());
+    }
+
+    // SDK_PARITY_LINT(skip): pins a typed SDK's completion of a forwarded panic under a single-class throws
+    @Test
+    void test_host_callables_forwarded_panic_stays_a_panic_under_a_declared_throws_class() {
+        // A panic from a nested BAML call, let escape the callback, is thrown
+        // back as the panic it is: under `throws ValidationError` too, since a
+        // panic is a panic whatever the callable declares.
+        Function<Long, String> cb = x -> {
+            baml_sdk.throws_test.Fns.DoPanic("forwarded");
+            return "unreachable";
+        };
+        BamlPanic panic = assertThrows(
+                BamlPanic.class, () -> Fns.call_with_typed_throws_propagating(cb, 1L));
+        assertEquals("baml.panics.UserPanic", panic.class_name());
+        assertEquals("forwarded", assertInstanceOf(UserPanic.class, panic.value()).message());
+    }
+
+    // SDK_PARITY_LINT(skip): pins a typed SDK's completion of a nested call's cancellation, which it surfaces as its native cancellation
+    @Test
+    void test_host_callables_forwarded_async_cancellation_stays_a_panic() {
+        // A nested async call's engine-driven cancellation surfaces in Java as
+        // a BamlCancelledError carrying its `Cancelled` panic; let escape the
+        // callback, it is thrown back as that panic, not raised as a host
+        // exception.
+        Function<Long, String> cb = x -> {
+            throw new BamlCancelledError(
+                    new Cancelled("stopped"), List.of(), "baml.panics.Cancelled");
+        };
+        BamlPanic panic = assertThrows(
+                BamlPanic.class, () -> Fns.call_with_typed_throws_propagating(cb, 1L));
+        assertEquals("baml.panics.Cancelled", panic.class_name());
+        assertEquals("stopped", assertInstanceOf(Cancelled.class, panic.value()).message());
+    }
+
+    // SDK_PARITY_LINT(skip): pins the Java completion of a forwarded TypeMismatch, which Java surfaces as an IllegalArgumentException
+    @Test
+    void test_host_callables_forwarded_type_mismatch_crosses_as_the_baml_error_it_is() {
+        // A nested call's TypeMismatch surfaces in Java as an
+        // IllegalArgumentException carrying the BAML error; let escape the
+        // callback, it crosses back as that BAML error (the outer call raises
+        // a TypeMismatch of its own), not as a host exception rehydrated to
+        // the nested call's object.
+        IllegalArgumentException[] nested = new IllegalArgumentException[1];
+        Function<Long, String> cb = x -> {
+            try {
+                baml_sdk.generic_tests.Fns.parse_as("42");
+            } catch (IllegalArgumentException mismatch) {
+                nested[0] = mismatch;
+                throw mismatch;
+            }
+            return "unreachable";
+        };
+        IllegalArgumentException outer =
+                assertThrows(IllegalArgumentException.class, () -> Fns.call_with_callback(cb, 1L));
+        assertNotSame(nested[0], outer);
+        assertEquals(nested[0].getMessage(), outer.getMessage());
     }
 
     @Test
@@ -284,15 +408,44 @@ class TestHostCallables {
         }
     }
 
-    @Disabled(
-            "java-port note: mirrors Python's xfail (strict=False). Host-callable "
-                    + "release fires only when the engine GCs the Object::HostClosure on "
-                    + "its heap; one BAML call rarely triggers the GC heuristic. Java's "
-                    + "WeakReference + System.gc() is non-deterministic too, so this is "
-                    + "skipped (TS uses it.skip for the same reason).")
+    /**
+     * Wait until the host-value registry no longer holds {@code value}: BAML
+     * gives a key's references back once it collects the values holding them.
+     */
+    static void awaitReleased(Object value) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (HostCalls.holds(value)) {
+            assertTrue(System.nanoTime() < deadline, "the host value was never released");
+            baml_sdk.baml.sys.Fns.collect_garbage();
+            Thread.sleep(10);
+        }
+    }
+
     @Test
-    void test_host_callables_release_fires_on_drop_of_callable() {
-        // Intentionally empty — see @Disabled reason.
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void test_host_callables_release_fires_on_drop_of_callable() throws InterruptedException {
+        Function<Long, String> cb = x -> "seen:" + x;
+        assertEquals("seen:1", Fns.call_with_callback(cb, 1L));
+        awaitReleased(cb);
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void test_host_callables_raised_exception_is_released_after_its_round_trip() throws InterruptedException {
+        // The raised exception crosses back inside the error envelope with a
+        // pin the bridge gives back once it has rehydrated the original; then
+        // BAML's collection gives back the key, and the registry lets it go.
+        RuntimeException raised = new RuntimeException("released");
+        Function<Long, String> cb = x -> {
+            throw raised;
+        };
+        for (int i = 0; i < 8; i++) {
+            RuntimeException caught =
+                    assertThrows(RuntimeException.class, () -> Fns.propagate_throwing_callback(cb, 1L));
+            assertSame(raised, caught);
+        }
+        awaitReleased(raised);
+        awaitReleased(cb);
     }
 
     @Test

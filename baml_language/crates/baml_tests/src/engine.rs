@@ -84,8 +84,8 @@ pub fn function_index(program: &Program, name: &str) -> Option<usize> {
 /// The program's named functions plus its interface bodies, as
 /// `(fq name, object index)` pairs. Named callables come from the package
 /// tables' rendered view; bodies are anonymous (in no table), so they are
-/// enumerated straight off the object pool — their `Function::name` display
-/// field is exactly the spelling bytecode snapshots show.
+/// enumerated straight off the object pool and rendered under the label of
+/// the package whose cells hold them — the spelling bytecode snapshots show.
 pub fn named_and_interface_body_functions(
     program: &Program,
 ) -> impl Iterator<Item = (String, usize)> + '_ {
@@ -93,18 +93,19 @@ pub fn named_and_interface_body_functions(
         .rendered_callables()
         .into_iter()
         .map(|(name, callable)| (name, callable.object.raw()))
-        .chain(
-            program
-                .objects
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, obj)| match obj {
-                    bex_vm_types::Object::Function(f) if f.is_interface_body => {
-                        Some((f.name.clone(), idx))
-                    }
-                    _ => None,
-                }),
-        )
+        .chain(program.objects.iter().enumerate().filter_map(|(idx, obj)| {
+            match obj {
+                bex_vm_types::Object::Function(f) if f.is_interface_body() => Some((
+                    program
+                        .function_name(bex_vm_types::ObjectIndex::from_raw(idx))
+                        .unwrap_or_else(|| {
+                            unreachable!("every pooled function is placed by a package")
+                        }),
+                    idx,
+                )),
+                _ => None,
+            }
+        }))
 }
 
 /// Like [`display_user_functions`], but lets the caller include auto-derived
@@ -138,9 +139,9 @@ pub fn display_user_functions_with_options(program: &Program, show_auto_derive: 
 /// anything can display a type, and an unbound head renders as its tag
 /// (`<unresolved type #…>`).
 ///
-/// Float constants are boxed into the pool first, exactly as the engine's
-/// load path does — `resolve_function_constants` (inside the heap build)
-/// refuses a raw `ConstValue::Float`.
+/// Float constants with no inline `Value` encoding are boxed into the pool
+/// first, exactly as the engine's load path does — `resolve_function_constants`
+/// (inside the heap build) refuses such a raw `ConstValue::Float`.
 pub fn bound_pool(program: &Program) -> bex_heap::BexHeap {
     let mut objects = program.objects.0.clone();
     for index in 0..objects.len() {
@@ -153,7 +154,11 @@ pub fn bound_pool(program: &Program) -> bex_heap::BexHeap {
             .iter()
             .enumerate()
             .filter_map(|(slot, constant)| match constant {
-                bex_vm_types::ConstValue::Float(value) => Some((slot, *value)),
+                bex_vm_types::ConstValue::Float(value)
+                    if bex_vm_types::Value::try_inline_float(value.get()).is_none() =>
+                {
+                    Some((slot, value.get()))
+                }
                 _ => None,
             })
             .collect();
@@ -178,16 +183,40 @@ pub fn bound_pool(program: &Program) -> bex_heap::BexHeap {
 /// in the program that names the declaration carries exactly this tag, so a
 /// type position is checked by identity rather than by rendered name.
 pub fn declared_type_tag(program: &Program, fq_name: &str) -> Option<baml_type::typetag::TypeTag> {
-    program.objects.iter().find_map(|object| {
-        let (name, tag) = match object {
-            Object::Class(class) => (class.name.declared()?.render_dotted(false), class.type_tag),
-            Object::Enum(enm) => (enm.name.declared()?.render_dotted(false), enm.type_tag),
-            Object::Interface(iface) => (iface.name.render_dotted(false), iface.type_tag),
-            Object::TypeAlias(alias) => (alias.name.render_dotted(false), alias.type_tag),
-            _ => return None,
-        };
-        (name == fq_name).then_some(tag)
+    // A pooled declaration carries only its path; the package tables say
+    // which package declares it, and so what it is called.
+    program.packages.iter().find_map(|package| {
+        [
+            &package.classes,
+            &package.enums,
+            &package.interfaces,
+            &package.type_aliases,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|(path, _)| path.under(&package.name).render_dotted(false) == fq_name)
+        .and_then(|(_, object)| program.objects[*object].declaration_tag())
     })
+}
+
+/// Every class `program` declares at the root namespace under the item name
+/// `name`, as `(display name, tag)` in package order. Read from the package
+/// tables: a pooled class carries only its path, and its package's label is
+/// what it renders under — `Point` in a package labelled `user`, `lib.Point`
+/// in one labelled `lib`. Display names, so two entries may read alike.
+pub fn classes_named(program: &Program, name: &str) -> Vec<(String, baml_type::typetag::TypeTag)> {
+    let path = bex_vm_types::types::LocalName::new(Vec::new(), baml_type::Name::new(name));
+    program
+        .packages
+        .iter()
+        .filter_map(|package| {
+            let object = package.classes.get(&path)?;
+            Some((
+                path.under(&package.name).display_name().to_string(),
+                program.objects[*object].declaration_tag()?,
+            ))
+        })
+        .collect()
 }
 
 /// Read the function at pool index `idx` out of a heap built by
@@ -415,18 +444,56 @@ pub fn db_with_root(root: &Path) -> ProjectDatabase {
     db
 }
 
-/// Like `run_test` but at `OptLevel::Two` (includes MIR constant folding).
-pub async fn run_test_mir_optimized(
-    source: &str,
-    entry: &str,
-    args: IndexMap<&str, BexExternalValue>,
-) -> TestOutput {
-    run_test(source, entry, args, OptLevel::Two).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn newline_rules_preserve_runtime_values_after_formatting() {
+        let source = concat!(
+            include_str!("../baml_src/ns_newline_parsing/newline_parsing.baml"),
+            "\nfunction main() -> bool { verify(true) && verify(false) }\n",
+        );
+        let mut versions = vec![source.to_owned()];
+        for line_width in [40, 100] {
+            let options = baml_fmt::FormatOptions {
+                line_width,
+                ..Default::default()
+            };
+            let formatted = baml_fmt::format(source, &options).expect("format newline fixture");
+            assert_eq!(baml_fmt::format(&formatted, &options).unwrap(), formatted);
+            versions.push(formatted);
+        }
+        for source in versions {
+            let output = run_test(&source, "main", IndexMap::new(), OptLevel::One).await;
+            assert_eq!(output.result, Ok(BexExternalValue::Bool(true)), "{source}");
+        }
+    }
+
+    /// A CRLF checkout must not change string values: every line break in
+    /// source, `\r\n` or a lone `\r`, is read as `\n`; only an escaped `\r` is
+    /// a carriage return.
+    #[tokio::test]
+    async fn crlf_source_has_the_same_string_values_as_lf() {
+        let lf = concat!(
+            "function main() -> string {\n",
+            "    let quoted = \"a\nb\";\n",
+            "    let backtick = `\n",
+            "        c\n",
+            "        d\n",
+            "        `;\n",
+            "    let lone = \"lone\rcr\";\n",
+            "    `${quoted}|${backtick}|\\r|${lone}`\n",
+            "}\n",
+        );
+        let crlf = lf.replace('\n', "\r\n");
+        // A lone `\r` is a line break, like `\n`; a carriage return is `\r`.
+        let expected = Ok(BexExternalValue::String("a\nb|c\nd|\r|lone\ncr".into()));
+        for source in [lf, crlf.as_str()] {
+            let output = run_test(source, "main", IndexMap::new(), OptLevel::One).await;
+            assert_eq!(output.result, expected, "{source:?}");
+        }
+    }
 
     #[tokio::test]
     async fn source_call_omitted_default_executes_in_callee_scope() {
@@ -461,12 +528,13 @@ mod tests {
         }
         "#;
 
-        let omitted = run_test(source, "is_null", IndexMap::new(), OptLevel::One).await;
+        let program = compile_source_with_opt(source, OptLevel::One);
+        let omitted = run_compiled(program.clone(), "is_null", IndexMap::new(), false).await;
         assert_eq!(omitted.result, Ok(BexExternalValue::Bool(false)));
 
         let mut args = IndexMap::new();
         args.insert("value", BexExternalValue::Null);
-        let explicit_null = run_test(source, "is_null", args, OptLevel::One).await;
+        let explicit_null = run_compiled(program, "is_null", args, false).await;
         assert_eq!(explicit_null.result, Ok(BexExternalValue::Bool(true)));
     }
 

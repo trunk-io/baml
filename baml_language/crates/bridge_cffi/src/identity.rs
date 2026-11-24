@@ -21,19 +21,6 @@ pub enum BridgeLanguage {
 }
 
 impl BridgeLanguage {
-    pub(crate) const fn inbound_union_ambiguity_policy(
-        self,
-    ) -> bex_project::InboundUnionAmbiguityPolicy {
-        match self {
-            Self::NodeJs | Self::Python | Self::Web | Self::Ruby => {
-                bex_project::InboundUnionAmbiguityPolicy::SelectDefault
-            }
-            Self::Go | Self::Rust | Self::CSharp | Self::Cpp | Self::Java | Self::Swift => {
-                bex_project::InboundUnionAmbiguityPolicy::Reject
-            }
-        }
-    }
-
     pub const fn telemetry_name(self) -> &'static str {
         match self {
             Self::NodeJs => "nodejs",
@@ -185,6 +172,17 @@ pub fn ensure_version_compatible(expected_version: &str) -> Result<(), String> {
     }
 }
 
+/// Env var that lets a locally built library load under a bridge stamped with
+/// a different toolchain version. Dev-only; the ABI table check is never
+/// skipped.
+pub const SKIP_VERSION_CHECK_ENV: &str = "DEV_BAML_BRIDGE_SKIP_VERSION_CHECK";
+
+fn skip_version_check() -> Result<bool, String> {
+    baml_env::bool_var(SKIP_VERSION_CHECK_ENV)
+        .map(|skip| skip.unwrap_or(false))
+        .map_err(|error| error.to_string())
+}
+
 pub fn register_bridge(info: BridgeInfo) -> Result<&'static BridgeInfo, String> {
     if info.bridge_runtime_name.is_empty() {
         return Err("BAML bridge runtime name must not be empty".to_string());
@@ -192,7 +190,7 @@ pub fn register_bridge(info: BridgeInfo) -> Result<&'static BridgeInfo, String> 
     if info.bridge_runtime_version.is_empty() {
         return Err("BAML bridge runtime version must not be empty".to_string());
     }
-    if ensure_version_compatible(&info.toolchain_version).is_err() {
+    if !skip_version_check()? && ensure_version_compatible(&info.toolchain_version).is_err() {
         return Err(format!(
             "BAML {} {} cannot use native runtime {} because it requires BAML toolchain {}",
             info.bridge_runtime_name,
@@ -202,9 +200,6 @@ pub fn register_bridge(info: BridgeInfo) -> Result<&'static BridgeInfo, String> 
         ));
     }
     let registered = REGISTERED_BRIDGE.register(info)?;
-    bex_project::register_inbound_union_ambiguity_policy(
-        registered.language.inbound_union_ambiguity_policy(),
-    )?;
     Ok(registered)
 }
 
@@ -239,14 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn ruby_identity_is_stable_and_uses_dynamic_union_selection() {
+    fn ruby_identity_is_stable() {
         assert_eq!(BridgeLanguage::try_from(10), Ok(BridgeLanguage::Ruby));
         assert_eq!(BridgeLanguage::Ruby.telemetry_name(), "ruby");
         assert_eq!(BridgeLanguage::Ruby.package_kind(), "the Ruby gem");
         assert_eq!(BridgeLanguage::Ruby.legacy_runtime_name(), "Baml::Bridge");
-        assert_eq!(
-            BridgeLanguage::Ruby.inbound_union_ambiguity_policy(),
-            bex_project::InboundUnionAmbiguityPolicy::SelectDefault,
-        );
     }
 }

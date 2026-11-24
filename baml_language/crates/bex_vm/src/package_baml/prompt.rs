@@ -1,21 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use baml_builtins2::{PromptAst, PromptAstSimple};
 use bex_heap::TlabHolder;
-use bex_vm_types::{
-    HeapPtr,
-    types::{Object, Value},
-};
+use bex_str::BexStr;
+use bex_vm_types::{HeapPtr, PromptAst, PromptAstSimple, RootHaver, RootVisitor, types::Value};
 
 use super::{
     Continuation, NativeCallResult, make_to_string_callee,
     root::{StringRenderState, StructuralRenderSink, collect_to_string_overrides, render_to_sink},
 };
 use crate::{
-    BexVm,
+    BexVm, VmPanic,
+    errors::VmRustFnError,
     package_ai::{
         BamlClassPrompt, BamlNamespaceInternal, BamlPackageAi, PackageAiImpl, view as ai_view,
     },
+    package_load::StdlibClass,
 };
 
 #[derive(Default)]
@@ -63,6 +62,8 @@ impl PromptContentSink {
 }
 
 impl StructuralRenderSink for PromptContentSink {
+    type Error = VmRustFnError;
+
     fn push_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -78,17 +79,18 @@ impl StructuralRenderSink for PromptContentSink {
             .push(Arc::new(PromptAstSimple::String(text.to_string())));
     }
 
-    fn try_push_special(&mut self, vm: &BexVm, value: Value) -> bool {
+    fn try_push_special(&mut self, vm: &BexVm, value: Value) -> Result<bool, VmRustFnError> {
         if let Some(media) = super::json::read_media_value(vm, value) {
             self.parts.push(Arc::new(PromptAstSimple::Media(media)));
-            return true;
+            return Ok(true);
         }
-        if let Some(args) = read_cache_delimiter(vm, value) {
+        if let Some(args) = cache_delimiter_args(vm, value) {
+            let args = prompt_json(vm, args, "the `args` of an `ai.CacheDelimiter`")?;
             self.parts
                 .push(Arc::new(PromptAstSimple::CacheDelimiter(args)));
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -102,22 +104,29 @@ struct PromptRole {
     synthetic: bool,
 }
 
+/// A `json` value a prompt carries, as the `serde_json` its AST holds. One
+/// that JSON cannot hold (a float that is not finite, a list that contains
+/// itself) panics the prompt that interpolates it: the part is sent to a
+/// model as JSON text, and the prompt's functions declare no error.
+fn prompt_json(vm: &BexVm, value: Value, what: &str) -> Result<serde_json::Value, VmRustFnError> {
+    super::json::json_value_to_serde(vm, value).map_err(|unrepresentable| {
+        VmRustFnError::Panic(VmPanic::UserPanic {
+            message: format!("{what}: {unrepresentable}"),
+        })
+    })
+}
+
 /// The `args` of an `ai.CacheDelimiter` instance, which is what `${cache(args)}`
 /// interpolates. `None` for any other value.
-fn read_cache_delimiter(vm: &BexVm, value: Value) -> Option<serde_json::Value> {
-    let ptr = value.as_object_ptr()?;
-    let (class, args) = match vm.get_object(ptr) {
-        Object::Instance(instance) => (instance.class, instance.fields.first()?.load()),
-        _ => return None,
-    };
-    let head = match vm.get_object(class) {
-        Object::Class(c) => bex_vm_types::TypeHead::new(class, c.type_tag),
-        _ => return None,
-    };
-    if !vm.stdlib_heads().is_cache_delimiter(head) {
+fn cache_delimiter_args(vm: &BexVm, value: Value) -> Option<Value> {
+    let instance = vm.get_instance(value.as_object_ptr()?)?;
+    if !vm.stdlib_heads().is_class(
+        StdlibClass::CacheDelimiter,
+        instance.class_object().type_tag,
+    ) {
         return None;
     }
-    Some(super::json::value_to_serde(vm, args))
+    Some(instance.load_value(0))
 }
 
 /// Trim leading whitespace off a run of content parts: whitespace-only text
@@ -189,43 +198,45 @@ fn message(role: PromptRole, mut content: PromptContentSink, trim: bool) -> Arc<
     })
 }
 
-fn prompt_role(vm: &BexVm, value: Value) -> Option<PromptRole> {
-    let ptr = value.as_object_ptr()?;
-    let (class_ptr, fields) = match vm.get_object(ptr) {
-        Object::Instance(instance) => (
-            instance.class,
-            instance.field_values().collect::<Vec<Value>>(),
-        ),
-        _ => return None,
+/// The `name` and `metadata` of an `ai.Role` instance, which opens a message.
+/// `None` for any other value.
+fn role_fields(vm: &BexVm, value: Value) -> Option<(String, Value)> {
+    let instance = vm.get_instance(value.as_object_ptr()?)?;
+    let class = instance.class_object();
+    if !vm
+        .stdlib_heads()
+        .is_class(StdlibClass::PromptRole, class.type_tag)
+    {
+        return None;
+    }
+    let field = |name: &str| {
+        class
+            .instance_fields()
+            .iter()
+            .position(|field| field.name == name)
     };
-    let (name_index, metadata_index) = match vm.get_object(class_ptr) {
-        Object::Class(class)
-            if class
-                .name
-                .declared()
-                .is_some_and(|qtn| qtn.render_dotted(false) == "ai.Role") =>
-        {
-            (
-                class.fields.iter().position(|field| field.name == "name")?,
-                class
-                    .fields
-                    .iter()
-                    .position(|field| field.name == "metadata")?,
-            )
-        }
-        _ => return None,
+    let name = vm.as_string(&instance.load_value(field("name")?)).ok()?;
+    Some((
+        name.as_str().to_string(),
+        instance.load_value(field("metadata")?),
+    ))
+}
+
+/// The role `value` opens a message with, if it is an `ai.Role`.
+fn prompt_role(vm: &BexVm, value: Value) -> Result<Option<PromptRole>, VmRustFnError> {
+    let Some((name, metadata)) = role_fields(vm, value) else {
+        return Ok(None);
     };
-    let name = vm.as_string(fields.get(name_index)?).ok()?;
-    let mut metadata = super::json::value_to_serde(vm, *fields.get(metadata_index)?);
+    let mut metadata = prompt_json(vm, metadata, &format!("the `metadata` of role `{name}`"))?;
     let mut synthetic = false;
     if let serde_json::Value::Object(entries) = &mut metadata {
         synthetic = entries.remove("__baml_synthetic_role").is_some();
     }
-    Some(PromptRole {
-        name: name.as_str().to_string(),
+    Ok(Some(PromptRole {
+        name,
         metadata,
         synthetic,
-    })
+    }))
 }
 
 struct PromptAssembly {
@@ -249,12 +260,18 @@ impl PromptAssembly {
                 content.push_text(part.as_str());
             }
 
-            if let Some(role) = prompt_role(vm, value) {
+            let role = match prompt_role(vm, value) {
+                Ok(role) => role,
+                Err(error) => return NativeCallResult::Error(error),
+            };
+            if let Some(role) = role {
                 if let Some(previous_role) = current_role.replace(role) {
                     pending_messages.push((previous_role, std::mem::take(&mut content)));
                 }
-            } else {
-                render_to_sink(vm, value, false, 0, &mut render_state, &mut content);
+            } else if let Err(error) =
+                render_to_sink(vm, value, false, 0, &mut render_state, &mut content)
+            {
+                return NativeCallResult::Error(error);
             }
         }
 
@@ -287,11 +304,7 @@ impl PromptAssembly {
         }
         .merge_adjacent();
 
-        let prompt_ast_class = vm.resolve_class("ai.Prompt");
-        let data = Value::object(vm.alloc_rust_data(ast));
-        NativeCallResult::Done(Value::object(
-            vm.alloc_instance(prompt_ast_class, vec![data]),
-        ))
+        NativeCallResult::Done(vm.alloc_prompt(ast))
     }
 
     fn dispatch_next(self, vm: &mut BexVm) -> NativeCallResult {
@@ -321,6 +334,20 @@ impl PromptAssembly {
     }
 }
 
+impl RootHaver for PromptAssembly {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            parts,
+            values,
+            pending,
+            results: _,
+        } = self;
+        parts.visit_roots(visitor);
+        values.visit_roots(visitor);
+        pending.visit_roots(visitor);
+    }
+}
+
 impl Continuation for PromptAssembly {
     fn call(mut self: Box<Self>, vm: &mut BexVm, value: Value) -> NativeCallResult {
         self.results.push(
@@ -330,52 +357,23 @@ impl Continuation for PromptAssembly {
         );
         self.dispatch_next(vm)
     }
-
-    fn gc_roots(&self) -> Vec<HeapPtr> {
-        self.parts
-            .iter()
-            .chain(&self.values)
-            .filter_map(Value::as_object_ptr)
-            .chain(self.pending.iter().copied())
-            .collect()
-    }
-
-    fn apply_forwarding(&mut self, forwarding: &HashMap<HeapPtr, HeapPtr>) {
-        for value in self.parts.iter_mut().chain(&mut self.values) {
-            if let Some(ptr) = value.as_object_ptr()
-                && let Some(&new_ptr) = forwarding.get(&ptr)
-            {
-                *value = Value::object(new_ptr);
-            }
-        }
-        for ptr in &mut self.pending {
-            if let Some(&new_ptr) = forwarding.get(ptr) {
-                *ptr = new_ptr;
-            }
-        }
-    }
 }
 
 impl BamlClassPrompt for PackageAiImpl {
-    fn text(vm: &BexVm, prompt: &ai_view::Prompt<'_>) -> bex_str::BexStr {
-        let data = prompt.instance.load_field(0);
-        let prompt = vm
-            .as_rust_data::<PromptAst>(&data)
-            .expect("ai.Prompt._data must contain baml_builtins2::PromptAst");
-        bex_str::BexStr::from(prompt.render_text())
+    fn text(prompt: &ai_view::Prompt<'_>) -> bex_str::BexStr {
+        bex_str::BexStr::from(prompt.payload().render_text())
     }
 
     fn messages(vm: &mut BexVm, prompt: &Value) -> Vec<Value> {
         let messages = {
             let instance = vm
-                .as_instance(prompt)
+                .as_rust_instance(prompt)
                 .expect("ai.Prompt.messages receiver must be an ai.Prompt instance");
-            let data = instance.load_field(0);
-            vm.as_rust_data::<PromptAst>(&data)
-                .expect("ai.Prompt._data must contain baml_builtins2::PromptAst")
+            ai_view::Prompt { instance }
+                .payload()
                 .to_structured_messages()
         };
-        let message_class = vm.resolve_class("ai.PromptMessage");
+        let message_class = vm.lang_object(crate::lang_items::AI_PROMPT_MESSAGE);
         messages
             .into_iter()
             .map(|(role, content, metadata)| {
@@ -408,22 +406,9 @@ fn prompt_metadata_value(vm: &mut BexVm, metadata: serde_json::Value) -> Value {
 fn prompt_content_values(vm: &mut BexVm, content: &PromptAstSimple) -> Vec<Value> {
     match content {
         PromptAstSimple::String(text) => vec![Value::object(vm.alloc_string(text.clone()))],
-        PromptAstSimple::Media(media) => {
-            let class_name = match media.kind {
-                baml_type::MediaKind::Image => "baml.media.Image",
-                baml_type::MediaKind::Audio => "baml.media.Audio",
-                baml_type::MediaKind::Video => "baml.media.Video",
-                baml_type::MediaKind::Pdf => "baml.media.Pdf",
-                baml_type::MediaKind::Generic => {
-                    panic!("generic media cannot inhabit a concrete prompt part")
-                }
-            };
-            let class = vm.resolve_class(class_name);
-            let data = Value::object(vm.alloc_rust_data(media.clone()));
-            vec![Value::object(vm.alloc_instance(class, vec![data]))]
-        }
+        PromptAstSimple::Media(media) => vec![vm.alloc_media(media.clone())],
         PromptAstSimple::CacheDelimiter(args) => {
-            let class = vm.resolve_class("ai.CacheDelimiter");
+            let class = vm.lang_object(crate::lang_items::AI_CACHE_DELIMITER);
             let args = super::json::serde_to_value(vm, args);
             vec![Value::object(vm.alloc_instance(class, vec![args]))]
         }
@@ -434,11 +419,80 @@ fn prompt_content_values(vm: &mut BexVm, content: &PromptAstSimple) -> Vec<Value
     }
 }
 
+/// `ai.internal._describe_unreadable_credential_file`, by the classification
+/// `GOOGLE_APPLICATION_CREDENTIALS` errors use.
+#[cfg(not(target_arch = "wasm32"))]
+fn describe_unreadable_credential_file(
+    setting: &str,
+    value: &str,
+    read_error: &str,
+    document_option: &str,
+) -> String {
+    use google_cloud_auth::PathSetting;
+    let held = PathSetting::classify(value);
+    let described = held.describe_unreadable(setting);
+    match held {
+        PathSetting::Path(_) => format!("{described}: {read_error}"),
+        PathSetting::Document { .. } => {
+            format!("{described}; pass the document through {document_option} instead")
+        }
+        PathSetting::Empty
+        | PathSetting::QuotedPath(_)
+        | PathSetting::PaddedPath(_)
+        | PathSetting::Unrecognized { .. } => described,
+    }
+}
+
+/// `ai.internal._describe_unreadable_credential_file` where the classifier is
+/// not built: Google auth is native-only, so a credential file can name
+/// nothing usable here, and the value is described by its length alone.
+#[cfg(target_arch = "wasm32")]
+fn describe_unreadable_credential_file(
+    setting: &str,
+    value: &str,
+    _read_error: &str,
+    _document_option: &str,
+) -> String {
+    format!(
+        "{setting} names no readable file (the value, {} characters, is not shown)",
+        value.chars().count()
+    )
+}
+
 impl BamlNamespaceInternal for PackageAiImpl {
+    fn _sanitize_text(text: &BexStr) -> BexStr {
+        BexStr::from(btel_settings::network::sanitize_text(
+            text.as_str(),
+            btel_settings::network::Scrub::Log,
+        ))
+    }
+
+    fn _describe_unreadable_credential_file(
+        setting: &BexStr,
+        value: &BexStr,
+        read_error: &BexStr,
+        document_option: &BexStr,
+    ) -> BexStr {
+        BexStr::from(describe_unreadable_credential_file(
+            setting.as_str(),
+            value.as_str(),
+            read_error.as_str(),
+            document_option.as_str(),
+        ))
+    }
+
+    fn _sanitize_request_header(name: &BexStr, value: &BexStr) -> BexStr {
+        BexStr::from(btel_settings::network::sanitize_request_header(
+            name.as_str(),
+            value.as_str(),
+            btel_settings::network::Scrub::Log,
+        ))
+    }
+
     fn assemble_prompt(vm: &mut BexVm, parts: &[Value], values: &[Value]) -> NativeCallResult {
         let mut pending = Vec::new();
         for value in values.iter().copied() {
-            if prompt_role(vm, value).is_none()
+            if role_fields(vm, value).is_none()
                 && let Err(e) = collect_to_string_overrides(vm, value, &mut pending)
             {
                 return NativeCallResult::Error(e.into());

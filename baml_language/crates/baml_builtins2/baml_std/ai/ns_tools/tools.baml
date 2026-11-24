@@ -23,24 +23,101 @@ class Tool {
     ///
     /// A raw tool (`raw_tool`) hands the argument map straight to its
     /// `raw_handler` and returns that string as-is. A schema-derived tool
-    /// validates, dispatches through reflection, and JSON-serializes the
-    /// result; that reflection boundary widens exactly representable integral
-    /// arguments into float parameters (see reflect.call_any).
+    /// aligns a model's arguments to its handler's parameters
+    /// (`_typed_arguments`), dispatches through reflection, which validates
+    /// them, and JSON-serializes the result.
     function call(self, args: map<string, unknown>) -> string {
         if let rh: (map<string, unknown>) -> string throws unknown = self.raw_handler {
             return rh(args);
         }
         if let h: reflect.AnyFunction = self.handler {
-            let value = reflect.call_any(h, args) catch (e) {
+            let value = reflect.call_any(h, _typed_arguments(self.name, h, args)) catch (e) {
                 let bad: reflect.InvalidArgumentError => {
-                    throw baml.errors.InvalidArgument { message: `invalid arguments for ${self.name}: ${bad.to_string()}` }
+                    throw baml.errors.InvalidArgument {
+                        message: `invalid arguments for ${self.name}: ${bad.to_string()}`,
+                    };
                 },
             };
-            baml.json.stringify(baml.json.to_json(value))
+            baml.json.stringify(value)
         } else {
-            throw baml.errors.InvalidArgument { message: `tool ${self.name} has no handler` }
+            throw baml.errors.InvalidArgument {
+                message: `tool ${self.name} has no handler`,
+            };
         }
     }
+}
+
+/// (internal) The arguments of a tool call as `reflect.call_any` takes them.
+///
+/// A provider hands over a model's arguments as parsed JSON: a class is a
+/// map, an enum a string, a list a list of json. `reflect.call_any` takes
+/// values of the parameter types, and the only JSON values that are such
+/// values are the scalars. So the parameters that were sent JSON are read as
+/// the fields of one class, the JSON is aligned to that class as any other
+/// model output is (`baml.sap.coerce`), and the fields of the result are
+/// the arguments.
+///
+/// An argument passes as it arrived when it names no parameter, and when it is
+/// already a value of its parameter's type: that is what BAML code passes when
+/// it calls a tool itself, and it is every value of an `unknown` parameter.
+/// `reflect.call_any` judges every argument that passed. One exception: when a
+/// model writes part of the parameter's type as a `baml.FromLlmOutput` shape,
+/// its JSON is always aligned, so it reads as `baml.sap.parse` reads it. For
+/// `at: baml.time.Instant | string`, the string `"2026-01-01T00:00:00Z"` is
+/// an `Instant`, not a string.
+function _typed_arguments(
+    tool: string,
+    handler: reflect.AnyFunction,
+    args: map<string, unknown>,
+) -> map<string, unknown> throws baml.errors.InvalidArgument {
+    let sig = reflect.signature(handler);
+    let fields: map<string, reflect.TypeView | reflect.WithMeta<reflect.Type>> = {};
+    let sent: map<string, baml.json.json> = {};
+    for (let param in sig.args.concat(sig.opts.values())) {
+        if (!args.has(param.name)) {
+            continue;
+        }
+        if let value: baml.json.json = args.get(param.name) {
+            let type Declared = param.type;
+            if (!(value is Declared) || baml.sap._reads_shapes<Declared>()) {
+                let _ = fields.set(param.name, param.type);
+                let _ = sent.set(param.name, value);
+            }
+        }
+    }
+    if (fields.length() == 0) {
+        return args;
+    }
+    let parameters = reflect.Class.new("Arguments", fields) catch (e) {
+        reflect.errors.CompilationError => {
+            throw baml.errors.InvalidArgument {
+                message: `invalid arguments for ${tool}: ${e.message}`,
+            };
+        },
+    };
+    let type Arguments = parameters;
+    let aligned = baml.sap.coerce<Arguments>(sent) catch (e) {
+        baml.errors.ParseError => {
+            // The text goes back to the model, and it quotes the value that
+            // did not align, whatever its size.
+            throw baml.errors.InvalidArgument {
+                message: `invalid arguments for ${tool}: ${e.message.slice(0, 1000)}`,
+            };
+        },
+    };
+    let typed: map<string, unknown> = {};
+    for (let name in args.keys()) {
+        let _ = typed.set(name, args.get(name));
+    }
+    for (let name in fields.keys()) {
+        let value = reflect.Class.get_field<unknown>(aligned, name) catch (e) {
+            reflect.errors.CompilationError => {
+                baml.sys.panic(`the aligned arguments of ${tool} have no field ${name}`)
+            },
+        };
+        let _ = typed.set(name, value);
+    }
+    typed
 }
 
 /// The explicit constructor. `tools: [f]` normalizes through this.
@@ -54,7 +131,9 @@ function tool(
     let resolved_name = name ?? sig.name;
     if let n: string = resolved_name {
         if (n == "__baml_return_output") {
-            throw baml.errors.InvalidArgument { message: "the tool name __baml_return_output is reserved" }
+            throw baml.errors.InvalidArgument {
+                message: "the tool name __baml_return_output is reserved",
+            };
         }
         Tool {
             name: n,
@@ -65,7 +144,9 @@ function tool(
             on_error: on_error,
         }
     } else {
-        throw baml.errors.InvalidArgument { message: "anonymous tool needs a name" }
+        throw baml.errors.InvalidArgument {
+            message: "anonymous tool needs a name",
+        };
     }
 }
 
@@ -81,7 +162,9 @@ function raw_tool(
     on_error: ErrorMode? = null,
 ) -> Tool {
     if (name == "__baml_return_output") {
-        throw baml.errors.InvalidArgument { message: "the tool name __baml_return_output is reserved" }
+        throw baml.errors.InvalidArgument {
+            message: "the tool name __baml_return_output is reserved",
+        };
     }
     Tool {
         name: name,
@@ -101,7 +184,9 @@ class Toolbox {
         let names: string[] = [];
         for (let t in tools) {
             if (names.includes(t.name)) {
-                throw baml.errors.InvalidArgument { message: `duplicate tool name: ${t.name}` }
+                throw baml.errors.InvalidArgument {
+                    message: `duplicate tool name: ${t.name}`,
+                };
             }
             names.push(t.name);
         }
@@ -113,13 +198,10 @@ class Toolbox {
     }
 
     function get(self, name: string) -> Tool? {
-        self.entries.find((t) -> {
-            t.name == name
-        })
+        self.entries.find((t) -> { t.name == name })
     }
 
     function is_empty(self) -> bool {
         self.entries.length() == 0
     }
 }
-

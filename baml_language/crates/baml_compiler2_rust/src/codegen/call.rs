@@ -1,0 +1,683 @@
+//! Generates inline calls, suspension requests, and interface dispatch operands.
+
+use std::fmt::Write as _;
+
+use baml_compiler2_mir::{BlockId, Constant, Operand, TyTemplateInterface, function_display_name};
+use bex_vm_types::{FunctionKind, types::Function};
+
+use super::{Expr, Gen, Generator, unsupported};
+use crate::{
+    admit::Rejection,
+    analysis::{Repr, builtin_is_callable, call_shape, null_compared},
+    index::DispatchArm,
+    render::coerce,
+    stack::takes_param,
+};
+
+/// Beyond this many implementations a site is megamorphic: each arm inlines
+/// a whole call, code size spent on a guess the VM's cache makes as well.
+const MAX_DISPATCH_ARMS: usize = 8;
+
+impl<'db> Generator<'_, 'db> {
+    pub(super) fn call(
+        &mut self,
+        block: BlockId,
+        callee: &Operand<'db>,
+        args: &[Operand<'db>],
+        ntypeargs: usize,
+        layout: Option<&baml_type::CallLayout>,
+    ) -> Gen<Expr> {
+        let Operand::Constant(Constant::Function(func)) = callee else {
+            return Err(Rejection::Invalid(
+                "call through a function value emitted inline".into(),
+            ));
+        };
+        let name = function_display_name(self.db, *func);
+        let Some((object, info)) = self.index.function(self.db, *func) else {
+            return unsupported(format!("callee `{name}` not found in the program"));
+        };
+        if let Some(test) = self.null_test(block, info, ntypeargs, args)? {
+            return Ok(test);
+        }
+        if let Some(&(callee, params)) = self.plan.and_then(|plan| plan.calls.get(&block.0)) {
+            if callee != object
+                || ntypeargs != 0
+                || layout.is_some_and(|layout| layout.0.iter().any(Option::is_some))
+            {
+                return Err(Rejection::Invalid(
+                    "stack call planned for another call".into(),
+                ));
+            }
+            return self.stack_call(block, object, params, args);
+        }
+        let shape = call_shape(self.body, args, ntypeargs, &self.analysis.static_types);
+        let (type_args, args) = args.split_at(ntypeargs.min(args.len()));
+        let types = self.type_operands("call", type_args)?;
+        if info.kind == FunctionKind::Bytecode && self.symbols.contains_key(&object) {
+            let (call, repr) = self.compiled_entry(block, object, &name, layout, args, &types)?;
+            return Ok(Expr::new(self.call_code(block, object, &call)?, repr));
+        }
+        let values = self.laid_out_args(block, &name, info, layout, args)?;
+        match info.kind {
+            FunctionKind::Bytecode => Err(Rejection::Invalid(format!(
+                "call to uncompiled `{name}` emitted directly"
+            ))),
+            FunctionKind::NativeUnresolved | FunctionKind::Native(..) => {
+                let Some(key) = info.native_key.as_deref() else {
+                    return unsupported(format!("builtin `{name}` has no native key"));
+                };
+                if !builtin_is_callable(key, shape) {
+                    return Err(Rejection::Invalid(format!(
+                        "yielding builtin `{key}` emitted inline"
+                    )));
+                }
+                let call = |local: bool| Self::builtin_call(key, local, &values, &types);
+                // A thread-local receiver takes the builtin's lock-free twin.
+                let needs = if matches!(info.kind, FunctionKind::Native(_, Some(_))) {
+                    self.analysis.escape.twin_needs(block)
+                } else {
+                    baml_compiler2_mir::escape::NEVER
+                };
+                let locked = (needs != 0).then(|| call(false)).transpose()?;
+                let local = (needs != baml_compiler2_mir::escape::NEVER)
+                    .then(|| call(true))
+                    .transpose()?;
+                let call = self.by_locality(
+                    needs,
+                    local.as_deref().unwrap_or_default(),
+                    locked.as_deref().unwrap_or_default(),
+                );
+                self.fallible_expr(block, &call, Repr::Value)
+            }
+            FunctionKind::SysOp(_) => Err(Rejection::Invalid(format!(
+                "sys op `{name}` emitted inline"
+            ))),
+        }
+    }
+
+    /// Use a typed direct entry when the callee has no VM-frame state and the
+    /// VM allows it: the call's `R<_>` expression and the representation of
+    /// its result.
+    fn compiled_entry(
+        &mut self,
+        block: BlockId,
+        object: usize,
+        name: &str,
+        layout: Option<&baml_type::CallLayout>,
+        args: &[Operand<'db>],
+        types: &[String],
+    ) -> Gen<(String, Repr)> {
+        let symbol = self.symbols[&object].clone();
+        let index = self.index;
+        let info = index.info(object);
+        let site = self.site_pc(block);
+        let callee = format!("vm.record_object(fr, ObjectIndex::from_raw({object}))");
+        // A generic callee's frame starts with the call's type arguments (a
+        // plain function carries none of its own).
+        let type_args = if types.is_empty() {
+            "&[]".to_string()
+        } else {
+            let name = format!("ty{}", self.temps);
+            self.temps += 1;
+            self.pending.push(format!(
+                "let {name}: [RealizedTy; {}] = [{}];",
+                types.len(),
+                types.join(", ")
+            ));
+            format!("&{name}")
+        };
+        let slots = self.laid_out_operands(block, name, info, layout, args)?;
+        let typed = self.signatures.get(&object).filter(|signature| {
+            !self.framed.contains(&object)
+                && signature.params.len() == slots.len()
+                && slots
+                    .iter()
+                    .zip(&signature.params)
+                    .all(|(slot, repr)| slot.is_some() || *repr == Repr::Value)
+        });
+        let Some(signature) = typed else {
+            let values: Vec<String> = slots
+                .iter()
+                .map(|slot| match slot {
+                    Some(expr) => self.value_arg(expr),
+                    None => "Value::OMITTED_ARG".to_string(),
+                })
+                .collect();
+            let observed = format!(
+                "|_: &mut BexVm| -> [Value; {}] {{ [{}] }}",
+                values.len(),
+                values.join(", ")
+            );
+            let values = format!("&[{}]", values.join(", "));
+            let framed =
+                format!("vm.call_compiled(fr, {callee}, {symbol}, {type_args}, {values}, {site})");
+            // Through the boxed entry, with a frame record when the callee
+            // has no VM-frame state.
+            let call = if self.framed.contains(&object) {
+                framed
+            } else if types.is_empty() {
+                format!(
+                    "(if vm.direct_calls() {{ vm.call_record(fr, {callee}, {site}, {observed}, |vm, fr| {symbol}(vm, fr, {values})) }} else {{ {framed} }})"
+                )
+            } else {
+                format!(
+                    "(if vm.direct_calls_typed({type_args}) {{ unsafe {{ vm.call_record_typed(fr, {callee}, {type_args}, {site}, {observed}, |vm, fr| {symbol}(vm, fr, {values})) }} }} else {{ {framed} }})"
+                )
+            };
+            return Ok((call, Repr::Value));
+        };
+        // Arguments are bound once, as the callee holds them.
+        let mut typed_args = Vec::with_capacity(slots.len());
+        for (slot, repr) in slots.iter().zip(&signature.params) {
+            let code = match slot {
+                Some(expr) => coerce(&expr.code, expr.repr, *repr),
+                None => "Value::OMITTED_ARG".to_string(),
+            };
+            let temp = format!("a{}", self.temps);
+            self.temps += 1;
+            self.pending
+                .push(format!("let {temp}: {} = {code};", repr.rust_type()));
+            typed_args.push(temp);
+        }
+        let callee_mask = self.callee_mask(block);
+        let direct_args = typed_args.iter().fold(String::new(), |mut out, arg| {
+            let _ = write!(out, ", {arg}");
+            out
+        });
+        // Telemetry boxes the arguments only for an invocation it records.
+        let observed: Vec<String> = typed_args
+            .iter()
+            .zip(&signature.params)
+            .map(|(arg, repr)| coerce(arg, *repr, Repr::Value))
+            .collect();
+        let observed = format!(
+            "|vm: &mut BexVm| -> [Value; {}] {{ [{}] }}",
+            observed.len(),
+            observed.join(", ")
+        );
+        let direct = if types.is_empty() {
+            format!(
+                "vm.call_record(fr, {callee}, {site}, {observed}, |vm, fr| {symbol}_d(vm, fr{direct_args}, {callee_mask}))"
+            )
+        } else {
+            format!(
+                "unsafe {{ vm.call_record_typed(fr, {callee}, {type_args}, {site}, {observed}, |vm, fr| {symbol}_d(vm, fr{direct_args}, {callee_mask})) }}"
+            )
+        };
+        let mut boxed = String::from("{ ");
+        let mut values = Vec::with_capacity(typed_args.len());
+        for (j, (arg, repr)) in typed_args.iter().zip(&signature.params).enumerate() {
+            let _ = write!(boxed, "let v{j} = {}; ", coerce(arg, *repr, Repr::Value));
+            values.push(format!("v{j}"));
+        }
+        let unbox = match signature.ret {
+            Repr::Int => "bex_vm::compiled_rt::expect_int(v)",
+            Repr::Bool => "bex_vm::compiled_rt::expect_bool(v)",
+            Repr::Float => "bex_vm::compiled_rt::expect_f64(v)",
+            Repr::Value => "Ok(v)",
+        };
+        let _ = write!(
+            boxed,
+            "match vm.call_compiled(fr, {callee}, {symbol}, {type_args}, &[{}], {site}) {{ Ok(v) => {unbox}, Err(e) => Err(e) }} }}",
+            values.join(", ")
+        );
+        let allowed = if types.is_empty() {
+            "vm.direct_calls()".to_string()
+        } else {
+            format!("vm.direct_calls_typed({type_args})")
+        };
+        let body = format!("{symbol}_d(vm, fr{direct_args}, {callee_mask})");
+        let recorded = format!("if {allowed} {{ {direct} }} else {{ {boxed} }}");
+        let typed = (!types.is_empty()).then_some(type_args.as_str());
+        let call = self.frameless_or(object, &site, &body, typed, &allowed, &recorded);
+        Ok((call, signature.ret))
+    }
+
+    /// A call to `object` that runs `body` without linking a record when the
+    /// callee is frameless and `allowed`: on the caller's record when the
+    /// callee cannot pause, else on a pending record of its own (with the
+    /// call's `typed` arguments). Otherwise `recorded`.
+    fn frameless_or(
+        &self,
+        object: usize,
+        site: &str,
+        body: &str,
+        typed: Option<&str>,
+        allowed: &str,
+        recorded: &str,
+    ) -> String {
+        if !self.frameless.contains(&object) {
+            return format!("({recorded})");
+        }
+        let callee = format!("ObjectIndex::from_raw({object})");
+        let frameless = if typed.is_none() && !self.pausing.contains(&object) {
+            format!("vm.call_frameless(fr, {callee}, {site}, |vm| {body})")
+        } else {
+            let function = if typed.is_none() && object == self.object {
+                format!("vm.own_callable(fr, {callee})")
+            } else {
+                format!("vm.record_object(fr, {callee})")
+            };
+            let type_args = typed.unwrap_or("&[]");
+            format!("vm.call_pending(fr, {function}, {type_args}, {site}, |vm, fr| {body})")
+        };
+        format!("(if {allowed} && vm.frameless_calls() {{ {frameless} }} else {recorded})")
+    }
+
+    /// Route a compiled call's error, rooting the caller's live values when
+    /// the callee may suspend.
+    fn call_code(&mut self, block: BlockId, object: usize, call: &str) -> Gen<String> {
+        if self.pausing.contains(&object) {
+            self.rooted_call(block, call)
+        } else {
+            self.fallible(block, call)
+        }
+    }
+
+    /// The operands of a call in callee slot order; `None` for a slot left to
+    /// its default.
+    fn laid_out_operands(
+        &mut self,
+        block: BlockId,
+        name: &str,
+        info: &Function,
+        layout: Option<&baml_type::CallLayout>,
+        args: &[Operand<'db>],
+    ) -> Gen<Vec<Option<Expr>>> {
+        let exprs = args
+            .iter()
+            .map(|arg| self.operand(block, arg))
+            .collect::<Gen<Vec<_>>>()?;
+        layout_args(name, info, layout, exprs)
+    }
+
+    /// `x == null` as a bit test (`analysis::null_compared`).
+    fn null_test(
+        &mut self,
+        block: BlockId,
+        info: &Function,
+        ntypeargs: usize,
+        args: &[Operand<'db>],
+    ) -> Gen<Option<Expr>> {
+        let Some(other) = null_compared(self.body, info.native_key.as_deref(), ntypeargs, args)
+        else {
+            return Ok(None);
+        };
+        if self.stack_operand(other).is_some() {
+            return Ok(Some(Expr::new("false", Repr::Bool)));
+        }
+        let other = self.operand(block, other)?;
+        let value = self.value_arg(&other);
+        Ok(Some(Expr::new(format!("{value}.is_null()"), Repr::Bool)))
+    }
+
+    /// A call passing stack objects: the callee's stack variant in a frame
+    /// record, or, when the VM requires a VM frame, its boxed entry with the
+    /// objects materialized and their fields copied back after.
+    fn stack_call(
+        &mut self,
+        block: BlockId,
+        object: usize,
+        params: u64,
+        args: &[Operand<'db>],
+    ) -> Gen<Expr> {
+        let Some(symbol) = self.symbols.get(&object) else {
+            return Err(Rejection::Invalid(
+                "stack call to an uncompiled callee".into(),
+            ));
+        };
+        let Some(signature) = self.signatures.get(&object) else {
+            return Err(Rejection::Invalid(
+                "stack call to a callee without a direct entry".into(),
+            ));
+        };
+        if signature.params.len() != args.len() {
+            return Err(Rejection::Invalid("stack call arity mismatch".into()));
+        }
+        let site = self.site_pc(block);
+        let callee = format!("vm.record_object(fr, ObjectIndex::from_raw({object}))");
+        let mut direct = String::new();
+        let mut observed = Vec::with_capacity(args.len());
+        let mut boxed = String::from("{ ");
+        let mut boxed_values = Vec::with_capacity(args.len());
+        let mut reloads = Vec::new();
+        for (i, (arg, repr)) in args.iter().zip(&signature.params).enumerate() {
+            if takes_param(params, i) {
+                let Some(group) = self.stack_operand(arg) else {
+                    return Err(Rejection::Invalid(
+                        "stack argument is not a stack object".into(),
+                    ));
+                };
+                let storage = group.storage.clone();
+                let snapshot = format!("o{}", self.temps);
+                self.temps += 1;
+                self.pending.push(format!("let {snapshot} = {storage};"));
+                let _ = write!(direct, ", &mut {storage}");
+                observed.push(format!("{snapshot}.heap(vm, fr)"));
+                let _ = write!(boxed, "let v{i} = {storage}.heap(vm, fr); ");
+                boxed_values.push(format!("v{i}"));
+                reloads.push(format!("{storage}.reload(vm, v{i})"));
+            } else {
+                let expr = self.operand(block, arg)?;
+                let code = coerce(&expr.code, expr.repr, *repr);
+                let temp = format!("a{}", self.temps);
+                self.temps += 1;
+                self.pending
+                    .push(format!("let {temp}: {} = {code};", repr.rust_type()));
+                let _ = write!(direct, ", {temp}");
+                observed.push(coerce(&temp, *repr, Repr::Value));
+                let _ = write!(boxed, "let v{i} = {}; ", coerce(&temp, *repr, Repr::Value));
+                boxed_values.push(format!("v{i}"));
+            }
+        }
+        let callee_mask = self.callee_mask(block);
+        let observed = format!(
+            "|vm: &mut BexVm| -> [Value; {}] {{ [{}] }}",
+            observed.len(),
+            observed.join(", ")
+        );
+        let direct_args = direct;
+        let direct = format!(
+            "vm.call_record(fr, {callee}, {site}, {observed}, |vm, fr| {symbol}_stack{params:x}(vm, fr{direct_args}, {callee_mask}))"
+        );
+        let unbox = match signature.ret {
+            Repr::Int => "bex_vm::compiled_rt::expect_int(v)",
+            Repr::Bool => "bex_vm::compiled_rt::expect_bool(v)",
+            Repr::Float => "bex_vm::compiled_rt::expect_f64(v)",
+            Repr::Value => "Ok(v)",
+        };
+        let reload = reloads.iter().fold(String::new(), |mut out, reload| {
+            let _ = write!(out, "{reload}?; ");
+            out
+        });
+        let _ = write!(
+            boxed,
+            "let r = vm.call_compiled(fr, {callee}, {symbol}, &[], &[{}], {site}); \
+             (|| -> R<()> {{ {reload}Ok(()) }})().and(match r {{ Ok(v) => {unbox}, Err(e) => Err(e) }}) }}",
+            boxed_values.join(", ")
+        );
+        let body = format!("{symbol}_stack{params:x}(vm, fr{direct_args}, {callee_mask})");
+        let recorded = format!("if vm.direct_calls() {{ {direct} }} else {{ {boxed} }}");
+        let call = self.frameless_or(object, &site, &body, None, "vm.direct_calls()", &recorded);
+        let code = self.fallible(block, &call)?;
+        Ok(Expr::new(code, signature.ret))
+    }
+
+    pub(super) fn callee_ptr(
+        &mut self,
+        block: BlockId,
+        callee: &Operand<'db>,
+        trace: Option<&Operand<'db>>,
+    ) -> Gen<()> {
+        let code = match callee {
+            Operand::Constant(Constant::Function(func)) => {
+                let Some((object, _)) = self.index.function(self.db, *func) else {
+                    let name = function_display_name(self.db, *func);
+                    return unsupported(format!("callee `{name}` not found in the program"));
+                };
+                format!("vm.record_object(fr, ObjectIndex::from_raw({object}))")
+            }
+            Operand::Constant(Constant::GlobalItem(_)) | Operand::Copy(_) | Operand::Move(_) => {
+                let value = self.value_operand(block, callee)?;
+                if let Some(trace) = trace {
+                    // SetCallTrace precedes CallIndirect's callable check.
+                    let trace = self.value_operand(block, trace)?;
+                    let set_trace = self.fallible(block, &format!("vm.set_call_trace({trace})"))?;
+                    self.emit_statement(&format!("{set_trace};"));
+                }
+                self.fallible(block, &format!("vm.indirect_callee({value})"))?
+            }
+            Operand::Constant(_) => {
+                return unsupported("call of a constant that is not a function");
+            }
+        };
+        self.emit_statement(&format!("let callee = {code};"));
+        Ok(())
+    }
+
+    /// Lay out arguments in callee slot order, filling defaults with `OMITTED_ARG`.
+    pub(super) fn laid_out_args(
+        &mut self,
+        block: BlockId,
+        name: &str,
+        info: &Function,
+        layout: Option<&baml_type::CallLayout>,
+        args: &[Operand<'db>],
+    ) -> Gen<Vec<String>> {
+        let values = self.arg_values(block, args)?;
+        Ok(layout_args(name, info, layout, values)?
+            .into_iter()
+            .map(|slot| slot.unwrap_or_else(|| "Value::OMITTED_ARG".to_string()))
+            .collect())
+    }
+
+    pub(super) fn arg_values(&mut self, block: BlockId, args: &[Operand<'db>]) -> Gen<Vec<String>> {
+        args.iter()
+            .map(|arg| self.value_operand(block, arg))
+            .collect()
+    }
+
+    pub(super) fn type_operands(
+        &mut self,
+        what: &str,
+        operands: &[Operand<'db>],
+    ) -> Gen<Vec<String>> {
+        operands
+            .iter()
+            .map(|operand| self.type_operand(what, operand))
+            .collect()
+    }
+
+    /// Associated types are implementation outputs and do not select the implementation.
+    pub(super) fn interface_operands(
+        &mut self,
+        iface: &TyTemplateInterface,
+    ) -> Gen<(String, String)> {
+        let name = decl_display_name(self.db, &iface.name);
+        let Some(object) = self.index.interface_at(&iface.name) else {
+            return unsupported(format!("interface `{name}` not found in the program"));
+        };
+        let args = self.realized_all(&iface.generics)?;
+        Ok((
+            format!("vm.record_object(fr, ObjectIndex::from_raw({object}))"),
+            format!("&[{}]", args.join(", ")),
+        ))
+    }
+
+    /// Reuse the interpreter's resolver/cache; only matching arities run inline.
+    /// `args` starts with type arguments; `self_arg` indexes the value arguments.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn virtual_request(
+        &mut self,
+        block: BlockId,
+        iface: &TyTemplateInterface,
+        method: &str,
+        args: &[Operand<'db>],
+        traced: bool,
+        ntypeargs: usize,
+        self_arg: usize,
+        layout: Option<&baml_type::CallLayout>,
+    ) -> Gen<String> {
+        let (iface_ptr, iface_args) = self.interface_operands(iface)?;
+        let (type_args, args) = args.split_at(ntypeargs.min(args.len()));
+        let types = self.type_operands("interface method call", type_args)?;
+        let values = self.arg_values(block, args)?;
+        let Some(receiver) = values.get(self_arg) else {
+            return Err(Rejection::Invalid(format!(
+                "virtual call dispatches on argument {self_arg} of {}",
+                values.len()
+            )));
+        };
+        // Implementations may add optional parameters, so only matching arities run inline.
+        let named = layout.is_some_and(|layout| layout.0.iter().any(Option::is_some));
+        let layout = layout.map_or_else(
+            || "None".to_string(),
+            |layout| format!("Some(&[{}])", named_arg_slots(layout)),
+        );
+        // A known site shares the interpreter's cache for its `VirtualCall`.
+        let cache_site = self
+            .positions
+            .block_pcs
+            .get(block.0)
+            .and_then(|pcs| pcs.terminator)
+            .map_or_else(|| "None".to_string(), |pc| format!("Some((fr, {pc}))"));
+        let resolve = format!(
+            "let callee = vm.virtual_target({receiver}, {iface_ptr}, {iface_args}, {method:?}, &[{}], {cache_site})?;",
+            types.join(", ")
+        );
+        let site = self.site_pc(block);
+        let values = values.join(", ");
+        let suspend = if traced {
+            let call = self.attach_trace("vm.suspend_from(fr, Step::Call { callee, argc })");
+            format!(
+                "match vm.push_virtual_args(callee, {layout}, &[{values}]) {{ \
+                 Ok(argc) => {{ fr.note_pc({site}); {call} }}, Err(e) => Err(e) }}"
+            )
+        } else {
+            format!(
+                "{{ let argc = vm.push_virtual_args(callee, {layout}, &[{values}])?; \
+                 fr.note_pc({site}); vm.suspend_from(fr, Step::Call {{ callee, argc }}) }}"
+            )
+        };
+        // The VM must apply trace attachments, so traced calls cannot run inline.
+        if named || traced {
+            return Ok(format!("{{ {resolve} {suspend} }}"));
+        }
+        let fallback = format!(
+            "{{ {resolve} match vm.call_inline(fr, callee, &[{values}], {site}) {{ \
+             Ok(Some(v)) => Ok(v), Ok(None) => {suspend}, Err(e) => Err(e) }} }}"
+        );
+        let arms = self.dispatch_arms(iface, method, ntypeargs, self_arg, args.len());
+        self.class_dispatch(block, &arms, args, receiver, fallback)
+    }
+
+    /// `fallback` behind a comparison of the receiver's class with each class
+    /// whose implementation compiled code can call directly.
+    fn class_dispatch(
+        &mut self,
+        block: BlockId,
+        arms: &[DispatchArm],
+        args: &[Operand<'db>],
+        receiver: &str,
+        fallback: String,
+    ) -> Gen<String> {
+        if arms.is_empty() {
+            return Ok(fallback);
+        }
+        let site_bindings = std::mem::take(&mut self.pending);
+        let index = self.index;
+        let mut code = format!("{{ let class = vm.instance_class({receiver}); ");
+        for &DispatchArm {
+            class,
+            body: object,
+            default,
+        } in arms
+        {
+            let class_ptr = format!("vm.record_object(fr, ObjectIndex::from_raw({class}))");
+            let types = if default {
+                vec![format!("vm.class_type({class_ptr})")]
+            } else {
+                Vec::new()
+            };
+            let (call, repr) =
+                self.compiled_entry(block, object, index.display(object), None, args, &types)?;
+            let bindings = std::mem::take(&mut self.pending).concat();
+            let call = match repr {
+                Repr::Value => call,
+                _ => format!("{call}.map(|v| {})", coerce("v", repr, Repr::Value)),
+            };
+            let _ = write!(
+                code,
+                "if class == Some({class_ptr}) {{ {bindings} {call} }} else "
+            );
+        }
+        self.pending = site_bindings;
+        Ok(format!("{code}{fallback} }}"))
+    }
+
+    /// The arms of a site that dispatches on its first
+    /// argument with no type arguments, on a non-generic interface: each
+    /// implementation compiled and of the call's arity. None past
+    /// [`MAX_DISPATCH_ARMS`].
+    fn dispatch_arms(
+        &self,
+        iface: &TyTemplateInterface,
+        method: &str,
+        ntypeargs: usize,
+        self_arg: usize,
+        arity: usize,
+    ) -> Vec<DispatchArm> {
+        if ntypeargs != 0 || self_arg != 0 || !iface.generics.is_empty() {
+            return Vec::new();
+        }
+        let Some(interface) = self.index.interface_at(&iface.name) else {
+            return Vec::new();
+        };
+        let arms: Vec<_> = self
+            .index
+            .class_implementations(interface, method)
+            .into_iter()
+            .filter(|arm| {
+                self.symbols.contains_key(&arm.body) && self.index.info(arm.body).arity == arity
+            })
+            .collect();
+        if arms.len() > MAX_DISPATCH_ARMS {
+            return Vec::new();
+        }
+        arms
+    }
+}
+
+/// Named arguments in callee slot order; positional calls keep their original order.
+fn layout_args<T>(
+    name: &str,
+    info: &Function,
+    layout: Option<&baml_type::CallLayout>,
+    args: Vec<T>,
+) -> Gen<Vec<Option<T>>> {
+    let slots = layout
+        .filter(|layout| layout.0.iter().any(Option::is_some))
+        .map(|layout| layout.map_to(&info.argument_layout()))
+        .transpose()
+        .map_err(|mismatch| {
+            Rejection::Invalid(format!("call to `{name}` does not fit it: {mismatch:?}"))
+        })?;
+    let arity = slots.as_ref().map_or(args.len(), Vec::len);
+    if arity != info.arity {
+        return Err(Rejection::Invalid(format!(
+            "`{name}` called with {arity} of {} arguments",
+            info.arity
+        )));
+    }
+    let mut args: Vec<_> = args.into_iter().map(Some).collect();
+    Ok(match slots {
+        Some(slots) => slots
+            .into_iter()
+            .map(|slot| slot.and_then(|i| args[i].take()))
+            .collect(),
+        None => args,
+    })
+}
+
+pub(super) fn named_arg_slots(layout: &baml_type::CallLayout) -> String {
+    layout
+        .0
+        .iter()
+        .map(|slot| match slot {
+            Some(name) => format!("Some({:?})", name.as_str()),
+            None => "None".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn decl_display_name(db: &dyn baml_compiler2_mir::Db, name: &baml_type::DeclName) -> String {
+    let mut parts = vec![
+        baml_compiler2_hir_ty::render::Viewpoint::canonical(db)
+            .display_label(name.root())
+            .to_string(),
+    ];
+    parts.extend(name.namespace().iter().map(ToString::to_string));
+    parts.push(name.name().to_string());
+    parts.join(".")
+}

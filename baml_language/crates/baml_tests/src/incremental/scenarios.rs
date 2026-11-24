@@ -17,6 +17,42 @@ fn query_semantic_index(db: &baml_db::ProjectDatabase, file: SourceFile) {
     let _ = baml_compiler2_hir::file_semantic_index(db, file);
 }
 
+/// An empty package needs no dependency export work. Adding implementations
+/// afterward must still invalidate the empty coherence result.
+#[test]
+fn empty_package_check_avoids_dependency_interfaces_and_tracks_new_impls() {
+    let mut test_db = IncrementalTestDb::new();
+    let file = test_db
+        .db_mut()
+        .file("test.baml", "// No declarations yet.\n");
+
+    let diagnostics = test_db.assert_not_executed(
+        |db| db.check_file(file),
+        &[
+            "package_resolution_context",
+            "package_interface",
+            "normalized_alias_map",
+        ],
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    file.set_text(test_db.db_mut()).to(r#"
+interface Marker {}
+class Subject {}
+implement Marker for Subject {}
+implement Marker for Subject {}
+"#
+    .to_string());
+    let diagnostics =
+        test_db.assert_not_executed(|db| db.check_file(file), &["package_resolution_context"]);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.id == baml_compiler_diagnostics::DiagnosticId::OverlappingImplements
+        }),
+        "adding local implementations must invalidate the empty coherence result: {diagnostics:#?}",
+    );
+}
+
 /// Test that editing a function body doesn't invalidate the item tree.
 ///
 /// The ItemTree only contains function names, not bodies. So changing a
@@ -40,7 +76,7 @@ function Greet(name: string) -> string {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 
     // Modify only the prompt (body change)
@@ -58,7 +94,7 @@ function Greet(name: string) -> string {
             query_semantic_index(db, file);
         },
         &[
-            ("lex_file", 1), // Must re-run: input text changed
+            ("parse_typed", 1), // Must re-run: input text changed
         ],
     );
 }
@@ -83,7 +119,7 @@ function OldName(x: string) -> string {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 
     // Rename the function
@@ -100,7 +136,7 @@ function NewName(x: string) -> string {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 }
 
@@ -129,7 +165,7 @@ class Address {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 
     // Add a new class
@@ -155,7 +191,7 @@ class NewClass {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 }
 
@@ -178,7 +214,7 @@ class MyClass {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 
     // Add a comment
@@ -195,7 +231,7 @@ class MyClass {
         |db| {
             query_semantic_index(db, file);
         },
-        &[("lex_file", 1)],
+        &[("parse_typed", 1)],
     );
 }
 
@@ -241,7 +277,7 @@ class ClassA {
             query_semantic_index(db, file_b);
         },
         &[
-            ("lex_file", 0), // file_b unchanged
+            ("parse_typed", 0), // file_b unchanged
         ],
     );
 
@@ -251,7 +287,7 @@ class ClassA {
             query_semantic_index(db, file_a);
         },
         &[
-            ("lex_file", 1), // Must re-run: real file changed
+            ("parse_typed", 1), // Must re-run: real file changed
         ],
     );
 }
@@ -272,10 +308,10 @@ function Greet(name: string) -> string {
     );
 
     // First run
-    test_db.assert_executed(|db| query_semantic_index(db, file), &[("lex_file", 1)]);
+    test_db.assert_executed(|db| query_semantic_index(db, file), &[("parse_typed", 1)]);
 
     // Second run without changes - should be fully cached
-    test_db.assert_executed(|db| query_semantic_index(db, file), &[("lex_file", 0)]);
+    test_db.assert_executed(|db| query_semantic_index(db, file), &[("parse_typed", 0)]);
 }
 
 /// Test that whitespace-only changes don't unnecessarily invalidate compilation.
@@ -292,7 +328,7 @@ fn type_inference_cached_on_whitespace_change() {
     );
 
     // First run
-    test_db.assert_executed(|db| query_semantic_index(db, file), &[("lex_file", 1)]);
+    test_db.assert_executed(|db| query_semantic_index(db, file), &[("parse_typed", 1)]);
 
     // Add whitespace (blank lines at end)
     file.set_text(test_db.db_mut())
@@ -305,11 +341,11 @@ fn type_inference_cached_on_whitespace_change() {
 "##
         .to_string());
 
-    // After whitespace change: lex must re-run (input changed)
+    // After whitespace change: the parse must re-run (input changed)
     test_db.assert_executed(
         |db| query_semantic_index(db, file),
         &[
-            ("lex_file", 1), // Must re-run
+            ("parse_typed", 1), // Must re-run
         ],
     );
 }
@@ -330,7 +366,7 @@ function Greet(name: string) -> string {
     );
 
     // First run
-    test_db.assert_executed(|db| query_semantic_index(db, file), &[("lex_file", 1)]);
+    test_db.assert_executed(|db| query_semantic_index(db, file), &[("parse_typed", 1)]);
 
     // Change the return type
     file.set_text(test_db.db_mut()).to(r##"
@@ -342,7 +378,7 @@ function Greet(name: string) -> int {
     .to_string());
 
     // Signature changes must invalidate queries
-    test_db.assert_executed(|db| query_semantic_index(db, file), &[("lex_file", 1)]);
+    test_db.assert_executed(|db| query_semantic_index(db, file), &[("parse_typed", 1)]);
 }
 
 // ── Firewall queries ─────────────────────────────────────────────────────────
@@ -482,7 +518,6 @@ type ClassFingerprint = (
     Vec<baml_compiler2_hir::item_data::GenericParamData>,
     baml_compiler2_hir::type_ref::TypeRefStore,
     Vec<baml_compiler2_hir::item_data::FieldData>,
-    Vec<baml_compiler2_hir::item_data::ImplementsData>,
     baml_compiler2_hir::item_tree::ClassAttrs,
 );
 
@@ -497,7 +532,6 @@ fn class_fingerprint(
         data.generic_params.clone(),
         data.type_refs.clone(),
         data.fields.clone(),
-        data.implements.clone(),
         data.attrs.clone(),
     )
 }
@@ -592,7 +626,7 @@ fn editing_a_function_body_preserves_its_signature_data() {
 
 /// A downstream consumer that reads spans out of the memoized signature, the
 /// way a signature-lowering pass anchors its diagnostics.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 fn signature_param_type_spans<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     function: baml_compiler2_hir::loc::FunctionLoc<'db>,
@@ -1076,8 +1110,8 @@ fn hir_ty_editing_one_file_preserves_other_files_inference() {
 /// THE firewall (S3): a body edit that leaves the callee's SIGNATURE
 /// unchanged (declared return, unchanged inferred effect) does not
 /// re-infer its callers - `function_signature`/`callable_throws`
-/// re-execute but produce EQUAL results, and the PartialEq-driven
-/// `salsa::Update` cuts the caller's `infer_function_body` off.
+/// re-execute but produce EQUAL results, and Salsa's PartialEq-based change
+/// detection cuts the caller's `infer_function_body` off.
 #[test]
 fn hir_ty_body_edit_with_stable_signature_does_not_reinfer_callers() {
     let mut test_db = IncrementalTestDb::new();

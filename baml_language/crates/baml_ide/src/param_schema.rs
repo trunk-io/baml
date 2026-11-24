@@ -35,13 +35,6 @@ use serde::Serialize;
 /// `CycleDetector`.
 const MAX_DEPTH: usize = 64;
 
-/// The compiler appends synthetic trailing `client: ai.Client? = null` and
-/// `on_event: ((ai.events.Event) -> void)? = null` parameters to every LLM
-/// function. Both names are reserved on LLM functions
-/// (`reject_reserved_llm_params`), so trailing params with these names
-/// can only be the injected ones. The form must render neither.
-const INJECTED_PARAM_NAMES: [&str; 2] = ["client", "on_event"];
-
 /// Schema for one function parameter.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,6 +107,9 @@ pub enum FieldSchema {
         key: Box<FieldSchema>,
         value: Box<FieldSchema>,
     },
+    Tuple {
+        elements: Vec<FieldSchema>,
+    },
     /// A nullable union (`T?` / `T | null`), folded to its non-null payload.
     Optional {
         inner: Box<FieldSchema>,
@@ -145,12 +141,16 @@ pub(crate) fn function_param_schemas(
 ) -> Option<Vec<ParamSchema>> {
     let func = iface.lookup_function(namespace_path, name)?;
     let mut params = func.params.as_slice();
+    // The compiler appends synthetic trailing `client` and `on_event`
+    // parameters to every LLM function. Both names are reserved on LLM
+    // functions (`reject_reserved_llm_params`), so trailing params with these
+    // names can only be the injected ones. The form must render neither.
     if is_llm {
         while let Some((last, rest)) = params.split_last() {
             let is_injected = last
                 .name
                 .as_ref()
-                .is_some_and(|n| INJECTED_PARAM_NAMES.contains(&n.as_str()));
+                .is_some_and(|n| baml_compiler2_ast::is_injected_llm_param(n));
             if is_injected {
                 params = rest;
             } else {
@@ -327,6 +327,12 @@ impl SchemaCx<'_, '_> {
                 key: Box::new(self.field_schema(key, depth + 1)),
                 value: Box::new(self.field_schema(value, depth + 1)),
             },
+            Ty::Tuple(elements) => FieldSchema::Tuple {
+                elements: elements
+                    .iter()
+                    .map(|element| self.field_schema(element, depth + 1))
+                    .collect(),
+            },
             Ty::Union(members) => {
                 if ty.is_nullable_union() {
                     let stripped = ty.strip_null();
@@ -348,9 +354,10 @@ impl SchemaCx<'_, '_> {
                     }
                 }
             }
-            // Everything non-data: functions, interfaces, type variables,
-            // opaque runtime types, and the TIR sentinels (`Unknown`/`Error`/…)
-            // that reliably appear while the user is mid-edit.
+            // Everything without a data schema: functions, interfaces, type
+            // variables, opaque runtime types, the top type `unknown`, and the
+            // compiler's `Error` sentinel that appears while the user is
+            // mid-edit.
             _ => self.unsupported(ty),
         }
     }
@@ -546,7 +553,10 @@ mod tests {
                 "ns_shapes/shapes.baml",
                 "class Box { w int }\nfunction make(b: Box) -> int { 1 }",
             ),
-            ("main.baml", "function use_box(b: shapes.Box) -> int { 1 }"),
+            (
+                "main.baml",
+                "function use_box(b: root.shapes.Box) -> int { 1 }",
+            ),
         ]);
         let listing = list_functions_with_metadata(&db, package);
         let expected_ref = json!({ "type": "ref", "name": "user.shapes.Box" });
@@ -749,6 +759,40 @@ mod tests {
     }
 
     #[test]
+    fn tuple_lists_its_slot_schemas_in_order() {
+        let (db, package) = db_with(&[(
+            "main.baml",
+            r#"
+            class Point { x int }
+            function t(a: (int, string), b: (Point,), c: (int, (bool, float?))[]) -> int { 1 }
+            "#,
+        )]);
+        let listing = list_functions_with_metadata(&db, package);
+        let params = params_json(&listing, "t");
+        assert_eq!(
+            params[0]["schema"],
+            json!({ "type": "tuple",
+                    "elements": [ { "type": "int" }, { "type": "string" } ] })
+        );
+        assert_eq!(
+            params[1]["schema"],
+            json!({ "type": "tuple",
+                    "elements": [ { "type": "ref", "name": "user.Point" } ] })
+        );
+        assert_eq!(
+            params[2]["schema"],
+            json!({ "type": "list", "item": { "type": "tuple", "elements": [
+                { "type": "int" },
+                { "type": "tuple", "elements": [
+                    { "type": "bool" },
+                    { "type": "optional", "inner": { "type": "float" } },
+                ] },
+            ] } })
+        );
+        assert!(types_json(&listing)["user.Point"].is_object());
+    }
+
+    #[test]
     fn unresolved_param_type_degrades_to_unsupported() {
         let (db, package) = db_with(&[("main.baml", "function bad(x: Nope) -> int { 1 }")]);
         let listing = list_functions_with_metadata(&db, package);
@@ -863,7 +907,7 @@ function plain(x: int) -> int { x }
             }
             type JSON = string | JSON[]
             enum Status { Active Inactive }
-            function golden(p: Person, c: Color, j: JSON, s: Status.Active, l: string[], m: map<string, float>, u: int | string, i: image, x: int = 3) -> int { 1 }
+            function golden(p: Person, c: Color, j: JSON, s: Status.Active, l: string[], m: map<string, float>, u: int | string, i: image, t: (int, (Color,)?), x: int = 3) -> int { 1 }
             "#,
         )]);
         let listing = list_functions_with_metadata(&db, package);

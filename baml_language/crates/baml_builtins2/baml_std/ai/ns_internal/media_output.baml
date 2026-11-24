@@ -15,16 +15,16 @@
 /// shapes are enumerated. The nullable list/union forms behave exactly like
 /// their non-null counterparts once decoded, so they share a form.
 function _media_shape(t: reflect.Type) -> string {
-    if (t == reflect.Type.of<image>()) {
+    if (t == image.type()) {
         return "one:image";
     }
-    if (t == reflect.Type.of<audio>()) {
+    if (t == audio.type()) {
         return "one:audio";
     }
-    if (t == reflect.Type.of<video>()) {
+    if (t == video.type()) {
         return "one:video";
     }
-    if (t == reflect.Type.of<pdf>()) {
+    if (t == pdf.type()) {
         return "one:pdf";
     }
     if (t == reflect.Type.of<image?>()) {
@@ -52,11 +52,14 @@ function _media_shape(t: reflect.Type) -> string {
 }
 
 /// (internal) A media block's payload as its BEP-038 `{kind, source, value, mime}`
-/// envelope — the form `baml.json.from_json<Out>` decodes media back from.
+/// envelope — the form `baml.json.to<Out>` decodes media back from.
 function _media_envelope(m: root.content.Media) -> baml.json.json {
-    baml.json.to_json(m.media) catch_all (e) {
+    baml.json.from(m.media) catch_all (e) {
         _ => {
-            throw baml.errors.UnknownError { data: e, message: [e.to_string()] }
+            throw baml.errors.UnknownError {
+                data: e,
+                message: [e.to_string()],
+            };
         },
     }
 }
@@ -143,6 +146,6 @@ function _media_reject_mixed(turn: root.ModelTurn, kind: string, provider: strin
         throw root.errors.ParseFailed {
             provider: provider,
             raw_output: `Expected only ${kind} output parts, got ${unexpected} non-${kind} part(s). Use a text/image union return type to preserve mixed outputs.`,
-        }
+        };
     }
 }

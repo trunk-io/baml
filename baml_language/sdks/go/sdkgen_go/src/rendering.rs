@@ -35,6 +35,9 @@ pub(crate) enum GeneratorIdent {
     UnionSelectedLocal,
     UnionPayloadLocal,
     UnionVariantField,
+    OtherParameter,
+    ReferenceField,
+    TupleSlotsLocal,
     StringType,
     Int64Type,
     Float64Type,
@@ -49,12 +52,6 @@ pub(crate) enum GeneratorIdent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ClassCodecDirection {
-    Encode,
-    Decode,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EnumCodecDirection {
     Encode,
     Decode,
@@ -66,11 +63,11 @@ pub(crate) enum UnionCodecDirection {
     Decode,
 }
 
-/// A generator-owned package declaration. Projected BAML declarations are
+/// A generator-owned class decoder name. Projected BAML declarations are
 /// exported and can never start with `_`, so this namespace cannot collide
-/// with user code. The stable index comes from sorted BAML class FQNs.
+/// with user code. The stable index comes from sorted BAML class FQNs. A class
+/// has no encoder here: it encodes itself through its own `BAMLInput` method.
 pub(crate) struct ClassCodecIdent {
-    direction: ClassCodecDirection,
     index: usize,
 }
 
@@ -84,6 +81,59 @@ pub(crate) struct EnumCodecIdent {
 pub(crate) struct UnionCodecIdent {
     direction: UnionCodecDirection,
     index: usize,
+}
+
+pub(crate) struct TupleCodecIdent {
+    direction: UnionCodecDirection,
+    index: usize,
+}
+
+impl TupleCodecIdent {
+    pub(crate) fn new(direction: UnionCodecDirection, index: usize) -> Self {
+        Self { direction, index }
+    }
+}
+
+impl fmt::Display for TupleCodecIdent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let direction = match self.direction {
+            UnionCodecDirection::Encode => "Encode",
+            UnionCodecDirection::Decode => "Decode",
+        };
+        write!(f, "_baml{direction}Tuple{}", self.index)
+    }
+}
+
+pub(crate) struct TupleSlotField {
+    index: usize,
+}
+
+impl TupleSlotField {
+    pub(crate) fn new(index: usize) -> Self {
+        Self { index }
+    }
+}
+
+impl fmt::Display for TupleSlotField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Item{}", self.index)
+    }
+}
+
+pub(crate) struct TupleSlotLocal {
+    index: usize,
+}
+
+impl TupleSlotLocal {
+    pub(crate) fn new(index: usize) -> Self {
+        Self { index }
+    }
+}
+
+impl fmt::Display for TupleSlotLocal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "_bamlSlot{}_", self.index)
+    }
 }
 
 pub(crate) struct CallbackCodecIdent {
@@ -103,6 +153,24 @@ impl CallbackArgumentIdent {
 impl fmt::Display for CallbackArgumentIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "_bamlCallbackArg{}_", self.index)
+    }
+}
+
+/// A type parameter of a generic callback adapter, by the position of the
+/// BAML type variable in the callback's signature.
+pub(crate) struct CallbackTypeParameterIdent {
+    index: usize,
+}
+
+impl CallbackTypeParameterIdent {
+    pub(crate) fn new(index: usize) -> Self {
+        Self { index }
+    }
+}
+
+impl fmt::Display for CallbackTypeParameterIdent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "_bamlCallbackType{}_", self.index)
     }
 }
 
@@ -141,18 +209,14 @@ impl EnumCodecIdent {
 }
 
 impl ClassCodecIdent {
-    pub(crate) fn new(direction: ClassCodecDirection, index: usize) -> Self {
-        Self { direction, index }
+    pub(crate) fn new(index: usize) -> Self {
+        Self { index }
     }
 }
 
 impl fmt::Display for ClassCodecIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let direction = match self.direction {
-            ClassCodecDirection::Encode => "Encode",
-            ClassCodecDirection::Decode => "Decode",
-        };
-        write!(f, "_baml{direction}Class{}", self.index)
+        write!(f, "_bamlDecodeClass{}", self.index)
     }
 }
 
@@ -196,6 +260,9 @@ impl GeneratorIdent {
         Self::UnionSelectedLocal,
         Self::UnionPayloadLocal,
         Self::UnionVariantField,
+        Self::OtherParameter,
+        Self::ReferenceField,
+        Self::TupleSlotsLocal,
         Self::StringType,
         Self::Int64Type,
         Self::Float64Type,
@@ -236,6 +303,9 @@ impl GeneratorIdent {
             Self::UnionSelectedLocal => "selected_",
             Self::UnionPayloadLocal => "payload_",
             Self::UnionVariantField => "variant_",
+            Self::OtherParameter => "other_",
+            Self::ReferenceField => "handle_",
+            Self::TupleSlotsLocal => "slots_",
             Self::StringType => "string",
             Self::Int64Type => "int64",
             Self::Float64Type => "float64",
@@ -313,20 +383,42 @@ impl fmt::Display for GeneratorIdent {
     }
 }
 
+/// The methods the generated reference wrapper of an opaque class declares
+/// besides `BAMLInput` (which [`GeneratorIdent::InputMethod`] protects
+/// everywhere). A member of an opaque class is escaped away from these names;
+/// any other class keeps them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReferenceWrapperMethod {
+    Equal,
+    Type,
+    Decode,
+}
+
+impl ReferenceWrapperMethod {
+    pub(crate) const ALL: &'static [Self] = &[Self::Equal, Self::Type, Self::Decode];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Equal => "Equal",
+            Self::Type => "BAMLType",
+            Self::Decode => "BAMLDecode",
+        }
+    }
+}
+
+impl fmt::Display for ReferenceWrapperMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn class_codec_identifiers_are_generator_owned_and_stable() {
-        assert_eq!(
-            ClassCodecIdent::new(ClassCodecDirection::Encode, 7).to_string(),
-            "_bamlEncodeClass7"
-        );
-        assert_eq!(
-            ClassCodecIdent::new(ClassCodecDirection::Decode, 7).to_string(),
-            "_bamlDecodeClass7"
-        );
+        assert_eq!(ClassCodecIdent::new(7).to_string(), "_bamlDecodeClass7");
         assert_eq!(
             EnumCodecIdent::new(EnumCodecDirection::Encode, 4).to_string(),
             "_bamlEncodeEnum4"

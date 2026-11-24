@@ -31,14 +31,17 @@ use crate::{
 /// `capabilities.experimental.baml` so the extension's version-skew check
 /// has something to read (it silently skips servers that send nothing).
 ///
-/// The playground numbers mirror the `/api/ws` handshake's `hello` frame
-/// (protocol 2, min client 2) — the WS layer is the source of truth for
-/// what those versions MEAN; these exist so a client can learn them before
-/// opening a socket.
+/// The playground numbers are the ones the `/api/ws` handshake's `hello`
+/// frame sends, so a client can learn them before opening a socket.
+///
+/// Playground protocol 3: `startRun` and `startPreviewRun` carry the
+/// arguments form's JSON text in `args` (protocol 2 sent proto bytes in
+/// `argsBytes`). The two are not compatible, so a client of either refuses
+/// a server of the other instead of hanging on a run that never starts.
 pub(crate) const LSP_PROTOCOL: u32 = 1;
 pub(crate) const MIN_SUPPORTED_CLIENT_LSP_PROTOCOL: u32 = 1;
-pub(crate) const PLAYGROUND_PROTOCOL: u32 = 2;
-pub(crate) const MIN_SUPPORTED_CLIENT_PLAYGROUND_PROTOCOL: u32 = 2;
+pub const PLAYGROUND_PROTOCOL: u32 = 3;
+pub const MIN_SUPPORTED_CLIENT_PLAYGROUND_PROTOCOL: u32 = 3;
 
 /// The `BamlServerMetadata` the extension reads from
 /// `capabilities.experimental.baml` (camelCase is the wire contract).
@@ -356,7 +359,8 @@ pub(super) fn code_lens_resolve(
 // ── Snapshot ─────────────────────────────────────────────────────────────
 
 /// Whole-document formatting. A file that does not parse yields no edits
-/// (the diagnostics say why); an unchanged file yields no edits.
+/// (the diagnostics say why); an unchanged or `baml-format: ignore` file
+/// yields no edits.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "dispatch-table signature: handlers own their params"
@@ -371,22 +375,28 @@ pub(super) fn formatting(
         return Err(LspError::FileNotFound(path));
     };
     let text = file.text(db);
+    // The database text has `\n` line endings; the editor's buffer is what
+    // the edit applies to, so keep its line ending.
+    let buffer = snap
+        .open_documents()
+        .get(&path)
+        .map_or(text.as_str(), |doc| &*doc.text);
     let formatted = match baml_fmt::format_salsa(db, file, baml_fmt::FormatOptions::default()) {
-        Ok(formatted) => formatted,
+        Ok(formatted) => formatted.apply_to(buffer),
         Err(baml_fmt::FormatterError::ParseErrors(_)) => return Ok(None),
-        Err(baml_fmt::FormatterError::StrongAstError(error)) => {
-            return Err(LspError::RequestFailed(format!(
-                "cannot format: {}",
-                error.print_with_file_context(&path, text)
-            )));
+        Err(
+            error @ (baml_fmt::FormatterError::Incomplete(_)
+            | baml_fmt::FormatterError::Violation(_)),
+        ) => {
+            return Err(LspError::Internal(error.to_string()));
         }
     };
-    if formatted == *text {
+    if formatted == buffer {
         return Ok(None);
     }
     // Replace the whole document: [0:0, document end) in the session's
     // encoding, so CRLF and non-ASCII last lines are measured correctly.
-    let codec = PositionCodec::new(text, snap.cx().encoding);
+    let codec = PositionCodec::new(buffer, snap.cx().encoding);
     Ok(Some(vec![lsp_types::TextEdit {
         range: lsp_types::Range {
             start: lsp_types::Position::default(),
@@ -930,9 +940,45 @@ mod tests {
         let baml = &experimental["baml"];
         assert_eq!(baml["lspProtocol"], 1);
         assert_eq!(baml["minSupportedClientLspProtocol"], 1);
-        assert_eq!(baml["playgroundProtocol"], 2, "mirrors the WS hello");
-        assert_eq!(baml["minSupportedClientPlaygroundProtocol"], 2);
+        // The protocol numbers are a contract with the TypeScript clients, so
+        // they are pinned as literals (a silent regression of a constant
+        // fails here) and checked against the range each client compiles in.
+        assert_eq!(baml["playgroundProtocol"], 3, "mirrors the WS hello");
+        assert_eq!(baml["minSupportedClientPlaygroundProtocol"], 3);
         assert!(baml["toolchainVersion"].is_string());
+        for client in [
+            "typescript2/pkg-playground/src/protocol.ts",
+            "typescript2/app-vscode-ext/src/compat.ts",
+        ] {
+            let path = format!("{}/../../../{client}", env!("CARGO_MANIFEST_DIR"));
+            let source =
+                std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+            let min = ts_const(&source, "BAML_PLAYGROUND_PROTOCOL_MIN");
+            let max = ts_const(&source, "BAML_PLAYGROUND_PROTOCOL_MAX");
+            assert!(
+                (min..=max).contains(&PLAYGROUND_PROTOCOL),
+                "{client} speaks {min}..={max}, not the server's {PLAYGROUND_PROTOCOL}"
+            );
+            assert!(
+                MIN_SUPPORTED_CLIENT_PLAYGROUND_PROTOCOL <= max,
+                "{client}'s newest protocol {max} is below the server's minimum \
+                 {MIN_SUPPORTED_CLIENT_PLAYGROUND_PROTOCOL}"
+            );
+        }
+    }
+
+    /// The value of `export const NAME = <number>;` in a TypeScript source.
+    fn ts_const(source: &str, name: &str) -> u32 {
+        let needle = format!("export const {name} = ");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no `{needle}` in the client source"))
+            + needle.len();
+        source[start..]
+            .split(';')
+            .next()
+            .and_then(|digits| digits.trim().parse().ok())
+            .unwrap_or_else(|| panic!("`{name}` is not an integer literal"))
     }
 
     #[test]

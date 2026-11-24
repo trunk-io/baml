@@ -33,11 +33,9 @@ class PlainDate {
     /// - `baml.errors.InvalidArgument` if a component is out of range
     ///   (e.g. month 13, Feb 30) or the year is outside ±9999.
     //baml:mut_vm
-    function from_components(
-        year: int,
-        month: int,
-        day: int,
-    ) -> PlainDate throws root.errors.InvalidArgument {
+    function from_components(year: int, month: int, day: int) -> PlainDate
+        throws root.errors.InvalidArgument
+    {
         $rust_function
     }
     /// Parses an extended-format ISO 8601 calendar date: `1979-05-27`.
@@ -54,7 +52,7 @@ class PlainDate {
     function parse(s: string) -> PlainDate throws root.errors.ParseError {
         $rust_function
     }
-    implements baml.ToString {
+    implements root.ToString {
         /// Serializes to an ISO 8601 calendar date: `1979-05-27`. A negative
         /// year carries a leading `-`.
         ///
@@ -140,7 +138,7 @@ class PlainDate {
         $rust_function
     }
 
-    implements baml.FromJson {
+    implements root.FromJson {
         /// Decodes a `PlainDate` from a JSON string, accepting exactly what
         /// `PlainDate.parse` accepts.
         ///
@@ -148,22 +146,48 @@ class PlainDate {
         ///
         /// - `baml.json.DecodeError` if the value is not a string, or is a
         ///   string `PlainDate.parse` rejects.
-        function from_json(j: baml.json.json) -> Self throws baml.json.DecodeError {
+        function from_json(j: root.json.json) -> Self throws root.json.DecodeError {
             match (j) {
                 string => {
                     PlainDate.parse(j) catch (_) {
                         root.errors.ParseError { message } => {
-                            throw baml.json.DecodeError { message: message, path: "" }
+                            throw root.json.DecodeError {
+                                message: message,
+                                path: "",
+                            };
                         },
                     }
                 },
                 _ => {
-                    throw baml.json.DecodeError { message: "Expected ISO 8601 date string", path: "" }
+                    throw root.json.DecodeError {
+                        message: "Expected ISO 8601 date string",
+                        path: "",
+                    };
                 },
             }
         }
     }
-    implements baml.ToJson {
+    implements root.FromLlmOutput {
+        type Shape = string;
+
+        /// Builds a `PlainDate` from a date a model wrote, accepting exactly what
+        /// `PlainDate.parse` accepts.
+        ///
+        /// # Throws
+        ///
+        /// - `baml.json.DecodeError` if `PlainDate.parse` rejects the string.
+        function from_llm_output(shape: string) -> Self throws root.json.DecodeError {
+            PlainDate.parse(shape) catch (_) {
+                root.errors.ParseError { message } => {
+                    throw root.json.DecodeError {
+                        message: message,
+                        path: "",
+                    };
+                },
+            }
+        }
+    }
+    implements root.ToJson {
         /// Encodes `self` as the same ISO 8601 date string `to_string`
         /// produces.
         ///
@@ -173,16 +197,18 @@ class PlainDate {
         ///   year range. The same failure panics in `to_string`: a serializer
         ///   is called with a caller standing by to react, so it gets the error
         ///   channel.
-        function to_json(self) -> baml.json.json throws baml.json.SerializationError {
+        function to_json(self) -> root.json.json throws root.json.SerializationError {
             self._to_string_impl() catch (_) {
                 root.errors.InvalidArgument { message } => {
-                    throw baml.json.SerializationError {
+                    throw root.json.SerializationError {
                         message: message,
                         path: "",
                         reason: "unserializable",
-                    }
+                    };
                 },
             }
         }
     }
+
+    @@description("An ISO 8601 date, for example 1979-05-27")
 }

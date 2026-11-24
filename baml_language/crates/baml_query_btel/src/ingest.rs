@@ -16,14 +16,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use btel_reader::{
-    discovery::{self, DiscoveredFile, DiscoveredRecording, FileStamp},
-    evidence::{self, ArgumentNames},
-    file::{self, FileError, FileRead},
-    layout::SourceLayout,
-    timing::EpochStatus,
+use btel_core::{
+    reader::{
+        discovery::{self, DiscoveredFile, DiscoveredRecording, FileStamp},
+        evidence::{self, ArgumentNames},
+        file::{self, FileError, FileRead},
+        layout::SourceLayout,
+        timing::EpochStatus,
+    },
+    recording::v2::{self as proto, function_definition::Resolution, span_event::Event},
 };
-use btel_recorder::proto::{self, function_definition::Resolution, span_event::Event};
 use prost::Message as _;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params, types::ValueRef};
 use serde::Serialize;
@@ -33,6 +35,7 @@ use crate::{Error, store};
 mod bulk;
 mod context;
 mod profile;
+mod totals;
 
 #[derive(Clone, Debug)]
 pub struct RefreshOptions {
@@ -99,7 +102,7 @@ pub(crate) fn id(value: u64) -> [u8; 8] {
     value.to_be_bytes()
 }
 
-fn snapshot_id(id: &proto::SnapshotId) -> [u8; 16] {
+fn cas_id(id: &proto::CasId) -> [u8; 16] {
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&id.low.to_le_bytes());
     bytes[8..].copy_from_slice(&id.high.to_le_bytes());
@@ -197,7 +200,7 @@ pub fn refresh(
     conn: &mut Connection,
     layout: &SourceLayout,
     options: &RefreshOptions,
-    cas: &btel_reader::cas::CasStore,
+    cas: &btel_core::reader::store::CasStore,
 ) -> Result<RefreshMetrics, Error> {
     let started = Instant::now();
     let mut metrics = RefreshMetrics::default();
@@ -217,7 +220,7 @@ fn refresh_locked(
     conn: &mut Connection,
     layout: &SourceLayout,
     options: &RefreshOptions,
-    cas: &btel_reader::cas::CasStore,
+    cas: &btel_core::reader::store::CasStore,
     metrics: &mut RefreshMetrics,
 ) -> Result<(), Error> {
     metrics.schema_rebuilt = store::ensure_schema(conn)?;
@@ -346,7 +349,8 @@ pub(super) fn record_process(
                baml_version = COALESCE(baml_version, ?3), host = COALESCE(host, ?4),
                command = COALESCE(command, ?5),
                process_started_ns = COALESCE(process_started_ns, ?6),
-               source_cas = COALESCE(source_cas, ?7)
+               source_cas = COALESCE(source_cas, ?7),
+               initial_context_cas = COALESCE(initial_context_cas, ?8)
              WHERE rec = ?1",
         )?
         .execute(params![
@@ -356,8 +360,15 @@ pub(super) fn record_process(
             header.host,
             command,
             header.process_started_at_unix_ns,
-            header.source_cas_id.as_ref().map(snapshot_id)
+            header.source_cas_id.as_ref().map(cas_id),
+            header.initial_context_cas_id.as_ref().map(cas_id)
         ])?;
+        if let Some(context) = &header.initial_context_cas_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO context_snapshot (cas) VALUES (?1)",
+                [cas_id(context)],
+            )?;
+        }
     }
     if let Some(end) = file.end.as_ref().and_then(|end| end.process_end.as_ref()) {
         tx.prepare_cached(
@@ -595,7 +606,7 @@ fn reconcile(
             tx.execute(
                 "UPDATE recording SET indexed_sequence = 0, terminal_sequence = NULL,
                    source_snapshot_id = NULL, indexed_bytes = 0, format_minor = 0,
-                   generation = generation + 1, process_id = NULL, baml_version = NULL, host = NULL, command = NULL, process_started_ns = NULL, source_cas = NULL, process_end_status = NULL, process_end_ns = NULL, folded = 0
+                   generation = generation + 1, process_id = NULL, baml_version = NULL, host = NULL, command = NULL, process_started_ns = NULL, source_cas = NULL, initial_context_cas = NULL, process_end_status = NULL, process_end_ns = NULL, folded = 0
                  WHERE rec = ?1",
                 [rec_key],
             )?;
@@ -834,11 +845,12 @@ fn apply_fresh<'p>(
         tx.execute(
             "UPDATE recording SET indexed_sequence = 0, terminal_sequence = NULL,
                source_snapshot_id = NULL, indexed_bytes = 0, format_minor = 0,
-               generation = generation + 1, process_id = NULL, baml_version = NULL, host = NULL, command = NULL, process_started_ns = NULL, source_cas = NULL, process_end_status = NULL, process_end_ns = NULL, folded = 0
+               generation = generation + 1, process_id = NULL, baml_version = NULL, host = NULL, command = NULL, process_started_ns = NULL, source_cas = NULL, initial_context_cas = NULL, process_end_status = NULL, process_end_ns = NULL, folded = 0
              WHERE rec = ?1",
             [rec],
         )?;
     }
+    let charged = merged.charged();
     merged.write(&tx, rec, applied.last().is_some_and(|file| file.end))?;
     let mut terminal = None;
     let mut source_snapshot = None;
@@ -887,6 +899,7 @@ fn apply_fresh<'p>(
         }
         metrics.files_applied += 1;
     }
+    totals::apply(&tx, rec, &charged)?;
     if rebuild || !applied.is_empty() {
         mark_profile_pending(&tx, rec)?;
     }
@@ -1020,6 +1033,8 @@ struct Applier<'t> {
     /// Functions whose metadata replaced an "unavailable" observation: the
     /// profiler nodes named after them change.
     renamed_functions: HashSet<u64>,
+    /// Calls and threads whose usage this transaction stored, for the totals.
+    charged: Vec<([u8; 8], Vec<crate::usage::ModelUsage>)>,
 }
 
 impl<'t> Applier<'t> {
@@ -1033,6 +1048,7 @@ impl<'t> Applier<'t> {
             entries: Vec::new(),
             sysops: HashMap::new(),
             renamed_functions: HashSet::new(),
+            charged: Vec::new(),
         }
     }
 
@@ -1120,27 +1136,6 @@ impl<'t> Applier<'t> {
                 entry.1 = entry.1.saturating_add(u128::from(time.total_ticks));
             }
         }
-        if let Some(usage) = &file.usage {
-            let mut insert = self.tx.prepare_cached(
-                "INSERT INTO model_usage (rec, sequence, position, node_id, model, input_tokens,
-                   output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for (position, entry) in usage.entries.iter().enumerate() {
-                insert.execute(params![
-                    self.rec,
-                    sequence_i64(sequence)?,
-                    saturating(position as u64),
-                    id(entry.node_id),
-                    entry.model,
-                    saturating(entry.input_tokens),
-                    saturating(entry.output_tokens),
-                    entry.cache_read_tokens.map(saturating),
-                    entry.cache_write_tokens.map(saturating),
-                    entry.reasoning_tokens.map(saturating)
-                ])?;
-            }
-        }
         if let Some(spans) = &file.spans {
             // Each network event's position among the file's.
             let mut network_events = 0_u32;
@@ -1190,10 +1185,12 @@ impl<'t> Applier<'t> {
                                      VALUES (?1, ?2, 0)",
                                 )?
                                 .execute(params![self.rec, id(section.thread_id)])?;
+                            let usage = crate::usage::from_wire(&done.usage);
                             let changed = self
                                 .tx
                                 .prepare_cached(
-                                    "UPDATE thread SET completed_ticks = ?3, outcome = ?4, panicked = ?5
+                                    "UPDATE thread SET completed_ticks = ?3, outcome = ?4, panicked = ?5,
+                                       usage = ?6, error_cas = ?7
                                      WHERE rec = ?1 AND thread_id = ?2 AND outcome IS NULL",
                                 )?
                                 .execute(params![
@@ -1201,8 +1198,13 @@ impl<'t> Applier<'t> {
                                     id(section.thread_id),
                                     completed,
                                     done.outcome,
-                                    done.panicked
+                                    done.panicked,
+                                    crate::usage::to_json(&usage),
+                                    done.error_cas_id.as_ref().map(cas_id)
                                 ])?;
+                            if changed > 0 && !usage.is_empty() {
+                                self.charged.push((id(section.thread_id), usage));
+                            }
                             if changed == 0 {
                                 let existing: Option<(Option<i64>, Option<i64>)> = self
                                     .tx
@@ -1239,13 +1241,14 @@ impl<'t> Applier<'t> {
                             self.tx
                                 .prepare_cached(
                                     "INSERT INTO call (rec, call_id, thread_id, parent_id, call_path_id,
-                                       announced_sequence, entered_ticks, inputs_cas, type_args_cas)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                       announced_sequence, entered_ticks, inputs_cas, type_args_cas, manual)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                                      ON CONFLICT (rec, call_id) DO UPDATE SET
                                        conflict = CASE WHEN conflict > 0 THEN conflict
                                          WHEN announced_sequence IS NOT NULL
                                            OR thread_id IS NOT excluded.thread_id
                                            OR parent_id IS NOT excluded.parent_id
+                                           OR manual IS NOT excluded.manual
                                            OR call_path_id IS NOT excluded.call_path_id
                                            OR entered_ticks IS NOT excluded.entered_ticks
                                          THEN 1 ELSE 0 END,
@@ -1261,8 +1264,9 @@ impl<'t> Applier<'t> {
                                     i64::from(entry.call_path_id),
                                     sequence_i64(sequence)?,
                                     tick(entry.entered_at_ticks),
-                                    entry.inputs_cas_id.as_ref().map(snapshot_id),
-                                    entry.type_args_cas_id.as_ref().map(snapshot_id)
+                                    entry.inputs_cas_id.as_ref().map(cas_id),
+                                    entry.type_args_cas_id.as_ref().map(cas_id),
+                                    entry.manual
                                 ])?;
                         }
                         Some(Event::FunctionCompletion(done)) => {
@@ -1298,7 +1302,7 @@ impl<'t> Applier<'t> {
                                     seq,
                                     observed.name,
                                     tick(observed.at_ticks),
-                                    observed.payload_cas_id.as_ref().map(snapshot_id)
+                                    observed.payload_cas_id.as_ref().map(cas_id)
                                 ])?;
                         }
                         Some(Event::NetworkCompletion(done)) => {
@@ -1332,30 +1336,42 @@ impl<'t> Applier<'t> {
             evidence::completion(done, late).expect("validated completion flags");
         let (path, reentry) = evidence::split_node(done.node);
         self.references.paths.insert(path);
+        let usage = crate::usage::from_wire(&done.usage);
+        // The first usage stored wins: a second completion is a conflict.
+        let charges = !usage.is_empty()
+            && self
+                .tx
+                .prepare_cached("SELECT usage IS NULL FROM call WHERE rec = ?1 AND call_id = ?2")?
+                .query_row(params![self.rec, id(done.id)], |r| r.get::<_, bool>(0))
+                .optional()?
+                .unwrap_or(true);
         self.tx
             .prepare_cached(
                 "INSERT INTO call (rec, call_id, thread_id, parent_id, call_path_id, reentry,
                    completed_sequence, late, entered_ticks, exited_ticks, self_await_ticks,
-                   outcome, needs_announcement, value_cas, panicked)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                   outcome, needs_announcement, value_cas, panicked, manual, usage)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT (rec, call_id) DO UPDATE SET
                    conflict = CASE WHEN conflict > 0 THEN conflict
                      WHEN completed_sequence IS NOT NULL
                        OR thread_id IS NOT excluded.thread_id
                        OR parent_id IS NOT excluded.parent_id
+                       OR manual IS NOT excluded.manual
                        OR call_path_id IS NOT excluded.call_path_id
                        OR (entered_ticks IS NOT NULL AND entered_ticks IS NOT excluded.entered_ticks)
                      THEN 1 ELSE 0 END,
                    reentry = excluded.reentry,
                    completed_sequence = excluded.completed_sequence,
                    late = excluded.late,
+                   manual = excluded.manual,
                    entered_ticks = COALESCE(entered_ticks, excluded.entered_ticks),
                    exited_ticks = excluded.exited_ticks,
                    self_await_ticks = excluded.self_await_ticks,
                    outcome = excluded.outcome,
                    needs_announcement = excluded.needs_announcement,
                    value_cas = excluded.value_cas,
-                   panicked = excluded.panicked",
+                   panicked = excluded.panicked,
+                   usage = COALESCE(usage, excluded.usage)",
             )?
             .execute(params![
                 self.rec,
@@ -1371,9 +1387,14 @@ impl<'t> Applier<'t> {
                 tick(done.self_await_ticks),
                 outcome.code(),
                 needs_announcement,
-                done.value_cas_id.as_ref().map(snapshot_id),
-                done.panicked
+                done.value_cas_id.as_ref().map(cas_id),
+                done.panicked,
+                done.completion_flags & 32 != 0,
+                crate::usage::to_json(&usage)
             ])?;
+        if charges {
+            self.charged.push((id(done.id), usage));
+        }
         Ok(())
     }
 
@@ -1397,7 +1418,7 @@ impl<'t> Applier<'t> {
             path.map(i64::from),
             entry.method,
             entry.url,
-            entry.request_cas_id.as_ref().map(snapshot_id),
+            entry.request_cas_id.as_ref().map(cas_id),
             tick(entry.started_at_ticks)
         ];
         let inserted = self
@@ -1460,7 +1481,7 @@ impl<'t> Applier<'t> {
             tick(done.completed_at_ticks),
             done.outcome,
             done.panicked,
-            done.error_cas_id.as_ref().map(snapshot_id)
+            done.error_cas_id.as_ref().map(cas_id)
         ];
         self.tx
             .prepare_cached(
@@ -1538,7 +1559,10 @@ impl<'t> Applier<'t> {
                 let names = layout.map(|layout| ArgumentNames::from_wire(layout).encode());
                 let span = metadata.source_span.as_ref();
                 let map = metadata.source_map.as_ref().map(|map| {
-                    btel_reader::source_map::SourceMap::from_wire(map, span.map(|s| s.file_id))
+                    btel_core::reader::source_map::SourceMap::from_wire(
+                        map,
+                        span.map(|s| s.file_id),
+                    )
                 });
                 if let Some(Err(reason)) = &map {
                     self.issue(
@@ -1569,9 +1593,9 @@ impl<'t> Applier<'t> {
                            definition_key, kind, kind_detail, origin, source_file, source_file_id,
                            source_start, source_end, package, namespace, namespace_json,
                            owner_type_key, parent_function_key, lambda_path, argument_names,
-                           parameter_count, metadata, source_map, source_map_state)
+                           parameter_count, metadata, source_map, source_map_state, model_invoke)
                          VALUES (?1, ?2, 2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                           ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                           ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                          ON CONFLICT (rec, function_id) DO UPDATE SET
                            state = 2, fqn = excluded.fqn, display_name = excluded.display_name,
                            definition_key = excluded.definition_key, kind = excluded.kind,
@@ -1588,7 +1612,8 @@ impl<'t> Applier<'t> {
                            parameter_count = excluded.parameter_count,
                            metadata = excluded.metadata,
                            source_map = excluded.source_map,
-                           source_map_state = excluded.source_map_state",
+                           source_map_state = excluded.source_map_state,
+                           model_invoke = excluded.model_invoke",
                     )?
                     .execute(params![
                         self.rec,
@@ -1613,7 +1638,8 @@ impl<'t> Applier<'t> {
                         layout.map(|l| i64::try_from(l.slots.len()).unwrap_or(i64::MAX)),
                         encoded,
                         map_blob,
-                        map_state
+                        map_state,
+                        metadata.model_invoke
                     ])?;
                 if let Some(layout) = layout {
                     let mut insert = self.tx.prepare_cached(
@@ -1801,7 +1827,7 @@ impl<'t> Applier<'t> {
         let utc = epoch
             .utc
             .as_ref()
-            .and_then(btel_reader::timing::UtcAnchor::from_wire);
+            .and_then(btel_core::reader::timing::UtcAnchor::from_wire);
         let values = params![
             self.rec,
             id(epoch.epoch_id),
@@ -2019,7 +2045,7 @@ impl<'t> Applier<'t> {
             .execute([self.rec])?;
         forget_nodes(self.tx, self.rec, &self.renamed_functions)?;
         resolve_nodes(self.tx, self.rec)?;
-        Ok(())
+        totals::apply(self.tx, self.rec, &self.charged)
     }
 }
 
@@ -2096,9 +2122,9 @@ pub(super) fn resolve_nodes(tx: &Transaction<'_>, rec: i64) -> Result<(), Error>
             let (_, callee, edge) = &waiting[&path];
             let node = match parent_node {
                 Some(None) => None,
-                parent => names
-                    .get(callee)
-                    .map(|name| crate::functions::node_hash(parent.flatten(), name, *edge)),
+                parent => names.get(callee).map(|name| {
+                    btel_core::reader::profile::node_hash(parent.flatten(), name, *edge)
+                }),
             };
             nodes.insert(path, node);
             parent_node = Some(node);
@@ -2159,7 +2185,7 @@ fn forget_nodes(tx: &Transaction<'_>, rec: i64, functions: &HashSet<u64>) -> Res
     }
 }
 
-/// Crash injection for recovery tests: `BAML_QUERY_FAULT=<point>[:<n>]`
+/// Crash injection for recovery tests: `DEV_BAML_QUERY_FAULT=<point>[:<n>]`
 /// aborts the process at the n-th (default first) arrival at `point`.
 /// Compiled only with the `fault-injection` feature.
 mod fault {
@@ -2167,7 +2193,7 @@ mod fault {
     pub(super) fn point(name: &str) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static ARRIVALS: AtomicUsize = AtomicUsize::new(0);
-        let Ok(spec) = std::env::var("BAML_QUERY_FAULT") else {
+        let Some(spec) = baml_env::raw_var("DEV_BAML_QUERY_FAULT") else {
             return;
         };
         let (point, nth) = spec.split_once(':').unwrap_or((&spec, "1"));

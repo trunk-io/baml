@@ -4,7 +4,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder, FunctionId};
-use bex_heap::{CollectionLevel, HeapPermit};
+use bex_heap::HeapPermit;
 use bex_vm_types::{Function, Object};
 use sys_native::SysOpsExt;
 
@@ -51,11 +51,9 @@ async fn package_functions(
     let active = inactive.acquire().await;
     let pointer = engine.resolve_handle(active.proof(), handle).unwrap();
     // SAFETY: the active permit prevents collection; the handle roots the wrapper.
-    let Object::Instance(wrapper) = (unsafe { pointer.get() }) else {
-        panic!("not a package wrapper")
-    };
+    let wrapper = unsafe { bex_vm_types::InstanceRef::of(pointer) }.expect("not a package wrapper");
     let pointer = wrapper
-        .load_field(0)
+        .load_value(0)
         .as_object_ptr()
         .expect("package payload");
     // SAFETY: the wrapper roots its package payload under the same permit.
@@ -88,7 +86,7 @@ async fn package_functions(
                     function
                         .telemetry_function_id
                         .expect("identity assigned before execution"),
-                    function.name.clone(),
+                    function.name(),
                 )),
                 _ => None,
             }
@@ -107,7 +105,7 @@ function dependent(dep: reflect.Package) -> reflect.Package {
   reflect.Package.compile({"use.baml": "function use_leaf() -> int { dep.identity_leaf() }"}, packages = {"dep": dep})
 }
 function invoke(pkg: reflect.Package) -> int {
-  let f = pkg.get_function<() -> int>("root.use_leaf") ?? throw "missing function"
+  let f = pkg.get_function<() -> int>("root.use_leaf")
   f()
 }
 "#,
@@ -142,7 +140,7 @@ function invoke(pkg: reflect.Package) -> int {
         "same source is two runtime objects"
     );
     // Unregistered definitions can move before their first observation too.
-    engine.collect_garbage(CollectionLevel::Major).await;
+    engine.collect_garbage().await;
     assert_eq!(package_functions(&engine, &first).await, first_functions);
     let dependent = call(&engine, "user.dependent", vec![first.clone()]).await;
     let dependent_functions = package_functions(&engine, &dependent).await;
@@ -208,15 +206,9 @@ function invoke(pkg: reflect.Package) -> int {
         1,
         "only the observed definition registers; imports reuse it"
     );
-    // Two minors promote live dynamic definitions to Gen2. The third minor
-    // must preserve them even when old-generation tracing does not visit them.
-    for level in [
-        CollectionLevel::Minor,
-        CollectionLevel::Minor,
-        CollectionLevel::Minor,
-        CollectionLevel::Major,
-    ] {
-        engine.collect_garbage(level).await;
+    // Live dynamic definitions survive every collection.
+    for _ in 0..4 {
+        engine.collect_garbage().await;
         assert_eq!(package_functions(&engine, &first).await, first_functions);
         assert_eq!(
             package_functions(&engine, &dependent).await,
@@ -249,7 +241,7 @@ function invoke(pkg: reflect.Package) -> int {
         }
     });
     for _ in 0..4 {
-        engine.collect_garbage(CollectionLevel::Major).await;
+        engine.collect_garbage().await;
     }
     reader.await.unwrap();
     let retained = engine
@@ -258,13 +250,7 @@ function invoke(pkg: reflect.Package) -> int {
         .unwrap();
     let retained_name = retained.fqn.clone();
     drop((first, second, dependent));
-    // Old-generation weak entries survive a minor cycle, even without roots.
-    engine.collect_garbage(CollectionLevel::Minor).await;
-    assert_eq!(
-        engine.function_metadata(retained.function_id).await,
-        Some(retained.clone())
-    );
-    engine.collect_garbage(CollectionLevel::Major).await;
+    engine.collect_garbage().await;
     for (id, _) in first_functions
         .iter()
         .chain(&second_functions)
@@ -334,7 +320,7 @@ function run() -> int {
         &after.function_table.functions[..before.function_table.functions.len()],
         &before.function_table.functions
     );
-    engine.collect_garbage(CollectionLevel::Major).await;
+    engine.collect_garbage().await;
     for row in rows {
         assert!(engine.function_metadata(row.function_id).await.is_none());
         assert!(
@@ -358,13 +344,16 @@ async fn initial_ids_match_metadata_and_runtime_identity_is_not_serialized() {
     let serialized = borsh::to_vec(&program).unwrap();
     let reloaded = borsh::from_slice(&serialized).unwrap();
     let second = from_program(reloaded);
-    assert_ne!(
+    // The program's identity is its content, which serialization carries;
+    // the engine and its function ids are not part of it.
+    assert_eq!(
         first.program_metadata().await.program_id,
         second.program_metadata().await.program_id
     );
+    assert_ne!(first.engine_id(), second.engine_id());
     for engine in [&first, &second] {
         let table = engine.program_metadata().await.function_table;
-        engine.collect_garbage(CollectionLevel::Major).await;
+        engine.collect_garbage().await;
         assert_eq!(engine.program_metadata().await.function_table, table);
         let inactive = engine.heap_permit_manager().new_permit(()).await;
         let _active = inactive.acquire().await;
@@ -381,7 +370,7 @@ async fn initial_ids_match_metadata_and_runtime_identity_is_not_serialized() {
             };
             let id = function.telemetry_function_id.unwrap();
             assert!(ids.insert(id));
-            assert_eq!(table.get(id).unwrap().fqn, function.name);
+            assert_eq!(table.get(id).unwrap().fqn, function.name());
             assert_eq!(
                 id.get() as usize,
                 ids.len(),
@@ -420,6 +409,6 @@ async fn synthetic_entries_never_register_telemetry_functions() {
         .collect();
     assert!(entries.is_empty());
     assert_eq!(before_gc, initial);
-    engine.collect_garbage(CollectionLevel::Minor).await;
+    engine.collect_garbage().await;
     assert_eq!(engine.program_metadata().await.function_table, initial);
 }

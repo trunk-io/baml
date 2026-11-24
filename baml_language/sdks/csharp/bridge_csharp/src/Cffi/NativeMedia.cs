@@ -1,5 +1,3 @@
-using System.Text;
-
 using BamlBridge.Cffi.V1;
 
 namespace Baml.Cffi;
@@ -7,64 +5,11 @@ namespace Baml.Cffi;
 internal readonly record struct NativeMediaSnapshot(
     string Url,
     string Base64,
-    string File,
+    string Name,
     string MimeType);
 
 internal sealed unsafe partial class NativeApi
 {
-    private static readonly UTF8Encoding StrictMediaUtf8 = new(
-        encoderShouldEmitUTF8Identifier: false,
-        throwOnInvalidBytes: true);
-
-    internal BamlSafeHandle CreateMediaOwner(MediaTypeEnum mediaType, MediaPayload payload)
-    {
-        ArgumentNullException.ThrowIfNull(payload);
-        BamlHandleType expectedHandleType = MediaHandleType(mediaType);
-        string representation = payload.IsUrl
-            ? payload.Url!
-            : Convert.ToBase64String(payload.Bytes.Span);
-        byte[] encodedRepresentation = NullTerminatedMediaUtf8(representation, "media value");
-        byte[]? encodedMimeType = payload.MediaType is null
-            ? null
-            : NullTerminatedMediaUtf8(payload.MediaType, "media MIME type");
-        ulong key = 0;
-        int rawHandleType = 0;
-        BamlCffiStatus status;
-        fixed (byte* representationPointer = encodedRepresentation)
-        fixed (byte* mimeTypePointer = encodedMimeType)
-        {
-            status = payload.IsUrl
-                ? table->MediaFromUrl(
-                    (int)mediaType,
-                    representationPointer,
-                    mimeTypePointer,
-                    &key,
-                    &rawHandleType)
-                : table->MediaFromBase64(
-                    (int)mediaType,
-                    representationPointer,
-                    mimeTypePointer,
-                    &key,
-                    &rawHandleType);
-        }
-
-        if (status != BamlCffiStatus.Ok
-            || key == 0
-            || rawHandleType != (int)expectedHandleType)
-        {
-            if (key != 0)
-            {
-                _ = table->HandleRelease(key);
-            }
-
-            throw new BamlProtocolException(
-                "The native bridge could not create a BAML media value.",
-                $"Media constructor returned {status}, key {key}, and handle type {rawHandleType}; expected {(int)expectedHandleType}.");
-        }
-
-        return new BamlSafeHandle(key, table->HandleClone, table->HandleRelease);
-    }
-
     internal NativeMediaSnapshot ReadMedia(
         BamlSafeHandle owner,
         BamlHandleType handleType,
@@ -83,7 +28,7 @@ internal sealed unsafe partial class NativeApi
         return new NativeMediaSnapshot(
             ReadMediaField(lease.Key, handleType, table->MediaUrl, "URL"),
             ReadMediaField(lease.Key, handleType, table->MediaBase64, "base64"),
-            ReadMediaField(lease.Key, handleType, table->MediaFile, "file"),
+            ReadMediaField(lease.Key, handleType, table->MediaName, "name"),
             ReadMediaField(lease.Key, handleType, table->MediaMimeType, "MIME type"));
     }
 
@@ -116,32 +61,4 @@ internal sealed unsafe partial class NativeApi
             "The managed bridge encountered an unsupported BAML media kind.",
             $"Media kind {mediaType} has no public managed projection."),
     };
-
-    private static byte[] NullTerminatedMediaUtf8(string value, string description)
-    {
-        ArgumentNullException.ThrowIfNull(value);
-        if (value.Contains('\0'))
-        {
-            throw new BamlTypeMappingException(
-                typeof(string),
-                "media",
-                "$",
-                $"The {description} contains an interior NUL byte.");
-        }
-
-        try
-        {
-            byte[] bytes = new byte[StrictMediaUtf8.GetByteCount(value) + 1];
-            StrictMediaUtf8.GetBytes(value, bytes);
-            return bytes;
-        }
-        catch (EncoderFallbackException error)
-        {
-            throw new BamlTypeMappingException(
-                typeof(string),
-                "media",
-                "$",
-                $"The {description} is not valid Unicode: {error.Message}");
-        }
-    }
 }

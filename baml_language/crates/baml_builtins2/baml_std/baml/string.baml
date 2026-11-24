@@ -17,8 +17,8 @@
 class String {
     /// Renders any value as human-readable text.
     ///
-    /// Dispatches to `baml.ToString.to_string` when `value`'s runtime type
-    /// implements it, and to a default structural rendering otherwise.
+    /// Dispatches to `baml.ToString.to_string`, using the implicit structural
+    /// implementation when the runtime type has no explicit implementation.
     ///
     /// # Examples
     ///
@@ -28,10 +28,7 @@ class String {
     /// string.from([1, 2, 3])     // "[1, 2, 3]"
     /// ```
     function from<T>(value: T) -> string throws never {
-        match (value) {
-            baml.ToString => value.to_string(),
-            _ => root._to_string_default(value),
-        }
+        value.to_string()
     }
 
     /// Returns the number of characters (Unicode code points).
@@ -52,7 +49,7 @@ class String {
     /// "".length()       // 0
     /// ```
     function length(self) -> int throws never {
-        self.char_count()
+        $rust_function
     }
 
     /// Alias for `length()`.
@@ -68,6 +65,7 @@ class String {
     /// "".is_empty()       // true
     /// "hello".is_empty()  // false
     /// ```
+    /// baml:$trace=trace.hidden
     function is_empty(self) -> bool throws never {
         self.byte_length() == 0
     }
@@ -323,11 +321,9 @@ class String {
     /// "a.b".replace(baml.regex.new("."), "-")              // "-.b"
     /// "5 cm".replace(baml.regex.new("(\\d+) cm"), "${1}mm") // "5mm"
     /// ```
-    function replace(
-        self,
-        search: string | root.regex.Regex,
-        replacement: string,
-    ) -> string throws never {
+    function replace(self, search: string | root.regex.Regex, replacement: string) -> string
+        throws never
+    {
         root.regex._replace(self._as_string(), search, replacement, false)
     }
 
@@ -449,11 +445,9 @@ class String {
     /// "a.b.c".replace_all(".", "-")                       // "a-b-c"
     /// "a1b2".replace_all(baml.regex.new("\\d"), "#") // "a#b#"
     /// ```
-    function replace_all(
-        self,
-        search: string | root.regex.Regex,
-        replacement: string,
-    ) -> string throws never {
+    function replace_all(self, search: string | root.regex.Regex, replacement: string) -> string
+        throws never
+    {
         root.regex._replace(self._as_string(), search, replacement, true)
     }
 
@@ -476,11 +470,9 @@ class String {
 
     /// (internal) `replace_all` restricted to a literal search and a literal replacement.
     /// Called from `baml.regex._replace`, which owns the dispatch.
-    function _replace_all_literal(
-        self,
-        search: string,
-        replacement: string,
-    ) -> string throws never {
+    function _replace_all_literal(self, search: string, replacement: string) -> string
+        throws never
+    {
         $rust_function
     }
 
@@ -856,7 +848,7 @@ class String {
 // operation`. Widening `+` to render any right operand needs both of those
 // fixed first.
 implement root.ops.Add<string> for string {
-    type Output = string
+    type Output = string;
 
     /// Concatenates `self` and `rhs`. Backs the `+` operator on strings.
     ///

@@ -80,15 +80,11 @@ pub struct TestProfileManifest {
     pub unknown: IndexMap<String, toml::Value>,
 }
 
-/// Top-level keys that are valid in `baml.toml` but are *not* consumed by
-/// this internal binary, so they legitimately land in [`BamlToml::unknown`].
-/// They must not be flagged as typos. Currently just `toolchain` (typically a
-/// `[toolchain]` table, e.g. `channel = "nightly"`), which the `baml` wrapper
-/// reads to pick a toolchain version *before* exec'ing this binary — by the
-/// time we parse the manifest the choice is already made, so there is nothing
-/// here to act on, only a key to not warn about. Matching is by key name, so
-/// both the `[toolchain]` table and a bare `toolchain = "…"` are covered.
-const KNOWN_UNHANDLED_TOP_LEVEL_KEYS: &[&str] = &["toolchain"];
+/// Top-level keys owned outside the compiler's manifest model, preserved in
+/// [`BamlToml::unknown`].
+/// The wrapper reads `toolchain` to choose the executable; the CLI's cloud
+/// configuration reads `boundary`. Matching is by top-level key name.
+const KNOWN_UNHANDLED_TOP_LEVEL_KEYS: &[&str] = &["toolchain", "boundary", "pack", "bridge"];
 
 #[derive(Debug, Deserialize)]
 pub struct Package {
@@ -102,6 +98,16 @@ pub struct Package {
     /// user manifest setting it is warned about and ignored.
     #[serde(default)]
     pub prelude: bool,
+
+    /// `[package].version`: the version the package claims to be.
+    pub version: Option<String>,
+
+    /// `[package].organization`: who the package claims to be published by.
+    pub organization: Option<String>,
+
+    /// `[package].registry`: URL of the package repository the package claims
+    /// to be published on. The default repository when omitted.
+    pub registry: Option<String>,
 
     #[serde(flatten)]
     pub unknown: IndexMap<String, toml::Value>,
@@ -155,14 +161,20 @@ pub struct GeneratorManifest {
     /// e.g. `"preserve-case"`, `"language"`. Required for codegen.
     pub naming_convention: Option<Spanned<String>>,
 
-    /// Output directory, resolved relative to the project. Defaults to
-    /// `".."` when omitted.
+    /// Directory the generated SDK is placed under, resolved relative to the
+    /// project. Defaults to the project root when omitted.
     #[serde(default)]
     pub output_dir: Option<String>,
 
     /// Import path of the generated SDK root. Required only by Go because
     /// generated subpackages must import one another by module path.
     pub sdk_import_path: Option<Spanned<String>>,
+
+    /// Name of the generated SDK in the target language's terms (a dotted
+    /// Python import path, a Go package, a Rust crate, a TypeScript
+    /// directory). Also names the directory under `output_dir`. Defaults to
+    /// `baml_sdk`.
+    pub package_name: Option<Spanned<String>>,
 
     /// Maximum non-null union arity represented as a closed generated Go
     /// union. Larger unions use `any`. Go-only; defaults to 3.
@@ -251,6 +263,29 @@ pub fn package_name(
     Ok(name.clone())
 }
 
+/// What the manifest claims the package is (BEP-085): `[package]`'s name,
+/// version, organization and registry, as written. A blank value claims
+/// nothing, the same as an omitted one.
+pub fn claimed_identity(manifest: &BamlToml) -> baml_base::ClaimedIdentity {
+    let stated = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    manifest
+        .package
+        .as_ref()
+        .map(|package| baml_base::ClaimedIdentity {
+            registry: stated(&package.registry),
+            organization: stated(&package.organization),
+            name: stated(&package.name),
+            version: stated(&package.version),
+        })
+        .unwrap_or_default()
+}
+
 /// Human-readable warnings for keys we didn't recognize, so a typo
 /// (`[scriptz]`, `nmae = ...`, `outpt_type = ...`) surfaces instead of being
 /// silently ignored. Each warning is non-fatal — forward-compatible
@@ -306,6 +341,31 @@ mod tests {
         let m = parse("[package]\nname = \"app\"\n[scripts]\ndev = \"-f main\"\n").unwrap();
         assert_eq!(m.package.unwrap().name.as_deref(), Some("app"));
         assert_eq!(m.scripts["dev"].tokens(), vec!["-f", "main"]);
+    }
+
+    #[test]
+    fn claimed_identity_reads_the_package_table() {
+        let m = parse(
+            "[package]\nname = \"app\"\nversion = \"1.2.0\"\norganization = \"acme\"\n\
+             registry = \"https://packages.example.com\"\n",
+        )
+        .unwrap();
+        assert!(unknown_field_warnings(&m).is_empty());
+        assert_eq!(
+            claimed_identity(&m),
+            baml_base::ClaimedIdentity {
+                registry: Some("https://packages.example.com".to_owned()),
+                organization: Some("acme".to_owned()),
+                name: Some("app".to_owned()),
+                version: Some("1.2.0".to_owned()),
+            }
+        );
+        let blank = parse("[package]\nname = \"app\"\nversion = \" \"\n").unwrap();
+        assert_eq!(claimed_identity(&blank).version, None);
+        assert_eq!(
+            claimed_identity(&parse("[scripts]\n").unwrap()),
+            baml_base::ClaimedIdentity::default()
+        );
     }
 
     #[test]
@@ -391,10 +451,16 @@ mod tests {
              output_type = \"python/pydantic\"\n\
              naming_convention = \"preserve-case\"\n\
              output_dir = \"../python\"\n\
-             sdk_import_path = \"example.com/project/baml_sdk\"\n",
+             sdk_import_path = \"example.com/project/baml_sdk\"\n\
+             package_name = \"my_app._generated\"\n",
         )
         .unwrap();
         let g = &m.generator["lang_python"];
+        assert_eq!(
+            g.get_ref().package_name.as_ref().unwrap().get_ref(),
+            "my_app._generated"
+        );
+        assert!(g.get_ref().unknown.is_empty());
         assert_eq!(
             g.get_ref().output_type.as_ref().unwrap().get_ref(),
             "python/pydantic"

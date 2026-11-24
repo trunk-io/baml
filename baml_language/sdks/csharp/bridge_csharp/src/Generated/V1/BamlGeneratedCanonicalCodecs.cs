@@ -58,6 +58,28 @@ internal static class BamlGeneratedTypeMetadata
             },
         }.ToByteArray();
 
+    internal static byte[] Tuple(IReadOnlyList<byte[]> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        if (items.Count == 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(items),
+                "A generated BAML tuple must contain at least one slot.");
+        }
+
+        var tuple = new BamlTyTuple();
+        foreach (byte[] item in items)
+        {
+            tuple.Items.Add(Parse(item, "tuple slot"));
+        }
+
+        return new BamlTy { Tuple = tuple }.ToByteArray();
+    }
+
+    internal static string Describe(byte[] metadata, string description) =>
+        Render(Parse(metadata, description));
+
     internal static byte[] Union(IReadOnlyList<byte[]> options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -105,6 +127,9 @@ internal static class BamlGeneratedTypeMetadata
             $"{Render(type.Optional.Inner)} | null",
         BamlTy.TyOneofCase.Union =>
             string.Join(" | ", type.Union.Options.Select(Render)),
+        BamlTy.TyOneofCase.Tuple => type.Tuple.Items.Count == 1
+            ? $"({Render(type.Tuple.Items[0])},)"
+            : $"({string.Join(", ", type.Tuple.Items.Select(Render))})",
         BamlTy.TyOneofCase.Literal => type.Literal.LiteralCase switch
         {
             BamlTyLiteral.LiteralOneofCase.StringValue =>
@@ -133,11 +158,9 @@ internal static class BamlGeneratedTypeMetadata
             type.Interface.TypeArgs),
         BamlTy.TyOneofCase.EnumVariant =>
             $"{RequireName(type.EnumVariant.Name, type)}.{RequireName(type.EnumVariant.Variant, type)}",
-        BamlTy.TyOneofCase.RustType => "$rust_type",
         BamlTy.TyOneofCase.MetaType => "type",
         BamlTy.TyOneofCase.Resource => "baml.llm.Resource",
         BamlTy.TyOneofCase.PromptAst => "baml.llm.PromptAst",
-        BamlTy.TyOneofCase.Void => "void",
         BamlTy.TyOneofCase.TypeVar => RequireName(type.TypeVar.Name, type),
         BamlTy.TyOneofCase.Never => "never",
         _ => throw UnsupportedOption(type),
@@ -244,24 +267,18 @@ internal static class BamlGeneratedTypeMetadata
     }
 }
 
-internal sealed class BamlGeneratedFunctionSpecCodec<TFinal>(
-    BamlGeneratedType<TFinal> finalType,
-    byte[] metadata)
+internal sealed class BamlGeneratedFunctionSpecCodec<TFinal>(BamlGeneratedType<TFinal> finalType)
     : IBamlGeneratedCodec<global::Baml.BamlFunctionSpec<TFinal>>
 {
     public BamlGeneratedValue Encode(
         BamlGeneratedCodecContext context,
         global::Baml.BamlFunctionSpec<TFinal> value) =>
-        context.FunctionSpec(value, "ai.FunctionSpec", metadata);
+        context.FunctionSpec(value, "ai.FunctionSpec");
 
     public global::Baml.BamlFunctionSpec<TFinal> Decode(
         BamlGeneratedCodecContext context,
         BamlGeneratedValue value) =>
-        context.ReadFunctionSpec(
-            value,
-            "ai.FunctionSpec",
-            metadata,
-            finalType);
+        context.ReadFunctionSpec(value, "ai.FunctionSpec", finalType);
 }
 
 internal sealed class BamlGeneratedNullableValueCodec<T>(BamlGeneratedType<T> inner)
@@ -335,6 +352,27 @@ internal sealed class BamlGeneratedUnionCodec<T0, T1>(
                 $"Union case {selected.CaseIndex} was outside the generated descriptor."),
         };
     }
+}
+
+/// <summary>
+/// A tuple whose slot types are only known once a generic call binds its type
+/// parameters: a native <c>ValueTuple</c> over them. It crosses as the
+/// declared tuple type built from its slots, so the engine
+/// checks every slot; the generated delegates convert between the host value
+/// and the slot carriers, each slot through its own codec.
+/// </summary>
+internal sealed class BamlGeneratedSlotTupleCodec<T>(
+    byte[] tupleMetadata,
+    int arity,
+    Func<BamlGeneratedCodecContext, T, IReadOnlyList<BamlGeneratedValue>> encode,
+    Func<BamlGeneratedCodecContext, IReadOnlyList<BamlGeneratedValue>, T> decode)
+    : IBamlGeneratedCodec<T>
+{
+    public BamlGeneratedValue Encode(BamlGeneratedCodecContext context, T value) =>
+        context.Tuple(encode(context, value), tupleMetadata);
+
+    public T Decode(BamlGeneratedCodecContext context, BamlGeneratedValue value) =>
+        decode(context, context.ReadTuple(value, tupleMetadata, arity));
 }
 
 internal sealed class BamlGeneratedListCodec<T>(

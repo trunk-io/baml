@@ -46,6 +46,26 @@ pub struct Dependency {
     pub root: SourceRoot,
 }
 
+/// What a package's manifest claims it is: a name, a version, and where and
+/// by whom it is published (BEP-085).
+///
+/// A claim is an assertion, not an identity: the compiler and runtime never
+/// compare or index packages by it, and two packages may make the same
+/// claim. It is hashed into the package's interface and so into its
+/// compilation unit, and tooling decides what the claim is worth.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, borsh::BorshSerialize, borsh::BorshDeserialize,
+)]
+pub struct ClaimedIdentity {
+    /// URL of the package repository. `None` is the default repository.
+    pub registry: Option<String>,
+    /// The publishing organization. `None` for a local, dynamically loaded,
+    /// or builtin package.
+    pub organization: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
 /// Input: one source root — a directory subtree holding the files of exactly
 /// one package. The root IS the package: package identity is this input's
 /// id, and every package-level query is keyed on it.
@@ -68,6 +88,7 @@ pub struct SourceRoot {
     #[returns(ref)]
     pub path: PathBuf,
 
+    #[returns(clone)]
     pub kind: SourceRootKind,
 
     /// The package's own name: `[package].name` from its manifest, or the
@@ -78,11 +99,27 @@ pub struct SourceRoot {
     /// by; never compared for identity — the root id is the identity, and the
     /// name a package is reached by lives on the depending package's edge
     /// ([`Dependency::name`]).
+    #[returns(clone)]
     pub self_name: Option<Name>,
 
     /// Files in this root, in insertion order.
     #[returns(ref)]
     pub files: Vec<SourceFile>,
+
+    /// Omit test/testset registrars from the compiler's semantic input. Used
+    /// by SDK generation so test bodies, closures, constants, and interface
+    /// rows never enter the persisted program. Normal compilation includes
+    /// tests by default.
+    #[default]
+    #[returns(clone)]
+    pub exclude_tests: bool,
+
+    /// What the package's manifest claims it is. Empty for a package with
+    /// no manifest. Unlike [`Self::self_name`] it names nothing the compiler
+    /// resolves or renders: it is metadata the package's hashes cover.
+    #[default]
+    #[returns(clone)]
+    pub claim: ClaimedIdentity,
 
     /// The package's serialized compiler interface (`borsh(PackageInterface)`,
     /// versioned as a `baml_artifact`), when the package is served from one
@@ -158,6 +195,7 @@ pub struct SourceFile {
     pub text: String,
 
     /// File path (for diagnostics and error reporting)
+    #[returns(clone)]
     pub path: PathBuf,
 
     /// The FileId associated with this source file.
@@ -165,11 +203,13 @@ pub struct SourceFile {
     /// Used to create lightweight Span values that can be embedded in tokens.
     /// This allows spans to identify their source file without carrying
     /// the full SourceFile reference (which is a Salsa-tracked entity).
+    #[returns(clone)]
     pub file_id: FileId,
 
     /// Whether this is compiler-generated source for a `Session.eval`
     /// submission. Session lowering represents persistent bindings as root
     /// lets internally; ordinary BAML source files must reject them.
+    #[returns(clone)]
     pub is_session_submission: bool,
 
     /// The source root this file belongs to.
@@ -179,5 +219,6 @@ pub struct SourceFile {
     /// adding or removing an unrelated root never invalidates a file's
     /// package identity. A file revived from a remove/re-add cycle must have
     /// this field re-set — the owning root may have changed.
+    #[returns(clone)]
     pub source_root: SourceRoot,
 }

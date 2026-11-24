@@ -1,8 +1,7 @@
-use ::bex_heap::HeapPermit as _;
 use ::std::sync::Arc;
 use async_trait::async_trait;
 use bex_engine::{BexCallArg, BexEngine, FunctionCallContext, UnhandledSpawnErrorHandler};
-use bex_heap::{BexExternalValue, BexValue};
+use bex_heap::BexExternalValue;
 use sys_types::CallId;
 
 use crate::{BexArgs, RuntimeError};
@@ -14,6 +13,41 @@ pub struct BexRunResult {
 /// Core runtime API: call functions and introspect parameters.
 #[async_trait]
 pub trait Bex: Send + Sync {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn begin_host_invocation(
+        self: Arc<Self>,
+        definition: &crate::HostDefinition,
+        inherited: Option<&crate::InheritedInvocationState>,
+        options: &crate::TraceOptionsData,
+        caller: &crate::HostCallSite,
+        inputs: Option<&crate::HostCapture>,
+    ) -> Result<crate::HostInvocation, RuntimeError> {
+        let _ = (definition, inherited, options, caller, inputs);
+        Err(RuntimeError::Other(
+            "runtime does not support host instrumentation".into(),
+        ))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn begin_stream_invocation(
+        self: Arc<Self>,
+        function_name: &str,
+        context: &FunctionCallContext,
+        inputs: Option<&crate::HostCapture>,
+    ) -> Result<crate::HostInvocation, RuntimeError> {
+        let _ = (function_name, context, inputs);
+        Err(RuntimeError::Other(
+            "runtime does not support retained stream tracing".into(),
+        ))
+    }
+
+    /// Nanoseconds in this runtime's fixed monotonic invocation clock domain.
+    fn invocation_clock_ns(&self) -> Result<u64, RuntimeError>;
+    /// Freeze relative controls before argument binding or adapter queueing.
+    fn bind_invocation_context(
+        &self,
+        context: FunctionCallContext,
+    ) -> Result<FunctionCallContext, RuntimeError>;
     /// Execute a function by name. Returns a fully owned value (no Handle variants).
     async fn call_function(
         self: Arc<Self>,
@@ -54,13 +88,24 @@ pub trait Bex: Send + Sync {
 
     fn cancel_function_call(&self, call_id: CallId) -> Result<(), RuntimeError>;
 
+    /// Release pending cancellation when bridge preparation is abandoned.
+    /// Active execution owns its own registration and is never released here.
+    fn release_prepared_call(&self, call_id: CallId);
+
     fn set_unhandled_spawn_error_handler(&self, handler: Option<UnhandledSpawnErrorHandler>);
+
+    /// Finalize the host's BAML lifetime before closing its telemetry recording.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn record_process_exit(&self, status: bex_engine::ProcessStatus);
 
     /// Wait for in-flight calls and spawned work, report unreachable
     /// unobserved errors, and close the runtime. `grace` bounds the whole
     /// wait (`None` waits for as long as the work takes); see
     /// `BexEngine::shutdown_with_deadline` for what happens at the deadline.
     async fn shutdown(self: Arc<Self>, grace: Option<std::time::Duration>);
+
+    /// Whether `handle` was issued by this runtime. Reads no heap.
+    fn owns_handle(&self, handle: &crate::Handle) -> bool;
 
     /// Run-vocabulary alias for host-call cancellation. The parameter is still
     /// the adapter-owned `HostCallId` backing value, not a `RunId`.
@@ -71,6 +116,40 @@ pub trait Bex: Send + Sync {
 
 #[async_trait]
 impl Bex for BexEngine {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn begin_host_invocation(
+        self: Arc<Self>,
+        definition: &crate::HostDefinition,
+        inherited: Option<&crate::InheritedInvocationState>,
+        options: &crate::TraceOptionsData,
+        caller: &crate::HostCallSite,
+        inputs: Option<&crate::HostCapture>,
+    ) -> Result<crate::HostInvocation, RuntimeError> {
+        BexEngine::begin_host_invocation(&self, definition, inherited, options, caller, inputs)
+            .map_err(RuntimeError::from)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn begin_stream_invocation(
+        self: Arc<Self>,
+        function_name: &str,
+        context: &FunctionCallContext,
+        inputs: Option<&crate::HostCapture>,
+    ) -> Result<crate::HostInvocation, RuntimeError> {
+        BexEngine::begin_stream_invocation(&self, function_name, context, inputs)
+            .await
+            .map_err(RuntimeError::from)
+    }
+
+    fn invocation_clock_ns(&self) -> Result<u64, RuntimeError> {
+        BexEngine::invocation_clock_ns(self).map_err(RuntimeError::from)
+    }
+    fn bind_invocation_context(
+        &self,
+        context: FunctionCallContext,
+    ) -> Result<FunctionCallContext, RuntimeError> {
+        BexEngine::bind_invocation_context(self, context).map_err(RuntimeError::from)
+    }
     /// Resolve named `BexArgs` into the positional `Vec<BexExternalValue>` that
     /// `BexEngine::call_function` expects, using the engine's parameter metadata.
     async fn call_function(
@@ -105,6 +184,7 @@ impl Bex for BexEngine {
         }: BexArgs,
         call_ctx: FunctionCallContext,
     ) -> Result<BexRunResult, RuntimeError> {
+        let call_ctx = BexEngine::bind_invocation_context(&self, call_ctx)?;
         let params = self
             .function_params(function_name)
             .map_err(RuntimeError::from)?;
@@ -152,20 +232,9 @@ impl Bex for BexEngine {
         )
         .await?;
 
-        let value = match result.value {
-            Ok(result) => {
-                let permit = self
-                    .heap_permit_manager()
-                    .new_permit(())
-                    .await
-                    .acquire()
-                    .await;
-                let owned_result = BexValue::from(&result)
-                    .as_owned_with_package_handles(self.heap(), permit.proof())?;
-                Ok(owned_result)
-            }
-            Err(err) => Err(RuntimeError::from(err)),
-        };
+        // The engine copied the result out through its converter: it is the
+        // value a host receives.
+        let value = result.value.map_err(RuntimeError::from);
 
         Ok(BexRunResult { value })
     }
@@ -174,12 +243,25 @@ impl Bex for BexEngine {
         BexEngine::cancel_function_call(self, call_id).map_err(RuntimeError::from)
     }
 
+    fn release_prepared_call(&self, call_id: CallId) {
+        BexEngine::release_prepared_call(self, call_id);
+    }
+
     fn set_unhandled_spawn_error_handler(&self, handler: Option<UnhandledSpawnErrorHandler>) {
         BexEngine::set_unhandled_spawn_error_handler(self, handler);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn record_process_exit(&self, status: bex_engine::ProcessStatus) {
+        BexEngine::record_process_exit(self, status);
     }
 
     async fn shutdown(self: Arc<Self>, grace: Option<std::time::Duration>) {
         BexEngine::shutdown_with_deadline(&self, grace, BexEngine::report_shutdown_wait, |_| {})
             .await;
+    }
+
+    fn owns_handle(&self, handle: &crate::Handle) -> bool {
+        BexEngine::owns_handle(self, handle)
     }
 }

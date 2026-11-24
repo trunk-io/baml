@@ -9,17 +9,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code handleType} the wire {@code BamlHandleType} discriminant. The Java
  * analog of {@code bridge_python}'s {@code BamlPyHandle}: the actual
  * {@code CffiHandleTableEntry} lives in the Rust {@code HANDLE_TABLE}; this
- * object is just a token that owns the row's lifetime.
+ * object is just a token that owns one ownership of the row.
  *
  * <h2>Lifecycle</h2>
  * <ul>
  *   <li><b>Construct</b> (decode side): the wire codec builds a
- *       {@code BamlHandle} over the key the engine minted. This object now owns
- *       the row.</li>
- *   <li><b>Clone for the wire</b> (encode side): {@link #cloneKeyForWire} mints
- *       a fresh key via {@code baml_handle_clone} so the engine can
- *       {@code drain} its copy on decode while this object keeps its own — never
- *       sharing a key would double-release.</li>
+ *       {@code BamlHandle} over the key the engine handed over. This object now
+ *       owns that ownership.</li>
+ *   <li><b>Clone for the wire</b> (encode side): {@link #cloneKeyForWire} takes
+ *       one more ownership via {@code baml_handle_clone} for the engine to
+ *       {@code drain} on decode, while this object keeps its own: the same key
+ *       for a row naming an engine object, a fresh key for an identity-free row
+ *       (media).</li>
  *   <li><b>Release</b>: a {@link Cleaner} calls {@code baml_handle_release} once
  *       the {@code BamlHandle} is unreachable; {@link #close()} releases eagerly.
  *       JVM finalizers are deprecated, so a {@code Cleaner} is the durable
@@ -27,10 +28,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       values).</li>
  * </ul>
  *
- * <p>Host-owned handles ({@code HOST_VALUE_CALLABLE} / {@code HOST_VALUE_OPAQUE})
- * are <em>not</em> tracked in {@code HANDLE_TABLE}; releasing them by key could
- * evict an unrelated engine row (the two keyspaces share the {@code u64} value
- * space), so the release path skips them — same guard as {@code BamlPyHandle}.
+ * <p>Host-value handles ({@code HOST_VALUE_CALLABLE} / {@code HOST_VALUE_OPAQUE})
+ * are the engine's references to objects this host registered, numbered by the
+ * host registry ({@link HostCalls}) and never present in the engine's handle
+ * table. Sending one takes one more count of its key in the registry; the
+ * engine gives the counts back. One the engine sent ({@link #hostValue}) owns
+ * the engine's {@code HOST_VALUE_PIN} row instead: the pin keeps the engine's
+ * references to the key, and with them its registration, until this object is
+ * released.
  */
 public final class BamlHandle implements AutoCloseable {
     /** Shared cleaner; daemon-threaded, so it never keeps the JVM alive. */
@@ -45,9 +50,15 @@ public final class BamlHandle implements AutoCloseable {
     public static final int ADT_MEDIA_AUDIO = 7;
     public static final int ADT_MEDIA_VIDEO = 8;
     public static final int ADT_MEDIA_PDF = 9;
-    public static final int ADT_MEDIA_GENERIC = 10;
     public static final int HOST_VALUE_CALLABLE = 15;
     public static final int HOST_VALUE_OPAQUE = 16;
+    public static final int ADT_RUNTIME_VALUE = 18;
+
+    /**
+     * Test seam: called with each key as it is released, before the native
+     * release. Lets offline codec tests observe ownership without the bridge.
+     */
+    static volatile java.util.function.LongConsumer releaseObserver;
 
     private final long key;
     private final int handleType;
@@ -57,33 +68,35 @@ public final class BamlHandle implements AutoCloseable {
     private final Cleaner.Cleanable cleanable;
 
     /**
-     * The cleaning action. Kept in a separate class that captures only the key +
-     * type (never the enclosing {@code BamlHandle}) so the referent stays
+     * The cleaning action. Kept in a separate class that captures only the row
+     * it releases (never the enclosing {@code BamlHandle}) so the referent stays
      * collectible — a common {@code Cleaner} pitfall is capturing {@code this}.
      */
     private static final class State implements Runnable {
-        private final long key;
-        private final int handleType;
+        /**
+         * The {@code HANDLE_TABLE} row this handle owns: its own key for an
+         * engine handle; a host value's pin, or {@code 0} for none.
+         */
+        private final long owned;
         private final AtomicBoolean released = new AtomicBoolean(false);
 
-        State(long key, int handleType) {
-            this.key = key;
-            this.handleType = handleType;
+        State(long owned) {
+            this.owned = owned;
         }
 
         @Override
         public void run() {
             // Per-instance atomic latch: release exactly once across a possible
             // race between explicit close() and the Cleaner.
-            if (!released.compareAndSet(false, true)) {
+            if (!released.compareAndSet(false, true) || owned == 0) {
                 return;
             }
-            // Host-value handles live in a per-bridge registry, not HANDLE_TABLE.
-            if (handleType == HOST_VALUE_CALLABLE || handleType == HOST_VALUE_OPAQUE) {
-                return;
+            java.util.function.LongConsumer observer = releaseObserver;
+            if (observer != null) {
+                observer.accept(owned);
             }
             try {
-                BamlFfi.nativeHandleRelease(key);
+                BamlFfi.nativeHandleRelease(owned);
             } catch (Throwable ignored) {
                 // Best-effort: during JVM teardown (or if the native library is
                 // unavailable in an offline unit-test JVM) the release is a no-op
@@ -105,14 +118,34 @@ public final class BamlHandle implements AutoCloseable {
     /**
      * Wrap an engine row together with the root class identity carried on the
      * outbound handle. Ordinary/media handles have no class identity; tagged
-     * heap handles use it to derive their instance-method FQNs.
+     * heap handles use it to derive their instance-method FQNs. A host-value
+     * type names the host's key and owns no row.
      */
     public BamlHandle(long key, int handleType, String classFqn) {
+        this(key, handleType, classFqn, isHostValue(handleType) ? 0 : key);
+    }
+
+    private BamlHandle(long key, int handleType, String classFqn, long owned) {
         this.key = key;
         this.handleType = handleType;
         this.classFqn = classFqn;
-        this.state = new State(key, handleType);
+        this.state = new State(owned);
         this.cleanable = CLEANER.register(this, state);
+    }
+
+    /**
+     * A host value the engine sent: the host's {@code key}, and the engine's
+     * {@code pin} row ({@code 0} for none), which this handle owns. While the
+     * pin is held the key stays registered, so the value can be read and sent
+     * again.
+     *
+     * @throws IllegalArgumentException when {@code handleType} is not a host-value type
+     */
+    public static BamlHandle hostValue(long key, int handleType, String classFqn, long pin) {
+        if (!isHostValue(handleType)) {
+            throw new IllegalArgumentException("handle type " + handleType + " is not a host value");
+        }
+        return new BamlHandle(key, handleType, classFqn, pin);
     }
 
     /** The engine-side {@code HANDLE_TABLE} key. */
@@ -131,12 +164,61 @@ public final class BamlHandle implements AutoCloseable {
     }
 
     /**
-     * Mint a fresh owned key over the same row for inbound wire ownership. The
-     * engine {@code drain}s the returned key on decode; this object keeps its own
-     * key, so the original media/handle value stays valid after the call.
+     * The key to send this handle under, holding a reference of its own for
+     * the request, given back if the request never reaches the engine
+     * ({@code EncodingScope}). An engine row takes one more ownership
+     * ({@code baml_handle_clone}: the same key for a row naming an engine
+     * object, a fresh key for an identity-free row), which the engine
+     * {@code drain}s on decode; this object keeps its own, so the value stays
+     * valid after the call. A host value goes under its own key, taking one
+     * more count of it in the host registry ({@link HostCalls#sendAgain}).
+     *
+     * @throws baml_bridge.internal.ProtoWriter.WireFaultException when the row
+     *     cannot be cloned, or the host key is no longer registered
      */
     public long cloneKeyForWire() {
-        return BamlFfi.nativeHandleClone(key);
+        if (state.released.get()) throw new IllegalStateException("handle is closed");
+        if (isHostValue()) {
+            HostCalls.sendAgain(key);
+            return key;
+        }
+        long cloned;
+        try {
+            cloned = BamlFfi.nativeHandleClone(key);
+        } catch (RuntimeException failure) {
+            // The row is ours and alive, so this is the bridge's own failure,
+            // not anything the value did.
+            throw new baml_bridge.internal.ProtoWriter.WireFaultException(
+                    "the Java bridge could not clone handle " + key + " for the wire: "
+                            + failure.getMessage(),
+                    failure);
+        }
+        baml_bridge.internal.EncodingScope.own(cloned, handleType);
+        return cloned;
+    }
+
+    /** Keep an independently owned reference to this row (for a host value, to its pin). */
+    public BamlHandle cloneOwned() {
+        if (state.released.get()) throw new IllegalStateException("handle is closed");
+        if (isHostValue()) {
+            long pin = state.owned == 0 ? 0 : BamlFfi.nativeHandleClone(state.owned);
+            return new BamlHandle(key, handleType, classFqn, pin);
+        }
+        return new BamlHandle(BamlFfi.nativeHandleClone(key), handleType, classFqn);
+    }
+
+    /**
+     * Whether this handle is the engine's reference to a host object (a
+     * registered callable or opaque value), as opposed to this host's reference
+     * to an engine object. The two are numbered independently and never meet
+     * in the engine's handle table.
+     */
+    public boolean isHostValue() {
+        return isHostValue(handleType);
+    }
+
+    private static boolean isHostValue(int handleType) {
+        return handleType == HOST_VALUE_CALLABLE || handleType == HOST_VALUE_OPAQUE;
     }
 
     /** Release the owned row eagerly (idempotent). */
@@ -158,9 +240,11 @@ public final class BamlHandle implements AutoCloseable {
         return new BamlHandle(BamlFfi.nativeMediaFromUrl(kind, url, mimeType), handleType);
     }
 
-    /** Mint a media handle from a local file path. */
-    public static BamlHandle mediaFromFile(int kind, int handleType, String path, String mimeType) {
-        return new BamlHandle(BamlFfi.nativeMediaFromFile(kind, path, mimeType), handleType);
+    /** Mint a media handle from base64 content read from {@code file}. Reads nothing. */
+    public static BamlHandle mediaFromFileContent(
+            int kind, int handleType, String file, String base64, String mimeType) {
+        return new BamlHandle(
+                BamlFfi.nativeMediaFromFileContent(kind, file, base64, mimeType), handleType);
     }
 
     /** Mint a media handle from a base64 payload. */
@@ -174,9 +258,9 @@ public final class BamlHandle implements AutoCloseable {
         return BamlFfi.nativeMediaUrl(key);
     }
 
-    /** The media's local file path, or {@code null} when not file-backed. */
-    public String mediaFile() {
-        return BamlFfi.nativeMediaFile(key);
+    /** The base name of the file the content was read from, or {@code null}. */
+    public String mediaName() {
+        return BamlFfi.nativeMediaName(key);
     }
 
     /** The media's base64 payload (never {@code null}). */

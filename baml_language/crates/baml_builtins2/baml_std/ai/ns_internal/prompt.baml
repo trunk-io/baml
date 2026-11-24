@@ -6,31 +6,33 @@
 
 /// Reject output types that cannot be represented faithfully at the shared
 /// LLM render boundary. Both prompt preview and execution call this guard.
-function validate_output_type(
-    return_type: reflect.Type,
-) -> void throws reflect.errors.CompilationError {
+function validate_output_type(return_type: reflect.Type) -> void
+    throws reflect.errors.CompilationError
+{
     return_type._validate_renderable();
     match (return_type.as_enum()) {
-        let enum_type: reflect.enum.Type => {
+        let enum_type: reflect.Enum => {
             if (enum_type.values().length() == 0) {
                 let message = "empty enum `"
                     + return_type.to_string()
                     + "` cannot be rendered as an LLM output schema";
                 throw reflect.errors.CompilationError {
                     message: message,
-                    diagnostics: [reflect.Diagnostic {
-                        code: "E0159",
-                        span: null,
-                        message: message,
-                        severity: "error",
-                        phase: null,
-                        headline: message,
-                        primary_label: null,
-                        message_highlights: [],
-                        annotations: [],
-                        related_info: [],
-                    }],
-                }
+                    diagnostics: [
+                        reflect.Diagnostic {
+                            code: "E0159",
+                            span: null,
+                            message: message,
+                            severity: "error",
+                            phase: null,
+                            headline: message,
+                            primary_label: null,
+                            message_highlights: [],
+                            annotations: [],
+                            related_info: [],
+                        },
+                    ],
+                };
             }
         },
         null => null,
@@ -39,6 +41,17 @@ function validate_output_type(
 
 /// Render a return type's schema with the default output-format options.
 function render_output_format(return_type: reflect.Type) -> string throws never {
+    $rust_io_function
+}
+
+/// Whether a value of `t` can hold media anywhere a model's JSON answer fills:
+/// in a union member, a list element, a map value, a class field that is not
+/// `@skip`, or behind a recursive alias. A `@skip` field is not in the JSON, so
+/// its value never comes from the model, and neither is a union member with
+/// no JSON form, which `baml.json.schema` drops. A model returns the media it
+/// generates as content of its own, never inside its text, so a client that
+/// holds the answer to a JSON Schema rejects an output type that can.
+function reaches_media(t: reflect.Type) -> bool throws baml.errors.Unsupported {
     $rust_io_function
 }
 
@@ -60,21 +73,20 @@ enum OutputFormatDefault {
 /// Construct a typed role marker for structural prompt assembly.
 /// The `${role(...)}` desugar in an LLM prompt body lowers to this call.
 ///
-/// `metadata` carries per-message provider directives, which reach the provider
-/// client as `ai.PromptMessage.metadata`.
-function make_role(
-    name: string,
-    metadata: map<string, baml.json.json> = {},
-) -> root.Role throws never {
-    root.Role { name: name, metadata: metadata }
+/// `metadata` is free-form per-message data, which reaches the client as
+/// `ai.PromptMessage.metadata`. The built-in clients do not read it.
+function make_role(name: string, metadata: map<string, baml.json.json> = {}) -> root.Role
+    throws never
+{
+    root.Role {
+        name: name,
+        metadata: metadata,
+    }
 }
 
 /// Construct a cache delimiter for structural prompt assembly.
 /// The `${cache(...)}` desugar in an LLM prompt body lowers to this call.
-///
-/// `args` is the provider's own cache object. It reaches the provider client
-/// as `ai.CacheDelimiter.args`, untouched.
-function make_cache(args: baml.json.json) -> root.CacheDelimiter throws never {
+function make_cache(args: baml.json.json = null) -> root.CacheDelimiter throws never {
     root.CacheDelimiter { args: args }
 }
 

@@ -48,10 +48,8 @@
 interface StreamingClient requires root.Client {
     /// InvokeError, not just Failure | UnknownError: a streaming invocation
     /// preserves Timeout/Cancelled/CompilationError exactly like Client.invoke.
-    function invoke_stream(
-        self,
-        input: root.ModelTurnInput,
-    ) -> TurnStream throws root.errors.InvokeError;
+    function invoke_stream(self, input: root.ModelTurnInput) -> TurnStream
+        throws root.errors.InvokeError;
 }
 
 /// One decoded raw SSE event, as produced by `baml.http.SseStream.next()`:
@@ -65,7 +63,7 @@ class SseEvent {
 /// One `SseStream.next()` batch -> the raw SSE events it contains. Provider
 /// decoders parse each event's `data` payload with their own envelope classes.
 function decode_sse_batch(batch: string) -> SseEvent[] {
-    baml.json.from_string<SseEvent[]>(batch)
+    baml.json.decode<SseEvent[]>(batch)
 }
 
 // The provider-agnostic events a decoder yields from one SSE batch.
@@ -78,16 +76,13 @@ class TextDelta {
 
 /// Turn metadata as it arrives on the wire. Providers send stop_reason and
 /// token counts on different events; each TurnMeta carries what its event had
-/// and TurnStream folds non-null fields together (last write wins). The token
-/// counts mean what they mean in `root.events.Usage`.
+/// and TurnStream folds the non-null values together, count by count (last
+/// write wins).
 class TurnMeta {
     stop_reason: root.content.StopReason?,
-    input_tokens: int?,
-    output_tokens: int?,
-    cached_input_tokens: int?,
-    cache_write_input_tokens: int?,
-    uncached_input_tokens: int?,
-    reasoning_tokens: int?,
+    usage: root.events.Usage?,
+    // The model the response names, when this event names it.
+    resolved_model: string?,
 }
 
 /// The provider's explicit end-of-turn marker — the decoded form of `[DONE]`,
@@ -99,8 +94,7 @@ class TurnMeta {
 /// connection that closed early as a failure instead of a complete turn. For a
 /// protocol with no terminal marker, TurnDone is optional and a socket close
 /// still completes the turn.
-class TurnDone {
-}
+class TurnDone {}
 
 /// Non-empty content that is not assistant text: a reasoning or tool-input
 /// delta, or a complete tool-call or file part. There is nothing to deliver to
@@ -109,8 +103,7 @@ class TurnDone {
 /// it for every content-bearing event that produces no TextDelta; events that
 /// carry no content (`message_start`, `response.created`, pings, usage-only
 /// frames, empty deltas) yield nothing.
-class ContentSeen {
-}
+class ContentSeen {}
 
 /// One provider-agnostic event decoded from an SSE batch: a piece of
 /// assistant text, content that is not text, the turn metadata that arrived
@@ -120,15 +113,23 @@ type Event = TextDelta | ContentSeen | TurnMeta | TurnDone;
 /// The single end-of-stream marker returned by both raw turn streams and typed
 /// function streams. A nominal sentinel is required because null may itself be
 /// a valid partial value.
-class Done {
-}
+class Done {}
 
-/// Pulls the next normalized event, or `Done` once the turn is over.
+/// Pulls every normalized event that is ready, or `Done` once the turn is
+/// over.
 ///
 /// The callback behind `TurnStream.from_event_source`: it lets a composite
 /// client relay a member's events without exposing that member's wire
-/// format.
-type EventSource = () -> Event | Done throws root.errors.InvokeError;
+/// format. The text deltas of one batch reach the caller as one
+/// `TurnStream.next()` batch, so a source holding several ready events
+/// returns them together rather than one per call.
+///
+/// # Panics
+///
+/// - The stream panics if the source returns an empty batch. A source waits
+///   until it has at least one event or the turn is over, so the stream never
+///   spins on a source with nothing ready.
+type EventSource = () -> Event[] | Done throws root.errors.InvokeError;
 
 /// The raw text-delta stream of ONE model turn. Pull-based: nothing is read
 /// from the wire until `next()` or `final_turn()` is called.
@@ -155,12 +156,7 @@ class TurnStream {
     // folded state.
     _text: string,
     _stop_reason: root.content.StopReason?,
-    _input_tokens: int?,
-    _output_tokens: int?,
-    _cached_input_tokens: int?,
-    _cache_write_input_tokens: int?,
-    _uncached_input_tokens: int?,
-    _reasoning_tokens: int?,
+    _usage: root.events.Usage?,
     _done: bool,
     // strict termination (see the contract at the top of this file): the
     // provider id when this stream requires an explicit TurnDone, null when a
@@ -168,13 +164,18 @@ class TurnStream {
     _require_terminal: string?,
     // whether a TurnDone was actually decoded before the stream ended.
     _saw_terminal: bool,
-    // Wire telemetry (LLMCall records), surfaced by final_turn().calls.
-    // _calls is the full oldest-first list; composite relays share it by
-    // reference to prepend failed legs. _wire_call is THIS stream's own
-    // exchange record (set by provider invoke_stream implementations), which
-    // ttft/duration stamping and SSE capture mutate in place.
-    _calls: root.events.LLMCall[],
-    _wire_call: root.events.LLMCall?,
+    // Surfaced by final_turn(). _wire_call is this stream's own call record,
+    // which provider invoke_stream implementations set and ttft/duration
+    // stamping, SSE capture and the folded usage mutate in place. A stream
+    // with token counts and no call records no usage. _child_turns holds a
+    // composite relay's member attempts, shared by reference with the relay.
+    _wire_call: root.events.ModelCall?,
+    _requested_model: string?,
+    // The model the response named, latest event winning; the call's
+    // resolved model when it names one.
+    _resolved_model: string?,
+    _child_turns: root.ModelTurn[],
+    _settled: root.ModelTurn?,
     _call_started: baml.time.Instant?,
     // TTFT base: stamped when the SSE response opened (legacy TTFT semantics);
     // falls back to _call_started when a provider did not set it.
@@ -233,7 +234,7 @@ class TurnStream {
         if let limit: baml.time.Duration = first_token_timeout {
             if (waited.to_nanoseconds() >= limit.to_nanoseconds()) {
                 sse.close();
-                throw _token_timeout_error(limit, "first_token_timeout")
+                throw _token_timeout_error(limit, "first_token_timeout");
             }
         }
         TurnStream {
@@ -246,17 +247,15 @@ class TurnStream {
             _pcursor: 0,
             _text: "",
             _stop_reason: null,
-            _input_tokens: null,
-            _output_tokens: null,
-            _cached_input_tokens: null,
-            _cache_write_input_tokens: null,
-            _uncached_input_tokens: null,
-            _reasoning_tokens: null,
+            _usage: null,
             _done: false,
             _require_terminal: require_terminal,
             _saw_terminal: false,
-            _calls: [],
             _wire_call: null,
+            _requested_model: null,
+            _resolved_model: null,
+            _child_turns: [],
+            _settled: null,
             _call_started: null,
             _ttft_from: null,
             _first_token_timeout: first_token_timeout,
@@ -282,17 +281,15 @@ class TurnStream {
             _pcursor: 0,
             _text: "",
             _stop_reason: null,
-            _input_tokens: null,
-            _output_tokens: null,
-            _cached_input_tokens: null,
-            _cache_write_input_tokens: null,
-            _uncached_input_tokens: null,
-            _reasoning_tokens: null,
+            _usage: null,
             _done: false,
             _require_terminal: null,
             _saw_terminal: false,
-            _calls: [],
             _wire_call: null,
+            _requested_model: null,
+            _resolved_model: null,
+            _child_turns: [],
+            _settled: null,
             _call_started: null,
             _ttft_from: null,
             _first_token_timeout: null,
@@ -307,8 +304,17 @@ class TurnStream {
     /// use this to relay a chosen member's deltas and final metadata while
     /// retaining TurnStream's ordinary accumulation and termination behavior.
     /// The source itself owns any retry/fallback policy; once it returns a
-    /// TextDelta, that delta is immediately visible to the caller.
-    function from_event_source(next_event: EventSource) -> TurnStream {
+    /// batch, the TextDeltas in it are immediately visible to the caller,
+    /// together as one `next()` batch.
+    ///
+    /// `call` records the model call behind the source, when there is one: it
+    /// is the turn's call, and the token counts the source's `TurnMeta`
+    /// events carry are its usage. A relay that makes no call itself leaves
+    /// it null.
+    function from_event_source(
+        next_event: EventSource,
+        call: root.events.ModelCall? = null,
+    ) -> TurnStream {
         TurnStream {
             _event_source: next_event,
             _sse: null,
@@ -319,17 +325,15 @@ class TurnStream {
             _pcursor: 0,
             _text: "",
             _stop_reason: null,
-            _input_tokens: null,
-            _output_tokens: null,
-            _cached_input_tokens: null,
-            _cache_write_input_tokens: null,
-            _uncached_input_tokens: null,
-            _reasoning_tokens: null,
+            _usage: null,
             _done: false,
             _require_terminal: null,
             _saw_terminal: false,
-            _calls: [],
-            _wire_call: null,
+            _wire_call: call,
+            _requested_model: null,
+            _resolved_model: null,
+            _child_turns: [],
+            _settled: null,
             _call_started: null,
             _ttft_from: null,
             _first_token_timeout: null,
@@ -342,10 +346,10 @@ class TurnStream {
 
     /// (internal) Stamp time-to-first-token on this stream's wire record, once.
     function _stamp_first_delta(self) -> void {
-        if let call: root.events.LLMCall = self._wire_call {
-            if (call.timing.ttft_ms == null) {
+        if let call: root.events.ModelCall = self._wire_call {
+            if (call.timing.ttft == null) {
                 if let base: baml.time.Instant = self._ttft_from ?? self._call_started {
-                    call.timing.ttft_ms = base.elapsed().to_milliseconds();
+                    call.timing.ttft = base.elapsed();
                 }
             }
         }
@@ -384,7 +388,7 @@ class TurnStream {
                 let remaining = limit.sub(self._token_waited);
                 if (remaining.to_nanoseconds() <= 0n) {
                     self._finish();
-                    throw _token_timeout_error(limit, timeout_type)
+                    throw _token_timeout_error(limit, timeout_type);
                 }
                 let pull_started = baml.time.Instant.now();
                 let pulled = baml.future.with_timeout(remaining, () -> {
@@ -394,7 +398,7 @@ class TurnStream {
                 }) catch (e) {
                     baml.errors.Timeout => {
                         self._finish();
-                        throw _token_timeout_error(limit, timeout_type)
+                        throw _token_timeout_error(limit, timeout_type);
                     },
                 };
                 self._token_waited = self._token_waited.add(pull_started.elapsed());
@@ -413,14 +417,18 @@ class TurnStream {
         if (!self._capture_sse) {
             return;
         }
-        if let call: root.events.LLMCall = self._wire_call {
+        if let call: root.events.ModelCall = self._wire_call {
             let none: SseEvent[] = [];
             let decoded = decode_sse_batch(batch) catch_all (e) {
                 _ => none,
             };
             let records = call.sse_responses ?? [];
             for (let e in decoded) {
-                records.push(root.events.SseEventRecord { event: e.event, data: e.data, id: e.id });
+                records.push(root.events.SseEventRecord {
+                    event: e.event,
+                    data: e.data,
+                    id: e.id,
+                });
             }
             call.sse_responses = records;
         }
@@ -433,6 +441,8 @@ class TurnStream {
         if let sse: baml.http.SseStream = self._sse {
             sse.close();
         }
+        // A stream nobody finalizes still bills; settle it as it ends.
+        let _ = self._settled_turn();
     }
 
     /// (internal) The strict-termination check: a no-op unless this stream required an
@@ -442,16 +452,13 @@ class TurnStream {
     function _check_terminal(self) -> void {
         if let provider: string = self._require_terminal {
             if (!self._saw_terminal) {
-                let partial: string? = if (self._text == "") {
-                    null
-                } else {
-                    self._text
-                };
-                throw root.errors.NetworkFailure { status_code: null,
+                let partial: string? = if (self._text == "") { null } else { self._text };
+                throw root.errors.NetworkFailure {
+                    status_code: null,
                     provider: provider,
                     detail: `stream ended before the provider's terminal event: the connection closed after ${self._text.length()} characters of assistant text with no end-of-turn event, so the turn is truncated`,
                     raw_body: partial,
-                }
+                };
             }
         }
     }
@@ -468,7 +475,8 @@ class TurnStream {
     /// one-element batches; a consumer that falls behind (e.g. a partial
     /// parse slower than the token interval) gets the whole backlog in one
     /// return instead of replaying it delta by delta — the pull-model
-    /// equivalent of the legacy engine's latest-snapshot watch channel.
+    /// equivalent of the legacy engine's latest-snapshot watch channel. A
+    /// returned batch is never empty.
     function next(self) -> string[] | Done {
         let ready: string[] = [];
         while (true) {
@@ -497,23 +505,11 @@ class TurnStream {
                         if let s: root.content.StopReason = m.stop_reason {
                             self._stop_reason = s;
                         }
-                        if let i: int = m.input_tokens {
-                            self._input_tokens = i;
+                        if let u: root.events.Usage = m.usage {
+                            self._usage = _overlay_usage(self._usage, u);
                         }
-                        if let o: int = m.output_tokens {
-                            self._output_tokens = o;
-                        }
-                        if let c: int = m.cached_input_tokens {
-                            self._cached_input_tokens = c;
-                        }
-                        if let w: int = m.cache_write_input_tokens {
-                            self._cache_write_input_tokens = w;
-                        }
-                        if let u: int = m.uncached_input_tokens {
-                            self._uncached_input_tokens = u;
-                        }
-                        if let r: int = m.reasoning_tokens {
-                            self._reasoning_tokens = r;
+                        if let model: string = m.resolved_model {
+                            self._resolved_model = model;
                         }
                         null
                     },
@@ -536,8 +532,14 @@ class TurnStream {
             }
             if let source: EventSource = self._event_source {
                 match (source()) {
-                    let event: Event => {
-                        self._pending.push(event);
+                    let events: Event[] => {
+                        // Pulling again at once would spin; see EventSource.
+                        if (events.length() == 0) {
+                            baml.sys.panic("an EventSource returned an empty batch");
+                        }
+                        for (let e in events) {
+                            self._pending.push(e);
+                        }
                         null
                     },
                     let done: Done => {
@@ -560,7 +562,9 @@ class TurnStream {
                         },
                         let batch: string => {
                             self._capture_batch(batch);
-                            if let decode: (string) -> Event[] throws root.errors.InvokeError = self._decode {
+                            if let decode: (string) -> Event[]
+                                throws root.errors.InvokeError = self._decode
+                            {
                                 for (let e in decode(batch)) {
                                     self._pending.push(e);
                                 }
@@ -590,7 +594,6 @@ class TurnStream {
                 },
             };
         }
-        baml.sys.panic("unreachable")
     }
 
     /// Drain the stream and return the completed turn. Safe to call at any
@@ -613,31 +616,68 @@ class TurnStream {
         // covers a stream finished by some other route (a Done delivered from
         // an already-closed stream) before the terminal event was seen.
         self._check_terminal();
-        let usage: root.events.Usage? = if (self._input_tokens != null || self._output_tokens != null) {
-            root.events.Usage {
-                input_tokens: self._input_tokens ?? 0,
-                output_tokens: self._output_tokens ?? 0,
-                cached_input_tokens: self._cached_input_tokens,
-                reasoning_tokens: self._reasoning_tokens,
-                cache_write_input_tokens: self._cache_write_input_tokens,
-                uncached_input_tokens: self._uncached_input_tokens,
-            }
-        } else {
-            null
-        };
-        if let call: root.events.LLMCall = self._wire_call {
-            if (call.timing.duration_ms == null) {
-                if let started: baml.time.Instant = self._call_started {
-                    call.timing.duration_ms = started.elapsed().to_milliseconds();
-                }
-            }
+        self._settled_turn()
+    }
+
+    /// (internal) The turn, settled once: when the stream finishes, or here when
+    /// it ended by another route.
+    function _settled_turn(self) -> root.ModelTurn {
+        match (self._settled) {
+            let turn: root.ModelTurn => turn,
+            null => {
+                let turn = self._settle();
+                self._settled = turn;
+                turn
+            },
         }
-        root.ModelTurn {
+    }
+
+    /// (internal) Fold the stream into its turn. Runs exactly once per stream
+    /// (`_settled_turn`): telemetry charges the usage of the turn's own calls
+    /// when it returns, as it does for `ai.Client.invoke`.
+    function _settle(self) -> root.ModelTurn {
+        let turn = root.ModelTurn {
             content: [root.content.Text { text: self._text }],
             stop_reason: self._stop_reason ?? root.content.StopReason.Complete,
-            usage: usage,
-            calls: self._calls,
+            calls: [],
+            child_turns: self._child_turns,
+        };
+        if let call: root.events.ModelCall = self._wire_call {
+            if (call.timing.duration == null) {
+                if let started: baml.time.Instant = self._call_started {
+                    call.timing.duration = started.elapsed();
+                }
+            }
+            // As a whole response finishes: the model it named, else the one
+            // asked for.
+            return root.internal.with_own_call(
+                turn,
+                call,
+                self._usage,
+                self._requested_model,
+                self._resolved_model,
+            );
         }
+        // A relay answers as the member attempt that succeeded, the last one.
+        if (self._child_turns.length() > 0) {
+            let answered = self._child_turns[self._child_turns.length() - 1];
+            turn.resolved_model = answered.resolved_model;
+            turn.requested_model = answered.requested_model;
+        }
+        turn
+    }
+}
+
+/// (internal) `base` with every count `next` reports replaced: a provider
+/// reports its counts across several events, the latest value of each winning.
+function _overlay_usage(base: root.events.Usage?, next: root.events.Usage) -> root.events.Usage {
+    root.events.Usage {
+        input_tokens: next.input_tokens ?? base?.input_tokens,
+        output_tokens: next.output_tokens ?? base?.output_tokens,
+        cached_input_tokens: next.cached_input_tokens ?? base?.cached_input_tokens,
+        reasoning_tokens: next.reasoning_tokens ?? base?.reasoning_tokens,
+        cache_write_input_tokens: next.cache_write_input_tokens ?? base?.cache_write_input_tokens,
+        uncached_input_tokens: next.uncached_input_tokens ?? base?.uncached_input_tokens,
     }
 }
 
@@ -680,26 +720,63 @@ function _token_timeout_error(
 ///
 /// Partial and final values share one type: a partial is the declared type parsed
 /// from the text received so far.
+class _StreamValue<T> {
+    value: T,
+}
+
+class _StreamError {
+    error: root.errors.InvokeError | trace.SpanError | baml.panics.Panic,
+}
+
 class Stream<T> {
+    _provider: string,
     _next_text: () -> string? throws root.errors.InvokeError,
+    _release: () -> void throws never,
+    _span: trace.Span,
     _cache: baml.sap._ParseCache<T>,
     _text: string,
     _finished: bool,
+    _result: _StreamValue<T> | _StreamError | null,
 
-    /// Return the next parsed partial value, or Done after EOF.
+    /// Return a partial value, or Done at EOF. EOF also settles the final
+    /// parse; a final parse error is cached for final(), preserving Done.
     function next(self) -> T | Done {
+        if (self._finished) {
+            return Done {};
+        }
+        let caller = trace.current_context();
+        self._span.run(() -> {
+            _in_context(() -> { self._next() }, $trace = _context_patch(caller))
+        }) catch_all_panics (e, context) {
+            _ => {
+                self._fail(e, context);
+                throw e;
+            },
+        }
+    }
+
+    function _next(self) -> T | Done {
         while (true) {
-            if (self._finished) {
-                return Done {};
-            }
-            match (self._next_text()) {
+            match ((self._next_text)()) {
                 null => {
                     self._finished = true;
+                    self._settle() catch (e) {
+                        root.errors.ParseFailed => {},
+                    };
                     return Done {};
                 },
                 let s: string => {
                     self._text = self._text + s;
-                    let parsed: T | baml.sap._NoYield = self._cache._parse_partial(self._text);
+                    let parsed: T | baml.sap._NoYield = self._cache
+                        ._parse_partial(self._text) catch (e) {
+                            let parse: baml.errors.LlmClient => {
+                                throw root.errors.ParseFailed {
+                                    provider: self._provider,
+                                    raw_output: self._text,
+                                    message: parse.message,
+                                };
+                            },
+                        };
                     match (parsed) {
                         baml.sap._NoYield => {},
                         let p: T => {
@@ -709,23 +786,112 @@ class Stream<T> {
                 },
             }
         }
-        baml.sys.panic("unreachable")
     }
 
-    /// Drain the stream and parse the accumulated text as the final value.
+    /// Drain and return the cached final value, or rethrow the cached error.
     function final(self) -> T {
-        while (!self._finished) {
-            match (self._next_text()) {
-                null => {
-                    self._finished = true
-                },
-                let s: string => {
-                    self._text = self._text + s
-                },
-            }
+        if (self._result != null) {
+            return self._settle();
         }
-        self._cache._parse_final(self._text)
+        let caller = trace.current_context();
+        self._span.run(() -> {
+            _in_context(
+                () -> {
+                    while (!self._finished) {
+                        match ((self._next_text)()) {
+                            null => {
+                                self._finished = true;
+                            },
+                            let s: string => {
+                                self._text = self._text + s;
+                            },
+                        }
+                    }
+                    self._settle()
+                },
+                $trace = _context_patch(caller),
+            )
+        }) catch_all_panics (e, context) {
+            _ => {
+                self._fail(e, context);
+                throw e;
+            },
+        }
     }
+
+    function _settle(self) -> T {
+        match (self._result) {
+            let result: _StreamValue<T> => {
+                return result.value;
+            },
+            let failure: _StreamError => {
+                throw failure.error;
+            },
+            null => {},
+        }
+        let value = self._parse_final_value() catch_all_panics (e, context) {
+            _ => {
+                self._fail(e, context);
+                throw e;
+            },
+        };
+        self._result = _StreamValue<T> { value: value };
+        self._span.finish(value);
+        value
+    }
+
+    function _parse_final_value(self) -> T {
+        self._cache._parse_final(self._text) catch (e) {
+            let parse: baml.errors.LlmClient => {
+                throw root.errors.ParseFailed {
+                    provider: self._provider,
+                    raw_output: self._text,
+                    message: parse.message,
+                };
+            },
+        }
+    }
+
+    function _fail(
+        self,
+        error: root.errors.InvokeError | trace.SpanError | baml.panics.Panic,
+        context: baml.errors.Context,
+    ) -> void {
+        if (self._result == null) {
+            self._finished = true;
+            self._result = _StreamError { error: error };
+            (self._release)();
+            self._span.fail_with_context(error, context);
+        }
+    }
+
+    /// Release stream resources and end any still-open tracing lifetime.
+    /// Abandonment does not imply cancellation or successful parsing.
+    function cleanup(self) -> void {
+        self._finished = true;
+        (self._release)() catch_all (e) {
+            _ => {
+                self._span.close();
+                throw e;
+            },
+        };
+        self._span.close();
+    }
+}
+
+/// (internal) Run `body`; its `$trace` layers a context over the current one.
+function _in_context<T, E>(body: () -> T throws E) -> T throws E {
+    body()
+}
+
+/// (internal) A patch that layers `caller`'s context over the span's, so work a
+/// stream does for a step keeps the context that step was called in.
+function _context_patch(caller: trace.Context) -> trace.Options throws never {
+    let metadata: map<string, string | int | float | bool | null> = {};
+    for (let key in caller.metadata.keys()) {
+        metadata[key] = caller.metadata[key];
+    }
+    trace.context(metadata = metadata, distinct_id = caller.distinct_id)
 }
 
 /// One-turn streaming over a spec: render the spec's prompt exactly as the
@@ -739,16 +905,12 @@ class Stream<T> {
 /// non-streaming client fails at the call site; the spec's DEFAULT client is
 /// only checked at runtime (ai.errors.StreamingUnsupported when it cannot
 /// stream).
+//baml:trace_passthrough
 function from_spec<T>(
     spec: root.FunctionSpec<T>,
     client: StreamingClient? = null,
     on_event: ((root.events.Event) -> void)? = null,
 ) -> Stream<T> {
-    if (!spec.tools().is_empty()) {
-        throw baml.errors.InvalidArgument {
-            message: `streaming does not run the tool loop yet: ${spec.name()} has a non-empty toolbox`,
-        }
-    }
     let selected: StreamingClient = match (client) {
         let s: StreamingClient => s,
         null => {
@@ -756,67 +918,98 @@ function from_spec<T>(
                 let s: StreamingClient => s,
                 _ => {
                     throw root.errors.StreamingUnsupported {
-                        client_id: spec.default_client.id(),
-                    }
+                        requested_model: spec.default_client.requested_model(),
+                    };
                 },
             }
         },
     };
-    // StreamingClient requires Client, so the downcast always succeeds.
-    let provider = match (selected) {
-        let c: root.Client => c.id(),
-    };
-    let emit = root.events.guard(on_event);
-    let settled = false;
-    if let cb: (root.events.Event) -> void throws never = emit {
-        cb(root.events.RunStarted { spec_name: spec.name(), arguments: spec.arguments() });
+    let inputs: map<string, unknown> = {};
+    let arguments = spec.arguments();
+    for (let key in arguments.keys()) {
+        inputs[key] = arguments[key];
     }
-    let turns = selected.invoke_stream(
-        root.ModelTurnInput {
+    inputs["client"] = selected;
+    inputs["on_event"] = on_event;
+    let span = trace._create_span(
+        spec.target(),
+        inputs = inputs,
+        config = trace._passthrough(),
+    );
+    span.run(() -> {
+        if (!spec.tools().is_empty()) {
+            throw baml.errors.InvalidArgument {
+                message: `streaming does not run the tool loop yet: ${spec.name()} has a non-empty toolbox`,
+            };
+        }
+        let emit = root.events.guard(on_event);
+        let settled = false;
+        if let cb: (root.events.Event) -> void throws never = emit {
+            cb(root.events.RunStarted {
+                spec_name: spec.name(),
+                arguments: spec.arguments(),
+            });
+        }
+        let turns = selected.invoke_stream(root.ModelTurnInput {
             prompt: spec.prompt_template,
             journal: root.Journal.new(spec),
             toolbox: spec.tools(),
             output_type: spec.output_type(),
-        },
-    );
-    // The host-facing stream is `ai.stream.Stream`. It is provider-agnostic:
-    // all it needs is a way to pull the next text delta from TurnStream.
-    Stream {
-        _next_text: () -> {
-            match (turns.next()) {
-                let d: Done => {
-                    // Settle: fold the completed turn (this is where the
-                    // previously-discarded streamed usage is recovered) and
-                    // emit the same events the Agent path emits. The flag
-                    // guards re-entry: a listener that pulls this same stream
-                    // (e.g. calls final() mid-callback) must not re-settle.
-                    if (!settled) {
-                        settled = true;
-                        if let cb: (root.events.Event) -> void throws never = emit {
-                            let turn = turns.final_turn();
-                            cb(
-                                root.events.AssistantMessage {
+        });
+        // A relay has no call of its own until a member answers.
+        let provider = turns._wire_call?.resolved_model?.provider ?? "unknown";
+        // The host-facing stream is `ai.stream.Stream`. It is provider-agnostic:
+        // all it needs is a way to pull the next text delta from TurnStream.
+        Stream {
+            _provider: provider,
+            _next_text: () -> {
+                match (turns.next()) {
+                    let d: Done => {
+                        // Settle: fold the completed turn (this is where the
+                        // previously-discarded streamed usage is recovered) and
+                        // emit the same events the Agent path emits. The flag
+                        // guards re-entry: a listener that pulls this same stream
+                        // (e.g. calls final() mid-callback) must not re-settle.
+                        if (!settled) {
+                            settled = true;
+                            if let cb: (root.events.Event) -> void throws never = emit {
+                                let turn = turns.final_turn();
+                                cb(root.events.AssistantMessage {
                                     content: turn.content,
-                                    client_id: provider,
-                                },
-                            );
-                            if let u: root.events.Usage = turn.usage {
-                                cb(u);
-                            }
-                            for (let call in turn.calls) {
-                                cb(call);
+                                    resolved_model: turn.resolved_model,
+                                    requested_model: turn.requested_model,
+                                });
+                                for (let call in turn.all_calls()) {
+                                    cb(call);
+                                }
                             }
                         }
-                    }
-                    null
+                        null
+                    },
+                    let batch: string[] => batch.join(""),
+                } catch_all (e) {
+                    _ => throw root.errors.normalize(e),
+                }
+            },
+            _release: () -> {
+                turns._finish();
+            },
+            _span: span,
+            _result: null,
+            _cache: baml.sap._new_parse_cache<T>() catch (e) {
+                let err: baml.errors.ParseError => {
+                    throw baml.errors.InvalidArgument {
+                        message: err.message,
+                    };
                 },
-                let batch: string[] => batch.join(""),
-            } catch_all (e) {
-                _ => throw root.errors.normalize(e),
-            }
+            },
+            _text: "",
+            _finished: false,
+        }
+    }) catch_all_panics (e, context) {
+        _ => {
+            span.fail_with_context(e, context);
+            throw e;
         },
-        _cache: baml.sap._new_parse_cache<T>(),
-        _text: "",
-        _finished: false,
     }
 }

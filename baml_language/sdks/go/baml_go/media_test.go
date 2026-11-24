@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -25,6 +26,14 @@ var (
 	_ func(string, *string) (Pdf, error)   = NewPdfFromUrl
 	_ func(string, *string) (Pdf, error)   = NewPdfFromFile
 	_ func(string, *string) (Pdf, error)   = NewPdfFromBase64
+
+	_ func(string, string, *string) (Image, error) = NewImageFromFileContent
+	_ func(string, string, *string) (Audio, error) = NewAudioFromFileContent
+	_ func(string, string, *string) (Video, error) = NewVideoFromFileContent
+	_ func(string, string, *string) (Pdf, error)   = NewPdfFromFileContent
+
+	_ func(Image) (*string, error) = Image.Name
+	_ func(Pdf) (*string, error)   = Pdf.Name
 )
 
 func TestMediaDescriptorsAreExactAndDistinct(t *testing.T) {
@@ -91,7 +100,7 @@ func TestZeroMediaValuesFailEncodingWithoutPanic(t *testing.T) {
 	}
 }
 
-func TestCollectOutboundHandlesFindsNestedOwnedHandlesOnlyOnce(t *testing.T) {
+func TestOutboundHandlesAreOwnedOncePerOccurrence(t *testing.T) {
 	owned := &cffi.BamlOutboundValue{Value: &cffi.BamlOutboundValue_HandleValue{HandleValue: &cffi.BamlOutboundHandle{
 		Key: 41, HandleType: cffi.BamlHandleType_ADT_MEDIA_IMAGE,
 	}}}
@@ -114,17 +123,16 @@ func TestCollectOutboundHandlesFindsNestedOwnedHandlesOnlyOnce(t *testing.T) {
 			{Key: "map", Value: mapValue},
 		},
 	}}}
-	keys := make(map[uint64]struct{})
-	collectOutboundHandles(root, keys)
-	if len(keys) != 1 {
-		t.Fatalf("owned keys = %#v", keys)
-	}
-	if _, ok := keys[41]; !ok {
-		t.Fatalf("owned keys = %#v, missing media handle", keys)
+	// The engine transfers one reference per occurrence, and an identity-
+	// bearing row repeats its key, so a repeated key is owned once per
+	// occurrence.
+	keys := appendOutboundHandles(nil, root)
+	if !reflect.DeepEqual(keys, []uint64{41, 41, 41}) {
+		t.Fatalf("owned keys = %v, want [41 41 41]", keys)
 	}
 }
 
-func TestCollectOutboundHandlesDoesNotDropDeeplyNestedHandles(t *testing.T) {
+func TestOutboundHandlesSurviveDeepNesting(t *testing.T) {
 	value := &cffi.BamlOutboundValue{Value: &cffi.BamlOutboundValue_HandleValue{HandleValue: &cffi.BamlOutboundHandle{
 		Key: 42, HandleType: cffi.BamlHandleType_ADT_MEDIA_IMAGE,
 	}}}
@@ -133,10 +141,8 @@ func TestCollectOutboundHandlesDoesNotDropDeeplyNestedHandles(t *testing.T) {
 			Items: []*cffi.BamlOutboundValue{value},
 		}}}
 	}
-	keys := make(map[uint64]struct{})
-	collectOutboundHandles(value, keys)
-	if _, ok := keys[42]; !ok || len(keys) != 1 {
-		t.Fatalf("owned keys = %#v, want only deeply nested handle 42", keys)
+	if keys := appendOutboundHandles(nil, value); !reflect.DeepEqual(keys, []uint64{42}) {
+		t.Fatalf("owned keys = %v, want only deeply nested handle 42", keys)
 	}
 }
 
@@ -243,6 +249,36 @@ func TestDecodePortableMediaReconstructsTheTypedWrapper(t *testing.T) {
 	}
 	if image.media.handle == nil || image.media.handle.key != 77 {
 		t.Fatalf("decoded portable media = %#v", image)
+	}
+}
+
+func TestDecodeNamedPortableMediaKeepsTheName(t *testing.T) {
+	previous := constructPortableNamedMedia
+	defer func() { constructPortableNamedMedia = previous }()
+	constructPortableNamedMedia = func(kind mediaKind, file string, base64 string, mimeType *string) (mediaValue, error) {
+		if kind != mediaKindPDF || file != "q3.pdf" || base64 != "JVBERi0xLjc=" || mimeType != nil {
+			t.Fatalf("named portable media = %v / %q / %q / %#v", kind, file, base64, mimeType)
+		}
+		return mediaValue{
+			handle: &mediaHandle{key: 78, handleType: cffi.BamlHandleType_ADT_MEDIA_PDF},
+			kind:   mediaKindPDF,
+		}, nil
+	}
+
+	value := Value{value: &cffi.BamlOutboundValue{Value: &cffi.BamlOutboundValue_MediaValue{
+		MediaValue: &cffi.BamlValueMedia{
+			Media: cffi.MediaTypeEnum_PDF,
+			Value: &cffi.BamlValueMedia_FileContent{
+				FileContent: &cffi.BamlValueMediaFileContent{Name: "q3.pdf", Base64: "JVBERi0xLjc="},
+			},
+		},
+	}}}
+	pdf, err := value.Pdf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.media.handle == nil || pdf.media.handle.key != 78 {
+		t.Fatalf("decoded named portable media = %#v", pdf)
 	}
 }
 

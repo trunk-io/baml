@@ -13,6 +13,21 @@
 ///     (`GOOGLE_APPLICATION_CREDENTIALS`, the well-known ADC file, the gcloud
 ///     config file, the GCE metadata server).
 ///
+/// `credentials_json` and `credentials_file` are `ai.Credential`s: a literal,
+/// or `env.NAME`, read when a request is built. A variable that is unset, or
+/// any blank value, counts as not configured, and the next way is tried.
+/// `GOOGLE_APPLICATION_CREDENTIALS` is always a file path, as in google-auth;
+/// a document goes in `credentials_json` (or
+/// `GOOGLE_APPLICATION_CREDENTIALS_CONTENT`).
+///
+/// A v0 `credentials` option ports by what it held: a path becomes
+/// `credentials_file` and a document becomes `credentials_json` (v0 told the
+/// two apart; v1 does not). v0's `credentials_content` is `credentials_json`.
+/// A document kept in `GOOGLE_APPLICATION_CREDENTIALS` moves to a variable of
+/// its own, read with `credentials_json = env.NAME`, or to
+/// `GOOGLE_APPLICATION_CREDENTIALS_CONTENT`: other Google libraries in the same
+/// process read `GOOGLE_APPLICATION_CREDENTIALS` as a path.
+///
 /// `api_key` selects Vertex AI **express mode** instead: the key rides the URL
 /// as `?key=…`, no credentials are read, and the request goes to the
 /// project-less global endpoint unless a project is configured.
@@ -24,10 +39,11 @@ class VertexClient {
     // null resolves from GOOGLE_CLOUD_LOCATION / GOOGLE_CLOUD_REGION, else
     // the multi-region `global` endpoint.
     location: string?,
-    // An inline credential document, or the path to one. Whichever is set is
-    // used as-is: a broken value raises instead of falling back.
-    credentials_json: string?,
-    credentials_file: string?,
+    // An inline credential document, or the path to one. A value that is set
+    // is used as-is: a broken one raises instead of falling back. An unset
+    // `env.NAME` or a blank value is not set.
+    credentials_json: ai.Credential?,
+    credentials_file: ai.Credential?,
     // Express-mode API key (opt-in; there is deliberately no ambient env
     // fallback, so an unrelated GOOGLE_API_KEY cannot downgrade a
     // project-scoped client).
@@ -58,7 +74,7 @@ class VertexClient {
 
     safety_settings: SafetySetting[]?,
 
-    // Record request/response bodies (and raw SSE events) on the LLMCall wire
+    // Record request/response bodies (and raw SSE events) on the ModelCall wire
     // records delivered through on_event. Status, headers, and timing are
     // always recorded; this flag only gates the bodies.
     capture_wire: bool,
@@ -70,8 +86,8 @@ class VertexClient {
         model: string = "gemini-2.5-flash",
         project_id: ai.Credential? = null,
         location: string? = null,
-        credentials_json: string? = null,
-        credentials_file: string? = null,
+        credentials_json: ai.Credential? = null,
+        credentials_file: ai.Credential? = null,
         api_key: ai.Credential? = null,
         base_url: ai.Credential? = null,
         timeout: baml.time.Duration | ai.LlmTimeoutOptions | null = null,
@@ -122,12 +138,16 @@ class VertexClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `vertex/${self.model}`
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "vertex"
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            google.internal.vertex_preview(self, input) catch_all (e) {
+            root.internal.vertex_preview(self, input) catch_all (e) {
                 _ => throw ai.errors.normalize(e),
             }
         }
@@ -135,6 +155,17 @@ class VertexClient {
         function invoke(self, input: ai.ModelTurnInput) -> ai.ModelTurn {
             root.internal.vertex_invoke(self, input) catch_all (e) {
                 _ => throw ai.errors.normalize_invoke(e),
+            }
+        }
+
+        /// What a `${cache()}` sends. A Claude model is served over the
+        /// Anthropic Messages wire and takes its `cache_control`; Gemini has
+        /// no cache marker, so a `${cache()}` sends nothing there.
+        function default_cache_args(self) -> baml.json.json {
+            if (root.internal._vertex_publisher(self) == "anthropic") {
+                anthropic.internal.default_cache_control()
+            } else {
+                null
             }
         }
     }

@@ -1,7 +1,10 @@
 //! Enum emission: a fieldless Rust enum plus the value conversions.
-//! Variant identifiers come from the BAML variant names; the wire carries
+//! Variant identifiers come from the BAML variant names (respelled under
+//! `naming_convention = "language"`); the wire carries
 //! each variant's declared *value*, so both conversion directions match
-//! on the value string, never the Rust identifier.
+//! on the value string, never the Rust identifier. Under the `serde`
+//! feature a variant is its JSON string, its `@json.rename` or its name, as
+//! in BAML's own JSON.
 //!
 //! The impl shape is pinned by the hand-written executable spec in
 //! `bridge_rust/tests/conversions.rs`.
@@ -11,22 +14,29 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use super::function::doc_attrs;
-use crate::idents;
+use crate::{idents, names::RustNames};
 
-pub(crate) fn emit(name: &Name, enum_: &Enum) -> TokenStream {
+pub(crate) fn emit(name: &Name, enum_: &Enum, names: &RustNames) -> TokenStream {
     let fqn = name.to_string();
-    let ident = idents::ident(name.name().as_str());
+    let ident = idents::ident(names.type_name(name));
     let docs = doc_attrs(enum_.docstring.as_deref());
 
     let mut variant_defs = Vec::new();
     let mut encode_arms = Vec::new();
     let mut decode_arms = Vec::new();
     for variant in &enum_.variants {
-        let variant_ident = idents::ident(variant.name.as_str());
+        let variant_ident = idents::ident(names.variant(name, &variant.name));
         let value = variant.value.as_str();
         let variant_docs = doc_attrs(variant.docstring.as_deref());
+        let json_string = variant
+            .json_rename
+            .as_deref()
+            .unwrap_or(variant.name.as_str());
+        let serde_rename = (variant_ident != json_string || json_string.starts_with("r#"))
+            .then(|| quote! { #[cfg_attr(feature = "serde", serde(rename = #json_string))] });
         variant_defs.push(quote! {
             #(#variant_docs)*
+            #serde_rename
             #variant_ident
         });
         encode_arms.push(quote! { Self::#variant_ident => #value });
@@ -36,15 +46,22 @@ pub(crate) fn emit(name: &Name, enum_: &Enum) -> TokenStream {
     quote! {
         #(#docs)*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
         pub enum #ident {
             #(#variant_defs,)*
         }
 
         impl ::baml_bridge::baml_value::internal::__BamlValuePrivate for #ident {
-            fn to_baml(&self) -> ::baml_bridge::wire::InboundValue {
-                ::baml_bridge::encode::enum_value(#fqn, match self {
+            fn to_baml(
+                &self,
+                _encoder: &mut ::baml_bridge::baml_value::internal::Encoder,
+            ) -> ::std::result::Result<
+                ::baml_bridge::wire::InboundValue,
+                ::baml_bridge::EncodeError,
+            > {
+                ::std::result::Result::Ok(::baml_bridge::encode::enum_value(#fqn, match self {
                     #(#encode_arms,)*
-                })
+                }))
             }
 
             fn from_baml(

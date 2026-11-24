@@ -10,7 +10,6 @@ mod common;
 
 use std::sync::Arc;
 
-use ::bex_heap::CollectionLevel;
 use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder};
 use common::compile_for_engine;
 use sys_native::SysOpsExt;
@@ -23,13 +22,22 @@ const SOURCE: &str = r#"
 class Resource {
   log string[]
   function cleanup(self) -> void {
-    self.log.push("cleaned")
+    self.log.push("cleaned");
   }
 }
 function make_log() -> string[] { [] }
 function make_resource(log: string[]) -> Resource { Resource { log: log } }
 function clean(r: Resource) -> void { r.cleanup() }
 function read_log(log: string[]) -> string[] { log }
+
+class Crate<T> {
+  log string[]
+  item T
+  function cleanup(self) -> void {
+    self.log.push("crate");
+  }
+}
+function make_crate(log: string[]) -> Crate<int> { Crate { log: log, item: 7 } }
 "#;
 
 fn engine() -> Arc<BexEngine> {
@@ -95,7 +103,7 @@ async fn cleanup_runs_when_instance_is_collected() {
     drop(resource);
 
     // Collect: the unreachable `Resource` is finalized, pushing to the log.
-    engine.collect_garbage(CollectionLevel::Major).await;
+    engine.collect_garbage().await;
 
     let after = engine
         .call_function("read_log", vec![log], ctx(), true)
@@ -135,8 +143,73 @@ async fn gc_does_not_rerun_cleanup_already_done_explicitly() {
     // Drop the root, then GC must skip the already-cleaned instance — no second
     // marker.
     drop(resource);
-    engine.collect_garbage(CollectionLevel::Major).await;
+    engine.collect_garbage().await;
 
+    let after = engine
+        .call_function("read_log", vec![log], ctx(), true)
+        .await
+        .unwrap();
+    assert_eq!(expect_strings(&after), vec!["cleaned"]);
+}
+
+/// Here rather than in the corpus: the corpus runs every test in one engine,
+/// where another test's collection can take this instance's finalizer and
+/// leave it unfinished when this test's own collection returns (the `// BUG:`
+/// on `BexEngine::drain_finalizers`). This engine is the test's own, so its
+/// collection is the only one.
+#[tokio::test]
+async fn cleanup_runs_for_an_instance_of_a_generic_class() {
+    // The finalizer is the class's own method, reached through the instance;
+    // the class's type arguments ride on the instance, not on any name.
+    let engine = engine();
+
+    let log = engine
+        .call_function("make_log", vec![], ctx(), false)
+        .await
+        .unwrap();
+    let boxed = engine
+        .call_function("make_crate", vec![log.clone()], ctx(), false)
+        .await
+        .unwrap();
+    assert!(matches!(boxed, BexExternalValue::Handle(_)));
+
+    drop(boxed);
+    engine.collect_garbage().await;
+
+    let after = engine
+        .call_function("read_log", vec![log], ctx(), true)
+        .await
+        .unwrap();
+    assert_eq!(expect_strings(&after), vec!["crate"]);
+}
+
+/// An instance that survives collections is moved by each one, and the
+/// collector's finalizable list follows it. Once dead, it is finalized
+/// exactly once.
+#[tokio::test]
+async fn cleanup_runs_once_for_an_instance_that_survived_collections() {
+    let engine = engine();
+    let log = engine
+        .call_function("make_log", vec![], ctx(), false)
+        .await
+        .unwrap();
+    let resource = engine
+        .call_function("make_resource", vec![log.clone()], ctx(), false)
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        engine.collect_garbage().await;
+    }
+    let while_held = engine
+        .call_function("read_log", vec![log.clone()], ctx(), true)
+        .await
+        .unwrap();
+    assert_eq!(expect_strings(&while_held), Vec::<String>::new());
+
+    drop(resource);
+    engine.collect_garbage().await;
+    engine.collect_garbage().await;
     let after = engine
         .call_function("read_log", vec![log], ctx(), true)
         .await

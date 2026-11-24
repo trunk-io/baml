@@ -1,12 +1,15 @@
 //! Pool-wide analysis the emitters consume: which nominal types can be
-//! emitted, where recursive class fields need `Box`, and which module
-//! path segments must be renamed away from type-name collisions.
+//! emitted, where recursive class fields need `Box`, the Rust name of every
+//! binding, and which types get serde impls under the generated crate's
+//! `serde` feature.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use baml_sdkgen_types::{Name, Symbol, SymbolPool, Ty};
+use baml_sdkgen_types::{
+    Class, ClassCrossing, ClassProperty, Name, NamingConvention, Symbol, SymbolPool, Ty,
+};
 
-use crate::{SkipWarning, routing};
+use crate::{SkipWarning, names::RustNames};
 
 /// Results of [`analyze`]. Emitters treat this as read-only context.
 pub(crate) struct Analysis {
@@ -14,23 +17,48 @@ pub(crate) struct Analysis {
     /// reference to anything else in a signature or field makes the
     /// referencing symbol unsupported.
     pub(crate) emitted: HashSet<Name>,
-    /// Strongly-connected-component id per emitted class. Two classes in
-    /// the same SCC form a containment cycle through non-heap fields;
-    /// class references between them are boxed at the field site.
+    /// Strongly-connected-component id per emitted class and type alias.
+    /// Two nodes in the same SCC form a containment cycle through non-heap
+    /// fields; class and alias references between them are boxed at the
+    /// field site.
     scc: HashMap<Name, usize>,
-    /// Module-path renames: a namespace segment that collides with a type
-    /// name emitted in its parent module gets a trailing underscore
-    /// (Rust puts `mod` and type names in one namespace). Keyed by the
-    /// original routed path; values are the fully renamed path.
-    renames: HashMap<Vec<String>, Vec<String>>,
-    /// Emitted type names per (renamed) leaf — the namespace synthesized
+    /// The Rust spelling of every module, type, callable, field, variant
+    /// and parameter.
+    pub(crate) names: RustNames,
+    /// Emitted type names per module path — the namespace synthesized
     /// union enums must not collide with.
     type_names_by_leaf: HashMap<Vec<String>, HashSet<String>>,
+    /// The right-hand side of every emitted type alias that a statement
+    /// spells by its body. The one recursive alias the SDK emits, the stdlib's
+    /// `json`, exists as a declaration at run time and is spelled by name, so
+    /// it is not here.
+    alias_bodies: HashMap<Name, Ty>,
+    /// Emitted classes and aliases whose values all have a JSON form
+    /// serde can match to BAML's own (`baml.json`), so their Rust types
+    /// get serde impls under the generated crate's `serde` feature.
+    serde: HashSet<Name>,
+    /// What each class's literal fields say about a JSON object, for unions
+    /// to choose a member by.
+    json_tags: HashMap<Name, JsonTag>,
+    lacks_std_traits: HashSet<Name>,
+    bridged: HashSet<Name>,
+    /// How each class in the pool crosses the boundary, decided by the
+    /// compiler once per declaration.
+    crossings: HashMap<Name, ClassCrossing>,
+    /// `baml.json.json` and the aliases whose chain ends at it: their Rust
+    /// type is `baml_bridge::Json`, which reads a missing key as `null`
+    /// only with `serde(default)`.
+    json_aliases: HashSet<Name>,
 }
 
 impl Analysis {
     pub(crate) fn is_emitted(&self, name: &Name) -> bool {
         self.emitted.contains(name)
+    }
+
+    /// Whether the alias `name` is `baml.json.json` or resolves to it.
+    pub(crate) fn is_json_alias(&self, name: &Name) -> bool {
+        self.json_aliases.contains(name)
     }
 
     /// Whether a field of `owner` referencing `target` sits on a
@@ -42,27 +70,121 @@ impl Analysis {
         }
     }
 
-    /// The on-disk / in-crate module path for a routed path, with
-    /// collision renames applied.
-    pub(crate) fn renamed<'a>(&'a self, path: &'a [String]) -> &'a [String] {
-        match self.renames.get(path) {
-            Some(renamed) => renamed,
-            None => path,
-        }
+    /// The right-hand side of an emitted type alias a statement spells by
+    /// its body.
+    pub(crate) fn alias_body(&self, name: &Name) -> Option<&Ty> {
+        self.alias_bodies.get(name)
     }
 
-    /// Emitted type names in a (renamed) leaf.
+    /// Emitted type names in a module.
     pub(crate) fn type_names_in(&self, leaf: &[String]) -> HashSet<String> {
         self.type_names_by_leaf
             .get(leaf)
             .cloned()
             .unwrap_or_default()
     }
+
+    /// How the class `name` crosses the boundary, when the pool declares it.
+    pub(crate) fn crossing(&self, name: &Name) -> Option<ClassCrossing> {
+        self.crossings.get(name).copied()
+    }
+
+    /// Whether the emitted class `name` derives serde's traits.
+    pub(crate) fn derives_serde(&self, name: &Name) -> bool {
+        self.serde.contains(name)
+    }
+
+    /// The classes a value of `ty` can be, through aliases and unions, each
+    /// with what its literal fields say about a JSON object.
+    pub(crate) fn json_tags_in<'a>(&'a self, ty: &'a Ty) -> Vec<&'a JsonTag> {
+        fn walk<'a>(
+            analysis: &'a Analysis,
+            ty: &'a Ty,
+            seen: &mut HashSet<&'a Name>,
+            out: &mut Vec<&'a JsonTag>,
+        ) {
+            match ty {
+                Ty::Class(name, _) => out.extend(analysis.json_tags.get(name)),
+                Ty::Union(items) => {
+                    for item in items {
+                        walk(analysis, item, seen, out);
+                    }
+                }
+                Ty::TypeAlias(alias) if seen.insert(alias) => {
+                    if let Some(body) = analysis.alias_body(alias) {
+                        walk(analysis, body, seen, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, ty, &mut HashSet::new(), &mut out);
+        out
+    }
+
+    /// The literal `ty` is, through any chain of aliases.
+    pub(crate) fn literal_of<'a>(&'a self, ty: &'a Ty) -> Option<&'a baml_base::Literal> {
+        literal_through_aliases(ty, &self.alias_bodies)
+    }
+
+    /// Whether the Rust type for `ty` implements serde's traits under the
+    /// `serde` feature.
+    pub(crate) fn has_serde(&self, ty: &Ty) -> bool {
+        has_serde(ty, &self.serde)
+    }
+
+    pub(crate) fn has_std_traits(&self, ty: &Ty) -> bool {
+        has_std_traits(ty, &self.lacks_std_traits, &self.bridged)
+    }
+}
+
+/// How a class's instances appear to a Rust host, decided by the class's
+/// [`ClassCrossing`].
+pub(crate) enum ClassShape<'a> {
+    /// Plain data: a struct the host reads and builds by these fields.
+    Fields(&'a [ClassProperty]),
+    /// The engine's instance, held by reference: its declared fields are the
+    /// runtime's own internals and never reach the host.
+    Opaque,
+    /// A capability or value with a crossing of its own (`ai.stream.Stream`,
+    /// `ai.FunctionSpec`, `ai.Prompt`, `baml.host.Value`): a `baml_bridge`
+    /// type stands in wherever a type names the class, so the class itself
+    /// emits nothing.
+    Bridged,
+    /// A media wrapper, carried by its own wire arm.
+    Media,
+}
+
+impl<'a> ClassShape<'a> {
+    /// The fields a host sees: none for a class that does not cross by its
+    /// fields.
+    pub(crate) fn properties(&self) -> &'a [ClassProperty] {
+        match self {
+            Self::Fields(properties) => properties,
+            Self::Opaque | Self::Bridged | Self::Media => &[],
+        }
+    }
+
+    pub(crate) fn of(class: &'a Class) -> Self {
+        match class.crossing {
+            ClassCrossing::Fields => Self::Fields(&class.properties),
+            ClassCrossing::Opaque => Self::Opaque,
+            ClassCrossing::Stream
+            | ClassCrossing::FunctionSpec
+            | ClassCrossing::Prompt
+            | ClassCrossing::HostValue => Self::Bridged,
+            ClassCrossing::Media(_) => Self::Media,
+        }
+    }
 }
 
 /// Analyze the pool. Returns the analysis plus one warning per skipped
 /// class or type alias (functions warn separately at emission time).
-pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
+pub(crate) fn analyze(
+    pool: &SymbolPool,
+    convention: NamingConvention,
+) -> (Analysis, Vec<SkipWarning>) {
     let mut warnings = Vec::new();
 
     // Deterministic iteration everywhere: sort by Name.
@@ -74,11 +196,10 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
             Symbol::Class(class) => classes.push((name, class)),
             Symbol::Enum(_) => {
                 if name.name().as_str().contains('$') {
-                    warnings.push(SkipWarning {
-                        fqn: name.to_string(),
-                        reason: "`$`-named types are not representable as Rust identifiers"
-                            .to_string(),
-                    });
+                    warnings.push(SkipWarning::new(
+                        name,
+                        "`$`-named types are not representable as Rust identifiers",
+                    ));
                 } else {
                     enums.insert(name.clone());
                 }
@@ -95,14 +216,17 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
     // unsupported.
     let mut deps: BTreeMap<&Name, Vec<Name>> = BTreeMap::new();
     let mut alive: HashSet<Name> = HashSet::new();
+    // Classes a `baml_bridge` type represents: a reference to one is
+    // representable though the class itself emits nothing.
+    let mut bridged: HashSet<Name> = HashSet::new();
     for (name, class) in &classes {
         // `$`-named types are not representable as Rust identifiers —
         // same filter the function emitter applies.
         if name.name().as_str().contains('$') {
-            warnings.push(SkipWarning {
-                fqn: name.to_string(),
-                reason: "`$`-named types are not representable as Rust identifiers".to_string(),
-            });
+            warnings.push(SkipWarning::new(
+                name,
+                "`$`-named types are not representable as Rust identifiers",
+            ));
             continue;
         }
         // A generic class emits as a `<T: BamlValue>` struct: its own type
@@ -113,17 +237,36 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
             .iter()
             .map(baml_base::Name::as_str)
             .collect();
+        let shape = ClassShape::of(class);
+        let properties = match shape {
+            ClassShape::Fields(properties) => properties,
+            ClassShape::Opaque => &[],
+            ClassShape::Bridged => {
+                bridged.insert((*name).clone());
+                continue;
+            }
+            ClassShape::Media => {
+                // BUG: a media value has no Rust representation yet (the
+                // `media_value` wire arm has no `baml_bridge` type), so a
+                // media wrapper emits nothing and any signature naming one
+                // skips.
+                warnings.push(SkipWarning::new(
+                    name,
+                    "media values have no Rust representation yet",
+                ));
+                continue;
+            }
+        };
         let mut class_deps = Vec::new();
-        let unsupported = class.properties.iter().find_map(|prop| {
+        let unsupported = properties.iter().find_map(|prop| {
             field_deps(&prop.ty, &class_params, &mut class_deps)
                 .err()
                 .map(|reason| (prop.name.as_str(), reason))
         });
         match unsupported {
-            Some((field, reason)) => warnings.push(SkipWarning {
-                fqn: name.to_string(),
-                reason: format!("field `{field}`: {reason}"),
-            }),
+            Some((field, reason)) => {
+                warnings.push(SkipWarning::new(name, format!("field `{field}`: {reason}")));
+            }
             None => {
                 // Every type parameter must appear in some field in a
                 // *non-recursive* position. An entirely unused param is an
@@ -132,19 +275,23 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
                 // "type parameter is only used recursively" error — Rust
                 // cannot determine its variance. Either way the struct would
                 // not compile, and PhantomData would leak into the public
-                // struct literal, so skip (fail closed).
+                // struct literal, so skip (fail closed). An opaque class's
+                // parameters say what its instance is, through a private
+                // marker, so it needs no field to use them.
                 let mut used = HashSet::new();
-                for prop in &class.properties {
+                for prop in properties {
                     collect_non_recursive_type_vars(&prop.ty, name, &mut used);
                 }
-                if let Some(unused) = class_params.iter().find(|param| !used.contains(**param)) {
-                    warnings.push(SkipWarning {
-                        fqn: name.to_string(),
-                        reason: format!(
+                if let ClassShape::Fields(_) = shape
+                    && let Some(unused) = class_params.iter().find(|param| !used.contains(**param))
+                {
+                    warnings.push(SkipWarning::new(
+                        name,
+                        format!(
                             "generic type parameter `{unused}` is not used in a non-recursive \
                              field position (not representable as a Rust struct)"
                         ),
-                    });
+                    ));
                     continue;
                 }
                 deps.insert(name, class_deps);
@@ -153,35 +300,38 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
         }
     }
 
-    // Type aliases join the same fixpoint. Non-recursive alias
-    // *references* are inlined by the pool builder, so the alias items
-    // themselves are the SDK-surface representation of the user's named
-    // types; only recursive aliases (unrepresentable as a plain Rust
-    // `type`) and structurally unsupported right-hand sides skip.
+    // Type aliases join the same fixpoint. Alias references stay nominal in
+    // the pool, so the alias items are the SDK-surface representation of
+    // the user's named types; only recursive aliases (unrepresentable as a
+    // plain Rust `type`) and structurally unsupported right-hand sides skip.
     for (name, alias) in &aliases {
         if name.name().as_str().contains('$') {
-            warnings.push(SkipWarning {
-                fqn: name.to_string(),
-                reason: "`$`-named types are not representable as Rust identifiers".to_string(),
-            });
+            warnings.push(SkipWarning::new(
+                name,
+                "`$`-named types are not representable as Rust identifiers",
+            ));
+            continue;
+        }
+        // The stdlib's recursive `json` alias maps onto `baml_bridge::Json`
+        // rather than a Rust `type` of its expansion, so it is always
+        // representable and depends on nothing.
+        if crate::translate_ty::is_canonical_json(name) {
+            deps.insert(name, Vec::new());
+            alive.insert((*name).clone());
             continue;
         }
         if alias.recursive {
-            warnings.push(SkipWarning {
-                fqn: name.to_string(),
-                reason: "recursive type aliases are not representable as a plain Rust `type` yet"
-                    .to_string(),
-            });
+            warnings.push(SkipWarning::new(
+                name,
+                "recursive type aliases are not representable as a plain Rust `type` yet",
+            ));
             continue;
         }
         let mut alias_deps = Vec::new();
         // Aliases carry no type parameters of their own in the current
         // scope, so no TypeVar is ever in scope for their right-hand side.
         match field_deps(&alias.resolves_to, &[], &mut alias_deps) {
-            Err(reason) => warnings.push(SkipWarning {
-                fqn: name.to_string(),
-                reason,
-            }),
+            Err(reason) => warnings.push(SkipWarning::new(name, reason)),
             Ok(()) => {
                 deps.insert(name, alias_deps);
                 alive.insert((*name).clone());
@@ -200,12 +350,12 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
             }
             if let Some(dead) = class_deps
                 .iter()
-                .find(|dep| !alive.contains(dep) && !enums.contains(dep))
+                .find(|dep| !alive.contains(dep) && !enums.contains(dep) && !bridged.contains(dep))
             {
-                warnings.push(SkipWarning {
-                    fqn: name.to_string(),
-                    reason: format!("references skipped or unknown type `{dead}`"),
-                });
+                warnings.push(SkipWarning::new(
+                    name,
+                    format!("references skipped or unknown type `{dead}`"),
+                ));
                 removed.push((*name).clone());
             }
         }
@@ -220,27 +370,112 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
     let mut emitted = alive;
     emitted.extend(enums.iter().cloned());
 
-    // Containment graph over emitted classes: an edge per class reference
-    // reachable without crossing a heap-indirected container (`Vec`,
-    // `Map`); those already break cycles, so only direct/optional
-    // references participate.
+    // Greatest fixpoint, so recursive types keep their impls: start from
+    // every emitted class and alias, then drop each one holding a type
+    // without serde impls until nothing changes. Classes from BAML's
+    // bundled packages never start in: many render through a
+    // `baml.ToJson` override (`baml.time.PlainDate` is a date string),
+    // which a derive cannot follow, and some are `baml_bridge` handles.
+    let serde_candidates: Vec<(&Name, Vec<&Ty>)> = classes
+        .iter()
+        .filter(|(name, _)| !baml_base::LangPackage::is_manifest_name(name.package().as_str()))
+        .map(|(name, class)| (*name, class.properties.iter().map(|p| &p.ty).collect()))
+        .chain(
+            aliases
+                .iter()
+                .map(|(name, alias)| (*name, vec![&alias.resolves_to])),
+        )
+        .filter(|(name, _)| emitted.contains(*name))
+        .collect();
+    let mut serde: HashSet<Name> = serde_candidates
+        .iter()
+        .map(|(name, _)| (*name).clone())
+        .collect();
+    loop {
+        let lacking: Vec<&Name> = serde_candidates
+            .iter()
+            .filter(|(name, tys)| {
+                serde.contains(*name) && !tys.iter().all(|ty| has_serde(ty, &serde))
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        if lacking.is_empty() {
+            break;
+        }
+        for name in lacking {
+            serde.remove(name);
+        }
+    }
+
+    let std_candidates: Vec<(&Name, Vec<&Ty>)> = classes
+        .iter()
+        .map(|(name, class)| {
+            (
+                *name,
+                ClassShape::of(class)
+                    .properties()
+                    .iter()
+                    .map(|p| &p.ty)
+                    .collect(),
+            )
+        })
+        .chain(
+            aliases
+                .iter()
+                .map(|(name, alias)| (*name, vec![&alias.resolves_to])),
+        )
+        .filter(|(name, _)| emitted.contains(*name))
+        .collect();
+    let mut lacks_std_traits: HashSet<Name> = HashSet::new();
+    loop {
+        let lacking: Vec<&Name> = std_candidates
+            .iter()
+            .filter(|(name, tys)| {
+                !lacks_std_traits.contains(*name)
+                    && !tys
+                        .iter()
+                        .all(|ty| has_std_traits(ty, &lacks_std_traits, &bridged))
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        if lacking.is_empty() {
+            break;
+        }
+        lacks_std_traits.extend(lacking.into_iter().cloned());
+    }
+
+    // Containment graph over emitted classes and type aliases: an edge per
+    // class or alias reference reachable without crossing a heap-indirected
+    // container (`Vec`, `Map`); those already break cycles, so only
+    // direct/optional references participate. A Rust `type` alias holds its
+    // target inline, so `type Part = Text | Extra` with `class Extra { part
+    // Part }` is a cycle through the alias.
     let class_edges: BTreeMap<&Name, Vec<&Name>> = classes
         .iter()
         .filter(|(name, _)| emitted.contains(*name))
         .map(|(name, class)| {
             let mut targets = Vec::new();
-            for prop in &class.properties {
+            for prop in ClassShape::of(class).properties() {
                 non_heap_class_refs(&prop.ty, &emitted, &enums, &mut targets);
             }
             (*name, targets)
         })
+        .chain(
+            aliases
+                .iter()
+                .filter(|(name, _)| emitted.contains(*name))
+                .map(|(name, alias)| {
+                    let mut targets = Vec::new();
+                    non_heap_class_refs(&alias.resolves_to, &emitted, &enums, &mut targets);
+                    (*name, targets)
+                }),
+        )
         .collect();
     let scc = compute_sccs(&class_edges);
 
-    let renames = compute_renames(pool, &emitted);
+    let names = RustNames::build(pool, &emitted, convention);
 
-    // Emitted type names per renamed leaf, for synthesized-name
-    // de-collision.
+    // Emitted type names per module, for synthesized-name de-collision.
     let mut type_names_by_leaf: HashMap<Vec<String>, HashSet<String>> = HashMap::new();
     for (name, symbol) in pool {
         if matches!(
@@ -248,21 +483,58 @@ pub(crate) fn analyze(pool: &SymbolPool) -> (Analysis, Vec<SkipWarning>) {
             Symbol::Class(_) | Symbol::Enum(_) | Symbol::TypeAlias(_)
         ) && emitted.contains(name)
         {
-            let routed = routing::route(name).segments;
-            let leaf = renames.get(&routed).cloned().unwrap_or(routed);
             type_names_by_leaf
-                .entry(leaf)
+                .entry(names.module_path(name).to_vec())
                 .or_default()
-                .insert(name.name().to_string());
+                .insert(names.type_name(name).to_string());
         }
     }
 
+    let alias_bodies = aliases
+        .iter()
+        .filter(|(name, _)| {
+            emitted.contains(*name) && !crate::translate_ty::is_canonical_json(name)
+        })
+        .map(|(name, alias)| ((*name).clone(), alias.resolves_to.clone()))
+        .collect();
+    // Aliases of `json`, through any chain of aliases.
+    let mut json_aliases: HashSet<Name> = HashSet::from([Name::from_dotted_path(
+        baml_base::qualified_name::BAML_JSON_JSON,
+    )]);
+    loop {
+        let before = json_aliases.len();
+        for (name, alias) in &aliases {
+            if let Ty::TypeAlias(target) = &alias.resolves_to
+                && json_aliases.contains(target)
+            {
+                json_aliases.insert((*name).clone());
+            }
+        }
+        if json_aliases.len() == before {
+            break;
+        }
+    }
+
+    let json_tags = classes
+        .iter()
+        .map(|(name, class)| ((*name).clone(), JsonTag::of(class, &alias_bodies)))
+        .collect();
     (
         Analysis {
             emitted,
             scc,
-            renames,
+            names,
             type_names_by_leaf,
+            alias_bodies,
+            serde,
+            json_tags,
+            lacks_std_traits,
+            bridged,
+            crossings: classes
+                .iter()
+                .map(|(name, class)| ((*name).clone(), class.crossing))
+                .collect(),
+            json_aliases,
         },
         warnings,
     )
@@ -283,7 +555,6 @@ fn field_deps(ty: &Ty, generic_params: &[&str], deps: &mut Vec<Name>) -> Result<
         | Ty::String
         | Ty::Bool
         | Ty::Null
-        | Ty::Void
         | Ty::Literal(..)
         | Ty::Uint8Array => Ok(()),
         Ty::List(inner) => field_deps(inner, generic_params, deps),
@@ -311,6 +582,15 @@ fn field_deps(ty: &Ty, generic_params: &[&str], deps: &mut Vec<Name>) -> Result<
                 }
             }
         }
+        Ty::Tuple(items) => {
+            if let Some(reason) = crate::translate_ty::unsupported_tuple_arity(items.len()) {
+                return Err(reason);
+            }
+            for item in items {
+                field_deps(item, generic_params, deps)?;
+            }
+            Ok(())
+        }
         // A class reference depends on the class item; its concrete type
         // arguments are themselves types that must be representable (a
         // generic argument referencing a skipped type poisons this field).
@@ -327,9 +607,11 @@ fn field_deps(ty: &Ty, generic_params: &[&str], deps: &mut Vec<Name>) -> Result<
             deps.push(name.clone());
             Ok(())
         }
-        // Opaque alias references (the pool builder inlines in-package
-        // non-recursive aliases, so these are recursive or cross-package
-        // ones): representable iff the alias item itself is emitted.
+        // `baml.json.json` is `baml_bridge::Json`, with or without its
+        // alias item in the pool.
+        Ty::TypeAlias(name) if crate::translate_ty::is_canonical_json(name) => Ok(()),
+        // Alias references: representable iff the alias item itself is
+        // emitted.
         Ty::TypeAlias(name) => {
             deps.push(name.clone());
             Ok(())
@@ -356,7 +638,113 @@ fn field_deps(ty: &Ty, generic_params: &[&str], deps: &mut Vec<Name>) -> Result<
         Ty::Resource => Err("unsupported type: resource handle".to_string()),
         Ty::PromptAst => Err("unsupported type: prompt AST".to_string()),
         Ty::Never => Err("unsupported type: never".to_string()),
-        Ty::RustType => Err("unsupported type: $rust_type handle".to_string()),
+    }
+}
+
+/// What a class's literal fields say about a JSON object: the union member
+/// a value is, as the engine picks it in `baml.json`.
+#[derive(Clone)]
+pub(crate) struct JsonTag {
+    /// Each literal field's JSON key and value.
+    pub(crate) literals: Vec<(String, baml_base::Literal)>,
+    /// A `@json.fallback` class is the member no other member's tag matches.
+    pub(crate) fallback: bool,
+}
+
+impl JsonTag {
+    fn of(class: &baml_sdkgen_types::Class, aliases: &HashMap<Name, Ty>) -> Self {
+        Self {
+            literals: class
+                .properties
+                .iter()
+                .filter_map(|prop| {
+                    let literal = literal_through_aliases(&prop.ty, aliases)?;
+                    Some((json_key(prop).to_string(), literal.clone()))
+                })
+                .collect(),
+            fallback: class.properties.iter().any(|prop| prop.json_fallback),
+        }
+    }
+}
+
+/// The literal `ty` is, through any chain of aliases.
+fn literal_through_aliases<'a>(
+    ty: &'a Ty,
+    aliases: &'a HashMap<Name, Ty>,
+) -> Option<&'a baml_base::Literal> {
+    let mut seen = HashSet::new();
+    let mut current = ty;
+    loop {
+        match current {
+            Ty::Literal(literal, ..) => return Some(literal),
+            Ty::TypeAlias(alias) if seen.insert(alias) => current = aliases.get(alias)?,
+            _ => return None,
+        }
+    }
+}
+
+/// The key a class field goes by in JSON.
+pub(crate) fn json_key(prop: &ClassProperty) -> &str {
+    prop.json_rename.as_deref().unwrap_or(prop.name.as_str())
+}
+
+pub(crate) const STD_MAX_TUPLE_ARITY: usize = 12;
+
+const SERDE_MAX_TUPLE_ARITY: usize = 16;
+
+fn has_std_traits(ty: &Ty, lacking: &HashSet<Name>, bridged: &HashSet<Name>) -> bool {
+    let all = |items: &[Ty]| {
+        items
+            .iter()
+            .all(|item| has_std_traits(item, lacking, bridged))
+    };
+    match ty {
+        Ty::Tuple(items) => items.len() <= STD_MAX_TUPLE_ARITY && all(items),
+        Ty::List(inner) => has_std_traits(inner, lacking, bridged),
+        Ty::Map { value, .. } => has_std_traits(value, lacking, bridged),
+        Ty::Union(items) => all(items),
+        Ty::Class(name, _) if bridged.contains(name) => true,
+        Ty::Class(name, args) => !lacking.contains(name) && all(args),
+        Ty::TypeAlias(name) => !lacking.contains(name),
+        Ty::Function { .. } => false,
+        _ => true,
+    }
+}
+
+/// Whether the Rust type `translate_ty` produces for `ty` implements
+/// serde's traits in the JSON shape BAML's own `baml.json` uses, given the
+/// classes and aliases that do (`serde`).
+fn has_serde(ty: &Ty, serde: &HashSet<Name>) -> bool {
+    match ty {
+        Ty::Int | Ty::Float | Ty::String | Ty::Bool | Ty::Null | Ty::TypeVar(_) => true,
+        Ty::Enum(_) | Ty::EnumVariant(..) => true,
+        // A literal widens to its base primitive.
+        Ty::Literal(literal, ..) => !matches!(literal, baml_base::Literal::Bigint(_)),
+        // `uint8array` has no JSON form in BAML. A `bigint` is a JSON
+        // number of any size there, but `BigInt`'s own serde form is a
+        // `[sign, digits]` pair.
+        Ty::Bigint | Ty::Uint8Array => false,
+        Ty::List(inner) => has_serde(inner, serde),
+        Ty::Map { value, .. } => has_serde(value, serde),
+        Ty::Tuple(items) if items.len() > SERDE_MAX_TUPLE_ARITY => false,
+        Ty::Union(items) | Ty::Tuple(items) => items.iter().all(|item| has_serde(item, serde)),
+        Ty::Class(name, args) => {
+            serde.contains(name) && args.iter().all(|arg| has_serde(arg, serde))
+        }
+        // `baml_bridge::Json` is `serde_json::Value`: its serde form is the
+        // JSON value itself.
+        Ty::TypeAlias(name) if crate::translate_ty::is_canonical_json(name) => true,
+        Ty::TypeAlias(name) => serde.contains(name),
+        // Functions, handles and opaque values have no JSON form.
+        Ty::Media(_)
+        | Ty::Unknown
+        | Ty::Function { .. }
+        | Ty::Future(..)
+        | Ty::Interface(..)
+        | Ty::Type
+        | Ty::Resource
+        | Ty::PromptAst
+        | Ty::Never => false,
     }
 }
 
@@ -375,7 +763,7 @@ fn collect_non_recursive_type_vars<'a>(ty: &'a Ty, self_name: &Name, used: &mut 
             collect_non_recursive_type_vars(key, self_name, used);
             collect_non_recursive_type_vars(value, self_name, used);
         }
-        Ty::Union(items) => items
+        Ty::Union(items) | Ty::Tuple(items) => items
             .iter()
             .for_each(|item| collect_non_recursive_type_vars(item, self_name, used)),
         // A recursive self-reference does not constrain its args' variance,
@@ -389,8 +777,9 @@ fn collect_non_recursive_type_vars<'a>(ty: &'a Ty, self_name: &Name, used: &mut 
     }
 }
 
-/// Collect emitted-class references reachable without crossing `Vec` /
-/// `Map` (heap indirection already breaks the containment cycle there).
+/// Collect emitted class and type-alias references reachable without
+/// crossing `Vec` / `Map` (heap indirection already breaks the containment
+/// cycle there).
 fn non_heap_class_refs<'a>(
     ty: &'a Ty,
     emitted: &HashSet<Name>,
@@ -410,18 +799,16 @@ fn non_heap_class_refs<'a>(
                 non_heap_class_refs(arg, emitted, enums, out);
             }
         }
-        Ty::Union(items) => {
+        Ty::Union(items) | Ty::Tuple(items) => {
             for item in items {
                 non_heap_class_refs(item, emitted, enums, out);
             }
         }
         // Heap-indirected containers end the walk.
         Ty::List(..) | Ty::Map { .. } => {}
-        // Opaque alias references contribute no containment edges: an
-        // in-package non-recursive alias is inlined before it reaches
-        // codegen, and a cross-package alias cannot sit on a class cycle
-        // because package dependencies are acyclic.
-        Ty::TypeAlias(..) => {}
+        // An alias is a node of its own; its edges are what its target
+        // holds inline.
+        Ty::TypeAlias(name) if emitted.contains(name) => out.push(name),
         _ => {}
     }
 }
@@ -519,61 +906,4 @@ fn compute_sccs(edges: &BTreeMap<&Name, Vec<&Name>>) -> HashMap<Name, usize> {
         }
     }
     sccs
-}
-
-/// Rust puts modules and types in one namespace: a namespace segment
-/// whose name equals a type emitted in its parent module is renamed with
-/// a trailing underscore (deterministic, and cascading to descendants).
-fn compute_renames(
-    pool: &SymbolPool,
-    emitted: &HashSet<Name>,
-) -> HashMap<Vec<String>, Vec<String>> {
-    // Types per module path (original routed segments).
-    let mut types_in: HashMap<Vec<String>, HashSet<String>> = HashMap::new();
-    let mut all_paths: HashSet<Vec<String>> = HashSet::new();
-    for (name, symbol) in pool {
-        let path = routing::route(name).segments;
-        for depth in 0..=path.len() {
-            all_paths.insert(path[..depth].to_vec());
-        }
-        if matches!(
-            symbol,
-            Symbol::Class(_) | Symbol::Enum(_) | Symbol::TypeAlias(_)
-        ) && emitted.contains(name)
-        {
-            types_in
-                .entry(path.clone())
-                .or_default()
-                .insert(name.name().to_string());
-        }
-    }
-
-    // Rename each colliding segment, deepest paths inheriting their
-    // ancestors' renames.
-    let mut renames: HashMap<Vec<String>, Vec<String>> = HashMap::new();
-    let mut sorted_paths: Vec<Vec<String>> = all_paths.into_iter().collect();
-    sorted_paths.sort();
-    for path in sorted_paths {
-        let Some((child, parent)) = path.split_last() else {
-            continue;
-        };
-        let renamed_parent = renames
-            .get(parent)
-            .cloned()
-            .unwrap_or_else(|| parent.to_vec());
-        let collides = types_in
-            .get(parent)
-            .is_some_and(|types| types.contains(child));
-        let renamed_child = if collides {
-            format!("{child}_")
-        } else {
-            child.clone()
-        };
-        if collides || renames.contains_key(parent) {
-            let mut renamed = renamed_parent;
-            renamed.push(renamed_child);
-            renames.insert(path, renamed);
-        }
-    }
-    renames
 }

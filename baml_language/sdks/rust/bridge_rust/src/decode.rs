@@ -9,6 +9,7 @@ use prost::Message as _;
 
 use crate::{
     BamlValue, Error, SdkError,
+    error::ThrownValue,
     wire::{
         self, BamlLiteralValue, baml_literal_value::Literal, baml_outbound_value::Value as Out,
     },
@@ -114,24 +115,34 @@ fn literal_to_plain(lit: BamlLiteralValue) -> wire::BamlOutboundValue {
 ///   and trace preserved.
 /// - `panic` becomes [`Error::Panic`] — except exit panics, which
 ///   terminate the process (parity with the other SDKs' hard exit).
+///
+/// An error or panic keeps the value the engine sent
+/// ([`ThrownValue`](crate::error::ThrownValue)), which owns the engine
+/// references it holds; `E` is decoded from a clone of it.
 pub fn decode_result<R: BamlValue, E: BamlValue>(bytes: &[u8]) -> Result<R, Error<E>> {
     let envelope = wire::BamlOutboundResult::decode(bytes)
         .map_err(|e| Error::Sdk(SdkError::new(format!("malformed result envelope: {e}"))))?;
     match envelope.result {
         Some(wire::baml_outbound_result::Result::Ok(value)) => {
+            let _pins = crate::outbound::Pins::of([&value]);
             R::from_baml(value).map_err(Error::Decode)
         }
         Some(wire::baml_outbound_result::Result::Error(err)) => {
             let value = err.value.unwrap_or_default();
-            match E::from_baml(value.clone()) {
-                Ok(thrown) => Err(Error::Thrown {
-                    value: Box::new(thrown),
+            let class_name = class_fqn(&value);
+            let message = render_message(&value);
+            let thrown = ThrownValue::new(value);
+            match thrown.value().decode::<E>() {
+                Ok(declared) => Err(Error::Thrown {
+                    value: Box::new(declared),
                     trace: err.trace,
+                    thrown,
                 }),
                 Err(_) => Err(Error::Runtime {
-                    class_name: class_fqn(&value),
-                    message: render_message(&value),
+                    class_name,
+                    message,
                     trace: err.trace,
+                    thrown,
                 }),
             }
         }
@@ -146,8 +157,10 @@ pub fn decode_result<R: BamlValue, E: BamlValue>(bytes: &[u8]) -> Result<R, Erro
             }
             let value = panic.value.unwrap_or_default();
             Err(Error::Panic {
+                class_name: class_fqn(&value),
                 message: render_message(&value),
                 trace: panic.trace,
+                thrown: ThrownValue::new(value),
             })
         }
         None => Err(Error::Sdk(SdkError::new("empty result envelope"))),
@@ -175,6 +188,11 @@ impl ClassFields {
         match v.value {
             Some(Out::ClassValue(class)) => {
                 if class.name != expected_fqn {
+                    class
+                        .fields
+                        .into_iter()
+                        .filter_map(|entry| entry.value)
+                        .for_each(release);
                     return Err(crate::DecodeError::FqnMismatch {
                         expected: expected_fqn,
                         got: class.name,
@@ -189,10 +207,14 @@ impl ClassFields {
                         .collect(),
                 })
             }
-            _ => Err(crate::DecodeError::WrongType {
-                expected: expected_fqn,
-                got: crate::baml_value::wire_variant_kind(&v),
-            }),
+            _ => {
+                let error = crate::DecodeError::WrongType {
+                    expected: expected_fqn,
+                    got: crate::baml_value::wire_variant_kind(&v),
+                };
+                release(v);
+                Err(error)
+            }
         }
     }
 
@@ -212,6 +234,12 @@ impl ClassFields {
                 }
             }),
         }
+    }
+}
+
+impl Drop for ClassFields {
+    fn drop(&mut self) {
+        self.fields.drain().for_each(|(_, value)| release(value));
     }
 }
 
@@ -247,6 +275,23 @@ pub fn no_union_arm(expected: &'static str, v: &wire::BamlOutboundValue) -> crat
         expected,
         got: crate::baml_value::wire_variant_kind(v),
     }
+}
+
+pub fn refuse_union(expected: &'static str, v: wire::BamlOutboundValue) -> crate::DecodeError {
+    let error = no_union_arm(expected, &v);
+    release(v);
+    error
+}
+
+pub fn release(v: wire::BamlOutboundValue) {
+    crate::outbound::release(v);
+}
+
+pub fn trial<T: BamlValue>(v: &wire::BamlOutboundValue) -> Option<T> {
+    let mut encoder = crate::encode::Encoder::new();
+    let copy = crate::outbound::clone(v, &mut encoder).ok()?;
+    encoder.commit();
+    T::from_baml(copy).ok()
 }
 
 /// The class FQN of an error-arm value, when it is a class instance.

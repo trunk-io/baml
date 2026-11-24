@@ -142,7 +142,7 @@ function openai_images_request_shape() -> string {
                 + `|prompt_has_schema=${text.includes("Return an image output")}`
                 + `|b64=${result.value.base64()}`
                 + `|mime=${result.value.mime_type() ?? "?"}`
-                + `|usage=${result.usage.input_tokens}/${result.usage.output_tokens}`
+                + `|usage=${_images_usage(result.usage, "openai-images", "gpt-image-1")}`
         },
     )
 }
@@ -295,7 +295,7 @@ function openai_images_passthrough() -> string {
                 base_url = mock.base_url(),
                 n = 2,
                 quality = "low",
-                request_body = baml.json.parse(`{"n":3,"quality":null,"partial_images":2}`),
+                request_body = { "n": 3, "quality": null, "partial_images": 2 },
                 headers = { "X-Trace-Id": "abc", "Content-Type": "application/json" },
                 query_params = { "beta": "images v2" },
             );
@@ -435,7 +435,7 @@ test "openai_images_exactly_one_error" {
     )
 }
 
-// An empty data[] is a parse failure, not an empty turn.
+// An empty data[] is an invalid response, not an empty turn.
 function openai_images_no_data_error() -> string {
     let canned = `{"created":1,"data":[]}`;
     root.llm_mock.mock_json_serve(
@@ -447,7 +447,7 @@ function openai_images_no_data_error() -> string {
                 base_url = mock.base_url(),
             );
             ai.Agent.new(client = cl).run(ImagesDraw@spec("a lamp")).value.base64() catch_all (e) {
-                let failed: ai.errors.ParseFailed => failed.raw_output,
+                let failed: ai.errors.InvalidResponse => failed.message,
                 _ => `unexpected error class: ${e.to_string()}`,
             }
         },
@@ -672,9 +672,7 @@ function gateway_images_output_format_mime() -> string {
                 n = 2,
                 size = "1024x1024",
                 seed = 7,
-                request_body = baml.json.parse(
-                    `{"providerOptions":{"blackForestLabs":{"outputFormat":"jpeg"}}}`,
-                ),
+                request_body = { "providerOptions": { "blackForestLabs": { "outputFormat": "jpeg" } } },
             );
             let pictures = ai.Agent.new(client = cl)
                 .run(GatewayDrawSet@spec("a brass desk lamp"))
@@ -737,7 +735,7 @@ function gateway_images_data_url_not_base64() -> string {
                 base_url = mock.base_url(),
             );
             ai.Agent.new(client = cl).run(GatewayDraw@spec("a lamp")).value.base64() catch_all (e) {
-                let failed: ai.errors.ParseFailed => failed.raw_output,
+                let failed: ai.errors.InvalidResponse => failed.message,
                 _ => `unexpected error class: ${e.to_string()}`,
             }
         },
@@ -753,6 +751,16 @@ test "gateway_images_data_url_not_base64" {
 
 // The v4 protocol's `usage` object is surfaced as the turn's usage (sys_llm
 // dropped it), and an unfamiliar `warnings[]` variant must not fail the decode.
+/// `input/output` of the usage a run billed to one image model.
+function _images_usage(
+    usage: ai.events.ModelUsage[],
+    provider: string,
+    model: string,
+) -> string {
+    let u = ai.events.usage_for(usage, ai.events.ModelKey { provider: provider, model: model });
+    `${u?.input_tokens ?? -1}/${u?.output_tokens ?? -1}`
+}
+
 function gateway_images_usage() -> string {
     let canned = `{"images":["aGVsbG8="],"warnings":[{"type":"unsupported","feature":"seed","details":"the provider ignores seed"},{"type":"martian","hue":7}],"usage":{"inputTokens":12,"outputTokens":34,"totalTokens":46}}`;
     root.llm_mock.mock_json_serve(
@@ -765,7 +773,7 @@ function gateway_images_usage() -> string {
             );
             let result = ai.Agent.new(client = cl).run(GatewayDraw@spec("a lamp"));
             `${result.value.base64()}`
-                + `|${result.usage.input_tokens}/${result.usage.output_tokens}`
+                + `|${_images_usage(result.usage, "ai-gateway-images", "bfl/flux-2-pro")}`
         },
     )
 }
@@ -902,7 +910,7 @@ function gateway_images_no_images_error() -> string {
                 base_url = mock.base_url(),
             );
             ai.Agent.new(client = cl).run(GatewayDraw@spec("a lamp")).value.base64() catch_all (e) {
-                let failed: ai.errors.ParseFailed => failed.raw_output,
+                let failed: ai.errors.InvalidResponse => failed.message,
                 _ => `unexpected error class: ${e.to_string()}`,
             }
         },
@@ -976,9 +984,7 @@ function gateway_images_default_endpoint() -> string {
     let cl = vercel.AiGatewayImageClient.new(
         model = "bfl/flux-2-pro",
         api_key = "test-key",
-        request_body = baml.json.parse(
-            `{"n":2,"providerOptions":{"blackForestLabs":{"outputFormat":"jpeg"}}}`,
-        ),
+        request_body = { "n": 2, "providerOptions": { "blackForestLabs": { "outputFormat": "jpeg" } } },
     );
     let req = vercel.internal.gateway_images_render(
         cl,
@@ -1008,13 +1014,13 @@ function _stream_openai_images() -> string {
 
 function openai_images_streaming_unsupported() -> string {
     _stream_openai_images() catch_all (e) {
-        let unsupported: ai.errors.StreamingUnsupported => unsupported.client_id,
+        let unsupported: ai.errors.StreamingUnsupported => unsupported.requested_model,
         _ => "wrong error class",
     }
 }
 
 test "openai_images_streaming_unsupported" {
-    assert.equal(openai_images_streaming_unsupported(), "openai-images/gpt-image-1")
+    assert.equal(openai_images_streaming_unsupported(), "gpt-image-1")
 }
 
 function _stream_gateway_images() -> string {
@@ -1024,7 +1030,7 @@ function _stream_gateway_images() -> string {
 
 function gateway_images_streaming_unsupported() -> string {
     _stream_gateway_images() catch_all (e) {
-        let unsupported: ai.errors.StreamingUnsupported => unsupported.client_id,
+        let unsupported: ai.errors.StreamingUnsupported => unsupported.requested_model,
         _ => "wrong error class",
     }
 }
@@ -1032,7 +1038,7 @@ function gateway_images_streaming_unsupported() -> string {
 test "gateway_images_streaming_unsupported" {
     assert.equal(
         gateway_images_streaming_unsupported(),
-        "ai-gateway-images/bfl/flux-2-pro",
+        "bfl/flux-2-pro",
     )
 }
 

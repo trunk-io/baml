@@ -14,6 +14,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 /**
  * The generated SDK's type map: BAML fully-qualified name (FQN) &harr; generated
@@ -64,6 +66,11 @@ public final class TypeRegistry {
     private static final ConcurrentHashMap<String, ClassEntry> classesByJavaName = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, EnumEntry> enumsByJavaName = new ConcurrentHashMap<>();
 
+    // Classes that cross as an opaque reference ({@link BamlOpaque}): BAML FQN ->
+    // entry (decode), and generated Java binary name -> BAML FQN (type tokens).
+    private static final ConcurrentHashMap<String, OpaqueEntry> opaquesByFqn = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, String> opaqueFqnsByJavaName = new ConcurrentHashMap<>();
+
     // Unions. Forward index (decode): keyed structurally by the union's arm set
     // normalized to a sorted, distinct {@code List<BamlType>} ({@code List.equals}
     // rides {@code BamlType} value equality — order- and duplicate-insensitive,
@@ -76,6 +83,18 @@ public final class TypeRegistry {
     private static final ConcurrentHashMap<String, UnionEntry> unionsByFqn = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, UnionRecordEntry> unionRecordsByJavaName =
             new ConcurrentHashMap<>();
+    private static final Map<String, String> unionAliasFqnByRecordName = new ConcurrentHashMap<>();
+
+    // Recursive aliases: alias FQN -> the exact descriptor of the type it names.
+    // The generator expands a non-recursive alias at every use site, so a
+    // recursive one is the only alias a descriptor names (expanding it would
+    // not terminate). Aliases are transparent, so an encoder that meets one as
+    // a slot reads its body: an empty list under `json` is a `json[]` because
+    // that is the body's list member, and nothing else could say so.
+    private static final ConcurrentHashMap<String, BamlType> aliasBodiesByFqn = new ConcurrentHashMap<>();
+
+    private static final ConcurrentHashMap<BamlType, TupleEntry> tuplesByType = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, TupleEntry> tuplesByJavaName = new ConcurrentHashMap<>();
 
     static {
         // Runtime-owned stdlib types the emitter deliberately does NOT generate
@@ -121,12 +140,28 @@ public final class TypeRegistry {
      */
     public static void registerClass(
             String bamlFqn, String javaClassName, String[] fieldOrder, BamlType[] fieldDescs) {
+        registerClass(bamlFqn, javaClassName, fieldOrder, fieldDescs, null);
+    }
+
+    /**
+     * Register a generated generic class: as above, plus its type parameter
+     * names in declaration order, the order {@link #bindTypeArgs} takes the
+     * arguments in. The encoder substitutes an instance's bound arguments into
+     * the field descriptors that mention them, so a field declared {@code T[]}
+     * is encoded under {@code int[]} once {@code T} is bound.
+     */
+    public static void registerClass(
+            String bamlFqn,
+            String javaClassName,
+            String[] fieldOrder,
+            BamlType[] fieldDescs,
+            String[] typeParams) {
         if (fieldDescs != null && fieldDescs.length != fieldOrder.length) {
             throw new IllegalArgumentException(
                     "class field descriptor length mismatch for " + bamlFqn + ": "
                             + fieldOrder.length + " fields vs " + fieldDescs.length + " descriptors");
         }
-        ClassEntry entry = new ClassEntry(bamlFqn, javaClassName, fieldOrder, fieldDescs);
+        ClassEntry entry = new ClassEntry(bamlFqn, javaClassName, fieldOrder, fieldDescs, typeParams);
         if (classesByFqn.putIfAbsent(bamlFqn, entry) == null) {
             classesByJavaName.putIfAbsent(javaClassName, entry);
         }
@@ -149,6 +184,33 @@ public final class TypeRegistry {
         if (enumsByFqn.putIfAbsent(bamlFqn, entry) == null) {
             enumsByJavaName.putIfAbsent(javaClassName, entry);
         }
+    }
+
+    /**
+     * Register a generated class that crosses as an opaque reference
+     * ({@link BamlOpaque}): it has no fields to register, and decodes from its
+     * handle through the factory its own static initializer binds
+     * ({@link #bindOpaqueFactory}). Idempotent: the first registration of
+     * {@code bamlFqn} wins.
+     */
+    public static void registerOpaqueClass(String bamlFqn, String javaClassName) {
+        if (opaquesByFqn.putIfAbsent(bamlFqn, new OpaqueEntry(javaClassName)) == null) {
+            opaqueFqnsByJavaName.putIfAbsent(javaClassName, bamlFqn);
+        }
+    }
+
+    /**
+     * Bind the private constructor of the registered opaque class
+     * {@code bamlFqn} as its decode factory. Called once from the generated
+     * class's static initializer, the only code that can reach that constructor.
+     */
+    public static void bindOpaqueFactory(
+            String bamlFqn, Function<BamlHandle, ? extends BamlOpaque> factory) {
+        OpaqueEntry entry = opaquesByFqn.get(bamlFqn);
+        if (entry == null) {
+            throw new IllegalStateException(bamlFqn + " is not a registered opaque class");
+        }
+        entry.factory.compareAndSet(null, factory);
     }
 
     /**
@@ -187,6 +249,53 @@ public final class TypeRegistry {
             String aliasFqn, String sealedInterfaceName, BamlType[] armTokens, String[] recordNames) {
         UnionEntry entry = newUnionEntry(sealedInterfaceName, armTokens, recordNames);
         putUnion(unionsByFqn, aliasFqn, entry);
+        for (String recordName : recordNames) {
+            unionAliasFqnByRecordName.putIfAbsent(recordName, aliasFqn);
+        }
+    }
+
+    /**
+     * Register the body of the recursive alias {@code aliasFqn}: the exact
+     * descriptor of the type it names, in which the alias itself (and any other
+     * recursive alias) stays a {@link BamlType#typeAlias} token. Idempotent for
+     * an equal body; a different body for a registered alias is two
+     * declarations claiming one name and throws {@link IllegalStateException}.
+     */
+    public static void registerAliasBody(String aliasFqn, BamlType body) {
+        BamlType existing = aliasBodiesByFqn.putIfAbsent(aliasFqn, body);
+        if (existing != null && !existing.equals(body)) {
+            throw new IllegalStateException(
+                    "conflicting alias registration for '" + aliasFqn + "': already "
+                            + existing + ", refused " + body);
+        }
+    }
+
+    /**
+     * The registered body of the alias {@code alias} names. Every alias a
+     * generated descriptor names is registered with its body, so an unknown one
+     * is a broken invariant and throws {@link IllegalStateException}.
+     */
+    public static BamlType aliasBody(BamlType alias) {
+        if (alias.kind() != BamlType.Kind.TYPE_ALIAS) {
+            throw new IllegalArgumentException("not a type alias: " + alias);
+        }
+        BamlType body = aliasBodiesByFqn.get(alias.fqn());
+        if (body == null) {
+            throw new IllegalStateException(
+                    "the type alias `" + alias.fqn() + "` has no registered body; "
+                            + "regenerate the SDK");
+        }
+        return body;
+    }
+
+    /**
+     * The FQN of the declared alias a union wrapper record belongs to, or
+     * {@code null} for a record of an anonymous union. An alias record's value
+     * has the alias as its type ({@code baml.json.json}), not the structural
+     * type of what it happens to hold.
+     */
+    public static String unionAliasFqn(Object record) {
+        return unionAliasFqnByRecordName.get(record.getClass().getName());
     }
 
     /** Build a {@link UnionEntry} and register its records (unconditional — encode must unwrap any). */
@@ -224,6 +333,35 @@ public final class TypeRegistry {
         }
     }
 
+    /**
+     * Register a generated tuple record: {@code javaRecordName} is the binary
+     * name of the record whose components, in order, are the slots of
+     * {@code tupleType} (a {@link BamlType.Kind#TUPLE} token). Idempotent for
+     * the same record; a second record for one tuple identity, or one record
+     * for two identities, throws {@link IllegalStateException}, since decode
+     * would otherwise silently pick whichever registration won.
+     */
+    public static void registerTuple(String javaRecordName, BamlType tupleType) {
+        if (tupleType.kind() != BamlType.Kind.TUPLE) {
+            throw new IllegalArgumentException("not a tuple type: " + tupleType);
+        }
+        TupleEntry entry = new TupleEntry(javaRecordName, tupleType);
+        TupleEntry byName = tuplesByJavaName.putIfAbsent(javaRecordName, entry);
+        if (byName != null && !byName.tupleType.equals(tupleType)) {
+            throw new IllegalStateException(
+                    "conflicting tuple registration for " + javaRecordName + ": already "
+                            + byName.tupleType + ", refused " + tupleType);
+        }
+        TupleEntry claimed = byName != null ? byName : entry;
+        TupleEntry existing = tuplesByType.putIfAbsent(tupleType, claimed);
+        if (existing != null && !existing.javaRecordName.equals(javaRecordName)) {
+            tuplesByJavaName.remove(javaRecordName, entry);
+            throw new IllegalStateException(
+                    "conflicting tuple registration for " + tupleType + ": already bound to "
+                            + existing.javaRecordName + ", refused rebind to " + javaRecordName);
+        }
+    }
+
     // -- decode (BAML FQN -> generated instance) -----------------------------
 
     /**
@@ -235,6 +373,24 @@ public final class TypeRegistry {
     public static Object constructClass(String bamlFqn, Map<String, Object> fields) {
         ClassEntry entry = classesByFqn.get(bamlFqn);
         return entry == null ? null : entry.instantiate(fields);
+    }
+
+    /** Whether {@code bamlFqn} names a registered class that crosses as an opaque reference. */
+    public static boolean isOpaqueClass(String bamlFqn) {
+        return opaquesByFqn.containsKey(bamlFqn);
+    }
+
+    /**
+     * Wrap {@code handle}, the engine's reference to an instance of the
+     * registered opaque class {@code bamlFqn}, in that class's generated
+     * wrapper. Loading the wrapper class binds its factory.
+     */
+    public static BamlOpaque constructOpaque(String bamlFqn, BamlHandle handle) {
+        OpaqueEntry entry = opaquesByFqn.get(bamlFqn);
+        if (entry == null) {
+            throw new IllegalStateException(bamlFqn + " is not a registered opaque class");
+        }
+        return entry.construct(bamlFqn, handle);
     }
 
     /** Whether {@code bamlFqn} resolves to a registered generated class. */
@@ -262,6 +418,16 @@ public final class TypeRegistry {
     }
 
     /**
+     * The type parameter names, in declaration order, of the registered generic
+     * class {@code bamlFqn}, or {@code null} when it is not registered or not
+     * generic.
+     */
+    public static String[] classTypeParams(String bamlFqn) {
+        ClassEntry entry = classesByFqn.get(bamlFqn);
+        return entry == null ? null : entry.typeParams;
+    }
+
+    /**
      * The per-field type-directed decode descriptors ({@link BamlType}, parallel
      * to {@link #classFieldOrder}) of the registered class {@code bamlFqn}, or
      * {@code null} when it is not registered or was registered without
@@ -282,6 +448,18 @@ public final class TypeRegistry {
     public static Object resolveEnum(String bamlFqn, String wireName) {
         EnumEntry entry = enumsByFqn.get(bamlFqn);
         return entry == null ? null : entry.constantFor(wireName);
+    }
+
+    /**
+     * Construct the generated record registered for the tuple identity
+     * {@code tupleType} from its decoded slot values, in order. Returns
+     * {@code null} when no record is registered for that identity, so the
+     * caller falls back to a list representation. The arity was checked by the
+     * caller; a mismatch here is a broken invariant.
+     */
+    public static Object constructTuple(BamlType tupleType, List<Object> items) {
+        TupleEntry entry = tuplesByType.get(tupleType);
+        return entry == null ? null : entry.instantiate(items);
     }
 
     /**
@@ -373,6 +551,32 @@ public final class TypeRegistry {
     }
 
     /**
+     * The tuple payload for a host object: its registered tuple identity and
+     * its slot values in order, or {@code null} when the object's class is not
+     * a registered generated tuple record. A {@link BamlTupleList} is the tuple
+     * it was received as, its carried tuple type, where the wire can state it.
+     */
+    public static TupleWire tupleWire(Object obj) {
+        if (obj instanceof BamlTupleList received) {
+            return received.tupleType().isStatable()
+                    ? new TupleWire(received.tupleType(), received.slotValues())
+                    : null;
+        }
+        TupleEntry entry = tuplesByJavaName.get(obj.getClass().getName());
+        return entry == null ? null : entry.encode(obj);
+    }
+
+    /**
+     * The tuple identity of the registered generated tuple record
+     * {@code javaClass}, or {@code null} when it is not one. Lets
+     * {@link BamlType#of(Class)} name a tuple record's type.
+     */
+    public static BamlType tupleTypeForJavaClass(Class<?> javaClass) {
+        TupleEntry entry = tuplesByJavaName.get(javaClass.getName());
+        return entry == null ? null : entry.tupleType;
+    }
+
+    /**
      * The class-value wire payload for a host object, or {@code null} when the
      * object's class is not a registered generated class.
      */
@@ -407,7 +611,7 @@ public final class TypeRegistry {
      */
     public static String classFqnForJavaClass(Class<?> javaClass) {
         ClassEntry entry = classesByJavaName.get(javaClass.getName());
-        return entry == null ? null : entry.bamlFqn;
+        return entry == null ? opaqueFqnsByJavaName.get(javaClass.getName()) : entry.bamlFqn;
     }
 
     /**
@@ -523,12 +727,33 @@ public final class TypeRegistry {
         public final Object[] fieldValues;
         /** Declared field descriptors, parallel to the names, or {@code null}. */
         public final BamlType[] fieldDescs;
+        /** The class's type parameter names in declaration order, or {@code null}. */
+        public final String[] typeParams;
 
-        ClassWire(String fqn, String[] fieldNames, Object[] fieldValues, BamlType[] fieldDescs) {
+        ClassWire(
+                String fqn,
+                String[] fieldNames,
+                Object[] fieldValues,
+                BamlType[] fieldDescs,
+                String[] typeParams) {
             this.fqn = fqn;
             this.fieldNames = fieldNames;
             this.fieldValues = fieldValues;
             this.fieldDescs = fieldDescs;
+            this.typeParams = typeParams;
+        }
+    }
+
+    /** A tuple record decomposed for the inbound list payload that states its tuple type. */
+    public static final class TupleWire {
+        /** The record's registered tuple identity, stated on the enclosing value. */
+        public final BamlType type;
+        /** The slot values in position order, read via the component accessors. */
+        public final Object[] items;
+
+        TupleWire(BamlType type, Object[] items) {
+            this.type = type;
+            this.items = items;
         }
     }
 
@@ -547,6 +772,35 @@ public final class TypeRegistry {
 
     // -- entries -------------------------------------------------------------
 
+    private static final class OpaqueEntry {
+        final String javaClassName;
+        final AtomicReference<Function<BamlHandle, ? extends BamlOpaque>> factory =
+                new AtomicReference<>();
+
+        OpaqueEntry(String javaClassName) {
+            this.javaClassName = javaClassName;
+        }
+
+        BamlOpaque construct(String bamlFqn, BamlHandle handle) {
+            if (factory.get() == null) {
+                try {
+                    // Initializing the generated class runs its static block,
+                    // which binds the factory.
+                    Class.forName(javaClassName);
+                } catch (ClassNotFoundException e) {
+                    throw new IllegalStateException(
+                            "generated class not found on the classpath: " + javaClassName, e);
+                }
+            }
+            Function<BamlHandle, ? extends BamlOpaque> bound = factory.get();
+            if (bound == null) {
+                throw new IllegalStateException(
+                        javaClassName + " did not bind its factory for " + bamlFqn);
+            }
+            return bound.apply(handle);
+        }
+    }
+
     private static final class ClassEntry {
         final String bamlFqn;
         final String javaClassName;
@@ -555,6 +809,8 @@ public final class TypeRegistry {
         // null when the class was registered without them (wire-driven decode). An
         // individual entry may be null (that field is decoded wire-driven).
         final BamlType[] fieldDescs;
+        // Type parameter names in declaration order, or null for a non-generic class.
+        final String[] typeParams;
 
         // Lazily resolved (decode/encode reflection). Benign races only re-resolve
         // to the same value; volatile publishes the resolved object safely.
@@ -562,11 +818,17 @@ public final class TypeRegistry {
         private volatile Constructor<?> ctor;
         private volatile Method[] accessors;
 
-        ClassEntry(String bamlFqn, String javaClassName, String[] fieldOrder, BamlType[] fieldDescs) {
+        ClassEntry(
+                String bamlFqn,
+                String javaClassName,
+                String[] fieldOrder,
+                BamlType[] fieldDescs,
+                String[] typeParams) {
             this.bamlFqn = bamlFqn;
             this.javaClassName = javaClassName;
             this.fieldOrder = fieldOrder;
             this.fieldDescs = fieldDescs;
+            this.typeParams = typeParams;
         }
 
         private Class<?> javaClass() {
@@ -636,7 +898,7 @@ public final class TypeRegistry {
                             "failed to read field " + fieldOrder[i] + "() on " + javaClassName, e);
                 }
             }
-            return new ClassWire(bamlFqn, fieldOrder, values, fieldDescs);
+            return new ClassWire(bamlFqn, fieldOrder, values, fieldDescs, typeParams);
         }
 
         private Method[] accessors() {
@@ -836,6 +1098,108 @@ public final class TypeRegistry {
             }
             throw new IllegalStateException(
                     "no single-arg constructor on union record " + recordName);
+        }
+    }
+
+    private static final class TupleEntry {
+        final String javaRecordName;
+        final BamlType tupleType;
+
+        private volatile Constructor<?> ctor;
+        private volatile Method[] accessors;
+
+        TupleEntry(String javaRecordName, BamlType tupleType) {
+            this.javaRecordName = javaRecordName;
+            this.tupleType = tupleType;
+        }
+
+        int arity() {
+            return tupleType.tupleItems().size();
+        }
+
+        Object instantiate(List<Object> items) {
+            if (items.size() != arity()) {
+                throw new IllegalStateException(
+                        "a " + tupleType + " has " + arity() + " slots, not " + items.size());
+            }
+            try {
+                return constructor().newInstance(items.toArray());
+            } catch (ReflectiveOperationException | IllegalArgumentException e) {
+                throw new IllegalStateException(
+                        "failed to construct " + javaRecordName + " from tuple slots", e);
+            }
+        }
+
+        TupleWire encode(Object obj) {
+            Method[] acc = accessors(obj.getClass());
+            Object[] values = new Object[acc.length];
+            for (int i = 0; i < acc.length; i++) {
+                try {
+                    values[i] = acc[i].invoke(obj);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException(
+                            "failed to read slot " + i + " of " + javaRecordName, e);
+                }
+            }
+            return new TupleWire(tupleType, values);
+        }
+
+        private Class<?> javaClass() {
+            try {
+                return Class.forName(javaRecordName);
+            } catch (ClassNotFoundException e) {
+                throw new IllegalStateException(
+                        "generated tuple record not found on the classpath: " + javaRecordName, e);
+            }
+        }
+
+        private Constructor<?> constructor() {
+            Constructor<?> c = ctor;
+            if (c == null) {
+                Class<?> cls = javaClass();
+                Class<?>[] types = componentTypes(cls);
+                try {
+                    c = cls.getConstructor(types);
+                } catch (NoSuchMethodException e) {
+                    throw new IllegalStateException(
+                            "no canonical constructor on tuple record " + javaRecordName, e);
+                }
+                ctor = c;
+            }
+            return c;
+        }
+
+        /** The record's component accessors in slot order (from the object's own class). */
+        private Method[] accessors(Class<?> cls) {
+            Method[] m = accessors;
+            if (m == null) {
+                java.lang.reflect.RecordComponent[] components = recordComponents(cls);
+                m = new Method[components.length];
+                for (int i = 0; i < components.length; i++) {
+                    m[i] = components[i].getAccessor();
+                }
+                accessors = m;
+            }
+            return m;
+        }
+
+        private Class<?>[] componentTypes(Class<?> cls) {
+            java.lang.reflect.RecordComponent[] components = recordComponents(cls);
+            Class<?>[] types = new Class<?>[components.length];
+            for (int i = 0; i < components.length; i++) {
+                types[i] = components[i].getType();
+            }
+            return types;
+        }
+
+        private java.lang.reflect.RecordComponent[] recordComponents(Class<?> cls) {
+            java.lang.reflect.RecordComponent[] components = cls.getRecordComponents();
+            if (components == null || components.length != arity()) {
+                throw new IllegalStateException(
+                        javaRecordName + " is not a record of " + arity() + " components for "
+                                + tupleType);
+            }
+            return components;
         }
     }
 

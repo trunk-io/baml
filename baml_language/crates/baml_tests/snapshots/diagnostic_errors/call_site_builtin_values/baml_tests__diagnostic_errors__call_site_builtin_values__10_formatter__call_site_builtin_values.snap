@@ -42,11 +42,7 @@ function optional_call() -> void {
 
 function specialized_spawn() -> baml.future.Future<int, never> {
     let launch = baml.spawn.__spawn<int, never>;
-    launch(
-        baml.spawn.Plan.new(body = () -> int {
-            1
-        }),
-    )
+    launch(baml.spawn.Plan.new(body = () -> int { 1 }))
 }
 
 function specialized_await_any(futures: baml.future.Future<int, never>[]) -> int {
@@ -63,6 +59,6 @@ function current_package() -> reflect.Package {
 // do not change that.
 function direct_calls() -> reflect.Package {
     log.info("direct");
-    log.info("parenthesized");
+    (log.info)("parenthesized");
     reflect.Package.current()
 }

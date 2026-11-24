@@ -1,0 +1,152 @@
+//! Node's host executor owns the body; this binding owns native recording.
+use std::sync::Mutex;
+
+use bridge_ctypes::baml_bridge::cffi::BamlHandleType;
+use btel_snapshot::host::HostValue;
+use napi::bindgen_prelude::Buffer;
+use napi_derive::napi;
+
+use crate::{errors::bridge_error_to_napi, handle::BamlHandle};
+
+fn host_error(error: bridge_cffi::BridgeError) -> napi::Error {
+    match error {
+        bridge_cffi::BridgeError::InvocationProtocol(message) => {
+            napi::Error::new(napi::Status::InvalidArg, message)
+        }
+        other => bridge_error_to_napi(other),
+    }
+}
+
+#[napi(object)]
+pub struct HostDefinition {
+    pub module: String,
+    pub qualified_name: String,
+    pub source_file: String,
+    pub definition_line: u32,
+    pub wrapper_line: u32,
+    pub display_name: String,
+}
+
+#[napi(object)]
+pub struct HostCallSite {
+    pub source_file: String,
+    pub line: u32,
+}
+
+#[napi(js_name = "_HostExecution")]
+pub struct HostExecution(Mutex<Option<bex_project::HostInvocation>>);
+
+#[napi]
+impl HostExecution {
+    #[napi]
+    pub fn abandon(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    #[napi]
+    pub fn finish(&self, outcome: String, value: Option<String>) -> napi::Result<()> {
+        let outcome = match outcome.as_str() {
+            "ok" => btel_types::InvocationOutcome::Ok,
+            "error" => btel_types::InvocationOutcome::Errored,
+            "cancelled" => btel_types::InvocationOutcome::Cancelled,
+            _ => return Err(napi::Error::from_reason("invalid host outcome")),
+        };
+        if let Some(execution) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let captured = value
+                .filter(|_| execution.wants_value(outcome))
+                .map(|value| capture(&value));
+            execution.finish_with_value(outcome, captured.as_ref());
+        }
+        Ok(())
+    }
+}
+
+#[napi(js_name = "_validateHostOptions")]
+pub fn validate_host_options(options: Option<&BamlHandle>) -> napi::Result<Vec<bool>> {
+    bridge_cffi::host_instrumentation::options(options.map_or(0, BamlHandle::key_u64))
+        .map(|options| {
+            vec![
+                options.inputs == Some(true),
+                options.output == Some(true),
+                options.error == Some(true),
+            ]
+        })
+        .map_err(host_error)
+}
+
+#[napi(js_name = "_beginHostInvocation")]
+pub fn begin_host_invocation(
+    marker: &HostMarker,
+    inherited: Option<&BamlHandle>,
+    caller: HostCallSite,
+    inputs: Option<String>,
+) -> napi::Result<(HostExecution, BamlHandle, Buffer)> {
+    // The definition and options are the marker's, read once when the function
+    // was instrumented: a call reads no runtime state for them.
+    let marker = &marker.marker;
+    let inputs = inputs
+        .filter(|_| marker.options.inputs == Some(true))
+        .map(|value| capture(&value));
+    let (execution, key) = bridge_cffi::host_instrumentation::begin(
+        &marker.definition,
+        inherited.map_or(0, BamlHandle::key_u64),
+        &marker.options,
+        &bex_project::HostCallSite {
+            source_file: caller.source_file,
+            line: caller.line,
+        },
+        inputs.as_ref(),
+    )
+    .map_err(host_error)?;
+    let state = BamlHandle::from_parts(key, BamlHandleType::InvocationState as i32);
+    let cancel = bridge_cffi::host_instrumentation::cancel_token(&execution)
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+    Ok((
+        HostExecution(Mutex::new(Some(execution))),
+        state,
+        cancel.into(),
+    ))
+}
+
+// The adapter supplies a bounded tagged tree of copied data, never a JS object
+// that native conversion would inspect through getters or serializers.
+pub(crate) fn capture(wire: &str) -> HostValue {
+    bridge_cffi::host_capture::decode(wire)
+}
+
+/// The marker of an instrumented function, which the wrapper keeps beside the
+/// function and the bridge reads when the function is registered as a
+/// callback. JavaScript holds it but cannot build or look into one.
+#[napi(js_name = "_HostMarker")]
+pub struct HostMarker {
+    pub(crate) marker: std::sync::Arc<bex_project::HostMarker>,
+}
+
+#[napi(js_name = "_defineHostMarker")]
+pub fn define_host_marker(
+    definition: HostDefinition,
+    options: Option<&BamlHandle>,
+) -> napi::Result<HostMarker> {
+    let marker = bridge_cffi::host_instrumentation::define_marker(
+        bex_project::HostDefinition {
+            language: "typescript".into(),
+            module: definition.module,
+            qualified_name: definition.qualified_name,
+            source_file: definition.source_file,
+            definition_line: definition.definition_line,
+            wrapper_line: definition.wrapper_line,
+            display_name: definition.display_name,
+        },
+        options.map_or(0, BamlHandle::key_u64),
+    )
+    .map_err(host_error)?;
+    Ok(HostMarker { marker })
+}

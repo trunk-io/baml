@@ -1,14 +1,34 @@
 //! Function identity lookup owned by the engine's heap. Dynamic entries are
 //! weak: they never participate in tracing and are repaired/pruned by GC.
 
-use std::collections::HashMap;
-
 use bex_vm_types::{HeapPtr, Object, PermitProof};
 use btel_types::{FunctionId, FunctionMetadata, FunctionMetadataTable};
 
-use crate::{BexHeap, CollectionLevel, Generation};
+use crate::BexHeap;
 
 impl BexHeap {
+    /// Named manual operations share a definition across all VMs in this heap.
+    pub fn named_span_function_id(
+        &self,
+        name: &str,
+    ) -> Result<FunctionId, btel_types::FunctionIdExhausted> {
+        let mut definitions = self
+            .span_definitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(id) = definitions.get(name) {
+            return Ok(*id);
+        }
+        let id = self.functions.allocate_id()?;
+        definitions.insert(name.to_owned(), id);
+        Ok(id)
+    }
+
+    /// Reserve a definition identity without constructing a VM heap object.
+    pub fn allocate_host_function_id(&self) -> Result<FunctionId, btel_types::FunctionIdExhausted> {
+        self.functions.allocate_id()
+    }
+
     /// Register a function before publishing its first telemetry reference.
     /// Return its stable ID after registration; unsupported functions return None.
     ///
@@ -82,18 +102,13 @@ impl BexHeap {
 
     /// Only called at the GC safepoint, after tracing/finalizer preservation
     /// and before swapping or destroying from-space. Never marks anything live.
-    pub(crate) fn update_function_lookup(
-        &self,
-        forwarding: &HashMap<HeapPtr, HeapPtr>,
-        level: CollectionLevel,
-    ) {
+    pub(crate) fn update_function_lookup(&self) {
         self.functions.retain_dynamic(|ptr| {
-            if let Some(&new_ptr) = forwarding.get(ptr) {
-                *ptr = new_ptr;
-                true
-            } else {
-                level == CollectionLevel::Minor && self.generation_of(*ptr) == Generation::Gen2
-            }
+            let Some(new_ptr) = self.forwarded(*ptr) else {
+                return false;
+            };
+            *ptr = new_ptr;
+            true
         });
     }
 }

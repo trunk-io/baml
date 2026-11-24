@@ -7,7 +7,7 @@ class Arg {
     /// can never collide with a declared parameter or named-argument key.
     name: string,
     /// The parameter's type.
-    type: reflect.Type,
+    type: root.Type,
 }
 
 /// Metadata baked into reflected schema definitions.
@@ -92,22 +92,117 @@ class Diagnostic {
     related_info: DiagnosticRelatedInfo[],
 }
 
-/// Common identity-preserving surface shared by every reflection kind view.
+/// Any `type` value: `reflect.Type` itself and every reflection kind view.
+///
+/// Every reflection API that takes a type takes a `TypeView`, so a kind view
+/// goes wherever a `reflect.Type` does, and so does a class of your own that
+/// implements `TypeView`: the API calls its `as_type()`. The shared type
+/// operations below are default methods that run on the wrapped `type` value;
+/// `reflect.Type` declares its own. `to_string` comes from `baml.ToString`,
+/// which `reflect.Type` and every kind view implement.
 interface TypeView {
     /// The `type` value this view wraps, restoring the unnarrowed type.
-    function as_type(self) -> reflect.Type throws never;
+    /// `reflect.Type` returns itself.
+    function as_type(self) -> root.Type throws never;
+
+    /// Render deterministic canonical BAML source for this definition.
+    /// Non-equivalent declarations with the same display name are rejected.
+    function to_baml(self) -> string throws root.errors.CompilationError {
+        self.as_type().to_baml()
+    }
+
+    /// Construct an array type whose element is this type.
+    function array(self) -> root.Array throws never {
+        self.as_type().array()
+    }
+
+    /// Construct the canonical union of this type and null.
+    function optional(self) -> root.Union throws never {
+        self.as_type().optional()
+    }
+
+    /// Returns the precise kind view of this type value.
+    function kind(self) -> root.TypeKind throws never {
+        self.as_type().kind()
+    }
+
+    /// Pair this type value with schema metadata without changing its identity.
+    function meta(
+        self,
+        alias: string? = null,
+        description: string? = null,
+        docstring: string? = null,
+        other: map<string, string>? = null,
+    ) -> root.WithMeta<root.Type> throws never {
+        self.as_type().meta(
+            alias = alias,
+            description = description,
+            docstring = docstring,
+            other = other,
+        )
+    }
+
+    /// True iff this type nominally implements the interface `other`. Any
+    /// concrete type can: a class, an enum, a primitive, a list, a map, ...
+    /// `other` pins the interface's associated types (an omitted one takes
+    /// its default), and only an implementation with exactly those matches:
+    /// see `reflect.Type.implements`. `false` when `other` is not an
+    /// interface, or when this type is not a concrete type.
+    function implements(self, other: root.TypeView) -> bool throws never {
+        self.as_type().implements(other)
+    }
+
+    /// Reverse of `implements`: `iface.implemented_by(t)` is the same as
+    /// `t.implements(iface)`. `false` when this type is not an interface, or
+    /// when `other` is not a concrete type.
+    function implemented_by(self, other: root.TypeView) -> bool throws never {
+        self.as_type().implemented_by(other)
+    }
+}
+
+/// (internal) `types` with each view replaced by the `type` value it views.
+///
+/// Every API that takes a `TypeView` converts it in BAML before it reaches a
+/// native, so a class of the caller's own that implements `TypeView` runs
+/// its own `as_type()`, and the native only ever receives `type` values.
+function _as_types(types: root.TypeView[]) -> root.Type[] throws never {
+    let out: root.Type[] = [];
+    // NOTE: an index loop, not `for ... in`; see `AnyClass.get_field`.
+    for (let i = 0; i < types.length(); i += 1) {
+        out.push(types[i].as_type());
+    }
+    out
+}
+
+/// (internal) Class field rows with each view replaced by the `type` value it
+/// views, and each `WithMeta` row kept as is; see `_as_types`.
+function _as_field_rows(
+    fields: map<string, root.TypeView | root.WithMeta<root.Type>>,
+) -> map<string, root.Type | root.WithMeta<root.Type>> throws never {
+    let rows: map<string, root.Type | root.WithMeta<root.Type>> = {};
+    // NOTE: an index loop, not `for ... in`; see `AnyClass.get_field`.
+    let names = fields.keys();
+    for (let i = 0; i < names.length(); i += 1) {
+        let name = names[i];
+        rows[name] = match (fields[name]) {
+            let view: root.TypeView => view.as_type(),
+            let row => row,
+        };
+    }
+    rows
 }
 
 /// The closed set of reflection views for a runtime `type` value.
-type TypeKind = reflect.class.Type
-    | reflect.enum.Type
-    | reflect.union.Type
-    | reflect.literal.Type
-    | reflect.array.Type
-    | reflect.map.Type
-    | reflect.interface.Type
-    | reflect.primitive.Type
-    | reflect.function.Type;
+type TypeKind = root.Class
+    | root.Enum
+    | root.Union
+    | root.Literal
+    | root.Array
+    | root.Map
+    | root.Interface
+    | root.Primitive
+    | root.Function
+    | root.Tuple;
 
 /// Implemented automatically by every function value, with its parameter
 /// list erased. `Returns` pins the held function's return type and `Throws`
@@ -128,30 +223,89 @@ interface AnyFunction {
 /// Narrow an opaque value with `let value: reflect.AnyClass = opaque else { ... }`
 /// before using this surface. Ordinary class instances implement it, including
 /// runtime-minted classes. Of the sealed reflection-kind views, only
-/// `reflect.class.Type` implements it.
+/// `reflect.Class` implements it.
 interface AnyClass {
-    /// Read a field as `T`. A missing field returns `null`; use `has_field` to
-    /// distinguish that case from a present field whose value is null.
-    function get<T>(self, name: string) -> T? throws reflect.errors.TypeMismatch {
+    /// Read the field called `name` as `T`. Read a nullable field with a
+    /// nullable `T` (`get<int?>`). `find` returns `null` for a missing field
+    /// instead of throwing.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if this value's class declares no field
+    ///   called `name`.
+    /// - `reflect.errors.TypeMismatch` if the field's value is not a `T`.
+    function get<T>(self, name: string) -> T
+        throws root.errors.NotFound | root.errors.TypeMismatch
+    {
+        if (!self.has_field(name)) {
+            // NOTE: `_to_string_impl()`, not `to_string()`; see `name`.
+            throw root.errors.NotFound {
+                message: "no field named "
+                    + name
+                    + " on "
+                    + root.Type.of_value(self)._to_string_impl(),
+            };
+        }
+        root.Class.get_field<T>(self, name) catch (e) {
+            root.errors.CompilationError { message } => {
+                throw root.errors.TypeMismatch { message: message };
+            },
+        }
+    }
+
+    /// Read the field called `name` as `T`, or `null` if this value's class
+    /// declares no such field. A present field holding null also reads as
+    /// `null`; use `has_field` or `get<T?>` to tell the two apart.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.TypeMismatch` if the field's value is not a `T`.
+    function find<T>(self, name: string) -> T? throws root.errors.TypeMismatch {
         if (!self.has_field(name)) {
             return null;
         }
-        // NOTE: spelled with `let … else` rather than `self.get_field(name)?.value<T>()`
-        // because an optional-chained call does not thread `T` to the callee.
-        let field: reflect.class.Field = self.get_field(name) else {
-            return null;
-        };
-        field.value<T>()
+        self.get<T>(name) catch (e) {
+            root.errors.NotFound => null,
+        }
     }
 
-    /// Return a value-bound field handle, or `null` when no such field exists.
-    function get_field(self, name: string) -> reflect.class.Field? throws never {
-        let class_type: reflect.class.Type = reflect.Type.of_value(self).as_class() else {
+    /// A value-bound handle to the field called `name`. `find_field` returns
+    /// `null` instead of throwing.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if this value's class declares no field
+    ///   called `name`.
+    function get_field(self, name: string) -> root.class.Field throws root.errors.NotFound {
+        let field: root.class.Field = self.find_field(name) else {
+            // NOTE: `_to_string_impl()`, not `to_string()`; see `name`.
+            throw root.errors.NotFound {
+                message: "no field named "
+                    + name
+                    + " on "
+                    + root.Type.of_value(self)._to_string_impl(),
+            };
+        };
+        field
+    }
+
+    /// A value-bound handle to the field called `name`, or `null` if this
+    /// value's class declares no such field.
+    function find_field(self, name: string) -> root.class.Field? throws never {
+        let class_type: root.Class = root.Type.of_value(self).as_class() else {
             return null;
         };
-        for (let field in class_type.fields()) {
+        // NOTE: an index loop, not `for (let field in ...)`. `reflect` must not
+        // depend on `baml`, and code generation looks up the list's `Iterable`
+        // implementation (declared in `baml`) only in the packages this one
+        // depends on: a `for ... in` over a list type-checks here but fails to
+        // compile. Methods on the list itself (`length`, indexing) need no
+        // dependency.
+        let class_fields = class_type.fields();
+        for (let i = 0; i < class_fields.length(); i += 1) {
+            let field = class_fields[i];
             if (field.name == name) {
-                return reflect.class.Field {
+                return root.class.Field {
                     name: field.name,
                     type: field.type,
                     meta: field.meta,
@@ -165,10 +319,13 @@ interface AnyClass {
     /// Whether this value's runtime class declares a field called `name`.
     /// `false` when the runtime type is not a class.
     function has_field(self, name: string) -> bool throws never {
-        let class_type: reflect.class.Type = reflect.Type.of_value(self).as_class() else {
+        let class_type: root.Class = root.Type.of_value(self).as_class() else {
             return false;
         };
-        for (let field in class_type.fields()) {
+        // NOTE: an index loop, not `for ... in`; see `get_field`.
+        let class_fields = class_type.fields();
+        for (let i = 0; i < class_fields.length(); i += 1) {
+            let field = class_fields[i];
             if (field.name == name) {
                 return true;
             }
@@ -177,41 +334,52 @@ interface AnyClass {
     }
 
     /// Reflected fields bound to this value for `Field.value<T>()`.
-    function list_fields(self) -> reflect.class.Field[] throws never {
-        let class_type: reflect.class.Type = reflect.Type.of_value(self).as_class() else {
+    function list_fields(self) -> root.class.Field[] throws never {
+        let class_type: root.Class = root.Type.of_value(self).as_class() else {
             return [];
         };
-        let fields: reflect.class.Field[] = [];
-        for (let field in class_type.fields()) {
-            fields.push(
-                reflect.class.Field {
-                    name: field.name,
-                    type: field.type,
-                    meta: field.meta,
-                    _owner: self,
-                },
-            )
+        let fields: root.class.Field[] = [];
+        // NOTE: an index loop, not `for ... in`; see `get_field`.
+        let class_fields = class_type.fields();
+        for (let i = 0; i < class_fields.length(); i += 1) {
+            let field = class_fields[i];
+            fields.push(root.class.Field {
+                name: field.name,
+                type: field.type,
+                meta: field.meta,
+                _owner: self,
+            })
         }
         fields
     }
 
     /// The rendered name of this value's concrete runtime type.
     function name(self) -> string throws never {
-        reflect.Type.of_value(self).to_string()
+        // NOTE: `_to_string_impl()`, not `to_string()`. `reflect.Type`'s
+        // `baml.ToString` implementation is declared in `baml`, which `reflect`
+        // must not depend on, so here `to_string()` would silently bind to the
+        // interface's default body instead and crash the VM.
+        root.Type.of_value(self)._to_string_impl()
     }
 
     /// This value's concrete runtime type.
-    function type(self) -> reflect.Type throws never {
-        reflect.Type.of_value(self)
+    function type(self) -> root.Type throws never {
+        root.Type.of_value(self)
     }
 
     /// The class declaration's schema metadata, or empty metadata when the
     /// runtime type is not a class.
-    function attributes(self) -> reflect.Meta throws never {
-        let class_type: reflect.class.Type = reflect.Type.of_value(self).as_class() else {
-            return reflect.Meta { alias: null, description: null, docstring: null, other: {}, skip: false };
+    function attributes(self) -> root.Meta throws never {
+        let class_type: root.Class = root.Type.of_value(self).as_class() else {
+            return root.Meta {
+                alias: null,
+                description: null,
+                docstring: null,
+                other: {},
+                skip: false,
+            };
         };
-        class_type.meta()
+        class_type.metadata()
     }
 }
 
@@ -230,9 +398,9 @@ class Signature {
     /// Named/optional parameters, keyed by parameter name.
     opts: map<string, Arg>,
     /// The return type.
-    returns: reflect.Type,
+    returns: root.Type,
     /// The error type; `never` if the function cannot throw.
-    errors: reflect.Type,
+    errors: root.Type,
     /// The function's doc comment (joined `///` lines); null when absent.
     docstring: string?,
 }
@@ -246,13 +414,13 @@ class Signature {
 /// callee's whole function type and the value's type.
 class InvalidArgumentError {
     argument: string,
-    expected: reflect.Type,
-    got: reflect.Type,
+    expected: root.Type,
+    got: root.Type,
 }
 
 /// One-shot compiler output consumed by Package._finish or Session._finish.
 class CompileArtifact {
-    _inner: unknown,
+    @@rust_type
 }
 
 /// An isolated runtime-compiled package.
@@ -278,46 +446,83 @@ class Package {
     /// - `reflect.errors.CompilationError` if the source does not compile.
     /// - anything the package's top-level initialization throws, which is why
     ///   the clause is `unknown`.
-    function compile(
-        files: map<string, string>,
-        packages: map<string, Package> = {},
-    ) -> Package throws unknown {
+    function compile(files: map<string, string>, packages: map<string, Package> = {}) -> Package
+        throws unknown
+    {
         let artifact = Package._compile(files, packages);
         Package._finish(artifact, packages)
     }
 
-    function _compile(
-        files: map<string, string>,
-        packages: map<string, Package>,
-    ) -> CompileArtifact throws reflect.errors.CompilationError {
+    function _compile(files: map<string, string>, packages: map<string, Package>) -> CompileArtifact
+        throws root.errors.CompilationError
+    {
         $rust_io_function
     }
 
     //baml:mut_vm
     //baml:may_yield
-    function _finish(
-        artifact: CompileArtifact,
-        packages: map<string, Package>,
-    ) -> Package throws unknown {
+    function _finish(artifact: CompileArtifact, packages: map<string, Package>) -> Package
+        throws unknown
+    {
         $rust_function
     }
 
-    /// The exported class called `name`, or `null` if the package exports none.
+    /// The exported class called `name`. A name the package exports as some
+    /// other kind of declaration is a miss. `find_class` returns `null`
+    /// instead of throwing.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if the package exports no class called
+    ///   `name`.
     //baml:mut_vm
-    function get_class(self, name: string) -> reflect.class.Type? throws never {
+    function get_class(self, name: string) -> root.Class throws root.errors.NotFound {
+        $rust_function
+    }
+
+    /// The exported class called `name`, or `null` if the package exports
+    /// none.
+    //baml:mut_vm
+    function find_class(self, name: string) -> root.Class? throws never {
+        $rust_function
+    }
+
+    /// The exported enum called `name`. A name the package exports as some
+    /// other kind of declaration is a miss. `find_enum` returns `null` instead
+    /// of throwing.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if the package exports no enum called
+    ///   `name`.
+    //baml:mut_vm
+    function get_enum(self, name: string) -> root.Enum throws root.errors.NotFound {
         $rust_function
     }
 
     /// The exported enum called `name`, or `null` if the package exports none.
     //baml:mut_vm
-    function get_enum(self, name: string) -> reflect.enum.Type? throws never {
+    function find_enum(self, name: string) -> root.Enum? throws never {
+        $rust_function
+    }
+
+    /// The exported interface called `name`. A name the package exports as
+    /// some other kind of declaration is a miss. `find_interface` returns
+    /// `null` instead of throwing.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if the package exports no interface called
+    ///   `name`.
+    //baml:mut_vm
+    function get_interface(self, name: string) -> root.Interface throws root.errors.NotFound {
         $rust_function
     }
 
     /// The exported interface called `name`, or `null` if the package exports
     /// none.
     //baml:mut_vm
-    function get_interface(self, name: string) -> reflect.interface.Type? throws never {
+    function find_interface(self, name: string) -> root.Interface? throws never {
         $rust_function
     }
 
@@ -328,43 +533,113 @@ class Package {
     /// one type), any other type is declared as an alias, and every
     /// declaration a mounted type reaches is exported under its own name. A
     /// name this package already exports is refused.
+    function with_types(self, types: map<string, root.TypeView>) -> Package
+        throws root.errors.CompilationError
+    {
+        let mounted: map<string, root.Type> = {};
+        // NOTE: an index loop, not `for ... in`; see `AnyClass.get_field`.
+        let names = types.keys();
+        for (let i = 0; i < names.length(); i += 1) {
+            mounted[names[i]] = types[names[i]].as_type();
+        }
+        self._with_types(mounted)
+    }
+
+    /// (internal) Internal native backing `with_types`; every type is a `type`
+    /// value.
     //baml:mut_vm
-    function with_types(
-        self,
-        types: map<string, reflect.Type | reflect.TypeView>,
-    ) -> Package throws reflect.errors.CompilationError {
+    function _with_types(self, types: map<string, root.Type>) -> Package
+        throws root.errors.CompilationError
+    {
         $rust_function
     }
     //baml:mut_vm
     /// Extract an exported function through an ordinary function-type contract.
+    /// `find_function` returns `null` for a missing name instead of throwing.
     ///
     /// A lookup by name has nowhere to put type arguments, so an unspecialized
     /// generic function is refused here.
-    function get_function<F>(self, name: string) -> F? throws reflect.errors.CompilationError {
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if the package exports no function called
+    ///   `name`.
+    /// - `reflect.errors.CompilationError` if the function exists but is not
+    ///   an `F`, or is an unspecialized generic.
+    function get_function<F>(self, name: string) -> F
+        throws root.errors.NotFound | root.errors.CompilationError
+    {
+        $rust_function
+    }
+
+    //baml:mut_vm
+    /// Extract an exported function through an ordinary function-type
+    /// contract, or `null` if the package exports no function called `name`.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.CompilationError` if the function exists but is not
+    ///   an `F`, or is an unspecialized generic.
+    function find_function<F>(self, name: string) -> F? throws root.errors.CompilationError {
         $rust_function
     }
 
     /// Exported class types, keyed by package-local name.
     //baml:mut_vm
-    function classes(self) -> map<string, reflect.class.Type> throws never {
+    function classes(self) -> map<string, root.Class> throws never {
         $rust_function
     }
 
     /// Exported enum types, keyed by package-local name.
     //baml:mut_vm
-    function enums(self) -> map<string, reflect.enum.Type> throws never {
+    function enums(self) -> map<string, root.Enum> throws never {
         $rust_function
     }
 
     /// Exported interface types, keyed by package-local name.
     //baml:mut_vm
-    function interfaces(self) -> map<string, reflect.interface.Type> throws never {
+    function interfaces(self) -> map<string, root.Interface> throws never {
         $rust_function
     }
 
     //baml:mut_vm
     /// Exported free-function signatures, keyed by package-local name.
-    function functions(self) -> map<string, reflect.function.Type> throws never {
+    function functions(self) -> map<string, root.Function> throws never {
+        $rust_function
+    }
+
+    //baml:mut_vm
+    /// Global variables and `client` declarations, keyed by package-local
+    /// name, with their current values. Each value is the global itself,
+    /// shared with every reader: changing its contents is visible everywhere.
+    function globals(self) -> map<string, unknown> throws never {
+        $rust_function
+    }
+
+    //baml:mut_vm
+    /// The value of the global variable or `client` declaration called
+    /// `name`, as `T`. `find_global` returns `null` for a missing name instead
+    /// of throwing.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.NotFound` if the package has no global called `name`.
+    /// - `reflect.errors.TypeMismatch` if the global's value is not a `T`.
+    function get_global<T>(self, name: string) -> T
+        throws root.errors.NotFound | root.errors.TypeMismatch
+    {
+        $rust_function
+    }
+
+    //baml:mut_vm
+    /// The value of the global called `name` as `T`, or `null` if the package
+    /// has none. With a nullable `T`, a global holding `null` also reads as
+    /// `null`; use `get_global` to tell the two apart.
+    ///
+    /// # Throws
+    ///
+    /// - `reflect.errors.TypeMismatch` if the global's value is not a `T`.
+    function find_global<T>(self, name: string) -> T? throws root.errors.TypeMismatch {
         $rust_function
     }
 
@@ -393,16 +668,14 @@ class Session {
     /// # Throws
     ///
     /// - `reflect.errors.CompilationError` if the dependencies do not resolve.
-    function new(
-        packages: map<string, Package> = {},
-    ) -> Session throws reflect.errors.CompilationError {
+    function new(packages: map<string, Package> = {}) -> Session
+        throws root.errors.CompilationError
+    {
         Session._new(packages)
     }
 
     //baml:mut_vm
-    function _new(
-        packages: map<string, Package>,
-    ) -> Session throws reflect.errors.CompilationError {
+    function _new(packages: map<string, Package>) -> Session throws root.errors.CompilationError {
         $rust_function
     }
 
@@ -418,25 +691,23 @@ class Session {
     /// - `reflect.errors.CompilationError` if `source` does not compile.
     /// - `reflect.errors.EvaluationError` if it compiles but throws when run.
     /// - `reflect.errors.SessionBusy` if the session is already evaluating.
-    function eval<T>(
-        self,
-        source: string,
-    ) -> T throws reflect.errors.CompilationError | reflect.errors.EvaluationError | reflect.errors.SessionBusy {
+    function eval<T>(self, source: string) -> T
+        throws root.errors.CompilationError | root.errors.EvaluationError | root.errors.SessionBusy
+    {
         let artifact = self._compile<T>(source);
         self._finish<T>(artifact) catch (cause) {
             _ => {
-                throw reflect.errors.EvaluationError {
-          message: _render_cause(cause),
-          cause: cause,
-        }
-            }
+                throw root.errors.EvaluationError {
+                    message: _render_cause(cause),
+                    cause: cause,
+                };
+            },
         }
     }
 
-    function _compile<T>(
-        self,
-        source: string,
-    ) -> CompileArtifact throws reflect.errors.CompilationError | reflect.errors.SessionBusy {
+    function _compile<T>(self, source: string) -> CompileArtifact
+        throws root.errors.CompilationError | root.errors.SessionBusy
+    {
         $rust_io_function
     }
 
@@ -486,9 +757,8 @@ function signature(f: AnyFunction) -> Signature throws never {
 /// `reflect.errors.CompilationError`).
 //baml:mut_vm
 //baml:may_yield
-function call_any<R, E>(
-    f: AnyFunction<Returns = R, Throws = E>,
-    args: map<string, unknown>,
-) -> R throws E | InvalidArgumentError | reflect.errors.CompilationError {
+function call_any<R, E>(f: AnyFunction<Returns = R, Throws = E>, args: map<string, unknown>) -> R
+    throws E | InvalidArgumentError | root.errors.CompilationError
+{
     $rust_function
 }

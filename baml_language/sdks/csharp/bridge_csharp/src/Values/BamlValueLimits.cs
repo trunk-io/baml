@@ -7,6 +7,8 @@ internal static class BamlValueLimits
     internal const int MaxBytes = 64 * 1024 * 1024;
     internal const int MaxNodes = 2_000_000;
 
+    internal const int MaxNativeTupleArity = 7;
+
     internal static void RequireBytes(long length, string path, Type clrType)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -17,7 +19,8 @@ internal static class BamlValueLimits
                 clrType,
                 "dynamic value",
                 path,
-                $"The value at {path} exceeds the {MaxBytes}-byte BAML limit.");
+                $"The value at {path} exceeds the {MaxBytes}-byte BAML limit.",
+                fault: BamlTypeMappingFault.ExceedsLimit);
         }
     }
 
@@ -29,7 +32,8 @@ internal static class BamlValueLimits
                 clrType,
                 "dynamic value",
                 path,
-                $"The collection at {path} exceeds the {MaxCollectionItems}-item BAML limit.");
+                $"The collection at {path} exceeds the {MaxCollectionItems}-item BAML limit.",
+                fault: BamlTypeMappingFault.ExceedsLimit);
         }
     }
 
@@ -60,6 +64,14 @@ internal static class BamlValueLimits
                 Visit(values[index], $"{path}[{index}]", depth + 1, ref nodes);
             }
         }
+        else if (value.Kind == BamlValueKind.Tuple)
+        {
+            IReadOnlyList<BamlValue> values = value.ReadTupleValues();
+            for (int index = 0; index < values.Count; index++)
+            {
+                Visit(values[index], $"{path}[{index}]", depth + 1, ref nodes);
+            }
+        }
         else if (value.Kind == BamlValueKind.Map)
         {
             foreach ((string key, BamlValue child) in value.ReadMapValues())
@@ -85,7 +97,8 @@ internal static class BamlValueLimits
             typeof(BamlValue),
             "dynamic value",
             path,
-            $"The BAML value exceeded {limit}.");
+            $"The BAML value exceeded {limit}.",
+            fault: BamlTypeMappingFault.ExceedsLimit);
 }
 
 internal sealed class BamlDecodeBudget

@@ -3,7 +3,7 @@ use std::{fmt, num::NonZeroU64};
 
 use btel_processor::{AggregateDelta, Publisher};
 use btel_records::SpanRecord;
-use btel_settings::{encoding, publisher as settings};
+use btel_settings::publisher as settings;
 use btel_snapshot::Snapshot;
 pub use btel_types::RecordingId;
 use btel_types::TelemetryId;
@@ -12,9 +12,6 @@ pub use settings::RecordingConfig;
 use web_time::Instant;
 
 use crate::{ConversionBuffer, proto};
-
-/// `RecordingFile.errors`, written from pre-encoded bytes after the rest.
-const ERRORS_FIELD: u32 = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordingError {
@@ -81,13 +78,22 @@ pub struct ProcessRecording {
     pub info: btel_types::ProcessInfo,
     /// The project's sources, a `map<path, content>` snapshot.
     pub sources: Option<Snapshot>,
+    /// Canonical launch context snapshot; absence means unavailable.
+    pub context: Option<Snapshot>,
     pub exit: std::sync::Arc<btel_types::ProcessExitSlot>,
+    /// The linked program the engine runs.
+    pub program_id: Option<[u8; 16]>,
+    /// The build of the program's own package.
+    pub build: Option<btel_types::BuildRecord>,
 }
 
 struct ProcessHeader {
     info: btel_types::ProcessInfo,
-    source: Option<proto::SnapshotId>,
+    source: Option<proto::CasId>,
+    context: Option<proto::CasId>,
     exit: std::sync::Arc<btel_types::ProcessExitSlot>,
+    program_id: Option<[u8; 16]>,
+    build: Option<proto::Build>,
 }
 
 /// Sink-independent encoding, capture deduplication and recording sequencing.
@@ -165,14 +171,21 @@ impl RecordingBuilder {
     /// end marker reports `exit` when the host set it before shutdown.
     #[must_use]
     pub fn with_process(mut self, process: ProcessRecording) -> Self {
-        let source = process.sources.as_ref().map(crate::snapshot_id);
+        let source = process.sources.as_ref().map(crate::cas_id);
         if let Some(sources) = process.sources {
             self.pending_captures.push(sources);
+        }
+        let context = process.context.as_ref().map(crate::cas_id);
+        if let Some(context) = process.context {
+            self.pending_captures.push(context);
         }
         self.process = Some(ProcessHeader {
             info: process.info,
             source,
+            context,
             exit: process.exit,
+            program_id: process.program_id,
+            build: process.build.as_ref().map(build),
         });
         self
     }
@@ -204,7 +217,7 @@ impl RecordingBuilder {
         // allocate a worst-case span buffer. Reserve once for the whole batch.
         let records = self.pending_span_reservation.max(1);
         let bytes = records
-            .checked_mul(encoding::MAX_EVENT_BYTES)
+            .checked_mul(btel_core::recording::frame::MAX_EVENT_BYTES)
             .ok_or(RecordingError::EncodingTooLarge)?;
         self.reserve_encoding(bytes)?;
         self.span_credit = records;
@@ -215,7 +228,7 @@ impl RecordingBuilder {
         self.span_credit = 0;
         self.pending_span_reservation = 0;
     }
-    fn seal(&mut self, end: bool) -> Result<Option<SealedFile>, RecordingError> {
+    fn seal(&mut self, sealing: Sealing) -> Result<Option<SealedFile>, RecordingError> {
         self.clear_batch();
         if self.ended {
             return if self.buffer.is_empty() {
@@ -224,18 +237,60 @@ impl RecordingBuilder {
                 Err(RecordingError::InputAfterEnd)
             };
         }
-        // The terminal file exists even when nothing else is pending.
-        if !end && self.buffer.is_empty() {
-            return Ok(None);
-        }
+        let end = match sealing {
+            Sealing::Pending if self.buffer.is_empty() => return Ok(None),
+            Sealing::Pending | Sealing::Carrier => false,
+            Sealing::End => true,
+        };
         let sequence = self
             .next_sequence
             .ok_or(RecordingError::SequenceExhausted)?;
         let ready = self.buffer.take();
+        let process_exit = end
+            .then(|| self.process.as_ref().and_then(|p| p.exit.get()))
+            .flatten();
+        let identity = self.process.as_ref();
+        let platform = identity.filter(|p| !p.info.os.is_empty() || !p.info.arch.is_empty());
         let mut file = proto::RecordingFile {
             header: Some(proto::RecordingHeader {
-                format_major: encoding::FORMAT_MAJOR,
-                format_minor: self.buffer.spans.format_minor(),
+                format_major: btel_core::recording::FORMAT_MAJOR,
+                format_minor: self
+                    .buffer
+                    .spans
+                    .format_minor()
+                    .max(if self.process.is_some() {
+                        btel_core::recording::minor::PROCESS_CONTEXT
+                    } else {
+                        0
+                    })
+                    .max(
+                        if process_exit
+                            .is_some_and(|exit| exit.status == btel_types::ProcessStatus::Unknown)
+                        {
+                            btel_core::recording::minor::UNKNOWN_PROCESS_OUTCOME
+                        } else {
+                            0
+                        },
+                    )
+                    .max(if defines_model_invoke(&ready.definitions) {
+                        btel_core::recording::minor::MODEL_USAGE
+                    } else {
+                        0
+                    })
+                    .max(
+                        if identity.is_some_and(|p| p.program_id.is_some() || p.build.is_some())
+                            || defines_package_identity(&ready.definitions)
+                        {
+                            btel_core::recording::minor::PACKAGE_IDENTITY
+                        } else {
+                            0
+                        },
+                    )
+                    .max(if platform.is_some() {
+                        btel_core::recording::minor::PROCESS_PLATFORM
+                    } else {
+                        0
+                    }),
                 recording_id: self.id.as_bytes().to_vec(),
                 source_snapshot_id: self.source_snapshot_id.map(|id| id.to_vec()),
                 process_id: self.process.as_ref().map(|p| p.info.process_id.to_vec()),
@@ -251,6 +306,11 @@ impl RecordingBuilder {
                     .as_ref()
                     .map(|p| p.info.started_at_unix_ns),
                 source_cas_id: self.process.as_ref().and_then(|p| p.source),
+                initial_context_cas_id: self.process.as_ref().and_then(|p| p.context),
+                program_id: identity.and_then(|p| p.program_id).map(|id| id.to_vec()),
+                build: identity.and_then(|p| p.build.clone()),
+                os: platform.map(|p| p.info.os.clone()),
+                arch: platform.map(|p| p.info.arch.clone()),
             }),
             sequence: sequence.get(),
             definitions: Some(ready.definitions),
@@ -258,29 +318,24 @@ impl RecordingBuilder {
             spans: self.buffer.spans.is_empty().then(proto::SpanBatch::default),
             clock_states: Some(ready.clock_states),
             end: end.then(|| proto::RecordingEnd {
-                process_end: self
-                    .process
-                    .as_ref()
-                    .and_then(|p| p.exit.get())
-                    .map(|exit| proto::ProcessEnd {
-                        status: match exit.status {
-                            btel_types::ProcessStatus::Success => proto::ProcessStatus::Success,
-                            btel_types::ProcessStatus::Error => proto::ProcessStatus::Error,
-                            btel_types::ProcessStatus::Panicked => proto::ProcessStatus::Panicked,
-                        } as i32,
-                        at_unix_ns: exit.at_unix_ns,
-                    }),
+                process_end: process_exit.map(|exit| proto::ProcessEnd {
+                    status: match exit.status {
+                        btel_types::ProcessStatus::Unknown => proto::ProcessStatus::Unknown,
+                        btel_types::ProcessStatus::Success => proto::ProcessStatus::Success,
+                        btel_types::ProcessStatus::Error => proto::ProcessStatus::Error,
+                        btel_types::ProcessStatus::Panicked => proto::ProcessStatus::Panicked,
+                    } as i32,
+                    at_unix_ns: exit.at_unix_ns,
+                }),
             }),
             // Appended below from its pre-encoded body.
             errors: None,
-            // Only read now: cost comes from network spans.
-            usage: None,
         };
         // Absent without exceptions, so error-free files keep their bytes.
         let errors_len = if ready.errors.is_empty() {
             0
         } else {
-            prost::encoding::key_len(ERRORS_FIELD)
+            prost::encoding::key_len(btel_core::recording::field::recording_file::ERRORS)
                 + prost::encoding::encoded_len_varint(ready.errors.len() as u64)
                 + ready.errors.len()
         };
@@ -306,7 +361,7 @@ impl RecordingBuilder {
         file.encode_raw(&mut bytes);
         if errors_len != 0 {
             prost::encoding::encode_key(
-                ERRORS_FIELD,
+                btel_core::recording::field::recording_file::ERRORS,
                 prost::encoding::WireType::LengthDelimited,
                 &mut bytes,
             );
@@ -324,7 +379,8 @@ impl RecordingBuilder {
         Ok(Some(sealed))
     }
     /// Drain every batch after input chunk recycling, regardless of file sealing.
-    /// Holding capture slots until sealing can exhaust the VM's snapshot pool.
+    /// Captures held here stopped counting against the VM's capture budget
+    /// when the processor took them; draining returns their storage sooner.
     /// Dropping this iterator releases any remaining owners, including on unwind.
     pub fn take_snapshots(&mut self) -> impl Iterator<Item = Snapshot> + '_ {
         self.pending_captures.drain(..)
@@ -338,11 +394,22 @@ impl RecordingBuilder {
             if !self.buffer.is_empty() {
                 self.buffer.observe_unsettled_clocks(false);
             }
-            let file = self.seal(false)?;
+            let file = self.seal(Sealing::Pending)?;
             self.deadline = None;
             return Ok(file);
         }
         Ok(None)
+    }
+    /// Seal consumed input into a file even when nothing is pending, so that
+    /// a file exists to carry captures. Otherwise as `Self::flush_recording`.
+    pub fn flush_carrier(&mut self) -> Result<Option<SealedFile>, RecordingError> {
+        self.clear_batch();
+        if !self.buffer.is_empty() {
+            self.buffer.observe_unsettled_clocks(false);
+        }
+        let file = self.seal(Sealing::Carrier)?;
+        self.deadline = None;
+        Ok(file)
     }
     /// Seal consumed input now. Missing references do not block emission;
     /// readers resolve them later. Not recording completion: subsequent input
@@ -365,10 +432,14 @@ impl RecordingBuilder {
     /// `Self::flush_recording`.
     pub fn end_recording(&mut self) -> Result<Option<SealedFile>, RecordingError> {
         if self.ended {
-            return self.seal(false);
+            return self.seal(Sealing::Pending);
         }
         let settled = self.buffer.observe_unsettled_clocks(true);
-        let file = self.seal(settled)?;
+        let file = self.seal(if settled {
+            Sealing::End
+        } else {
+            Sealing::Pending
+        })?;
         self.ended = settled;
         self.deadline = None;
         Ok(file)
@@ -391,7 +462,7 @@ impl RecordingBuilder {
             // variable-length strings; later completion writes use that credit.
             let bytes = self
                 .span_credit
-                .checked_mul(encoding::MAX_EVENT_BYTES)
+                .checked_mul(btel_core::recording::frame::MAX_EVENT_BYTES)
                 .and_then(|bytes| bytes.checked_add(strings))
                 .ok_or(RecordingError::EncodingTooLarge);
             let bytes = terminal(bytes);
@@ -589,7 +660,62 @@ impl<F: FnMut(SealedFile), C: FnMut(Snapshot)> Publisher<Snapshot, Snapshot>
     }
 }
 
+/// What a sealed file is for.
+#[derive(Clone, Copy)]
+enum Sealing {
+    /// Pending input; no file when there is none.
+    Pending,
+    /// A file even with nothing pending, to carry captures.
+    Carrier,
+    /// The terminal file, which exists even with nothing pending.
+    End,
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+
+fn build(record: &btel_types::BuildRecord) -> proto::Build {
+    proto::Build {
+        build_id: record.build_id.to_vec(),
+        timestamp_unix_ns: record.timestamp_unix_ns,
+        origin: record.origin.as_str().to_owned(),
+        git: record.git.as_ref().map(|git| proto::GitInfo {
+            remote: git.remote.clone(),
+            hash: git.hash.as_bytes().to_vec(),
+            dirty: git.dirty,
+            branch: git.branch.clone(),
+            package_path: git.package_path.clone(),
+        }),
+        source_hash: record.source_hash.to_vec(),
+        compilation_unit_hash: record.compilation_unit_hash.to_vec(),
+    }
+}
+
+fn defines_package_identity(definitions: &proto::Definitions) -> bool {
+    defines(definitions, |metadata| {
+        metadata.compilation_unit_hash.is_some()
+    })
+}
+
+fn defines(
+    definitions: &proto::Definitions,
+    has: impl Fn(&proto::FunctionMetadata) -> bool,
+) -> bool {
+    definitions.functions.iter().any(|function| {
+        matches!(
+            &function.resolution,
+            Some(proto::function_definition::Resolution::Metadata(metadata)) if has(metadata)
+        )
+    })
+}
+
+fn defines_model_invoke(definitions: &proto::Definitions) -> bool {
+    definitions.functions.iter().any(|function| {
+        matches!(
+            &function.resolution,
+            Some(proto::function_definition::Resolution::Metadata(metadata)) if metadata.model_invoke
+        )
+    })
+}

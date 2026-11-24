@@ -5,8 +5,18 @@ enum Mode {
     Span,
 }
 
-/// Per-invocation capture overrides: true captures, false disables capture,
-/// and null inherits automatic behavior. Explicit values override function policy.
+/// Per-invocation capture requests: true requests capture; false and null add
+/// no request. Applicable function-policy requests still capture; false is not
+/// a privacy veto. Requests do not propagate to descendant invocations.
+/// By default, the innermost span a thrown error or a panic escapes records
+/// that error, unless it passes `error = false`; the spans the error then
+/// unwinds through record only that they failed. `error = true` records it at
+/// that span too. An LLM function's default policy requests its inputs,
+/// output and error, so `false` and `trace.empty_span()` do not leave them
+/// out; use `@trace.redact`, `trace.timing()` or `trace.hidden()`. A cancelled span records only that
+/// it was cancelled.
+/// `http_bodies = false` in `baml.toml` overrides every option here: no error
+/// value is recorded, since an error can quote a response body.
 class Capture {
     inputs: bool?,
     output: bool?,
@@ -36,13 +46,11 @@ class ContextOptions {
 /// Equality includes the recording scope, not just its local span number.
 /// There is no public constructor, component access, or serialization API.
 class SpanId {
-    _handle: $rust_type,
+    @@rust_type("SpanId")
 }
 
 /// Immutable, reusable tracing options. Builders leave their receiver unchanged.
 class Options {
-    _handle: $rust_type,
-
     /// Compose a shallow patch without reading ambient context.
     //baml:mut_vm
     function context(
@@ -59,14 +67,19 @@ class Options {
         $rust_function
     }
 
-    /// Select Span mode and replace all three capture overrides.
-    function span(
-        self,
-        inputs: bool? = null,
-        output: bool? = null,
-        error: bool? = null,
-    ) -> Options throws never {
+    /// Select Span mode and replace all three capture requests, by default
+    /// with requests for inputs, output and error, as `trace.span` does.
+    function span(self, inputs: bool? = true, output: bool? = true, error: bool? = true) -> Options
+        throws never
+    {
         self._span(inputs, output, error)
+    }
+
+    /// Select Span mode without requesting value capture: the span records
+    /// no inputs, no output and no error.
+    /// Applicable function-policy requests still capture values.
+    function empty_span(self) -> Options throws never {
+        self._span(false, false, false)
     }
 
     //baml:mut_vm
@@ -87,12 +100,12 @@ class Options {
     function reserve(self) -> ReservedSpan throws never {
         $rust_function
     }
+
+    @@rust_type("TraceOptions")
 }
 
 /// A single-use reservation. Inspection remains available after attachment.
 class ReservedSpan {
-    _handle: $rust_type,
-
     //baml:mut_vm
     function id(self) -> SpanId throws never {
         $rust_function
@@ -103,6 +116,8 @@ class ReservedSpan {
     function inspect(self) -> Settings throws never {
         $rust_function
     }
+
+    @@rust_type("ReservedSpan")
 }
 
 function options(mode: Mode? = null) -> Options throws never {
@@ -126,13 +141,22 @@ function timing() -> Options throws never {
     $rust_function
 }
 
-/// Record this invocation individually, with optional value capture overrides.
-function span(
-    inputs: bool? = null,
-    output: bool? = null,
-    error: bool? = null,
-) -> Options throws never {
+/// Record this invocation individually, capturing its inputs, output and error
+/// by default: a span asked for by name shows what went in and what came out.
+/// Pass `inputs = false`, `output = false` or `error = false` to leave one
+/// out, or use `empty_span` to record the invocation alone. A value that must
+/// never be recorded is withheld with `@trace.redact` wherever it is captured.
+function span(inputs: bool? = true, output: bool? = true, error: bool? = true) -> Options
+    throws never
+{
     _span(inputs, output, error)
+}
+
+/// Record this invocation individually without requesting value capture:
+/// the span records no inputs, no output and no error.
+/// Applicable function-policy requests still capture values.
+function empty_span() -> Options throws never {
+    _span(false, false, false)
 }
 
 //baml:mut_vm
@@ -166,5 +190,105 @@ function context(
 /// Read a detached snapshot of the current invocation, even with tracing off.
 //baml:mut_vm
 function current_context() -> Context throws never {
+    $rust_function
+}
+
+/// An invalid span target, parent, or activation of a closed span.
+class SpanError {
+    message: string,
+}
+
+/// An operation whose lifetime the code that starts it owns, instead of one
+/// function call's: for work that begins in one call and ends in another, such
+/// as a stream that is pulled step by step, or an agent run spanning many
+/// model turns. It is a span like a traced function call's, nested under the
+/// span active where it starts (or `parent`).
+///
+/// Start it with `trace.start_span`, run each piece of its work inside it with
+/// `run`, and end it once with `finish`, `fail`, `fail_with_context` or
+/// `close`. Inputs are captured at creation. The first ending wins; `close`
+/// makes no claim about the outcome.
+class Span {
+    //baml:mut_vm
+    function id(self) -> SpanId? throws never {
+        $rust_function
+    }
+
+    //baml:mut_vm
+    function is_closed(self) -> bool throws never {
+        $rust_function
+    }
+
+    /// Record a successful output and end the operation.
+    //baml:mut_vm
+    function finish<T>(self, value: T) -> void throws never {
+        $rust_function
+    }
+
+    /// Record an error value and end the operation. Does not throw that value.
+    //baml:mut_vm
+    function fail<E>(self, error: E) -> void throws never {
+        $rust_function
+    }
+
+    /// Record an error with its existing baml.errors.Context and end the operation.
+    //baml:mut_vm
+    //baml:fallible
+    function fail_with_context<E>(self, error: E, context: baml.errors.Context) -> void
+        throws never
+    {
+        $rust_function
+    }
+
+    /// End without asserting success, failure, or cancellation.
+    //baml:mut_vm
+    function close(self) -> void throws never {
+        $rust_function
+    }
+
+    /// Execute with this operation as the parent, using its context without completing it.
+    //baml:trace_passthrough
+    function run<T, E>(self, body: () -> T throws E) -> T throws E | SpanError {
+        self._activate();
+        body()
+    }
+
+    /// (internal) Make this operation the active span for the rest of the
+    /// calling frame, which `run` scopes to its body.
+    //baml:mut_vm
+    function _activate(self) -> void throws SpanError {
+        $rust_function
+    }
+
+    @@rust_type
+}
+
+/// Start an operation associated with a name or an existing function value.
+/// Creating it does not invoke the function or change the caller's active span.
+//baml:mut_vm
+function start_span(
+    target: string | reflect.AnyFunction,
+    inputs: map<string, unknown>? = null,
+    parent: Span? = null,
+    metadata: map<string, string | int | float | bool | null> = {},
+    distinct_id: string? = null,
+) -> Span throws SpanError {
+    $rust_function
+}
+
+/// Internal: read this pass-through invocation's effective tracing controls.
+//baml:mut_vm
+//baml:fallible
+function _passthrough() -> Options | ReservedSpan throws never {
+    $rust_function
+}
+
+/// Internal: create the operation using an already-claimed reservation, if any.
+//baml:mut_vm
+function _create_span(
+    target: string | reflect.AnyFunction,
+    inputs: map<string, unknown>,
+    config: Options | ReservedSpan,
+) -> Span throws SpanError {
     $rust_function
 }

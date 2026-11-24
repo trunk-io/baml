@@ -1,10 +1,8 @@
 //! `baml.crypto` ciphers and hashes (`$rust_function`).
 //!
 //! The AES-GCM-SIV ciphers are backed by the `aes-gcm-siv` crate and `Sha256` by
-//! the `sha2` crate. Every class here keeps its runtime state in an opaque
-//! `$rust_type` field, which puts that state out of BAML's reach: no BAML
-//! expression produces a `$rust_type`, so the class constructor is the only way
-//! to build one.
+//! the `sha2` crate. Every class here is a `@@rust_type` class, which puts its
+//! state out of BAML's reach: only the class's own functions create one.
 //!
 //! Crate types that share a name with the BAML class wrapping them are written
 //! out in full (`aes_gcm_siv::Aes256GcmSiv`, `sha2::Sha256`) so they are never
@@ -28,15 +26,13 @@
 //! # Hashes
 //!
 //! A hasher instance holds its compression state behind a mutex. Feeding and
-//! finishing both need `&mut` on the hasher, but a BAML value is shared as an
-//! immutable `Object::RustData`, so mutation has to go through interior
-//! mutability, and concurrent `update` calls on one hasher across `spawn` fibers
-//! must be serialized rather than racing on the compression state.
+//! finishing both need `&mut` on the hasher, but a native reaches the state
+//! through a shared borrow of the instance, so mutation has to go through
+//! interior mutability, and concurrent `update` calls on one hasher across
+//! `spawn` fibers must be serialized rather than racing on the compression
+//! state.
 
-use std::{
-    any::Any,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::sync::Arc;
 
 use aes_gcm_siv::aead::{
     Aead, AeadCore, KeyInit, Payload,
@@ -56,11 +52,11 @@ use super::{
 };
 use crate::{
     BexVm,
-    errors::{VmBamlError, VmInternalError, VmRustFnError},
+    errors::{VmBamlError, VmRustFnError},
 };
 
 /// Fully-qualified name of the class thrown when a ciphertext is rejected.
-const DECRYPTION_FAILURE_FQN: &str = "baml.crypto.DecryptionFailure";
+const DECRYPTION_FAILURE: baml_base::LangItem = crate::lang_items::BAML_CRYPTO_DECRYPTION_FAILURE;
 
 /// The per-algorithm facts the shared seal and open paths report on.
 ///
@@ -248,11 +244,7 @@ fn open_error(vm: &mut BexVm, algorithm: &str, err: OpenError) -> VmRustFnError 
         OpenError::Invalid(e) => return e,
         OpenError::Rejected(reason) => reason,
     };
-    let Some(class_ptr) = vm.lookup_type_by_fqn(DECRYPTION_FAILURE_FQN) else {
-        return VmRustFnError::InternalError(VmInternalError::MissingNativeFunction {
-            name: DECRYPTION_FAILURE_FQN.to_string(),
-        });
-    };
+    let class_ptr = vm.lang_object(DECRYPTION_FAILURE);
     let algorithm = Value::object(vm.alloc_string(algorithm.to_string()));
     let reason = Value::object(vm.alloc_string(reason));
     VmRustFnError::thrown_fresh(Value::object(
@@ -278,18 +270,16 @@ macro_rules! impl_aead_class {
         impl $class_trait for PackageBamlImpl {
             fn new(vm: &mut BexVm, key: &[u8]) -> Result<Value, VmRustFnError> {
                 let cipher: $cipher = build_cipher(&$algorithm, key)?;
-                let state: Arc<dyn Any + Send + Sync> = Arc::new(cipher);
-                Ok(copy::crypto::$class { _cipher: state }.to_value(vm))
+                Ok(copy::crypto::$class {
+                    payload: Arc::new(cipher),
+                }
+                .to_value(vm))
             }
         }
 
-        #[expect(
-            clippy::used_underscore_items,
-            reason = "the `_cipher` view accessor is generated from the private BAML field"
-        )]
         impl $aead_trait for PackageBamlImpl {
             fn encrypt(
-                vm: &BexVm,
+                _vm: &BexVm,
                 cipher: &view::crypto::$class<'_>,
                 nonce: &[u8],
                 plaintext: &[u8],
@@ -297,7 +287,7 @@ macro_rules! impl_aead_class {
             ) -> Result<Vec<u8>, VmRustFnError> {
                 seal(
                     &$algorithm,
-                    cipher._cipher::<$cipher>(vm),
+                    cipher.payload().as_ref(),
                     nonce,
                     plaintext,
                     aad,
@@ -317,15 +307,9 @@ macro_rules! impl_aead_class {
                 // borrow.
                 let opened = {
                     let view = view::crypto::$class {
-                        instance: vm.as_instance(cipher)?,
+                        instance: vm.as_rust_instance(cipher)?,
                     };
-                    open(
-                        &$algorithm,
-                        view._cipher::<$cipher>(vm),
-                        nonce,
-                        ciphertext,
-                        aad,
-                    )
+                    open(&$algorithm, view.payload().as_ref(), nonce, ciphertext, aad)
                 };
                 opened.map_err(|e| open_error(vm, $algorithm.name, e))
             }
@@ -366,45 +350,28 @@ impl_aead_class!(
 // Sha256
 // =========================================================================
 
-/// Lock a hasher's state, recovering from a poisoned mutex.
-///
-/// A panic can only reach the mutex through `sha2`'s own compression, which does
-/// not panic, so poisoning means the process is already unwinding. Recovering
-/// keeps a panicking fiber from turning every other holder of the same hasher
-/// into a second panic; the state is a partial digest either way, and a partial
-/// digest is exactly what an interrupted `update` sequence should leave behind.
-fn lock_hasher<'v>(
-    hasher: &view::crypto::Sha256<'_>,
-    vm: &'v BexVm,
-) -> std::sync::MutexGuard<'v, sha2::Sha256> {
-    #[expect(
-        clippy::used_underscore_items,
-        reason = "the `_state` view accessor is generated from the private BAML field"
-    )]
-    hasher
-        ._state::<Mutex<sha2::Sha256>>(vm)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
+// A hasher's state is the VM's own (`OwnedState`): a deep copy of a hasher
+// is a second, independent digest in progress.
 
 impl BamlClassCryptoSha256 for PackageBamlImpl {
     fn new(vm: &mut BexVm) -> Value {
-        let state: Arc<dyn Any + Send + Sync> = Arc::new(Mutex::new(sha2::Sha256::new()));
-        copy::crypto::Sha256 { _state: state }.to_value(vm)
+        copy::crypto::Sha256 {
+            payload: Box::new(bex_vm_types::OwnedState::new(sha2::Sha256::new())),
+        }
+        .to_value(vm)
     }
 }
 
 impl BamlClassCryptoHasher_for_Sha256 for PackageBamlImpl {
-    fn update(vm: &BexVm, hasher: &view::crypto::Sha256<'_>, data: &[u8]) {
-        lock_hasher(hasher, vm).update(data);
+    fn update(_vm: &BexVm, hasher: &view::crypto::Sha256<'_>, data: &[u8]) {
+        hasher.payload().lock().update(data);
     }
 
-    fn finish(vm: &BexVm, hasher: &view::crypto::Sha256<'_>) -> Vec<u8> {
+    fn finish(_vm: &BexVm, hasher: &view::crypto::Sha256<'_>) -> Vec<u8> {
         // `finalize_reset` rather than `finalize` because the BAML contract says
         // `finish` leaves the hasher ready for a new message. `finalize` would
-        // need to consume the hasher, which the shared `Object::RustData` behind
-        // `_state` cannot give up.
-        lock_hasher(hasher, vm).finalize_reset().to_vec()
+        // need to consume the hasher, which the instance cannot give up.
+        hasher.payload().lock().finalize_reset().to_vec()
     }
 }
 

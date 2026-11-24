@@ -58,9 +58,6 @@ export namespace baml_bridge {
                 /** InboundValue tyValue */
                 tyValue?: (baml_bridge.cffi.v1.IBamlTy|null);
 
-                /** InboundValue tyDefValue */
-                tyDefValue?: (baml_bridge.cffi.v1.IBamlTyDef|null);
-
                 /** InboundValue mediaValue */
                 mediaValue?: (baml_bridge.cffi.v1.IBamlValueMedia|null);
 
@@ -119,9 +116,6 @@ export namespace baml_bridge {
                 /** InboundValue tyValue. */
                 public tyValue?: (baml_bridge.cffi.v1.IBamlTy|null);
 
-                /** InboundValue tyDefValue. */
-                public tyDefValue?: (baml_bridge.cffi.v1.IBamlTyDef|null);
-
                 /** InboundValue mediaValue. */
                 public mediaValue?: (baml_bridge.cffi.v1.IBamlValueMedia|null);
 
@@ -132,7 +126,7 @@ export namespace baml_bridge {
                 public jsNumberValue?: (number|null);
 
                 /** InboundValue value. */
-                public value?: ("stringValue"|"intValue"|"floatValue"|"boolValue"|"listValue"|"mapValue"|"classValue"|"enumValue"|"handle"|"uint8arrayValue"|"bigintValue"|"tyValue"|"tyDefValue"|"mediaValue"|"promptAstValue"|"jsNumberValue");
+                public value?: ("stringValue"|"intValue"|"floatValue"|"boolValue"|"listValue"|"mapValue"|"classValue"|"enumValue"|"handle"|"uint8arrayValue"|"bigintValue"|"tyValue"|"mediaValue"|"promptAstValue"|"jsNumberValue");
 
                 /**
                  * Creates a new InboundValue instance using the specified properties.
@@ -738,9 +732,6 @@ export namespace baml_bridge {
 
                 /** BamlTyArg typeValue */
                 typeValue?: (baml_bridge.cffi.v1.IBamlTy|null);
-
-                /** BamlTyArg typeDefinition */
-                typeDefinition?: (baml_bridge.cffi.v1.IBamlTyDef|null);
             }
 
             /** Represents a BamlTyArg. */
@@ -757,9 +748,6 @@ export namespace baml_bridge {
 
                 /** BamlTyArg typeValue. */
                 public typeValue?: (baml_bridge.cffi.v1.IBamlTy|null);
-
-                /** BamlTyArg typeDefinition. */
-                public typeDefinition?: (baml_bridge.cffi.v1.IBamlTyDef|null);
 
                 /**
                  * Creates a new BamlTyArg instance using the specified properties.
@@ -856,6 +844,9 @@ export namespace baml_bridge {
 
                 /** CallFunctionArgs functionHandle */
                 functionHandle?: (number|Long|null);
+
+                /** CallFunctionArgs invocation */
+                invocation?: (baml_bridge.cffi.v1.IInvocationOptions|null);
             }
 
             /** Represents a CallFunctionArgs. */
@@ -881,6 +872,9 @@ export namespace baml_bridge {
 
                 /** CallFunctionArgs functionHandle. */
                 public functionHandle?: (number|Long|null);
+
+                /** CallFunctionArgs invocation. */
+                public invocation?: (baml_bridge.cffi.v1.IInvocationOptions|null);
 
                 /** CallFunctionArgs callTarget. */
                 public callTarget?: ("functionName"|"functionHandle");
@@ -957,6 +951,492 @@ export namespace baml_bridge {
 
                 /**
                  * Gets the default type url for CallFunctionArgs
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of an InvocationOptions. */
+            interface IInvocationOptions {
+
+                /** InvocationOptions trace */
+                trace?: (baml_bridge.cffi.v1.ITraceSelection|null);
+
+                /** InvocationOptions cancel */
+                cancel?: (baml_bridge.cffi.v1.IInboundValue|null);
+
+                /** InvocationOptions deadlineNs */
+                deadlineNs?: (number|Long|null);
+
+                /** InvocationOptions inheritedState */
+                inheritedState?: (number|Long|null);
+
+                /** InvocationOptions hostEnvironment */
+                hostEnvironment?: (number|Long|null);
+            }
+
+            /** Represents an InvocationOptions. */
+            class InvocationOptions implements IInvocationOptions {
+
+                /**
+                 * Constructs a new InvocationOptions.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IInvocationOptions);
+
+                /** InvocationOptions trace. */
+                public trace?: (baml_bridge.cffi.v1.ITraceSelection|null);
+
+                /** InvocationOptions cancel. */
+                public cancel?: (baml_bridge.cffi.v1.IInboundValue|null);
+
+                /** InvocationOptions deadlineNs. */
+                public deadlineNs?: (number|Long|null);
+
+                /** InvocationOptions inheritedState. */
+                public inheritedState: (number|Long);
+
+                /** InvocationOptions hostEnvironment. */
+                public hostEnvironment: (number|Long);
+
+                /**
+                 * Creates a new InvocationOptions instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns InvocationOptions instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IInvocationOptions): baml_bridge.cffi.v1.InvocationOptions;
+
+                /**
+                 * Encodes the specified InvocationOptions message. Does not implicitly {@link baml_bridge.cffi.v1.InvocationOptions.verify|verify} messages.
+                 * @param message InvocationOptions message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IInvocationOptions, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified InvocationOptions message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.InvocationOptions.verify|verify} messages.
+                 * @param message InvocationOptions message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IInvocationOptions, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes an InvocationOptions message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns InvocationOptions
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.InvocationOptions;
+
+                /**
+                 * Decodes an InvocationOptions message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns InvocationOptions
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.InvocationOptions;
+
+                /**
+                 * Verifies an InvocationOptions message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates an InvocationOptions message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns InvocationOptions
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.InvocationOptions;
+
+                /**
+                 * Creates a plain object from an InvocationOptions message. Also converts values to other types if specified.
+                 * @param message InvocationOptions
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.InvocationOptions, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this InvocationOptions to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for InvocationOptions
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of a TraceSelection. */
+            interface ITraceSelection {
+
+                /** TraceSelection options */
+                options?: (baml_bridge.cffi.v1.ITraceOptions|null);
+
+                /** TraceSelection reservation */
+                reservation?: (number|Long|null);
+            }
+
+            /** Represents a TraceSelection. */
+            class TraceSelection implements ITraceSelection {
+
+                /**
+                 * Constructs a new TraceSelection.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.ITraceSelection);
+
+                /** TraceSelection options. */
+                public options?: (baml_bridge.cffi.v1.ITraceOptions|null);
+
+                /** TraceSelection reservation. */
+                public reservation?: (number|Long|null);
+
+                /** TraceSelection selection. */
+                public selection?: ("options"|"reservation");
+
+                /**
+                 * Creates a new TraceSelection instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns TraceSelection instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.ITraceSelection): baml_bridge.cffi.v1.TraceSelection;
+
+                /**
+                 * Encodes the specified TraceSelection message. Does not implicitly {@link baml_bridge.cffi.v1.TraceSelection.verify|verify} messages.
+                 * @param message TraceSelection message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.ITraceSelection, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified TraceSelection message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.TraceSelection.verify|verify} messages.
+                 * @param message TraceSelection message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.ITraceSelection, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a TraceSelection message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns TraceSelection
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.TraceSelection;
+
+                /**
+                 * Decodes a TraceSelection message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns TraceSelection
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.TraceSelection;
+
+                /**
+                 * Verifies a TraceSelection message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a TraceSelection message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns TraceSelection
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.TraceSelection;
+
+                /**
+                 * Creates a plain object from a TraceSelection message. Also converts values to other types if specified.
+                 * @param message TraceSelection
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.TraceSelection, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this TraceSelection to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for TraceSelection
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of a TraceOptions. */
+            interface ITraceOptions {
+
+                /** TraceOptions mode */
+                mode?: (baml_bridge.cffi.v1.TraceMode|null);
+
+                /** TraceOptions inputs */
+                inputs?: (boolean|null);
+
+                /** TraceOptions output */
+                output?: (boolean|null);
+
+                /** TraceOptions error */
+                error?: (boolean|null);
+
+                /** TraceOptions distinctId */
+                distinctId?: (string|null);
+
+                /** TraceOptions metadata */
+                metadata?: ({ [k: string]: baml_bridge.cffi.v1.ITraceMetadataValue }|null);
+            }
+
+            /** Represents a TraceOptions. */
+            class TraceOptions implements ITraceOptions {
+
+                /**
+                 * Constructs a new TraceOptions.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.ITraceOptions);
+
+                /** TraceOptions mode. */
+                public mode?: (baml_bridge.cffi.v1.TraceMode|null);
+
+                /** TraceOptions inputs. */
+                public inputs?: (boolean|null);
+
+                /** TraceOptions output. */
+                public output?: (boolean|null);
+
+                /** TraceOptions error. */
+                public error?: (boolean|null);
+
+                /** TraceOptions distinctId. */
+                public distinctId?: (string|null);
+
+                /** TraceOptions metadata. */
+                public metadata: { [k: string]: baml_bridge.cffi.v1.ITraceMetadataValue };
+
+                /**
+                 * Creates a new TraceOptions instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns TraceOptions instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.ITraceOptions): baml_bridge.cffi.v1.TraceOptions;
+
+                /**
+                 * Encodes the specified TraceOptions message. Does not implicitly {@link baml_bridge.cffi.v1.TraceOptions.verify|verify} messages.
+                 * @param message TraceOptions message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.ITraceOptions, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified TraceOptions message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.TraceOptions.verify|verify} messages.
+                 * @param message TraceOptions message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.ITraceOptions, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a TraceOptions message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns TraceOptions
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.TraceOptions;
+
+                /**
+                 * Decodes a TraceOptions message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns TraceOptions
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.TraceOptions;
+
+                /**
+                 * Verifies a TraceOptions message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a TraceOptions message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns TraceOptions
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.TraceOptions;
+
+                /**
+                 * Creates a plain object from a TraceOptions message. Also converts values to other types if specified.
+                 * @param message TraceOptions
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.TraceOptions, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this TraceOptions to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for TraceOptions
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** TraceMode enum. */
+            enum TraceMode {
+                TRACE_MODE_UNSPECIFIED = 0,
+                TRACE_MODE_HIDDEN = 1,
+                TRACE_MODE_TIMING = 2,
+                TRACE_MODE_SPAN = 3
+            }
+
+            /** Properties of a TraceMetadataValue. */
+            interface ITraceMetadataValue {
+
+                /** TraceMetadataValue stringValue */
+                stringValue?: (string|null);
+
+                /** TraceMetadataValue intValue */
+                intValue?: (number|Long|null);
+
+                /** TraceMetadataValue floatValue */
+                floatValue?: (number|null);
+
+                /** TraceMetadataValue boolValue */
+                boolValue?: (boolean|null);
+
+                /** TraceMetadataValue remove */
+                remove?: (boolean|null);
+            }
+
+            /** Represents a TraceMetadataValue. */
+            class TraceMetadataValue implements ITraceMetadataValue {
+
+                /**
+                 * Constructs a new TraceMetadataValue.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.ITraceMetadataValue);
+
+                /** TraceMetadataValue stringValue. */
+                public stringValue?: (string|null);
+
+                /** TraceMetadataValue intValue. */
+                public intValue?: (number|Long|null);
+
+                /** TraceMetadataValue floatValue. */
+                public floatValue?: (number|null);
+
+                /** TraceMetadataValue boolValue. */
+                public boolValue?: (boolean|null);
+
+                /** TraceMetadataValue remove. */
+                public remove?: (boolean|null);
+
+                /** TraceMetadataValue value. */
+                public value?: ("stringValue"|"intValue"|"floatValue"|"boolValue"|"remove");
+
+                /**
+                 * Creates a new TraceMetadataValue instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns TraceMetadataValue instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.ITraceMetadataValue): baml_bridge.cffi.v1.TraceMetadataValue;
+
+                /**
+                 * Encodes the specified TraceMetadataValue message. Does not implicitly {@link baml_bridge.cffi.v1.TraceMetadataValue.verify|verify} messages.
+                 * @param message TraceMetadataValue message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.ITraceMetadataValue, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified TraceMetadataValue message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.TraceMetadataValue.verify|verify} messages.
+                 * @param message TraceMetadataValue message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.ITraceMetadataValue, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a TraceMetadataValue message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns TraceMetadataValue
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.TraceMetadataValue;
+
+                /**
+                 * Decodes a TraceMetadataValue message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns TraceMetadataValue
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.TraceMetadataValue;
+
+                /**
+                 * Verifies a TraceMetadataValue message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a TraceMetadataValue message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns TraceMetadataValue
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.TraceMetadataValue;
+
+                /**
+                 * Creates a plain object from a TraceMetadataValue message. Also converts values to other types if specified.
+                 * @param message TraceMetadataValue
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.TraceMetadataValue, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this TraceMetadataValue to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for TraceMetadataValue
                  * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
                  * @returns The default type url
                  */
@@ -1063,24 +1543,269 @@ export namespace baml_bridge {
                 public static getTypeUrl(typeUrlPrefix?: string): string;
             }
 
+            /** Properties of a HostCallCompletion. */
+            interface IHostCallCompletion {
+
+                /** HostCallCompletion returned */
+                returned?: (baml_bridge.cffi.v1.IInboundValue|null);
+
+                /** HostCallCompletion thrown */
+                thrown?: (baml_bridge.cffi.v1.IInboundValue|null);
+
+                /** HostCallCompletion raised */
+                raised?: (baml_bridge.cffi.v1.IHostException|null);
+
+                /** HostCallCompletion contractViolation */
+                contractViolation?: (string|null);
+
+                /** HostCallCompletion bridgeFailure */
+                bridgeFailure?: (string|null);
+            }
+
+            /** Represents a HostCallCompletion. */
+            class HostCallCompletion implements IHostCallCompletion {
+
+                /**
+                 * Constructs a new HostCallCompletion.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IHostCallCompletion);
+
+                /** HostCallCompletion returned. */
+                public returned?: (baml_bridge.cffi.v1.IInboundValue|null);
+
+                /** HostCallCompletion thrown. */
+                public thrown?: (baml_bridge.cffi.v1.IInboundValue|null);
+
+                /** HostCallCompletion raised. */
+                public raised?: (baml_bridge.cffi.v1.IHostException|null);
+
+                /** HostCallCompletion contractViolation. */
+                public contractViolation?: (string|null);
+
+                /** HostCallCompletion bridgeFailure. */
+                public bridgeFailure?: (string|null);
+
+                /** HostCallCompletion outcome. */
+                public outcome?: ("returned"|"thrown"|"raised"|"contractViolation"|"bridgeFailure");
+
+                /**
+                 * Creates a new HostCallCompletion instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns HostCallCompletion instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IHostCallCompletion): baml_bridge.cffi.v1.HostCallCompletion;
+
+                /**
+                 * Encodes the specified HostCallCompletion message. Does not implicitly {@link baml_bridge.cffi.v1.HostCallCompletion.verify|verify} messages.
+                 * @param message HostCallCompletion message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IHostCallCompletion, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified HostCallCompletion message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.HostCallCompletion.verify|verify} messages.
+                 * @param message HostCallCompletion message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IHostCallCompletion, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a HostCallCompletion message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns HostCallCompletion
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.HostCallCompletion;
+
+                /**
+                 * Decodes a HostCallCompletion message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns HostCallCompletion
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.HostCallCompletion;
+
+                /**
+                 * Verifies a HostCallCompletion message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a HostCallCompletion message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns HostCallCompletion
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.HostCallCompletion;
+
+                /**
+                 * Creates a plain object from a HostCallCompletion message. Also converts values to other types if specified.
+                 * @param message HostCallCompletion
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.HostCallCompletion, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this HostCallCompletion to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for HostCallCompletion
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of a HostException. */
+            interface IHostException {
+
+                /** HostException message */
+                message?: (string|null);
+
+                /** HostException className */
+                className?: (string|null);
+
+                /** HostException language */
+                language?: (string|null);
+
+                /** HostException traceback */
+                traceback?: (string|null);
+
+                /** HostException handle */
+                handle?: (number|Long|null);
+            }
+
+            /** Represents a HostException. */
+            class HostException implements IHostException {
+
+                /**
+                 * Constructs a new HostException.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IHostException);
+
+                /** HostException message. */
+                public message: string;
+
+                /** HostException className. */
+                public className: string;
+
+                /** HostException language. */
+                public language: string;
+
+                /** HostException traceback. */
+                public traceback?: (string|null);
+
+                /** HostException handle. */
+                public handle: (number|Long);
+
+                /**
+                 * Creates a new HostException instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns HostException instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IHostException): baml_bridge.cffi.v1.HostException;
+
+                /**
+                 * Encodes the specified HostException message. Does not implicitly {@link baml_bridge.cffi.v1.HostException.verify|verify} messages.
+                 * @param message HostException message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IHostException, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified HostException message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.HostException.verify|verify} messages.
+                 * @param message HostException message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IHostException, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a HostException message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns HostException
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.HostException;
+
+                /**
+                 * Decodes a HostException message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns HostException
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.HostException;
+
+                /**
+                 * Verifies a HostException message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a HostException message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns HostException
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.HostException;
+
+                /**
+                 * Creates a plain object from a HostException message. Also converts values to other types if specified.
+                 * @param message HostException
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.HostException, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this HostException to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for HostException
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
             /** BamlHandleType enum. */
             enum BamlHandleType {
                 HANDLE_UNSPECIFIED = 0,
-                UNTAGGED_RUST_DATA = 1,
                 UNTAGGED_BEX_HEAP = 2,
                 FUNCTION_REF = 5,
                 ADT_MEDIA_IMAGE = 6,
                 ADT_MEDIA_AUDIO = 7,
                 ADT_MEDIA_VIDEO = 8,
                 ADT_MEDIA_PDF = 9,
-                ADT_MEDIA_GENERIC = 10,
                 ADT_PROMPT_AST = 11,
-                ADT_TYPE = 13,
                 ADT_TAGGED_HEAP_HANDLE = 14,
                 HOST_VALUE_CALLABLE = 15,
                 HOST_VALUE_OPAQUE = 16,
                 ADT_FUNCTION_SPEC = 17,
-                ADT_RUNTIME_VALUE = 18
+                ADT_RUNTIME_VALUE = 18,
+                INVOCATION_STATE = 19,
+                TRACE_RESERVATION = 20,
+                HOST_VALUE_PIN = 21
             }
 
             /** Properties of a BamlHandle. */
@@ -1234,9 +1959,6 @@ export namespace baml_bridge {
                 /** BamlTy future */
                 future?: (baml_bridge.cffi.v1.IBamlTyFuture|null);
 
-                /** BamlTy rustType */
-                rustType?: (baml_bridge.cffi.v1.IBamlTyRustType|null);
-
                 /** BamlTy metaType */
                 metaType?: (baml_bridge.cffi.v1.IBamlTyMetaType|null);
 
@@ -1246,9 +1968,6 @@ export namespace baml_bridge {
                 /** BamlTy promptAst */
                 promptAst?: (baml_bridge.cffi.v1.IBamlTyPromptAst|null);
 
-                /** BamlTy void */
-                "void"?: (baml_bridge.cffi.v1.IBamlTyVoid|null);
-
                 /** BamlTy typeVar */
                 typeVar?: (baml_bridge.cffi.v1.IBamlTyTypeVar|null);
 
@@ -1257,6 +1976,9 @@ export namespace baml_bridge {
 
                 /** BamlTy never */
                 never?: (baml_bridge.cffi.v1.IBamlTyNever|null);
+
+                /** BamlTy tuple */
+                tuple?: (baml_bridge.cffi.v1.IBamlTyTuple|null);
             }
 
             /** Represents a BamlTy. */
@@ -1313,9 +2035,6 @@ export namespace baml_bridge {
                 /** BamlTy future. */
                 public future?: (baml_bridge.cffi.v1.IBamlTyFuture|null);
 
-                /** BamlTy rustType. */
-                public rustType?: (baml_bridge.cffi.v1.IBamlTyRustType|null);
-
                 /** BamlTy metaType. */
                 public metaType?: (baml_bridge.cffi.v1.IBamlTyMetaType|null);
 
@@ -1324,9 +2043,6 @@ export namespace baml_bridge {
 
                 /** BamlTy promptAst. */
                 public promptAst?: (baml_bridge.cffi.v1.IBamlTyPromptAst|null);
-
-                /** BamlTy void. */
-                public void?: (baml_bridge.cffi.v1.IBamlTyVoid|null);
 
                 /** BamlTy typeVar. */
                 public typeVar?: (baml_bridge.cffi.v1.IBamlTyTypeVar|null);
@@ -1337,8 +2053,11 @@ export namespace baml_bridge {
                 /** BamlTy never. */
                 public never?: (baml_bridge.cffi.v1.IBamlTyNever|null);
 
+                /** BamlTy tuple. */
+                public tuple?: (baml_bridge.cffi.v1.IBamlTyTuple|null);
+
                 /** BamlTy ty. */
-                public ty?: ("primitive"|"classTy"|"enum"|"list"|"map"|"optional"|"union"|"literal"|"typeAlias"|"unknown"|"media"|"interface"|"enumVariant"|"Function"|"future"|"rustType"|"metaType"|"resource"|"promptAst"|"void"|"typeVar"|"associatedTypeProjection"|"never");
+                public ty?: ("primitive"|"classTy"|"enum"|"list"|"map"|"optional"|"union"|"literal"|"typeAlias"|"unknown"|"media"|"interface"|"enumVariant"|"Function"|"future"|"metaType"|"resource"|"promptAst"|"typeVar"|"associatedTypeProjection"|"never"|"tuple");
 
                 /**
                  * Creates a new BamlTy instance using the specified properties.
@@ -1412,902 +2131,6 @@ export namespace baml_bridge {
 
                 /**
                  * Gets the default type url for BamlTy
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlTyDef. */
-            interface IBamlTyDef {
-
-                /** BamlTyDef root */
-                root?: (baml_bridge.cffi.v1.IBamlTy|null);
-
-                /** BamlTyDef classes */
-                classes?: (baml_bridge.cffi.v1.IBamlClassDef[]|null);
-
-                /** BamlTyDef enums */
-                enums?: (baml_bridge.cffi.v1.IBamlEnumDef[]|null);
-
-                /** BamlTyDef witnesses */
-                witnesses?: (baml_bridge.cffi.v1.IBamlWitnessDef[]|null);
-            }
-
-            /** Represents a BamlTyDef. */
-            class BamlTyDef implements IBamlTyDef {
-
-                /**
-                 * Constructs a new BamlTyDef.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlTyDef);
-
-                /** BamlTyDef root. */
-                public root?: (baml_bridge.cffi.v1.IBamlTy|null);
-
-                /** BamlTyDef classes. */
-                public classes: baml_bridge.cffi.v1.IBamlClassDef[];
-
-                /** BamlTyDef enums. */
-                public enums: baml_bridge.cffi.v1.IBamlEnumDef[];
-
-                /** BamlTyDef witnesses. */
-                public witnesses: baml_bridge.cffi.v1.IBamlWitnessDef[];
-
-                /**
-                 * Creates a new BamlTyDef instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlTyDef instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlTyDef): baml_bridge.cffi.v1.BamlTyDef;
-
-                /**
-                 * Encodes the specified BamlTyDef message. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyDef.verify|verify} messages.
-                 * @param message BamlTyDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlTyDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlTyDef message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyDef.verify|verify} messages.
-                 * @param message BamlTyDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlTyDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlTyDef message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlTyDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlTyDef;
-
-                /**
-                 * Decodes a BamlTyDef message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlTyDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlTyDef;
-
-                /**
-                 * Verifies a BamlTyDef message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlTyDef message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlTyDef
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlTyDef;
-
-                /**
-                 * Creates a plain object from a BamlTyDef message. Also converts values to other types if specified.
-                 * @param message BamlTyDef
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlTyDef, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlTyDef to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlTyDef
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlWitnessDef. */
-            interface IBamlWitnessDef {
-
-                /** BamlWitnessDef interface */
-                "interface"?: (string|null);
-
-                /** BamlWitnessDef interfaceArgs */
-                interfaceArgs?: (baml_bridge.cffi.v1.IBamlTy[]|null);
-
-                /** BamlWitnessDef associatedTypes */
-                associatedTypes?: (baml_bridge.cffi.v1.IBamlTyAssociatedBinding[]|null);
-
-                /** BamlWitnessDef fieldLinks */
-                fieldLinks?: (baml_bridge.cffi.v1.IBamlWitnessFieldLink[]|null);
-            }
-
-            /** Represents a BamlWitnessDef. */
-            class BamlWitnessDef implements IBamlWitnessDef {
-
-                /**
-                 * Constructs a new BamlWitnessDef.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlWitnessDef);
-
-                /** BamlWitnessDef interface. */
-                public interface: string;
-
-                /** BamlWitnessDef interfaceArgs. */
-                public interfaceArgs: baml_bridge.cffi.v1.IBamlTy[];
-
-                /** BamlWitnessDef associatedTypes. */
-                public associatedTypes: baml_bridge.cffi.v1.IBamlTyAssociatedBinding[];
-
-                /** BamlWitnessDef fieldLinks. */
-                public fieldLinks: baml_bridge.cffi.v1.IBamlWitnessFieldLink[];
-
-                /**
-                 * Creates a new BamlWitnessDef instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlWitnessDef instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlWitnessDef): baml_bridge.cffi.v1.BamlWitnessDef;
-
-                /**
-                 * Encodes the specified BamlWitnessDef message. Does not implicitly {@link baml_bridge.cffi.v1.BamlWitnessDef.verify|verify} messages.
-                 * @param message BamlWitnessDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlWitnessDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlWitnessDef message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlWitnessDef.verify|verify} messages.
-                 * @param message BamlWitnessDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlWitnessDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlWitnessDef message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlWitnessDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlWitnessDef;
-
-                /**
-                 * Decodes a BamlWitnessDef message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlWitnessDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlWitnessDef;
-
-                /**
-                 * Verifies a BamlWitnessDef message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlWitnessDef message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlWitnessDef
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlWitnessDef;
-
-                /**
-                 * Creates a plain object from a BamlWitnessDef message. Also converts values to other types if specified.
-                 * @param message BamlWitnessDef
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlWitnessDef, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlWitnessDef to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlWitnessDef
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlWitnessFieldLink. */
-            interface IBamlWitnessFieldLink {
-
-                /** BamlWitnessFieldLink interfaceField */
-                interfaceField?: (string|null);
-
-                /** BamlWitnessFieldLink classField */
-                classField?: (string|null);
-            }
-
-            /** Represents a BamlWitnessFieldLink. */
-            class BamlWitnessFieldLink implements IBamlWitnessFieldLink {
-
-                /**
-                 * Constructs a new BamlWitnessFieldLink.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlWitnessFieldLink);
-
-                /** BamlWitnessFieldLink interfaceField. */
-                public interfaceField: string;
-
-                /** BamlWitnessFieldLink classField. */
-                public classField: string;
-
-                /**
-                 * Creates a new BamlWitnessFieldLink instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlWitnessFieldLink instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlWitnessFieldLink): baml_bridge.cffi.v1.BamlWitnessFieldLink;
-
-                /**
-                 * Encodes the specified BamlWitnessFieldLink message. Does not implicitly {@link baml_bridge.cffi.v1.BamlWitnessFieldLink.verify|verify} messages.
-                 * @param message BamlWitnessFieldLink message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlWitnessFieldLink, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlWitnessFieldLink message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlWitnessFieldLink.verify|verify} messages.
-                 * @param message BamlWitnessFieldLink message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlWitnessFieldLink, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlWitnessFieldLink message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlWitnessFieldLink
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlWitnessFieldLink;
-
-                /**
-                 * Decodes a BamlWitnessFieldLink message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlWitnessFieldLink
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlWitnessFieldLink;
-
-                /**
-                 * Verifies a BamlWitnessFieldLink message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlWitnessFieldLink message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlWitnessFieldLink
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlWitnessFieldLink;
-
-                /**
-                 * Creates a plain object from a BamlWitnessFieldLink message. Also converts values to other types if specified.
-                 * @param message BamlWitnessFieldLink
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlWitnessFieldLink, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlWitnessFieldLink to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlWitnessFieldLink
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlTyMetadata. */
-            interface IBamlTyMetadata {
-
-                /** BamlTyMetadata description */
-                description?: (string|null);
-
-                /** BamlTyMetadata alias */
-                alias?: (string|null);
-
-                /** BamlTyMetadata docstring */
-                docstring?: (string|null);
-
-                /** BamlTyMetadata other */
-                other?: ({ [k: string]: string }|null);
-            }
-
-            /** Represents a BamlTyMetadata. */
-            class BamlTyMetadata implements IBamlTyMetadata {
-
-                /**
-                 * Constructs a new BamlTyMetadata.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlTyMetadata);
-
-                /** BamlTyMetadata description. */
-                public description?: (string|null);
-
-                /** BamlTyMetadata alias. */
-                public alias?: (string|null);
-
-                /** BamlTyMetadata docstring. */
-                public docstring?: (string|null);
-
-                /** BamlTyMetadata other. */
-                public other: { [k: string]: string };
-
-                /**
-                 * Creates a new BamlTyMetadata instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlTyMetadata instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlTyMetadata): baml_bridge.cffi.v1.BamlTyMetadata;
-
-                /**
-                 * Encodes the specified BamlTyMetadata message. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyMetadata.verify|verify} messages.
-                 * @param message BamlTyMetadata message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlTyMetadata, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlTyMetadata message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyMetadata.verify|verify} messages.
-                 * @param message BamlTyMetadata message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlTyMetadata, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlTyMetadata message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlTyMetadata
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlTyMetadata;
-
-                /**
-                 * Decodes a BamlTyMetadata message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlTyMetadata
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlTyMetadata;
-
-                /**
-                 * Verifies a BamlTyMetadata message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlTyMetadata message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlTyMetadata
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlTyMetadata;
-
-                /**
-                 * Creates a plain object from a BamlTyMetadata message. Also converts values to other types if specified.
-                 * @param message BamlTyMetadata
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlTyMetadata, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlTyMetadata to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlTyMetadata
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlClassDef. */
-            interface IBamlClassDef {
-
-                /** BamlClassDef name */
-                name?: (string|null);
-
-                /** BamlClassDef fields */
-                fields?: (baml_bridge.cffi.v1.IBamlClassFieldDef[]|null);
-
-                /** BamlClassDef metadata */
-                metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /** BamlClassDef genericParamCount */
-                genericParamCount?: (number|null);
-            }
-
-            /** Represents a BamlClassDef. */
-            class BamlClassDef implements IBamlClassDef {
-
-                /**
-                 * Constructs a new BamlClassDef.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlClassDef);
-
-                /** BamlClassDef name. */
-                public name: string;
-
-                /** BamlClassDef fields. */
-                public fields: baml_bridge.cffi.v1.IBamlClassFieldDef[];
-
-                /** BamlClassDef metadata. */
-                public metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /** BamlClassDef genericParamCount. */
-                public genericParamCount: number;
-
-                /**
-                 * Creates a new BamlClassDef instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlClassDef instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlClassDef): baml_bridge.cffi.v1.BamlClassDef;
-
-                /**
-                 * Encodes the specified BamlClassDef message. Does not implicitly {@link baml_bridge.cffi.v1.BamlClassDef.verify|verify} messages.
-                 * @param message BamlClassDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlClassDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlClassDef message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlClassDef.verify|verify} messages.
-                 * @param message BamlClassDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlClassDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlClassDef message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlClassDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlClassDef;
-
-                /**
-                 * Decodes a BamlClassDef message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlClassDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlClassDef;
-
-                /**
-                 * Verifies a BamlClassDef message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlClassDef message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlClassDef
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlClassDef;
-
-                /**
-                 * Creates a plain object from a BamlClassDef message. Also converts values to other types if specified.
-                 * @param message BamlClassDef
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlClassDef, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlClassDef to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlClassDef
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlClassFieldDef. */
-            interface IBamlClassFieldDef {
-
-                /** BamlClassFieldDef name */
-                name?: (string|null);
-
-                /** BamlClassFieldDef ty */
-                ty?: (baml_bridge.cffi.v1.IBamlTy|null);
-
-                /** BamlClassFieldDef metadata */
-                metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /** BamlClassFieldDef skip */
-                skip?: (boolean|null);
-            }
-
-            /** Represents a BamlClassFieldDef. */
-            class BamlClassFieldDef implements IBamlClassFieldDef {
-
-                /**
-                 * Constructs a new BamlClassFieldDef.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlClassFieldDef);
-
-                /** BamlClassFieldDef name. */
-                public name: string;
-
-                /** BamlClassFieldDef ty. */
-                public ty?: (baml_bridge.cffi.v1.IBamlTy|null);
-
-                /** BamlClassFieldDef metadata. */
-                public metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /** BamlClassFieldDef skip. */
-                public skip: boolean;
-
-                /**
-                 * Creates a new BamlClassFieldDef instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlClassFieldDef instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlClassFieldDef): baml_bridge.cffi.v1.BamlClassFieldDef;
-
-                /**
-                 * Encodes the specified BamlClassFieldDef message. Does not implicitly {@link baml_bridge.cffi.v1.BamlClassFieldDef.verify|verify} messages.
-                 * @param message BamlClassFieldDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlClassFieldDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlClassFieldDef message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlClassFieldDef.verify|verify} messages.
-                 * @param message BamlClassFieldDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlClassFieldDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlClassFieldDef message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlClassFieldDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlClassFieldDef;
-
-                /**
-                 * Decodes a BamlClassFieldDef message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlClassFieldDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlClassFieldDef;
-
-                /**
-                 * Verifies a BamlClassFieldDef message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlClassFieldDef message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlClassFieldDef
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlClassFieldDef;
-
-                /**
-                 * Creates a plain object from a BamlClassFieldDef message. Also converts values to other types if specified.
-                 * @param message BamlClassFieldDef
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlClassFieldDef, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlClassFieldDef to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlClassFieldDef
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlEnumDef. */
-            interface IBamlEnumDef {
-
-                /** BamlEnumDef name */
-                name?: (string|null);
-
-                /** BamlEnumDef variants */
-                variants?: (baml_bridge.cffi.v1.IBamlEnumVariantDef[]|null);
-
-                /** BamlEnumDef metadata */
-                metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-            }
-
-            /** Represents a BamlEnumDef. */
-            class BamlEnumDef implements IBamlEnumDef {
-
-                /**
-                 * Constructs a new BamlEnumDef.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlEnumDef);
-
-                /** BamlEnumDef name. */
-                public name: string;
-
-                /** BamlEnumDef variants. */
-                public variants: baml_bridge.cffi.v1.IBamlEnumVariantDef[];
-
-                /** BamlEnumDef metadata. */
-                public metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /**
-                 * Creates a new BamlEnumDef instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlEnumDef instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlEnumDef): baml_bridge.cffi.v1.BamlEnumDef;
-
-                /**
-                 * Encodes the specified BamlEnumDef message. Does not implicitly {@link baml_bridge.cffi.v1.BamlEnumDef.verify|verify} messages.
-                 * @param message BamlEnumDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlEnumDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlEnumDef message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlEnumDef.verify|verify} messages.
-                 * @param message BamlEnumDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlEnumDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlEnumDef message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlEnumDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlEnumDef;
-
-                /**
-                 * Decodes a BamlEnumDef message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlEnumDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlEnumDef;
-
-                /**
-                 * Verifies a BamlEnumDef message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlEnumDef message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlEnumDef
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlEnumDef;
-
-                /**
-                 * Creates a plain object from a BamlEnumDef message. Also converts values to other types if specified.
-                 * @param message BamlEnumDef
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlEnumDef, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlEnumDef to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlEnumDef
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlEnumVariantDef. */
-            interface IBamlEnumVariantDef {
-
-                /** BamlEnumVariantDef name */
-                name?: (string|null);
-
-                /** BamlEnumVariantDef metadata */
-                metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /** BamlEnumVariantDef skip */
-                skip?: (boolean|null);
-            }
-
-            /** Represents a BamlEnumVariantDef. */
-            class BamlEnumVariantDef implements IBamlEnumVariantDef {
-
-                /**
-                 * Constructs a new BamlEnumVariantDef.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlEnumVariantDef);
-
-                /** BamlEnumVariantDef name. */
-                public name: string;
-
-                /** BamlEnumVariantDef metadata. */
-                public metadata?: (baml_bridge.cffi.v1.IBamlTyMetadata|null);
-
-                /** BamlEnumVariantDef skip. */
-                public skip: boolean;
-
-                /**
-                 * Creates a new BamlEnumVariantDef instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlEnumVariantDef instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlEnumVariantDef): baml_bridge.cffi.v1.BamlEnumVariantDef;
-
-                /**
-                 * Encodes the specified BamlEnumVariantDef message. Does not implicitly {@link baml_bridge.cffi.v1.BamlEnumVariantDef.verify|verify} messages.
-                 * @param message BamlEnumVariantDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlEnumVariantDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlEnumVariantDef message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlEnumVariantDef.verify|verify} messages.
-                 * @param message BamlEnumVariantDef message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlEnumVariantDef, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlEnumVariantDef message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlEnumVariantDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlEnumVariantDef;
-
-                /**
-                 * Decodes a BamlEnumVariantDef message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlEnumVariantDef
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlEnumVariantDef;
-
-                /**
-                 * Verifies a BamlEnumVariantDef message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlEnumVariantDef message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlEnumVariantDef
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlEnumVariantDef;
-
-                /**
-                 * Creates a plain object from a BamlEnumVariantDef message. Also converts values to other types if specified.
-                 * @param message BamlEnumVariantDef
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlEnumVariantDef, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlEnumVariantDef to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlEnumVariantDef
                  * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
                  * @returns The default type url
                  */
@@ -2429,6 +2252,12 @@ export namespace baml_bridge {
                 /** BamlTyClass name */
                 name?: (string|null);
 
+                /** BamlTyClass live */
+                live?: (number|Long|null);
+
+                /** BamlTyClass anonymousLabel */
+                anonymousLabel?: (string|null);
+
                 /** BamlTyClass typeArgs */
                 typeArgs?: (baml_bridge.cffi.v1.IBamlTy[]|null);
             }
@@ -2443,10 +2272,19 @@ export namespace baml_bridge {
                 constructor(properties?: baml_bridge.cffi.v1.IBamlTyClass);
 
                 /** BamlTyClass name. */
-                public name: string;
+                public name?: (string|null);
+
+                /** BamlTyClass live. */
+                public live?: (number|Long|null);
+
+                /** BamlTyClass anonymousLabel. */
+                public anonymousLabel?: (string|null);
 
                 /** BamlTyClass typeArgs. */
                 public typeArgs: baml_bridge.cffi.v1.IBamlTy[];
+
+                /** BamlTyClass head. */
+                public head?: ("name"|"live"|"anonymousLabel");
 
                 /**
                  * Creates a new BamlTyClass instance using the specified properties.
@@ -2532,6 +2370,12 @@ export namespace baml_bridge {
                 /** BamlTyTypeAlias name */
                 name?: (string|null);
 
+                /** BamlTyTypeAlias live */
+                live?: (number|Long|null);
+
+                /** BamlTyTypeAlias anonymousLabel */
+                anonymousLabel?: (string|null);
+
                 /** BamlTyTypeAlias typeArgs */
                 typeArgs?: (baml_bridge.cffi.v1.IBamlTy[]|null);
             }
@@ -2546,10 +2390,19 @@ export namespace baml_bridge {
                 constructor(properties?: baml_bridge.cffi.v1.IBamlTyTypeAlias);
 
                 /** BamlTyTypeAlias name. */
-                public name: string;
+                public name?: (string|null);
+
+                /** BamlTyTypeAlias live. */
+                public live?: (number|Long|null);
+
+                /** BamlTyTypeAlias anonymousLabel. */
+                public anonymousLabel?: (string|null);
 
                 /** BamlTyTypeAlias typeArgs. */
                 public typeArgs: baml_bridge.cffi.v1.IBamlTy[];
+
+                /** BamlTyTypeAlias head. */
+                public head?: ("name"|"live"|"anonymousLabel");
 
                 /**
                  * Creates a new BamlTyTypeAlias instance using the specified properties.
@@ -2634,6 +2487,12 @@ export namespace baml_bridge {
 
                 /** BamlTyEnum name */
                 name?: (string|null);
+
+                /** BamlTyEnum live */
+                live?: (number|Long|null);
+
+                /** BamlTyEnum anonymousLabel */
+                anonymousLabel?: (string|null);
             }
 
             /** Represents a BamlTyEnum. */
@@ -2646,7 +2505,16 @@ export namespace baml_bridge {
                 constructor(properties?: baml_bridge.cffi.v1.IBamlTyEnum);
 
                 /** BamlTyEnum name. */
-                public name: string;
+                public name?: (string|null);
+
+                /** BamlTyEnum live. */
+                public live?: (number|Long|null);
+
+                /** BamlTyEnum anonymousLabel. */
+                public anonymousLabel?: (string|null);
+
+                /** BamlTyEnum head. */
+                public head?: ("name"|"live"|"anonymousLabel");
 
                 /**
                  * Creates a new BamlTyEnum instance using the specified properties.
@@ -3120,6 +2988,103 @@ export namespace baml_bridge {
                 public static getTypeUrl(typeUrlPrefix?: string): string;
             }
 
+            /** Properties of a BamlTyTuple. */
+            interface IBamlTyTuple {
+
+                /** BamlTyTuple items */
+                items?: (baml_bridge.cffi.v1.IBamlTy[]|null);
+            }
+
+            /** Represents a BamlTyTuple. */
+            class BamlTyTuple implements IBamlTyTuple {
+
+                /**
+                 * Constructs a new BamlTyTuple.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IBamlTyTuple);
+
+                /** BamlTyTuple items. */
+                public items: baml_bridge.cffi.v1.IBamlTy[];
+
+                /**
+                 * Creates a new BamlTyTuple instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns BamlTyTuple instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IBamlTyTuple): baml_bridge.cffi.v1.BamlTyTuple;
+
+                /**
+                 * Encodes the specified BamlTyTuple message. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyTuple.verify|verify} messages.
+                 * @param message BamlTyTuple message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IBamlTyTuple, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified BamlTyTuple message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyTuple.verify|verify} messages.
+                 * @param message BamlTyTuple message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlTyTuple, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a BamlTyTuple message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns BamlTyTuple
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlTyTuple;
+
+                /**
+                 * Decodes a BamlTyTuple message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns BamlTyTuple
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlTyTuple;
+
+                /**
+                 * Verifies a BamlTyTuple message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a BamlTyTuple message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns BamlTyTuple
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlTyTuple;
+
+                /**
+                 * Creates a plain object from a BamlTyTuple message. Also converts values to other types if specified.
+                 * @param message BamlTyTuple
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.BamlTyTuple, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this BamlTyTuple to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for BamlTyTuple
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
             /** Properties of a BamlTyUnknown. */
             interface IBamlTyUnknown {
             }
@@ -3448,6 +3413,12 @@ export namespace baml_bridge {
                 /** BamlTyInterface name */
                 name?: (string|null);
 
+                /** BamlTyInterface live */
+                live?: (number|Long|null);
+
+                /** BamlTyInterface anonymousLabel */
+                anonymousLabel?: (string|null);
+
                 /** BamlTyInterface typeArgs */
                 typeArgs?: (baml_bridge.cffi.v1.IBamlTy[]|null);
 
@@ -3465,13 +3436,22 @@ export namespace baml_bridge {
                 constructor(properties?: baml_bridge.cffi.v1.IBamlTyInterface);
 
                 /** BamlTyInterface name. */
-                public name: string;
+                public name?: (string|null);
+
+                /** BamlTyInterface live. */
+                public live?: (number|Long|null);
+
+                /** BamlTyInterface anonymousLabel. */
+                public anonymousLabel?: (string|null);
 
                 /** BamlTyInterface typeArgs. */
                 public typeArgs: baml_bridge.cffi.v1.IBamlTy[];
 
                 /** BamlTyInterface bindings. */
                 public bindings: baml_bridge.cffi.v1.IBamlTyAssociatedBinding[];
+
+                /** BamlTyInterface head. */
+                public head?: ("name"|"live"|"anonymousLabel");
 
                 /**
                  * Creates a new BamlTyInterface instance using the specified properties.
@@ -3660,6 +3640,12 @@ export namespace baml_bridge {
                 /** BamlTyEnumVariant name */
                 name?: (string|null);
 
+                /** BamlTyEnumVariant live */
+                live?: (number|Long|null);
+
+                /** BamlTyEnumVariant anonymousLabel */
+                anonymousLabel?: (string|null);
+
                 /** BamlTyEnumVariant variant */
                 variant?: (string|null);
             }
@@ -3674,10 +3660,19 @@ export namespace baml_bridge {
                 constructor(properties?: baml_bridge.cffi.v1.IBamlTyEnumVariant);
 
                 /** BamlTyEnumVariant name. */
-                public name: string;
+                public name?: (string|null);
+
+                /** BamlTyEnumVariant live. */
+                public live?: (number|Long|null);
+
+                /** BamlTyEnumVariant anonymousLabel. */
+                public anonymousLabel?: (string|null);
 
                 /** BamlTyEnumVariant variant. */
                 public variant: string;
+
+                /** BamlTyEnumVariant head. */
+                public head?: ("name"|"live"|"anonymousLabel");
 
                 /**
                  * Creates a new BamlTyEnumVariant instance using the specified properties.
@@ -4091,97 +4086,6 @@ export namespace baml_bridge {
                 public static getTypeUrl(typeUrlPrefix?: string): string;
             }
 
-            /** Properties of a BamlTyRustType. */
-            interface IBamlTyRustType {
-            }
-
-            /** Represents a BamlTyRustType. */
-            class BamlTyRustType implements IBamlTyRustType {
-
-                /**
-                 * Constructs a new BamlTyRustType.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlTyRustType);
-
-                /**
-                 * Creates a new BamlTyRustType instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlTyRustType instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlTyRustType): baml_bridge.cffi.v1.BamlTyRustType;
-
-                /**
-                 * Encodes the specified BamlTyRustType message. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyRustType.verify|verify} messages.
-                 * @param message BamlTyRustType message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlTyRustType, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlTyRustType message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyRustType.verify|verify} messages.
-                 * @param message BamlTyRustType message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlTyRustType, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlTyRustType message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlTyRustType
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlTyRustType;
-
-                /**
-                 * Decodes a BamlTyRustType message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlTyRustType
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlTyRustType;
-
-                /**
-                 * Verifies a BamlTyRustType message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlTyRustType message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlTyRustType
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlTyRustType;
-
-                /**
-                 * Creates a plain object from a BamlTyRustType message. Also converts values to other types if specified.
-                 * @param message BamlTyRustType
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlTyRustType, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlTyRustType to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlTyRustType
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
             /** Properties of a BamlTyMetaType. */
             interface IBamlTyMetaType {
             }
@@ -4449,97 +4353,6 @@ export namespace baml_bridge {
 
                 /**
                  * Gets the default type url for BamlTyPromptAst
-                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
-                 * @returns The default type url
-                 */
-                public static getTypeUrl(typeUrlPrefix?: string): string;
-            }
-
-            /** Properties of a BamlTyVoid. */
-            interface IBamlTyVoid {
-            }
-
-            /** Represents a BamlTyVoid. */
-            class BamlTyVoid implements IBamlTyVoid {
-
-                /**
-                 * Constructs a new BamlTyVoid.
-                 * @param [properties] Properties to set
-                 */
-                constructor(properties?: baml_bridge.cffi.v1.IBamlTyVoid);
-
-                /**
-                 * Creates a new BamlTyVoid instance using the specified properties.
-                 * @param [properties] Properties to set
-                 * @returns BamlTyVoid instance
-                 */
-                public static create(properties?: baml_bridge.cffi.v1.IBamlTyVoid): baml_bridge.cffi.v1.BamlTyVoid;
-
-                /**
-                 * Encodes the specified BamlTyVoid message. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyVoid.verify|verify} messages.
-                 * @param message BamlTyVoid message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encode(message: baml_bridge.cffi.v1.IBamlTyVoid, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Encodes the specified BamlTyVoid message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlTyVoid.verify|verify} messages.
-                 * @param message BamlTyVoid message or plain object to encode
-                 * @param [writer] Writer to encode to
-                 * @returns Writer
-                 */
-                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlTyVoid, writer?: $protobuf.Writer): $protobuf.Writer;
-
-                /**
-                 * Decodes a BamlTyVoid message from the specified reader or buffer.
-                 * @param reader Reader or buffer to decode from
-                 * @param [length] Message length if known beforehand
-                 * @returns BamlTyVoid
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlTyVoid;
-
-                /**
-                 * Decodes a BamlTyVoid message from the specified reader or buffer, length delimited.
-                 * @param reader Reader or buffer to decode from
-                 * @returns BamlTyVoid
-                 * @throws {Error} If the payload is not a reader or valid buffer
-                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
-                 */
-                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlTyVoid;
-
-                /**
-                 * Verifies a BamlTyVoid message.
-                 * @param message Plain object to verify
-                 * @returns `null` if valid, otherwise the reason why it is not
-                 */
-                public static verify(message: { [k: string]: any }): (string|null);
-
-                /**
-                 * Creates a BamlTyVoid message from a plain object. Also converts values to their respective internal types.
-                 * @param object Plain object
-                 * @returns BamlTyVoid
-                 */
-                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlTyVoid;
-
-                /**
-                 * Creates a plain object from a BamlTyVoid message. Also converts values to other types if specified.
-                 * @param message BamlTyVoid
-                 * @param [options] Conversion options
-                 * @returns Plain object
-                 */
-                public static toObject(message: baml_bridge.cffi.v1.BamlTyVoid, options?: $protobuf.IConversionOptions): { [k: string]: any };
-
-                /**
-                 * Converts this BamlTyVoid to JSON.
-                 * @returns JSON object
-                 */
-                public toJSON(): { [k: string]: any };
-
-                /**
-                 * Gets the default type url for BamlTyVoid
                  * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
                  * @returns The default type url
                  */
@@ -5233,8 +5046,8 @@ export namespace baml_bridge {
                 /** BamlOutboundValue tyValue */
                 tyValue?: (baml_bridge.cffi.v1.IBamlTy|null);
 
-                /** BamlOutboundValue tyDefValue */
-                tyDefValue?: (baml_bridge.cffi.v1.IBamlTyDef|null);
+                /** BamlOutboundValue tupleValue */
+                tupleValue?: (baml_bridge.cffi.v1.IBamlValueTuple|null);
             }
 
             /** Represents a BamlOutboundValue. */
@@ -5297,11 +5110,11 @@ export namespace baml_bridge {
                 /** BamlOutboundValue tyValue. */
                 public tyValue?: (baml_bridge.cffi.v1.IBamlTy|null);
 
-                /** BamlOutboundValue tyDefValue. */
-                public tyDefValue?: (baml_bridge.cffi.v1.IBamlTyDef|null);
+                /** BamlOutboundValue tupleValue. */
+                public tupleValue?: (baml_bridge.cffi.v1.IBamlValueTuple|null);
 
                 /** BamlOutboundValue value. */
-                public value?: ("nullValue"|"stringValue"|"intValue"|"floatValue"|"boolValue"|"classValue"|"enumValue"|"literalValue"|"listValue"|"mapValue"|"unionVariantValue"|"handleValue"|"mediaValue"|"promptAstValue"|"uint8arrayValue"|"bigintValue"|"tyValue"|"tyDefValue");
+                public value?: ("nullValue"|"stringValue"|"intValue"|"floatValue"|"boolValue"|"classValue"|"enumValue"|"literalValue"|"listValue"|"mapValue"|"unionVariantValue"|"handleValue"|"mediaValue"|"promptAstValue"|"uint8arrayValue"|"bigintValue"|"tyValue"|"tupleValue");
 
                 /**
                  * Creates a new BamlOutboundValue instance using the specified properties.
@@ -5392,6 +5205,9 @@ export namespace baml_bridge {
 
                 /** BamlOutboundHandle ty */
                 ty?: (baml_bridge.cffi.v1.IBamlTy|null);
+
+                /** BamlOutboundHandle pin */
+                pin?: (number|Long|null);
             }
 
             /** Represents a BamlOutboundHandle. */
@@ -5411,6 +5227,9 @@ export namespace baml_bridge {
 
                 /** BamlOutboundHandle ty. */
                 public ty?: (baml_bridge.cffi.v1.IBamlTy|null);
+
+                /** BamlOutboundHandle pin. */
+                public pin: (number|Long);
 
                 /**
                  * Creates a new BamlOutboundHandle instance using the specified properties.
@@ -5678,6 +5497,109 @@ export namespace baml_bridge {
 
                 /**
                  * Gets the default type url for BamlValueList
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of a BamlValueTuple. */
+            interface IBamlValueTuple {
+
+                /** BamlValueTuple items */
+                items?: (baml_bridge.cffi.v1.IBamlOutboundValue[]|null);
+
+                /** BamlValueTuple tupleType */
+                tupleType?: (baml_bridge.cffi.v1.IBamlTy|null);
+            }
+
+            /** Represents a BamlValueTuple. */
+            class BamlValueTuple implements IBamlValueTuple {
+
+                /**
+                 * Constructs a new BamlValueTuple.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IBamlValueTuple);
+
+                /** BamlValueTuple items. */
+                public items: baml_bridge.cffi.v1.IBamlOutboundValue[];
+
+                /** BamlValueTuple tupleType. */
+                public tupleType?: (baml_bridge.cffi.v1.IBamlTy|null);
+
+                /**
+                 * Creates a new BamlValueTuple instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns BamlValueTuple instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IBamlValueTuple): baml_bridge.cffi.v1.BamlValueTuple;
+
+                /**
+                 * Encodes the specified BamlValueTuple message. Does not implicitly {@link baml_bridge.cffi.v1.BamlValueTuple.verify|verify} messages.
+                 * @param message BamlValueTuple message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IBamlValueTuple, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified BamlValueTuple message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlValueTuple.verify|verify} messages.
+                 * @param message BamlValueTuple message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlValueTuple, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a BamlValueTuple message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns BamlValueTuple
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlValueTuple;
+
+                /**
+                 * Decodes a BamlValueTuple message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns BamlValueTuple
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlValueTuple;
+
+                /**
+                 * Verifies a BamlValueTuple message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a BamlValueTuple message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns BamlValueTuple
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlValueTuple;
+
+                /**
+                 * Creates a plain object from a BamlValueTuple message. Also converts values to other types if specified.
+                 * @param message BamlValueTuple
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.BamlValueTuple, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this BamlValueTuple to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for BamlValueTuple
                  * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
                  * @returns The default type url
                  */
@@ -6253,8 +6175,7 @@ export namespace baml_bridge {
                 IMAGE = 1,
                 AUDIO = 2,
                 PDF = 3,
-                VIDEO = 4,
-                OTHER = 5
+                VIDEO = 4
             }
 
             /** Properties of a BamlValueMedia. */
@@ -6272,8 +6193,8 @@ export namespace baml_bridge {
                 /** BamlValueMedia base64 */
                 base64?: (string|null);
 
-                /** BamlValueMedia file */
-                file?: (string|null);
+                /** BamlValueMedia fileContent */
+                fileContent?: (baml_bridge.cffi.v1.IBamlValueMediaFileContent|null);
             }
 
             /** Represents a BamlValueMedia. */
@@ -6297,11 +6218,11 @@ export namespace baml_bridge {
                 /** BamlValueMedia base64. */
                 public base64?: (string|null);
 
-                /** BamlValueMedia file. */
-                public file?: (string|null);
+                /** BamlValueMedia fileContent. */
+                public fileContent?: (baml_bridge.cffi.v1.IBamlValueMediaFileContent|null);
 
                 /** BamlValueMedia value. */
-                public value?: ("url"|"base64"|"file");
+                public value?: ("url"|"base64"|"fileContent");
 
                 /**
                  * Creates a new BamlValueMedia instance using the specified properties.
@@ -6375,6 +6296,109 @@ export namespace baml_bridge {
 
                 /**
                  * Gets the default type url for BamlValueMedia
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of a BamlValueMediaFileContent. */
+            interface IBamlValueMediaFileContent {
+
+                /** BamlValueMediaFileContent name */
+                name?: (string|null);
+
+                /** BamlValueMediaFileContent base64 */
+                base64?: (string|null);
+            }
+
+            /** Represents a BamlValueMediaFileContent. */
+            class BamlValueMediaFileContent implements IBamlValueMediaFileContent {
+
+                /**
+                 * Constructs a new BamlValueMediaFileContent.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IBamlValueMediaFileContent);
+
+                /** BamlValueMediaFileContent name. */
+                public name: string;
+
+                /** BamlValueMediaFileContent base64. */
+                public base64: string;
+
+                /**
+                 * Creates a new BamlValueMediaFileContent instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns BamlValueMediaFileContent instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IBamlValueMediaFileContent): baml_bridge.cffi.v1.BamlValueMediaFileContent;
+
+                /**
+                 * Encodes the specified BamlValueMediaFileContent message. Does not implicitly {@link baml_bridge.cffi.v1.BamlValueMediaFileContent.verify|verify} messages.
+                 * @param message BamlValueMediaFileContent message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IBamlValueMediaFileContent, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified BamlValueMediaFileContent message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.BamlValueMediaFileContent.verify|verify} messages.
+                 * @param message BamlValueMediaFileContent message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IBamlValueMediaFileContent, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a BamlValueMediaFileContent message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns BamlValueMediaFileContent
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.BamlValueMediaFileContent;
+
+                /**
+                 * Decodes a BamlValueMediaFileContent message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns BamlValueMediaFileContent
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.BamlValueMediaFileContent;
+
+                /**
+                 * Verifies a BamlValueMediaFileContent message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a BamlValueMediaFileContent message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns BamlValueMediaFileContent
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.BamlValueMediaFileContent;
+
+                /**
+                 * Creates a plain object from a BamlValueMediaFileContent message. Also converts values to other types if specified.
+                 * @param message BamlValueMediaFileContent
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.BamlValueMediaFileContent, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this BamlValueMediaFileContent to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for BamlValueMediaFileContent
                  * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
                  * @returns The default type url
                  */
@@ -6999,6 +7023,139 @@ export namespace baml_bridge {
 
                 /**
                  * Gets the default type url for BamlToHostCall
+                 * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
+                 * @returns The default type url
+                 */
+                public static getTypeUrl(typeUrlPrefix?: string): string;
+            }
+
+            /** Properties of a HostInvocation. */
+            interface IHostInvocation {
+
+                /** HostInvocation hostValueKey */
+                hostValueKey?: (number|Long|null);
+
+                /** HostInvocation callbackId */
+                callbackId?: (number|null);
+
+                /** HostInvocation applicationArgs */
+                applicationArgs?: (Uint8Array|null);
+
+                /** HostInvocation effectiveState */
+                effectiveState?: (number|Long|null);
+
+                /** HostInvocation hostEnvironment */
+                hostEnvironment?: (number|Long|null);
+
+                /** HostInvocation cancel */
+                cancel?: (baml_bridge.cffi.v1.IBamlOutboundValue|null);
+
+                /** HostInvocation deadlineNs */
+                deadlineNs?: (number|Long|null);
+            }
+
+            /** Represents a HostInvocation. */
+            class HostInvocation implements IHostInvocation {
+
+                /**
+                 * Constructs a new HostInvocation.
+                 * @param [properties] Properties to set
+                 */
+                constructor(properties?: baml_bridge.cffi.v1.IHostInvocation);
+
+                /** HostInvocation hostValueKey. */
+                public hostValueKey: (number|Long);
+
+                /** HostInvocation callbackId. */
+                public callbackId: number;
+
+                /** HostInvocation applicationArgs. */
+                public applicationArgs: Uint8Array;
+
+                /** HostInvocation effectiveState. */
+                public effectiveState: (number|Long);
+
+                /** HostInvocation hostEnvironment. */
+                public hostEnvironment: (number|Long);
+
+                /** HostInvocation cancel. */
+                public cancel?: (baml_bridge.cffi.v1.IBamlOutboundValue|null);
+
+                /** HostInvocation deadlineNs. */
+                public deadlineNs?: (number|Long|null);
+
+                /**
+                 * Creates a new HostInvocation instance using the specified properties.
+                 * @param [properties] Properties to set
+                 * @returns HostInvocation instance
+                 */
+                public static create(properties?: baml_bridge.cffi.v1.IHostInvocation): baml_bridge.cffi.v1.HostInvocation;
+
+                /**
+                 * Encodes the specified HostInvocation message. Does not implicitly {@link baml_bridge.cffi.v1.HostInvocation.verify|verify} messages.
+                 * @param message HostInvocation message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encode(message: baml_bridge.cffi.v1.IHostInvocation, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Encodes the specified HostInvocation message, length delimited. Does not implicitly {@link baml_bridge.cffi.v1.HostInvocation.verify|verify} messages.
+                 * @param message HostInvocation message or plain object to encode
+                 * @param [writer] Writer to encode to
+                 * @returns Writer
+                 */
+                public static encodeDelimited(message: baml_bridge.cffi.v1.IHostInvocation, writer?: $protobuf.Writer): $protobuf.Writer;
+
+                /**
+                 * Decodes a HostInvocation message from the specified reader or buffer.
+                 * @param reader Reader or buffer to decode from
+                 * @param [length] Message length if known beforehand
+                 * @returns HostInvocation
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): baml_bridge.cffi.v1.HostInvocation;
+
+                /**
+                 * Decodes a HostInvocation message from the specified reader or buffer, length delimited.
+                 * @param reader Reader or buffer to decode from
+                 * @returns HostInvocation
+                 * @throws {Error} If the payload is not a reader or valid buffer
+                 * @throws {$protobuf.util.ProtocolError} If required fields are missing
+                 */
+                public static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): baml_bridge.cffi.v1.HostInvocation;
+
+                /**
+                 * Verifies a HostInvocation message.
+                 * @param message Plain object to verify
+                 * @returns `null` if valid, otherwise the reason why it is not
+                 */
+                public static verify(message: { [k: string]: any }): (string|null);
+
+                /**
+                 * Creates a HostInvocation message from a plain object. Also converts values to their respective internal types.
+                 * @param object Plain object
+                 * @returns HostInvocation
+                 */
+                public static fromObject(object: { [k: string]: any }): baml_bridge.cffi.v1.HostInvocation;
+
+                /**
+                 * Creates a plain object from a HostInvocation message. Also converts values to other types if specified.
+                 * @param message HostInvocation
+                 * @param [options] Conversion options
+                 * @returns Plain object
+                 */
+                public static toObject(message: baml_bridge.cffi.v1.HostInvocation, options?: $protobuf.IConversionOptions): { [k: string]: any };
+
+                /**
+                 * Converts this HostInvocation to JSON.
+                 * @returns JSON object
+                 */
+                public toJSON(): { [k: string]: any };
+
+                /**
+                 * Gets the default type url for HostInvocation
                  * @param [typeUrlPrefix] your custom typeUrlPrefix(default "type.googleapis.com")
                  * @returns The default type url
                  */

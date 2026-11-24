@@ -4,8 +4,7 @@ import {
   BamlImage,
   BamlPdf,
   BamlVideo,
-  _seedFunctionRefHandle,
-  _seedGenericMediaHandle,
+  _seedMediaHandle,
 } from "@boundaryml/baml-bridge";
 import { describe, expect, it } from "vitest";
 import { isTestRuntime } from "./test_runtime.js";
@@ -31,8 +30,8 @@ describe("bridge handles and media — key ownership", () => {
   });
 
   it("bridge_handles_media_clones_ordinary_owners_and_wire_keys_independently", () => {
-    const [key, handleType] = _seedFunctionRefHandle(0xffff_ffff);
-    expect(handleType).toBe(5);
+    const [key, handleType] = _seedMediaHandle();
+    expect(handleType).toBe(6);
     const owner = new BamlHandle(key, handleType);
     const clone = owner.clone();
     const wireKeyOne = owner._cloneKeyForWire();
@@ -57,7 +56,7 @@ describe("bridge handles and media — key ownership", () => {
   });
 
   it("bridge_handles_media_rejects_an_invalid_ordinary_key_only_when_an_operation_resolves_it", () => {
-    const invalid = new BamlHandle({ low: 0x7fff_fffe, high: 0 }, 5);
+    const invalid = new BamlHandle({ low: 0x7fff_fffe, high: 0 }, 6);
     expect(invalid.key).toEqual({ low: 0x7fff_fffe, high: 0 });
     expect(() => invalid.clone()).toThrow(/invalid handle/);
     if (isWebRuntime) expect(releaseForWeb(invalid)).toBe(false);
@@ -68,19 +67,18 @@ describe("bridge handles and media — key ownership", () => {
     for (const handleType of [15, 16]) {
       const owner = new BamlHandle({ low: 1, high: 0 }, handleType);
       expect(owner.clone().key).toEqual(owner.key);
-      expect(owner._cloneKeyForWire()).toEqual(owner.key);
+      // A host value's key is the host's own: a wire occurrence takes one of
+      // its references, so a key the host has not registered is refused.
+      expect(() => owner._cloneKeyForWire()).toThrow(/no longer registered/);
       expect(releaseForWeb(owner)).toBe(false);
       expect(owner.clone()).toBeInstanceOf(BamlHandle);
     }
   });
 
   it("bridge_handles_media_exposes_stable_seed_tags", () => {
-    const [functionKey, functionType] = _seedFunctionRefHandle(7);
-    const [mediaKey, mediaType] = _seedGenericMediaHandle();
-    expect(functionType).toBe(5);
-    expect(mediaType).toBe(10);
+    const [mediaKey, mediaType] = _seedMediaHandle();
+    expect(mediaType).toBe(6);
     if (isWebRuntime) {
-      expect(releaseForWeb(new BamlHandle(functionKey, functionType))).toBe(true);
       expect(releaseForWeb(new BamlHandle(mediaKey, mediaType))).toBe(true);
     }
   });
@@ -95,7 +93,7 @@ const mediaKinds = [
 
 type MediaValue = {
   url(): string | null;
-  file(): string | null;
+  name(): string | null;
   base64(): string;
   mimeType(): string | null;
   _toHandle(): BamlHandle;
@@ -103,7 +101,7 @@ type MediaValue = {
 
 type MediaConstructor = {
   fromUrl(url: string, mimeType?: string | null): MediaValue;
-  fromFile(file: string, mimeType?: string | null): MediaValue;
+  fromFileContent(file: string, base64: string, mimeType?: string | null): MediaValue;
   fromBase64(base64: string, mimeType?: string | null): MediaValue;
   _fromHandle(handle: BamlHandle): MediaValue;
 };
@@ -119,14 +117,16 @@ describe.each(mediaKinds)(
   it("bridge_handles_media_constructs_url_file_and_base64_descriptors", () => {
     const url = Media.fromUrl("https://example.com/asset", "application/test");
     expect(url.url()).toBe("https://example.com/asset");
-    expect(url.file()).toBeNull();
+    expect(url.name()).toBeNull();
     expect(url.base64()).toBe("");
     expect(url.mimeType()).toBe("application/test");
 
-    const file = Media.fromFile("/tmp/asset");
+    // Content read from a file keeps the file's base name, never its path.
+    const file = Media.fromFileContent("/tmp/asset.bin", "aGVsbG8=", "application/test");
     expect(file.url()).toBeNull();
-    expect(file.file()).toBe("/tmp/asset");
-    expect(file.mimeType()).toBeNull();
+    expect(file.name()).toBe("asset.bin");
+    expect(file.base64()).toBe("aGVsbG8=");
+    expect(file.mimeType()).toBe("application/test");
 
     const base64 = Media.fromBase64("aGVsbG8=", "application/octet-stream");
     expect(base64.base64()).toBe("aGVsbG8=");

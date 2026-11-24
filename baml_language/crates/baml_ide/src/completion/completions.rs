@@ -218,7 +218,7 @@ impl<'db> Completions<'db> {
     }
 
     /// A builtin type alias (`int`, `string`, `json`) — the language's own
-    /// spelling table, offered wherever a type can be written.
+    /// alias table, offered wherever a type can be written.
     pub(super) fn add_builtin_type(&mut self, alias: &str) {
         let item = Completion {
             label: alias.to_string(),
@@ -297,6 +297,24 @@ impl<'db> Completions<'db> {
             documentation: None,
             relevance: CompletionRelevance {
                 is_parameter: true,
+                ..CompletionRelevance::default()
+            },
+        };
+        self.push(None, item);
+    }
+
+    pub(super) fn add_tuple_slot(&mut self, slot: usize, ty: &baml_type::Ty) {
+        let item = Completion {
+            label: slot.to_string(),
+            source_range: self.source_range,
+            insert: CompletionInsert::Plain(slot.to_string()),
+            kind: CompletionKind::Field,
+            detail: Some(crate::render::display_ty_canonical_for_file(
+                self.db, self.file, ty,
+            )),
+            documentation: None,
+            relevance: CompletionRelevance {
+                is_inherent: true,
                 ..CompletionRelevance::default()
             },
         };

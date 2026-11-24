@@ -1,3 +1,6 @@
+// Hide primitive iterator bookkeeping and identity wrappers; user callbacks
+// and iterator consumers retain their own tracing.
+
 /// The sentinel `baml.iter.Iterator.next` returns when there are no elements
 /// left.
 ///
@@ -9,8 +12,7 @@
 ///
 /// It carries no data — every `Done` is interchangeable — so it is written
 /// `Done {}` at a construction site.
-class Done {
-}
+class Done {}
 
 /// Implemented by types that can be iterated over.
 ///
@@ -109,7 +111,10 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         fn: (Self.Item) -> R throws E2,
     ) -> Iterator<Item = R, Error = Self.Error | E2> throws never {
-        Map<Self.Item, R, Self.Error, E2> { source: self, func: fn }
+        Map<Self.Item, R, Self.Error, E2> {
+            source: self,
+            func: fn,
+        }
     }
 
     /// Returns an iterator over the elements for which `predicate` is `true`, in
@@ -125,7 +130,10 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         predicate: (Self.Item) -> bool throws E2,
     ) -> Iterator<Item = Self.Item, Error = Self.Error | E2> throws never {
-        Filter<Self.Item, Self.Error, E2> { source: self, predicate: predicate }
+        Filter<Self.Item, Self.Error, E2> {
+            source: self,
+            predicate: predicate,
+        }
     }
 
     /// Returns an iterator over the non-null results of `fn`: `map` and `filter`
@@ -142,7 +150,10 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         fn: (Self.Item) -> R? throws E2,
     ) -> Iterator<Item = R, Error = Self.Error | E2> throws never {
-        FilterMap<Self.Item, R, Self.Error, E2> { source: self, func: fn }
+        FilterMap<Self.Item, R, Self.Error, E2> {
+            source: self,
+            func: fn,
+        }
     }
 
     /// Returns an iterator over the elements of the iterables `fn` produces, laid
@@ -160,7 +171,11 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         fn: (Self.Item) -> Iterable<Item = R, Error = E3> throws E2,
     ) -> Iterator<Item = R, Error = Self.Error | E2 | E3> throws never {
-        FlatMap<Self.Item, R, Self.Error, E2, E3> { source: self, func: fn, inner: Done {} }
+        FlatMap<Self.Item, R, Self.Error, E2, E3> {
+            source: self,
+            func: fn,
+            inner: Done {},
+        }
     }
 
     /// Returns an iterator over every `n`th element, starting with the first.
@@ -178,7 +193,11 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     ///
     /// A `baml.iter.StepBy`.
     function step_by(self, n: int) -> Iterator<Item = Self.Item, Error = Self.Error> throws never {
-        StepBy<Self.Item, Self.Error> { source: self, n: n, first: true }
+        StepBy<Self.Item, Self.Error> {
+            source: self,
+            n: n,
+            first: true,
+        }
     }
 
     /// Returns an iterator over all of `self`'s elements followed by all of
@@ -195,7 +214,11 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         other: Iterable<Item = Self.Item, Error = E2>,
     ) -> Iterator<Item = Self.Item, Error = Self.Error | E2> throws never {
-        Chain<Self.Item, Self.Error, E2> { first: self, other: other.iter(), first_done: false }
+        Chain<Self.Item, Self.Error, E2> {
+            first: self,
+            other: other.iter(),
+            first_done: false,
+        }
     }
 
     /// Returns an iterator with one element of look-ahead.
@@ -209,7 +232,11 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     /// A `baml.iter.Peekable` yielding exactly what `self` yields, plus a `peek`
     /// that reads the next element without consuming it.
     function peekable(self) -> Peekable<Self.Item, Self.Error> throws never {
-        Peekable<Self.Item, Self.Error> { source: self, buffer: Done {}, has_buffer: false }
+        Peekable<Self.Item, Self.Error> {
+            source: self,
+            buffer: Done {},
+            has_buffer: false,
+        }
     }
 
     /// Returns an iterator over at most the first `n` elements.
@@ -238,7 +265,10 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     /// baml.iter.Range.new(0, 10).take(3).collect() // [0, 1, 2]
     /// ```
     function take(self, n: int) -> Iterator<Item = Self.Item, Error = Self.Error> throws never {
-        Take<Self.Item, Self.Error> { source: self, remaining: n }
+        Take<Self.Item, Self.Error> {
+            source: self,
+            remaining: n,
+        }
     }
 
     /// Returns an iterator over everything after the first `n` elements.
@@ -263,7 +293,10 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     /// baml.iter.Range.new(0, 5).skip(2).collect() // [2, 3, 4]
     /// ```
     function skip(self, n: int) -> Iterator<Item = Self.Item, Error = Self.Error> throws never {
-        Skip<Self.Item, Self.Error> { source: self, remaining: n }
+        Skip<Self.Item, Self.Error> {
+            source: self,
+            remaining: n,
+        }
     }
 
     /// Returns an iterator over the leading run of elements for which
@@ -288,7 +321,11 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         predicate: (Self.Item) -> bool throws E2,
     ) -> Iterator<Item = Self.Item, Error = Self.Error | E2> throws never {
-        TakeWhile<Self.Item, Self.Error, E2> { source: self, predicate: predicate, done: false }
+        TakeWhile<Self.Item, Self.Error, E2> {
+            source: self,
+            predicate: predicate,
+            done: false,
+        }
     }
 
     /// Returns an iterator over everything from the first element `predicate`
@@ -312,7 +349,11 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
         self,
         predicate: (Self.Item) -> bool throws E2,
     ) -> Iterator<Item = Self.Item, Error = Self.Error | E2> throws never {
-        SkipWhile<Self.Item, Self.Error, E2> { source: self, predicate: predicate, skipping: true }
+        SkipWhile<Self.Item, Self.Error, E2> {
+            source: self,
+            predicate: predicate,
+            skipping: true,
+        }
     }
 
     /// Consumes the rest of this iterator into an array, in order.
@@ -358,11 +399,9 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     ///   not recoverable.
     ///
     /// ALIASES: fold
-    function reduce<A, E2>(
-        self,
-        fn: (A, Self.Item) -> A throws E2,
-        initial: A,
-    ) -> A throws Self.Error | E2 {
+    function reduce<A, E2>(self, fn: (A, Self.Item) -> A throws E2, initial: A) -> A
+        throws Self.Error | E2
+    {
         let acc: A = initial;
         while (true) {
             match (self.next()) {
@@ -438,10 +477,9 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     /// - `E2` if `predicate` throws.
     ///
     /// ALIASES: any
-    function some<E2>(
-        self,
-        predicate: (Self.Item) -> bool throws E2,
-    ) -> bool throws Self.Error | E2 {
+    function some<E2>(self, predicate: (Self.Item) -> bool throws E2) -> bool
+        throws Self.Error | E2
+    {
         while (true) {
             match (self.next()) {
                 Done => {
@@ -470,10 +508,9 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     /// - `E2` if `predicate` throws.
     ///
     /// ALIASES: all
-    function every<E2>(
-        self,
-        predicate: (Self.Item) -> bool throws E2,
-    ) -> bool throws Self.Error | E2 {
+    function every<E2>(self, predicate: (Self.Item) -> bool throws E2) -> bool
+        throws Self.Error | E2
+    {
         while (true) {
             match (self.next()) {
                 Done => {
@@ -505,10 +542,9 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
     ///
     /// - `Self.Error` if advancing the iterator fails.
     /// - `E2` if `predicate` throws.
-    function find<E2>(
-        self,
-        predicate: (Self.Item) -> bool throws E2,
-    ) -> Self.Item? throws Self.Error | E2 {
+    function find<E2>(self, predicate: (Self.Item) -> bool throws E2) -> Self.Item?
+        throws Self.Error | E2
+    {
         while (true) {
             match (self.next()) {
                 Done => {
@@ -541,7 +577,10 @@ interface Iterator requires Iterable<Item = Self.Item, Error = Self.Error> {
 function flatten<R, E, E3, I extends Iterable<Item = R, Error = E3>>(
     src: Iterator<Item = I, Error = E>,
 ) -> Iterator<Item = R, Error = E | E3> throws never {
-    Flatten<I, R, E, E3> { source: src, inner: Done {} }
+    Flatten<I, R, E, E3> {
+        source: src,
+        inner: Done {},
+    }
 }
 
 /// The iterator implementation for an array.
@@ -560,6 +599,7 @@ class ArrayIterator<T> {
 
     /// Creates an iterator positioned at the start of `arr`, which is not
     /// copied.
+    /// baml:$trace=trace.hidden
     function new(arr: T[]) -> ArrayIterator<T> throws never {
         ArrayIterator<T> { arr: arr, idx: 0 }
     }
@@ -568,6 +608,7 @@ class ArrayIterator<T> {
         type Item = T;
         type Error = never;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = never> throws never {
             self
         }
@@ -577,6 +618,7 @@ class ArrayIterator<T> {
         type Item = T;
         type Error = never;
 
+        /// baml:$trace=trace.hidden
         function next(self) -> T | Done throws never {
             // Bounds-check by index, not by matching the element against null: when
             // T is itself nullable, a stored null element must be yielded, not
@@ -629,14 +671,20 @@ class Range {
     /// - `max`: the exclusive upper bound. A `max` at or below `min` yields
     ///   nothing.
     /// - `step`: the increment between values; defaults to `1`.
+    /// baml:$trace=trace.hidden
     function new(min: int, max: int, step: int = 1) -> Range throws never {
-        Range { i: min, max: max, step: step }
+        Range {
+            i: min,
+            max: max,
+            step: step,
+        }
     }
 
     implements Iterable {
         type Item = int;
         type Error = never;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = int, Error = never> throws never {
             self
         }
@@ -646,6 +694,7 @@ class Range {
         type Item = int;
         type Error = never;
 
+        /// baml:$trace=trace.hidden
         function next(self) -> int | Done throws never {
             if (self.i < self.max) {
                 let cur = self.i;
@@ -679,14 +728,19 @@ class Repeat<T> {
     /// - `value`: the value to yield on every round.
     /// - `count`: how many times to yield it. `0` yields nothing; any negative
     ///   value, including the default, repeats without end.
+    /// baml:$trace=trace.hidden
     function new(value: T, count: int = -1) -> Repeat<T> throws never {
-        Repeat<T> { value: value, count: count }
+        Repeat<T> {
+            value: value,
+            count: count,
+        }
     }
 
     implements Iterable {
         type Item = T;
         type Error = never;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = never> throws never {
             self
         }
@@ -696,6 +750,7 @@ class Repeat<T> {
         type Item = T;
         type Error = never;
 
+        /// baml:$trace=trace.hidden
         function next(self) -> T | Done throws never {
             if (self.count < 0) {
                 self.value
@@ -728,6 +783,7 @@ class Map<T, R, E, E2> {
         type Item = R;
         type Error = E | E2;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = R, Error = E | E2> throws never {
             self
         }
@@ -740,7 +796,7 @@ class Map<T, R, E, E2> {
         function next(self) -> R | Done throws E | E2 {
             match (self.source.next()) {
                 Done => Done {},
-                let x: T => self.func(x),
+                let x: T => (self.func)(x),
             }
         }
     }
@@ -761,6 +817,7 @@ class Filter<T, E, E2> {
         type Item = T;
         type Error = E | E2;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E | E2> throws never {
             self
         }
@@ -777,13 +834,12 @@ class Filter<T, E, E2> {
                         return Done {};
                     },
                     let x: T => {
-                        if (self.predicate(x)) {
+                        if ((self.predicate)(x)) {
                             return x;
                         }
                     },
                 }
             }
-            Done {}
         }
     }
 }
@@ -803,6 +859,7 @@ class FilterMap<T, R, E, E2> {
         type Item = R;
         type Error = E | E2;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = R, Error = E | E2> throws never {
             self
         }
@@ -819,7 +876,7 @@ class FilterMap<T, R, E, E2> {
                         return Done {};
                     },
                     let x: T => {
-                        match (self.func(x)) {
+                        match ((self.func)(x)) {
                             null => {},
                             let y: R => {
                                 return y;
@@ -828,7 +885,6 @@ class FilterMap<T, R, E, E2> {
                     },
                 }
             }
-            Done {}
         }
     }
 }
@@ -853,6 +909,7 @@ class FlatMap<T, R, E, E2, E3> {
         type Item = R;
         type Error = E | E2 | E3;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = R, Error = E | E2 | E3> throws never {
             self
         }
@@ -881,14 +938,13 @@ class FlatMap<T, R, E, E2, E3> {
                                 return Done {};
                             },
                             let x: T => {
-                                let it = self.func(x).iter();
+                                let it = (self.func)(x).iter();
                                 self.inner = it;
                             },
                         }
                     },
                 }
             }
-            Done {}
         }
     }
 }
@@ -909,6 +965,7 @@ class Flatten<I extends Iterable<Item = R, Error = E3>, R, E, E3> {
         type Item = R;
         type Error = E | E3;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = R, Error = E | E3> throws never {
             self
         }
@@ -944,7 +1001,6 @@ class Flatten<I extends Iterable<Item = R, Error = E3>, R, E, E3> {
                     },
                 }
             }
-            Done {}
         }
     }
 }
@@ -992,6 +1048,7 @@ class Peekable<T, E> {
         type Item = T;
         type Error = E;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E> throws never {
             self
         }
@@ -1032,6 +1089,7 @@ class StepBy<T, E> {
         type Item = T;
         type Error = E;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E> throws never {
             self
         }
@@ -1076,6 +1134,7 @@ class Chain<T, E, E2> {
         type Item = T;
         type Error = E | E2;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E | E2> throws never {
             self
         }
@@ -1117,6 +1176,7 @@ class Take<T, E> {
         type Item = T;
         type Error = E;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E> throws never {
             self
         }
@@ -1165,6 +1225,7 @@ class Skip<T, E> {
         type Item = T;
         type Error = E;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E> throws never {
             self
         }
@@ -1213,6 +1274,7 @@ class TakeWhile<T, E, E2> {
         type Item = T;
         type Error = E | E2;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E | E2> throws never {
             self
         }
@@ -1231,7 +1293,7 @@ class TakeWhile<T, E, E2> {
                     self.done = true;
                 },
                 let x: T => {
-                    if (self.predicate(x)) {
+                    if ((self.predicate)(x)) {
                         return x;
                     }
                     self.done = true;
@@ -1259,6 +1321,7 @@ class SkipWhile<T, E, E2> {
         type Item = T;
         type Error = E | E2;
 
+        /// baml:$trace=trace.hidden
         function iter(self) -> Iterator<Item = T, Error = E | E2> throws never {
             self
         }
@@ -1276,7 +1339,7 @@ class SkipWhile<T, E, E2> {
                         return Done {};
                     },
                     let x: T => {
-                        if (!self.predicate(x)) {
+                        if (!(self.predicate)(x)) {
                             self.skipping = false;
                             return x;
                         }
@@ -1288,38 +1351,39 @@ class SkipWhile<T, E, E2> {
     }
 }
 
-implements<T> Iterable for T[] {
-  type Item = T
-  type Error = never
+implement<T> Iterable for T[] {
+    type Item = T;
+    type Error = never;
 
-  /// Returns a fresh `baml.iter.ArrayIterator` over the array's elements in
-  /// order, positioned at the start — so an array, unlike an iterator, can be
-  /// walked more than once.
-  ///
-  /// This is what backs `for (x in xs)` over an array and what lets an array be
-  /// passed anywhere an `Iterable` is wanted. Infallible: reading an array
-  /// cannot fail.
-  function iter(self) -> Iterator<Item = T, Error = never> throws never {
-    ArrayIterator.new(self)
-  }
+    /// Returns a fresh `baml.iter.ArrayIterator` over the array's elements in
+    /// order, positioned at the start — so an array, unlike an iterator, can be
+    /// walked more than once.
+    ///
+    /// This is what backs `for (x in xs)` over an array and what lets an array be
+    /// passed anywhere an `Iterable` is wanted. Infallible: reading an array
+    /// cannot fail.
+    /// baml:$trace=trace.hidden
+    function iter(self) -> Iterator<Item = T, Error = never> throws never {
+        ArrayIterator.new(self)
+    }
 }
 
-implements Iterable for string {
-  type Item = string
-  type Error = never
+implement Iterable for string {
+    type Item = string;
+    type Error = never;
 
-  /// Yields the string's Unicode code points as one-character strings — BAML
-  /// has no character type, so the item type is `string`.
-  ///
-  /// The unit is the code point, not the byte and not the grapheme cluster:
-  /// `"é😀"` yields two items, but an `é` written as a base letter plus a
-  /// combining accent yields two items of its own.
-  ///
-  /// This is the one `Iterable` here that is not lazy. It delegates to
-  /// `string.chars()`, which materializes the whole `string[]` up front, so
-  /// iterating a string costs its full length even if only the first character
-  /// is pulled.
-  function iter(self) -> Iterator<Item = string, Error = never> throws never {
-    self.chars().iter()
-  }
+    /// Yields the string's Unicode code points as one-character strings — BAML
+    /// has no character type, so the item type is `string`.
+    ///
+    /// The unit is the code point, not the byte and not the grapheme cluster:
+    /// `"é😀"` yields two items, but an `é` written as a base letter plus a
+    /// combining accent yields two items of its own.
+    ///
+    /// This is the one `Iterable` here that is not lazy. It delegates to
+    /// `string.chars()`, which materializes the whole `string[]` up front, so
+    /// iterating a string costs its full length even if only the first character
+    /// is pulled.
+    function iter(self) -> Iterator<Item = string, Error = never> throws never {
+        self.chars().iter()
+    }
 }

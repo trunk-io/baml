@@ -8,7 +8,7 @@
   "uploads": [],
   "forbidden_body": {
     "body_file": "recording.hex",
-    "length": 238,
-    "sha256": "e5e05fb0dca5f37d9a2f3b64a20f5c13e015357bc47696b8e902efcd6ce72456"
+    "length": 243,
+    "sha256": "1c605afb5775ec2297b898600b3b42c423c03e6fb73d28f8900b7796681aa632"
   }
 }

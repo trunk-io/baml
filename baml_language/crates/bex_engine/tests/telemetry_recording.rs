@@ -16,7 +16,7 @@ fn context() -> bex_engine::FunctionCallContext {
 // BAML cannot inspect recording protobufs or CAS files after engine shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trace_capture_reaches_cas_with_exact_values() {
-    let program = baml_db::testing::compile_source(include_str!(
+    let program = baml_test_support::compile_source(include_str!(
         "../../baml_tests/baml_src/ns_trace_capture/capture.baml"
     ));
     let source = program.source_content_hash;
@@ -73,9 +73,10 @@ async fn trace_capture_reaches_cas_with_exact_values() {
     let mut completions = HashMap::new();
     let mut paths = HashMap::new();
     let mut threads = HashMap::new();
-    for file in btel_file::read_directory(engine.telemetry_recording_directory().unwrap())
-        .unwrap()
-        .files
+    for file in
+        btel_core::recording::read_directory(engine.telemetry_recording_directory().unwrap())
+            .unwrap()
+            .files
     {
         let header = file.header.unwrap();
         assert_eq!(header.recording_id, id.as_bytes());
@@ -157,16 +158,14 @@ async fn trace_capture_reaches_cas_with_exact_values() {
 }
 
 /// The `error` of a captured `baml.errors.Context`, which must be a string.
-fn read_error_capture(root: &std::path::Path, id: proto::SnapshotId) -> String {
-    use btel_snapshot::{DecodeLimits, DecodedObject, DecodedRoot, DecodedValue, decode_blob};
+fn read_error_capture(root: &std::path::Path, id: proto::CasId) -> String {
+    use btel_core::cas::{DecodeLimits, DecodedObject, DecodedRoot, DecodedValue, decode_blob};
 
     let mut digest = [0; 16];
     digest[..8].copy_from_slice(&id.low.to_le_bytes());
     digest[8..].copy_from_slice(&id.high.to_le_bytes());
-    let path = btel_file::cas_path(
-        &root.join("cas"),
-        btel_snapshot::SnapshotId::from_bytes(digest),
-    );
+    let path =
+        btel_core::cas::cas_path(&root.join("cas"), btel_snapshot::CasId::from_bytes(digest));
     let snapshot = decode_blob(&std::fs::read(path).unwrap(), &DecodeLimits::default()).unwrap();
     let DecodedRoot::Value(DecodedValue::Object(context)) = snapshot.root else {
         panic!("expected a captured context object");
@@ -182,20 +181,18 @@ fn read_error_capture(root: &std::path::Path, id: proto::SnapshotId) -> String {
     error.to_string()
 }
 
-fn read_string_capture(root: &std::path::Path, id: proto::SnapshotId, args: bool) -> String {
-    use btel_snapshot::{DecodeLimits, DecodedRoot, DecodedValue, decode_blob};
+fn read_string_capture(root: &std::path::Path, id: proto::CasId, args: bool) -> String {
+    use btel_core::cas::{DecodeLimits, DecodedRoot, DecodedValue, decode_blob};
 
     let mut digest = [0; 16];
     digest[..8].copy_from_slice(&id.low.to_le_bytes());
     digest[8..].copy_from_slice(&id.high.to_le_bytes());
-    let path = btel_file::cas_path(
-        &root.join("cas"),
-        btel_snapshot::SnapshotId::from_bytes(digest),
-    );
+    let path =
+        btel_core::cas::cas_path(&root.join("cas"), btel_snapshot::CasId::from_bytes(digest));
     let bytes = std::fs::read(path).unwrap();
     let snapshot = decode_blob(&bytes, &DecodeLimits::default()).unwrap();
     assert_eq!(snapshot.id.as_bytes(), &digest);
-    assert!(!snapshot.limited);
+    assert!(snapshot.children.is_empty());
     assert!(snapshot.objects.is_empty());
     let value = match (snapshot.root, args) {
         (DecodedRoot::Value(value), false) => value,
@@ -215,7 +212,7 @@ fn read_string_capture(root: &std::path::Path, id: proto::SnapshotId, args: bool
     let DecodedValue::String(value) = value else {
         panic!("expected captured string");
     };
-    value.into()
+    value.to_string()
 }
 
 /// Every entry of a recording directory with its bytes, sorted by name:
@@ -234,7 +231,7 @@ fn recording_bytes(directory: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn execution_reaches_encoded_files_and_shutdown_drains_once() {
-    let mut program = baml_db::testing::compile_source(
+    let mut program = baml_test_support::compile_source(
         r#"
         function leaf() -> int { 7 }
         function main() -> int {
@@ -247,10 +244,8 @@ async fn execution_reaches_encoded_files_and_shutdown_drains_once() {
     // exposing a policy setter solely for this test. Executable code is unchanged.
     for object in &mut program.objects.0 {
         if let bex_vm_types::Object::Function(function) = object {
-            if function.name.rsplit('.').next() == Some("leaf") {
-                function.body_meta = Some(bex_vm_types::FunctionMeta::Llm {
-                    client: "test".into(),
-                });
+            if function.name().rsplit('.').next() == Some("leaf") {
+                function.body_meta = Some(bex_vm_types::FunctionMeta::Llm);
             }
         }
     }
@@ -290,7 +285,7 @@ async fn execution_reaches_encoded_files_and_shutdown_drains_once() {
     .expect("shutdown must drain without a heap-permit deadlock");
     assert_eq!(engine.telemetry_result(), Some(Ok(())));
     let directory = engine.telemetry_recording_directory().unwrap();
-    let read = btel_file::read_directory(directory).unwrap();
+    let read = btel_core::recording::read_directory(directory).unwrap();
     // No gap, unfinished file, invalid file or file after the end.
     assert!(read.issues.is_empty(), "{:?}", read.issues);
     let written = recording_bytes(directory);
@@ -414,7 +409,7 @@ fn telemetry_environment_modes() {
     }
     let mode = std::env::var("BAML_TELEMETRY").unwrap_or_else(|_| "medium".into());
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
-        let program = baml_db::testing::compile_source(r#"
+        let program = baml_test_support::compile_source(r#"
             function leaf() -> int { "abc".length() }
             function main() -> int { let child = spawn { leaf() }; leaf() + (await child) }
             function fail() -> int { baml.sys.exit(7); 1 }
@@ -443,7 +438,7 @@ fn telemetry_environment_modes() {
         }
         assert_eq!(engine.telemetry_result(), Some(Ok(())));
         let (mut aggregates, mut spans, mut announcements, mut threads) = (0, 0, 0, 0);
-        for file in btel_file::read_directory(engine.telemetry_recording_directory().unwrap()).unwrap().files {
+        for file in btel_core::recording::read_directory(engine.telemetry_recording_directory().unwrap()).unwrap().files {
             if let Some(batch) = file.aggregates {
                 aggregates += batch.entries.iter().map(|row| row.count).sum::<u64>();
             }
@@ -475,4 +470,86 @@ fn telemetry_environment_modes() {
             assert_eq!((spans, announcements), (0, 0));
         }
     });
+}
+
+// A child process keeps environment overrides isolated from concurrent tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_recordings_honor_baml_home() {
+    const CHILD: &str = "BAML_USER_RECORDING_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "user_recordings_honor_baml_home", "--nocapture"])
+            .env(CHILD, "1")
+            .env("BAML_HOME", home.path())
+            .env("BOUNDARY_API_KEY", "local")
+            .env("BAML_TELEMETRY", "medium")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated recording test failed");
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("BAML_HOME").unwrap()).join("btel");
+    let program = baml_test_support::compile_source(
+        r#"
+        function success(value: string) -> string { value + ":output" }
+        function capture_success(value: string) -> string {
+            success(value, $trace = trace.span())
+        }
+        "#,
+    );
+    let recording = TelemetryRecording::from_boundary_env().unwrap();
+    let engine = Arc::new(
+        BexEngine::new_with_telemetry_recording(
+            program,
+            Arc::new(sys_native::SysOps::native()),
+            vec![],
+            None,
+            btel_clock::ClockMode::Monotonic,
+            recording,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        engine
+            .telemetry_recording_directory()
+            .unwrap()
+            .parent()
+            .unwrap(),
+        root.join("recordings")
+    );
+    engine
+        .call_function(
+            "capture_success",
+            vec![BexExternalValue::String("relocated".into())],
+            context(),
+            true,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), engine.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(engine.telemetry_result(), Some(Ok(())));
+    let mut found_output = false;
+    for file in
+        btel_core::recording::read_directory(engine.telemetry_recording_directory().unwrap())
+            .unwrap()
+            .files
+    {
+        for section in file.spans.unwrap().sections {
+            for event in section.events {
+                if let Some(proto::span_event::Event::FunctionCompletion(done)) = event.event {
+                    if let Some(id) = done.value_cas_id {
+                        assert_eq!(read_string_capture(&root, id, false), "relocated:output");
+                        found_output = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found_output,
+        "expected an output snapshot in the relocated CAS"
+    );
 }

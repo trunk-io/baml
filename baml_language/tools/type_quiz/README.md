@@ -60,7 +60,7 @@ bracketed program is the one that compiles four times in five.
 An equivalence or an unrelated pair reads the same in both directions and so
 has no foil, and neither does anything at the coherence site, where the
 reverse draw is the same two blocks the other way up. Twenty-two of the
-bank's forty served items pair, and every one of the forty answers both
+bank's forty-one served items pair, and every one of the forty-one answers both
 ways across its seeds, which the next section is about.
 
 ## What a case's surface may not say
@@ -93,7 +93,7 @@ the other, on a coin. Two separate items would each answer one way, and
 nothing that re-weights items could then be trusted to leave the kinds of
 question balanced — selection re-weights them on every step, for good
 reasons of its own. As one item, the balance is the item's, and every one
-of the forty the bank serves answers both ways. The invariant wrappers are
+of the forty-one the bank serves answers both ways. The invariant wrappers are
 shapes too: `Box<S>` against `Box<T>` over a strict pair, which is always
 rejected, beside the same over an equivalent pair, which always compiles.
 
@@ -185,8 +185,8 @@ it has already been served, so a rule may come round as often as the estimate
 wants it while the same template does not. Both are measured in the suite: a
 perfect learner's questions do not get shallower over a sitting, no item
 comes round more than six times in a hundred-odd questions, and certifying
-one costs 81 to 133 questions — with two sittings in twelve not certified
-inside the budget at all, for the reason below.
+one costs 76 to 132 questions — with three sittings in twelve not certified
+inside the budget at all, for the reasons below.
 
 Selection cannot see which way a draw's coins fell. Two coins decide the
 answer — which way a pair flows, and which fact of a shape a draw is — and
@@ -209,8 +209,8 @@ holding exactly the rules the tracer reads off its case.
 
 That costs questions, and it is why the default budget is 140. An
 equivalence's rule is evidenced only on the half of its item's draws that
-are the equivalence, so a learner who answers everything right needs 81 to
-133 questions to be certified where they had needed 60 to 68 — the price of
+are the equivalence, so a learner who answers everything right needs 76 to
+132 questions to be certified where they had needed 60 to 68 — the price of
 the kind of question saying nothing about its answer, over the questions a
 learner is actually asked as well as over the bank.
 
@@ -219,8 +219,15 @@ equivalence through unchanged, so a case putting an equivalence in a `Box`,
 an array or a map turns on the equivalence and not on the wrap: no reading
 of the wrap would answer it differently. The wrap's rule is therefore
 evidenced only where the wrap decides something — over a strict pair — and
-two sittings in twelve now run out of budget rather than one. The evidence
+two sittings in twelve ran out of budget rather than one. The evidence
 those cases used to give was never earned.
+
+The unguarded cycle costs the same way again. `type B = B;` is a shape
+beside the same cycle through a list, `type B = B | B[];`, which the spec
+accepts, and each turns on a rule of its own — that a fully unguarded cycle
+is rejected, and that a cycle group with a list or map edge is legal — so
+each rule is evidenced by half the item's draws, and three sittings in
+twelve now run out of budget.
 
 ## Interestingness
 
@@ -348,7 +355,7 @@ write. They are tests rather than hooks because a hook gates a commit on the
 one machine that has it installed, and these gate a merge. The formatter
 itself stays a prek hook as well, since a hook can fix what a check can only
 report. Both of those and the `mise` task keep the CLI's home, cache and
-profile streams under `target/`. Invoking `baml-cli test --from tools/type_quiz` directly instead
+profile streams under `target/`. Invoking `baml-cli test --project-dir tools/type_quiz` directly instead
 leaves a few hundred megabytes of them in `tools/type_quiz/.baml`, which the
 CLI marks ignored but does not clean up.
 
@@ -422,7 +429,7 @@ answers, the same reveal after each one. It drives the quiz in-process through
 `adaptive_step`, so a step costs only what the model takes to answer.
 
 ```
-baml run take_quiz --from tools/type_quiz -- \
+baml run take_quiz --project-dir tools/type_quiz -- \
     --sessions 3 --models opus,sonnet,haiku --out target/type-quiz-llm
 ```
 
@@ -464,7 +471,7 @@ end of a sitting as the conversation grows.
 ## Compiler issues surfaced by this tool
 
 Building the quiz is dogfooding, and each of these was found by it. Repros are
-minimal single-file packages. One has since been fixed and says so; the rest
+minimal single-file packages. Two have since been fixed and say so; the rest
 still reproduce. The numbering is referred to from code comments, so an entry
 keeps its number once it has one.
 
@@ -483,15 +490,20 @@ keeps its number once it has one.
    a closure's own parameter works at any depth, and so does handing the
    captured value to a function that makes the call, which is what
    `root.engine.generate` in `ns_engine/sample.baml` is for.
-2. **Run-time membership of a function value is exact, not a subtyping
-   check, and `Package.tests()` lies about its value type.** The map is
-   declared `map<string, () -> null throws unknown>` but its values reflect as
+2. **FIXED by BEP-079.** `void` is now a spelling of the unit type `null`, so
+   a test body's value reflects as `() -> null throws never` and is a member
+   of the declared `() -> null throws unknown`; `failure_of` in
+   `ns_engine/verify.baml` now looks the test up directly. The diagnosis
+   this entry first carried was half wrong: membership of a function value
+   was a subtyping check all along (`never` satisfies `unknown`), and the
+   whole mismatch was `void` against `null`, which were one type statically
+   and two at run time. As first reported: run-time membership of a function
+   value looked exact rather than a subtyping check, and `Package.tests()`
+   looked to lie about its value type. The map was declared
+   `map<string, () -> null throws unknown>` but its values reflected as
    `() -> void throws never`, so `if let f: () -> null throws unknown = t.get(k)`
-   and the matching `is` are both false for a present key, while a value from
-   `get_function<F>` matches `F` exactly. Either `void`/`never` should satisfy
-   `null`/`unknown` under function subtyping, or `tests()` should declare what
-   it returns. Workaround in `ns_engine/verify.baml` (`passes`); see also
-   SPEC_GAPS.md G-002.
+   and the matching `is` were both false for a present key, while a value
+   from `get_function<F>` matched `F` exactly. See also SPEC_GAPS.md G-002.
 3. **Parse ambiguities at block boundaries.** `else { "none" }` parses the block
    as a map literal (`expected ':'`), and an `if let … { `…` } else …` whose
    then-block is a bare template literal fails with `expected expression, found
@@ -560,8 +572,8 @@ keeps its number once it has one.
    renderer's `quote` in `ns_algebra/render.baml` therefore cannot spell a
    control character at all, and the name pools hold the characters they mean.
 12. **An empty class in a union matches any JSON object, so its siblings
-   decode as it.** With `type M = Empty | Named`, `baml.json.to_string` writes
-   a `Named { model: "m" }` as `{"model":"m"}` and `from_string<M>` reads it
+   decode as it.** With `type M = Empty | Named`, `baml.json.stringify` writes
+   a `Named { model: "m" }` as `{"model":"m"}` and `baml.json.decode<M>` reads it
    back as `Empty`, silently. Decoding takes the first member that fits and an
    empty class fits everything, so listing it last happens to work, which makes
    correctness depend on the order of a type alias. The transcript's

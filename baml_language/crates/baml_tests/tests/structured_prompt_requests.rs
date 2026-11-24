@@ -4,6 +4,7 @@
 //! keeps only the test that must control the host environment (a late-bound
 //! `env.NAME` reference resolved during preview), which needs a re-exec'd
 //! child process for isolation.
+#![allow(clippy::disallowed_methods)]
 
 use baml_tests::baml_test;
 use bex_engine::BexExternalValue;
@@ -48,7 +49,7 @@ function main() -> string {
     prompt: Shape@spec().prompt_template,
     journal: ai.Journal { log: [] },
     toolbox: ai.tools.Toolbox.new([]),
-    output_type: reflect.Type.of<string>(),
+    output_type: string.type(),
   }
   let c: ai.Client = Vertex
   let request = c.render(input)

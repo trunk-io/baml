@@ -3,21 +3,19 @@
 //! Uses `TextRange` (file-relative) — `FileId` is added at the conversion
 //! boundary in `check_file()`.
 
-use baml_base::{ClientOptionsValidationError, FileId, Span};
+use baml_base::{FileId, Span};
 use baml_compiler_diagnostics::diagnostic::{Diagnostic, DiagnosticId, DiagnosticPhase, Severity};
 use text_size::TextRange;
 
-/// Where a written type lives, which decides what an author can do about a
-/// runtime type appearing in it: a body can introduce a `type T = …;`
-/// binding before the type is written, a declaration cannot - it has no
-/// scope of its own, so the runtime type has to arrive as a type argument.
+/// The book chapter on patterns and destructuring, linked from
+/// [`LoweringDiagnostic::InvalidAssignmentTarget`].
+pub const DESTRUCTURING_DOCS_URL: &str = "https://developer.boundaryml.com/baml/book/patterns";
+
+/// Which keyword a test block was written with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TypeExprOwner {
-    /// A type written inside a function, lambda, or block body.
-    Body,
-    /// A type written in a declaration: a field, a signature, a bound, an
-    /// `implements` argument, or a top-level alias.
-    Declaration,
+pub enum TestBlockKind {
+    Test,
+    Testset,
 }
 
 /// Diagnostic emitted during CST → AST lowering.
@@ -35,28 +33,14 @@ pub enum LoweringDiagnostic {
         associated_bindings: usize,
         span: TextRange,
     },
-
-    /// A top-level item (class, function, enum, etc.) has no name token.
-    MissingItemName {
-        item_kind: &'static str,
-        span: TextRange,
-    },
-
-    /// A class field has no name token.
-    MissingFieldName { class_name: String, span: TextRange },
-
+    /// `expr@spec(…)` whose `expr` is not a bare function name (`f<T>@spec`,
+    /// `(f)@spec`): a companion is named, not computed.
+    SpecTargetNotFunctionName { span: TextRange },
     /// A type expression could not be parsed — lowered to `TypeExpr::Unknown`.
     UnparseableType {
         context: String, // "field `Foo.bar`", "return type", "parameter `x`"
         span: TextRange,
     },
-
-    /// A function parameter has no name token.
-    MissingParamName {
-        function_name: String,
-        span: TextRange,
-    },
-
     /// A parameter default was parsed in a context that does not support defaults.
     UnsupportedParameterDefault { context: String, span: TextRange },
 
@@ -68,16 +52,6 @@ pub enum LoweringDiagnostic {
         reserved_for: &'static str,
         span: TextRange,
     },
-
-    /// An enum variant has no name token.
-    MissingVariantName { enum_name: String, span: TextRange },
-
-    /// An attribute could not be lowered (missing name token).
-    MalformedAttribute {
-        context: String, // "field `Foo.bar`", "class `Foo`"
-        span: TextRange,
-    },
-
     /// A `generator { … }` block was found in `.baml`. Code generators are
     /// now configured in `baml.toml` under `[generator.<name>]`; the block is
     /// ignored. Carries the optional generator name for the message.
@@ -85,77 +59,16 @@ pub enum LoweringDiagnostic {
         name: Option<String>,
         span: TextRange,
     },
-
-    /// A config block item (client, test, `retry_policy`) has a missing key.
-    MissingConfigKey {
-        block_kind: &'static str,
-        block_name: String,
-        span: TextRange,
-    },
-
-    /// A required config block is missing entirely (e.g., client without
-    /// options block, `retry_policy` without config block).
-    MissingConfigBlock {
-        block_kind: &'static str,
-        block_name: String,
-        span: TextRange,
-    },
-
-    /// The client's `provider` value is not a recognized provider name.
-    UnknownProvider {
-        client_name: String,
-        provider: String,
-        span: TextRange,
-    },
-
-    /// A client is missing required provider-specific options.
-    MissingClientOptions {
-        client_name: String,
-        error: ClientOptionsValidationError,
-        span: TextRange,
-    },
-
-    /// A byte string literal contains an invalid escape sequence.
-    InvalidByteStringEscape { message: String, span: TextRange },
-
-    /// The `instanceof` operator was used; it has been removed. Use `match` instead.
+    /// The client's `provider` value is not a recognized provider name.    /// A client is missing required provider-specific options.    /// A `"..."`, backtick, or `b"..."` literal contains an unknown or    /// The `instanceof` operator was used; it has been removed. Use `match` instead.
     InstanceofRemoved { span: TextRange },
-
-    /// A backtick template has a malformed block tag — an unclosed,
-    /// mismatched, or stray `${for}`/`${if}` open/close.
-    MalformedTemplateBlock {
-        kind: baml_compiler_syntax::BacktickStructuralErrorKind,
-        span: TextRange,
-    },
 
     /// A `${}` interpolation with no expression inside.
     EmptyInterpolation { span: TextRange },
-
-    /// `void` was used outside of a function return type position.
-    VoidInNonReturnPosition { context: String, span: TextRange },
 
     /// The `_` wildcard type was used in a position where it cannot be inferred
     /// (a signature, field, or alias type, as opposed to a `let` binding
     /// annotation or a `throws`-clause member).
     WildcardTypeNotAllowed { context: String, span: TextRange },
-
-    /// `unreflect(…)` written anywhere other than as the whole right-hand
-    /// side of a body-level `type T = …;` binding: a type argument, an
-    /// annotation, a pattern, an item signature, a top-level alias, or nested
-    /// inside a binding's static type. The binding is the one spelling that
-    /// lifts a runtime type; every other position names the bound `T`.
-    /// `owner` decides the remedy: a body can bind the type where it stands,
-    /// a declaration has no scope to bind one in at all.
-    UnreflectOutsideTypeBinding {
-        span: TextRange,
-        owner: TypeExprOwner,
-    },
-
-    /// `unreflect(expr)` nested inside the right-hand side of a body
-    /// `type T = …` statement (`type T = Wrapper<unreflect(t)>`). The
-    /// statement lifts exactly one runtime type, as its whole right-hand
-    /// side; compose through a second binding.
-    UnreflectNestedInTypeBinding { span: TextRange },
 
     /// A `:` type ascription was applied to a pattern that doesn't accept
     /// one. Only `let x: T` and `[…]: T` are supported. Things like
@@ -166,42 +79,55 @@ pub enum LoweringDiagnostic {
         span: TextRange,
     },
 
-    /// A source-authored `let` appeared at file scope. Only compiler-synthesized
-    /// globals (such as clients and retry policies) are supported.
-    TopLevelLetNotSupported { span: TextRange },
+    /// A file-scope binding that does not bind exactly one name: a
+    /// destructure, a wildcard, an alias chain, or a `const … else`. A global
+    /// variable is one named binding (optionally annotated with `: T`);
+    /// `reason` says which rule the declaration broke.
+    InvalidTopLevelLet {
+        reason: &'static str,
+        span: TextRange,
+    },
+
+    /// A `let type` binding at file scope. It binds a runtime type for the
+    /// rest of a block, and a file has no block for it to bind in.
+    TopLevelLetType { span: TextRange },
+
+    /// A `test`/`testset` block in a body that is no testset's.
+    TestOutsideTestset {
+        kind: TestBlockKind,
+        span: TextRange,
+    },
 
     /// `const` currently parses as a non-immutable alias for `let`.
     ConstBindingIntroducer { span: TextRange },
 
+    LetInConstDestructure {
+        span: TextRange,
+        const_span: TextRange,
+    },
+
+    /// `let` introducing a global variable. A global is declared with `const`;
+    /// `let` declares a reassignable binding, which only a body has.
+    TopLevelLetIntroducer { span: TextRange },
+
     /// `const` is reserved as future language surface and cannot be used as a
     /// binding name.
     ReservedConstBindingName { span: TextRange },
-
-    /// An assignment operator (`=`, `+=`, …) appeared in expression position,
-    /// e.g. `(x = 5)`. Assignment is statement-only in BAML, so the expression
-    /// has no value; without this diagnostic it would lower to a `Missing` that
-    /// only fails at runtime.
-    AssignmentInExpressionPosition { span: TextRange },
+    /// The left-hand side of an assignment (`=`, `+=`, …) is not a place:
+    /// e.g. `[x, y] = [1, 2]` or `P { a: a } = mk()`. BAML destructures with
+    /// `let` patterns (`let P { a, b } = v;`, `let P { a: let other_a, b } =
+    /// v;`); the left-hand side of an assignment is an expression, so these
+    /// are a class or array *literal*, not a pattern. Without this diagnostic
+    /// the store went into a temporary and the statement silently did
+    /// nothing. `destructure` is set for a plain `=` into a class or array
+    /// literal, which reads as a destructure; the message then links to
+    /// [`DESTRUCTURING_DOCS_URL`].
+    InvalidAssignmentTarget { span: TextRange, destructure: bool },
 
     /// Parser recovery produced an object-literal node without a constructor
     /// identifier. The AST cannot represent a constructor-less object, so the
     /// expression lowers to `Missing` and this diagnostic preserves the error.
     MissingObjectConstructor { span: TextRange },
-
-    /// Top-level `implements I for T` where `T` does not match any class in the file.
-    UnresolvedImplementsForTarget {
-        interface_name: String,
-        target_name: String,
-        span: TextRange,
-    },
-
-    /// Top-level `implements I for T` tried to add fields to a non-class
-    /// target. Primitive and fixed-shape types may only provide methods.
-    InvalidImplementsForFieldsTarget {
-        target_name: String,
-        span: TextRange,
-    },
-
     /// Field declarations inside `implements` blocks are the obsolete
     /// qualified-field model. Interface fields are satisfied by class fields
     /// or explicit `field as class_field` links.
@@ -215,16 +141,6 @@ pub enum LoweringDiagnostic {
     /// plain function reference (e.g. `(foo)<int>`). Only a path reference to a
     /// generic function may be specialized into a value (`foo<int>`).
     TypeArgsOnNonPathBase { span: TextRange },
-
-    /// An LLM function's `tools` field cannot switch the function to the
-    /// ai-package spec desugar: the function is missing a backtick prompt or a
-    /// `"provider/model"` client string with a known provider prefix.
-    InvalidLlmToolsField {
-        function_name: String,
-        reason: &'static str,
-        span: TextRange,
-    },
-
     /// A legacy `client<llm> Name { ... }` config block. Removed: clients are
     /// plain values now — `client Name = <expr>;`.
     ///
@@ -262,15 +178,6 @@ pub enum LoweringDiagnostic {
         reason: String,
         span: TextRange,
     },
-
-    /// A `${role(...)}` marker in an LLM prompt. Removed: the prompt is
-    /// instructions-only; the conversation lives in the journal and roles are
-    /// the client's wire concern.
-    LlmRoleMarkerRemoved {
-        function_name: String,
-        span: TextRange,
-    },
-
     /// A numeric literal token failed validation (`baml_base::num_lit`):
     /// uppercase base prefix, no digits after the prefix, a digit invalid
     /// for the base, or an integer magnitude exceeding `i64::MAX`. For
@@ -340,19 +247,12 @@ impl LoweringDiagnostic {
                 *span,
                 "invalid builtin type arguments",
             ),
-            LoweringDiagnostic::MissingItemName { item_kind, span } => (
-                DiagnosticId::MissingName,
+            LoweringDiagnostic::SpecTargetNotFunctionName { span } => (
+                DiagnosticId::InvalidSyntax,
                 Severity::Error,
-                format!("{item_kind} is missing a name"),
+                "`@spec` applies to a function name: write `Function@spec(...)` without type arguments or parentheses around the name".to_string(),
                 *span,
-                "expected a name here",
-            ),
-            LoweringDiagnostic::MissingFieldName { class_name, span } => (
-                DiagnosticId::MissingName,
-                Severity::Error,
-                format!("field in class `{class_name}` is missing a name"),
-                *span,
-                "expected a field name",
+                "not a function name",
             ),
             LoweringDiagnostic::UnparseableType { context, span } => (
                 DiagnosticId::UnparseableType,
@@ -360,16 +260,6 @@ impl LoweringDiagnostic {
                 format!("could not parse type expression for {context}"),
                 *span,
                 "unparseable type",
-            ),
-            LoweringDiagnostic::MissingParamName {
-                function_name,
-                span,
-            } => (
-                DiagnosticId::MissingName,
-                Severity::Error,
-                format!("parameter in function `{function_name}` is missing a name"),
-                *span,
-                "expected a parameter name",
             ),
             LoweringDiagnostic::UnsupportedParameterDefault { context, span } => (
                 DiagnosticId::InvalidSyntax,
@@ -391,20 +281,6 @@ impl LoweringDiagnostic {
                 ),
                 *span,
                 "reserved LLM parameter name",
-            ),
-            LoweringDiagnostic::MissingVariantName { enum_name, span } => (
-                DiagnosticId::MissingName,
-                Severity::Error,
-                format!("variant in enum `{enum_name}` is missing a name"),
-                *span,
-                "expected a variant name",
-            ),
-            LoweringDiagnostic::MalformedAttribute { context, span } => (
-                DiagnosticId::MalformedAttribute,
-                Severity::Error,
-                format!("attribute on {context} is missing a name"),
-                *span,
-                "malformed attribute",
             ),
             LoweringDiagnostic::GeneratorBlockInBaml { name, span } => {
                 let what = match name {
@@ -428,57 +304,6 @@ impl LoweringDiagnostic {
                 )
                 .with_phase(DiagnosticPhase::Hir);
             }
-            LoweringDiagnostic::MissingConfigKey {
-                block_kind,
-                block_name,
-                span,
-            } => (
-                DiagnosticId::MissingConfigKey,
-                Severity::Error,
-                format!("config entry in {block_kind} `{block_name}` is missing a key"),
-                *span,
-                "expected a key",
-            ),
-            LoweringDiagnostic::MissingConfigBlock {
-                block_kind,
-                block_name,
-                span,
-            } => (
-                DiagnosticId::MissingConfigBlock,
-                Severity::Error,
-                format!("{block_kind} `{block_name}` is missing a required config block"),
-                *span,
-                "expected a config block",
-            ),
-            LoweringDiagnostic::UnknownProvider {
-                client_name: _,
-                provider,
-                span,
-            } => (
-                DiagnosticId::UnknownProvider,
-                Severity::Error,
-                format!("unknown provider '{provider}'"),
-                *span,
-                "unknown provider",
-            ),
-            LoweringDiagnostic::MissingClientOptions {
-                client_name: _,
-                error,
-                span,
-            } => (
-                DiagnosticId::MissingClientOptions,
-                Severity::Error,
-                error.to_string(),
-                *span,
-                "missing options",
-            ),
-            LoweringDiagnostic::InvalidByteStringEscape { message, span } => (
-                DiagnosticId::InvalidByteStringEscape,
-                Severity::Error,
-                format!("invalid byte string literal: {message}"),
-                *span,
-                "invalid escape",
-            ),
             LoweringDiagnostic::InstanceofRemoved { span } => (
                 DiagnosticId::RemovedFeature,
                 Severity::Error,
@@ -486,58 +311,6 @@ impl LoweringDiagnostic {
                 *span,
                 "use `match` instead",
             ),
-            LoweringDiagnostic::MalformedTemplateBlock { kind, span } => {
-                use baml_compiler_syntax::BacktickStructuralErrorKind as K;
-                let (message, label): (&str, &str) = match kind {
-                    K::UnclosedFor => (
-                        "unclosed ${for} block — expected ${endfor}",
-                        "this ${for} is never closed",
-                    ),
-                    K::UnclosedIf => (
-                        "unclosed ${if} block — expected ${endif}",
-                        "this ${if} is never closed",
-                    ),
-                    K::MismatchedForClose => (
-                        "${for} block closed by ${endif} — expected ${endfor}",
-                        "expected ${endfor} here",
-                    ),
-                    K::MismatchedIfClose => (
-                        "${if} block closed by ${endfor} — expected ${endif}",
-                        "expected ${endif} here",
-                    ),
-                    K::StrayEndfor => (
-                        "stray ${endfor} with no matching ${for}",
-                        "no open ${for} to close",
-                    ),
-                    K::StrayEndif => (
-                        "stray ${endif} with no matching ${if}",
-                        "no open ${if} to close",
-                    ),
-                    K::StrayElse => (
-                        "stray ${else} outside an ${if} block",
-                        "${else} must be inside ${if}…${endif}",
-                    ),
-                    K::StrayElseIf => (
-                        "stray ${else if} outside an ${if} block",
-                        "${else if} must be inside ${if}…${endif}",
-                    ),
-                    K::DuplicateElse => (
-                        "duplicate ${else} in the same ${if} chain",
-                        "this ${if} already has an ${else}",
-                    ),
-                    K::ElseIfAfterElse => (
-                        "${else if} after ${else} in the same ${if} chain",
-                        "move ${else if} branches before ${else}",
-                    ),
-                };
-                (
-                    DiagnosticId::InvalidSyntax,
-                    Severity::Error,
-                    message.to_string(),
-                    *span,
-                    label,
-                )
-            }
             LoweringDiagnostic::EmptyInterpolation { span } => (
                 DiagnosticId::InvalidSyntax,
                 // Advisory, not fatal: an empty `${}` renders to the empty
@@ -550,13 +323,6 @@ impl LoweringDiagnostic {
                 *span,
                 "expected an expression inside ${…}",
             ),
-            LoweringDiagnostic::VoidInNonReturnPosition { context, span } => (
-                DiagnosticId::VoidInNonReturnPosition,
-                Severity::Error,
-                format!("`void` can only be used as a function return type, not as {context}"),
-                *span,
-                "`void` not allowed here",
-            ),
             LoweringDiagnostic::WildcardTypeNotAllowed { context, span } => (
                 DiagnosticId::WildcardTypeNotAllowed,
                 Severity::Error,
@@ -566,46 +332,6 @@ impl LoweringDiagnostic {
                 *span,
                 "`_` cannot be inferred here",
             ),
-            LoweringDiagnostic::UnreflectOutsideTypeBinding { span, owner } => {
-                // One constructor owns E0168's headline (the diagnostics
-                // crate), so the lowering gate and any later reporter can
-                // never drift apart on the message. Only the remedy differs:
-                // a declaration has no scope to bind a runtime type in, so
-                // pointing it at a `type` statement would name a spelling
-                // that is E0168 there too.
-                let label = match owner {
-                    TypeExprOwner::Body => {
-                        "bind it first with `type T = unreflect(…);`, then write `T` here"
-                    }
-                    // Deliberately does not promise a type parameter: a
-                    // field or a signature can take one, but a top-level
-                    // alias cannot, and every declaration position shares
-                    // the one true remedy - move it into a body.
-                    TypeExprOwner::Declaration => {
-                        "a runtime type has no scope in a declaration; bind it inside a function body with `type T = unreflect(…);`"
-                    }
-                };
-                return baml_compiler_diagnostics::runtime_type::runtime_type_must_be_named()
-                    .with_primary(
-                        Span {
-                            file_id,
-                            range: *span,
-                        },
-                        label,
-                    )
-                    .with_phase(DiagnosticPhase::Hir);
-            }
-            LoweringDiagnostic::UnreflectNestedInTypeBinding { span } => {
-                return baml_compiler_diagnostics::runtime_type::runtime_type_must_be_named()
-                    .with_primary(
-                        Span {
-                            file_id,
-                            range: *span,
-                        },
-                        "a `type` binding lifts one runtime type as its whole right-hand side; give this one a `type` statement of its own first, then write that name here",
-                    )
-                    .with_phase(DiagnosticPhase::Hir);
-            }
             LoweringDiagnostic::InvalidPatternAscription { reason, span } => (
                 DiagnosticId::TypeMismatch,
                 Severity::Error,
@@ -613,10 +339,32 @@ impl LoweringDiagnostic {
                 *span,
                 "type ascription not allowed here",
             ),
-            LoweringDiagnostic::TopLevelLetNotSupported { span } => (
+            LoweringDiagnostic::InvalidTopLevelLet { reason, span } => (
                 DiagnosticId::InvalidSyntax,
                 Severity::Error,
-                "top-level `let` bindings are not supported".to_string(),
+                format!("invalid top-level `const`: {reason}"),
+                *span,
+                "a global variable binds one name: `const NAME = value;` or `const NAME: Type = value;`",
+            ),
+            LoweringDiagnostic::TestOutsideTestset { kind, span } => (
+                DiagnosticId::InvalidSyntax,
+                Severity::Error,
+                "invalid syntax".to_string(),
+                *span,
+                match kind {
+                    TestBlockKind::Test => {
+                        "test blocks are only allowed at the top level or inside a testset"
+                    }
+                    TestBlockKind::Testset => {
+                        "testset blocks are only allowed at the top level or inside a testset"
+                    }
+                },
+            ),
+            LoweringDiagnostic::TopLevelLetType { span } => (
+                DiagnosticId::InvalidSyntax,
+                Severity::Error,
+                "`let type` binds a type for the rest of a block, so it is only allowed inside a body"
+                    .to_string(),
                 *span,
                 "move this binding into a function body",
             ),
@@ -627,6 +375,20 @@ impl LoweringDiagnostic {
                 *span,
                 "`const` behaves like `let` for now",
             ),
+            LoweringDiagnostic::LetInConstDestructure { span, .. } => (
+                DiagnosticId::InvalidSyntax,
+                Severity::Error,
+                "a destructure started with `const` binds only with `const`".to_string(),
+                *span,
+                "write `const` here, or start the destructure with `let` to mix introducers",
+            ),
+            LoweringDiagnostic::TopLevelLetIntroducer { span } => (
+                DiagnosticId::InvalidSyntax,
+                Severity::Error,
+                "global variables are declared with `const`: `const NAME = value;`".to_string(),
+                *span,
+                "write `const` here; `let` is only allowed inside a body",
+            ),
             LoweringDiagnostic::ReservedConstBindingName { span } => (
                 DiagnosticId::InvalidSyntax,
                 Severity::Error,
@@ -634,13 +396,22 @@ impl LoweringDiagnostic {
                 *span,
                 "`const` is reserved here",
             ),
-            LoweringDiagnostic::AssignmentInExpressionPosition { span } => (
+            LoweringDiagnostic::InvalidAssignmentTarget { span, destructure } => (
                 DiagnosticId::InvalidSyntax,
                 Severity::Error,
-                "assignment is not allowed in expression position; assignment is a statement"
-                    .to_string(),
+                if *destructure {
+                    format!(
+                        "invalid assignment target; the left side of `=` is an expression, \
+                         not a pattern. To destructure, use a `let` pattern: see \
+                         {DESTRUCTURING_DOCS_URL}"
+                    )
+                } else {
+                    "invalid assignment target; only a variable, a field, or an index can be \
+                     assigned to"
+                        .to_string()
+                },
                 *span,
-                "assignment not allowed here",
+                "cannot assign to this expression",
             ),
             LoweringDiagnostic::MissingObjectConstructor { span } => (
                 DiagnosticId::InvalidSyntax,
@@ -648,26 +419,6 @@ impl LoweringDiagnostic {
                 "object construction requires a class or type name".to_string(),
                 *span,
                 "expected a constructor name before `{`",
-            ),
-            LoweringDiagnostic::UnresolvedImplementsForTarget {
-                interface_name,
-                target_name,
-                span,
-            } => (
-                DiagnosticId::UnknownType,
-                Severity::Error,
-                format!("`implements {interface_name} for {target_name}`: type `{target_name}` not found"),
-                *span,
-                "unknown target type",
-            ),
-            LoweringDiagnostic::InvalidImplementsForFieldsTarget { target_name, span } => (
-                DiagnosticId::TypeMismatch,
-                Severity::Error,
-                format!(
-                    "`implements for {target_name}` cannot declare fields; only class targets can add interface fields"
-                ),
-                *span,
-                "fields are not allowed for this target",
             ),
             LoweringDiagnostic::InterfaceFieldDeclaredInImplementsBlock {
                 interface_name,
@@ -688,17 +439,6 @@ impl LoweringDiagnostic {
                 "type arguments can only be applied to a function reference".to_string(),
                 *span,
                 "specialize a generic function directly, e.g. `foo<int>`",
-            ),
-            LoweringDiagnostic::InvalidLlmToolsField {
-                function_name,
-                reason,
-                span,
-            } => (
-                DiagnosticId::InvalidSyntax,
-                Severity::Error,
-                format!("LLM function `{function_name}` cannot use a `tools` field: {reason}"),
-                *span,
-                "`tools` requires a backtick prompt and a \"provider/model\" client string",
             ),
             LoweringDiagnostic::ClientBlockRemoved {
                 name,
@@ -765,20 +505,6 @@ impl LoweringDiagnostic {
                 *span,
                 "use a \"provider/model\" string or an expression evaluating to ai.Client",
             ),
-            LoweringDiagnostic::LlmRoleMarkerRemoved {
-                function_name,
-                span,
-            } => (
-                DiagnosticId::InvalidSyntax,
-                Severity::Error,
-                format!(
-                    "`${{role(...)}}` markers are removed; the prompt of `{function_name}` is \
-                     instructions-only — the conversation lives in the journal, and message \
-                     roles are the client's wire concern"
-                ),
-                *span,
-                "delete the role marker; write plain instructions",
-            ),
             LoweringDiagnostic::InvalidNumericLiteral { error, span } => {
                 use baml_base::num_lit::IntLitError;
                 (
@@ -800,8 +526,18 @@ impl LoweringDiagnostic {
             }
         };
 
-        Diagnostic::new(id, severity, message)
-            .with_primary(Span { file_id, range }, label)
-            .with_phase(DiagnosticPhase::Hir)
+        let diagnostic =
+            Diagnostic::new(id, severity, message).with_primary(Span { file_id, range }, label);
+        let diagnostic = match self {
+            Self::LetInConstDestructure { const_span, .. } => diagnostic.with_secondary(
+                Span {
+                    file_id,
+                    range: *const_span,
+                },
+                "the destructure starts with `const` here",
+            ),
+            _ => diagnostic,
+        };
+        diagnostic.with_phase(DiagnosticPhase::Hir)
     }
 }

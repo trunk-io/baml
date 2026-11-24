@@ -18,11 +18,6 @@ pub const BUILTIN_PREFIX: &str = "<builtin>";
 pub struct RootEntry {
     pub root: SourceRoot,
     pub path: PathBuf,
-    /// The spelling the emitted program addresses this package by, which is
-    /// the unnamed default for a package that names no name. It identifies a
-    /// package to the engine and is NOT a label: several unnamed projects all
-    /// spell the same. Use [`RootEntry::self_name`] to show one to a person.
-    pub spelling: Name,
     /// What the package calls itself in `[package].name`, or `None` when it
     /// declares no name, which is every project discovered by a `baml_src/`
     /// marker alone. A reader with no name to show falls back to the
@@ -84,23 +79,6 @@ impl RootsView {
             .rev()
             .find(|(root_path, _)| path.starts_with(root_path))
             .map(|(_, index)| &self.entries[*index])
-    }
-
-    pub fn stdlib_dir(&self) -> Option<&Path> {
-        self.stdlib_dir.as_deref()
-    }
-
-    /// Map a database path to the path a client can open.
-    ///
-    /// Stdlib files are stored under the virtual `<builtin>/<pkg>/…` prefix
-    /// (a wire contract the emitted bytecode shares); when the host has a
-    /// materialized copy of the stubs on disk, presentation swaps the prefix
-    /// for that directory. Everything else is returned unchanged.
-    pub fn to_presentation_path(&self, db_path: &Path) -> Option<PathBuf> {
-        match db_path.strip_prefix(BUILTIN_PREFIX) {
-            Ok(rest) => self.stdlib_dir.as_ref().map(|dir| dir.join(rest)),
-            Err(_) => Some(db_path.to_path_buf()),
-        }
     }
 
     /// Map a client path back to database form: a path under the

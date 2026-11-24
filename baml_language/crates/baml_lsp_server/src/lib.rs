@@ -23,6 +23,9 @@
 //!  stdout ◀── writer thread ◀── OutboundBudget ◀── responder / ClientSender
 //! ```
 
+#![warn(clippy::disallowed_methods)]
+
+#[cfg(feature = "deadlock-watchdog")]
 mod deadlock_watchdog;
 pub mod engine;
 pub mod lsp_ingress;
@@ -353,27 +356,9 @@ pub fn version() -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Locate legacy stdlib files so incoming file URIs can alias embedded sources.
-/// Checks `BAML_STDLIB_DIR`, then `<exe dir>/../stdlib` from older installs,
-/// then the build-time `baml_std/` checkout. Clients can override this through
+/// Uses the build-time `baml_std/` checkout. Clients can override this through
 /// `initializationOptions.bamlClient.stdlibDir`.
 fn resolve_stdlib_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("BAML_STDLIB_DIR") {
-        let dir = PathBuf::from(dir);
-        if dir.is_dir() {
-            return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
-        }
-        tracing::warn!(
-            path = %dir.display(),
-            "BAML_STDLIB_DIR is not a directory; ignoring it"
-        );
-    }
-    let toolchain = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.join("..").join("stdlib")))
-        .filter(|candidate| candidate.is_dir());
-    if let Some(candidate) = toolchain {
-        return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
-    }
     let checkout = PathBuf::from(baml_builtins2::BAML_STD_DIR);
     checkout
         .is_dir()
@@ -532,6 +517,7 @@ fn run_server_inner(
     }));
 
     tracing::info!("baml-lsp v{} starting", version());
+    #[cfg(feature = "deadlock-watchdog")]
     deadlock_watchdog::spawn();
 
     let stdlib_dir = resolve_stdlib_dir();
@@ -994,7 +980,7 @@ mod tests {
              start.elapsed().to_milliseconds() >= 0n\n}\n",
         );
         let program = db
-            .get_bytecode_unchecked(root)
+            .get_bytecode(root)
             .unwrap_or_else(|e| unreachable!("the fixture compiles: {e}"));
 
         let engine = Arc::new(
@@ -1209,7 +1195,7 @@ mod tests {
                  baml.fs.read(\"note.txt\")\n}\n",
             );
             let program = db
-                .get_bytecode_unchecked(package)
+                .get_bytecode(package)
                 .unwrap_or_else(|e| unreachable!("the fixture compiles: {e}"));
             let engine = engine::construct_engine_candidate(
                 program,

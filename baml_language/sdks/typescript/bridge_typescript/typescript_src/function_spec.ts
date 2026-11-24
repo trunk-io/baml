@@ -1,26 +1,25 @@
 // Host proxy for a live ai.FunctionSpec<Out> value.
 
-import { BamlHandle, getRuntime, newFunctionCall as nativeNewFunctionCall } from './native.js';
-import { decodeCallResult, encodeCallArgs } from './proto.js';
+import { BamlHandle } from './native.js';
+import { invokeTarget } from './proto.js';
+import type { InvocationOptions } from './invocation.js';
 import type { BamlPrompt } from './proto.js';
 import type { BamlType } from './wire_ty.js';
 
 export interface BamlFunctionSpecCallOptions {
+    $baml?: InvocationOptions | null;
     client?: unknown;
     on_event?: unknown;
 }
 
 export interface BamlFunctionSpecBuildRequestOptions {
+    $baml?: InvocationOptions | null;
     client?: unknown;
-}
-
-function newFunctionCall(): bigint {
-    return BigInt(nativeNewFunctionCall());
 }
 
 function suppliedOptions(options: object | undefined): Record<string, unknown> {
     return Object.fromEntries(
-        Object.entries(options ?? {}).filter(([, value]) => value !== undefined),
+        Object.entries(options ?? {}).filter(([key, value]) => key !== '$baml' && value !== undefined),
     );
 }
 
@@ -45,101 +44,89 @@ export class BamlFunctionSpec<TOut> {
         return this.handle;
     }
 
-    name(): string {
-        return this._callSync('ai.FunctionSpec.name') as string;
+    nameSync(options?: { $baml?: InvocationOptions | null }): string {
+        return this._callSync('ai.FunctionSpec.name', {}, options) as string;
     }
 
-    async nameAsync(): Promise<string> {
-        return await this._callAsync('ai.FunctionSpec.name') as string;
+    async name(options?: { $baml?: InvocationOptions | null }): Promise<string> {
+        return await this._callAsync('ai.FunctionSpec.name', {}, options) as string;
     }
 
-    arguments(): Record<string, unknown> {
-        return this._callSync('ai.FunctionSpec.arguments') as Record<string, unknown>;
+    argumentsSync(options?: { $baml?: InvocationOptions | null }): Record<string, unknown> {
+        return this._callSync('ai.FunctionSpec.arguments', {}, options) as Record<string, unknown>;
     }
 
-    async argumentsAsync(): Promise<Record<string, unknown>> {
-        return await this._callAsync('ai.FunctionSpec.arguments') as Record<string, unknown>;
+    async arguments(options?: { $baml?: InvocationOptions | null }): Promise<Record<string, unknown>> {
+        return await this._callAsync('ai.FunctionSpec.arguments', {}, options) as Record<string, unknown>;
     }
 
-    outputType(): BamlType {
-        return this._callSync('ai.FunctionSpec.output_type') as BamlType;
+    outputTypeSync(options?: { $baml?: InvocationOptions | null }): BamlType {
+        return this._callSync('ai.FunctionSpec.output_type', {}, options) as BamlType;
     }
 
-    async outputTypeAsync(): Promise<BamlType> {
-        return await this._callAsync('ai.FunctionSpec.output_type') as BamlType;
+    async outputType(options?: { $baml?: InvocationOptions | null }): Promise<BamlType> {
+        return await this._callAsync('ai.FunctionSpec.output_type', {}, options) as BamlType;
     }
 
-    prompt(): BamlPrompt {
-        return this._callSync('ai.FunctionSpec.prompt') as BamlPrompt;
+    promptSync(options?: { $baml?: InvocationOptions | null }): BamlPrompt {
+        return this._callSync('ai.FunctionSpec.prompt', {}, options) as BamlPrompt;
     }
 
-    async promptAsync(): Promise<BamlPrompt> {
-        return await this._callAsync('ai.FunctionSpec.prompt') as BamlPrompt;
+    async prompt(options?: { $baml?: InvocationOptions | null }): Promise<BamlPrompt> {
+        return await this._callAsync('ai.FunctionSpec.prompt', {}, options) as BamlPrompt;
     }
 
-    tools(): unknown {
-        return this._callSync('ai.FunctionSpec.tools');
+    toolsSync(options?: { $baml?: InvocationOptions | null }): unknown {
+        return this._callSync('ai.FunctionSpec.tools', {}, options);
     }
 
-    async toolsAsync(): Promise<unknown> {
-        return await this._callAsync('ai.FunctionSpec.tools');
+    async tools(options?: { $baml?: InvocationOptions | null }): Promise<unknown> {
+        return await this._callAsync('ai.FunctionSpec.tools', {}, options);
     }
 
-    clientId(): string {
-        return this._callSync('ai.FunctionSpec.client_id') as string;
+    requestedModelSync(options?: { $baml?: InvocationOptions | null }): string {
+        return this._callSync('ai.FunctionSpec.requested_model', {}, options) as string;
     }
 
-    async clientIdAsync(): Promise<string> {
-        return await this._callAsync('ai.FunctionSpec.client_id') as string;
+    async requestedModel(options?: { $baml?: InvocationOptions | null }): Promise<string> {
+        return await this._callAsync('ai.FunctionSpec.requested_model', {}, options) as string;
     }
 
-    buildRequest(options?: BamlFunctionSpecBuildRequestOptions): unknown {
-        return this._callSync('ai.FunctionSpec.build_request', suppliedOptions(options));
+    buildRequestSync(options?: BamlFunctionSpecBuildRequestOptions): unknown {
+        return this._callSync('ai.FunctionSpec.build_request', suppliedOptions(options), options);
     }
 
-    async buildRequestAsync(options?: BamlFunctionSpecBuildRequestOptions): Promise<unknown> {
+    async buildRequest(options?: BamlFunctionSpecBuildRequestOptions): Promise<unknown> {
         return await this._callAsync(
             'ai.FunctionSpec.build_request',
-            suppliedOptions(options),
+            suppliedOptions(options), options,
         );
     }
 
-    parse(json: string): TOut {
-        return this._callSync('ai.FunctionSpec.parse', { json }) as TOut;
+    parseSync(json: string, options?: { $baml?: InvocationOptions | null }): TOut {
+        return this._callSync('ai.FunctionSpec.parse', { json }, options) as TOut;
     }
 
-    async parseAsync(json: string): Promise<TOut> {
-        return await this._callAsync('ai.FunctionSpec.parse', { json }) as TOut;
+    async parse(json: string, options?: { $baml?: InvocationOptions | null }): Promise<TOut> {
+        return await this._callAsync('ai.FunctionSpec.parse', { json }, options) as TOut;
     }
 
-    call(options?: BamlFunctionSpecCallOptions): TOut {
-        return this._callSync('ai.FunctionSpec.call', suppliedOptions(options)) as TOut;
+    callSync(options?: BamlFunctionSpecCallOptions): TOut {
+        return this._callSync('ai.FunctionSpec.call', suppliedOptions(options), options) as TOut;
     }
 
-    async callAsync(options?: BamlFunctionSpecCallOptions): Promise<TOut> {
+    async call(options?: BamlFunctionSpecCallOptions): Promise<TOut> {
         return await this._callAsync(
             'ai.FunctionSpec.call',
-            suppliedOptions(options),
+            suppliedOptions(options), options,
         ) as TOut;
     }
 
-    private _callSync(fqn: string, kwargs: Record<string, unknown> = {}): unknown {
-        const argsProto = encodeCallArgs(
-            { self: this, ...kwargs },
-            { syncMode: true, callId: newFunctionCall(), functionName: fqn },
-        );
-        return decodeCallResult(getRuntime().callFunctionSync(argsProto, null));
+    private _callSync(fqn: string, kwargs: Record<string, unknown> = {}, options?: { $baml?: InvocationOptions | null }): unknown {
+        return invokeTarget(fqn, { self: this, ...kwargs }, options, false);
     }
-
-    private async _callAsync(
-        fqn: string,
-        kwargs: Record<string, unknown> = {},
-    ): Promise<unknown> {
-        const argsProto = encodeCallArgs(
-            { self: this, ...kwargs },
-            { callId: newFunctionCall(), functionName: fqn },
-        );
-        return decodeCallResult(await getRuntime().callFunction(argsProto, null));
+    private async _callAsync(fqn: string, kwargs: Record<string, unknown> = {}, options?: { $baml?: InvocationOptions | null }): Promise<unknown> {
+        return await invokeTarget(fqn, { self: this, ...kwargs }, options, true);
     }
 
     toString(): string {

@@ -289,11 +289,7 @@ function _gm_strip_nulls(value: baml.json.json, opaque: bool) -> baml.json.json 
             }
             out
         },
-        let items: baml.json.json[] => {
-            items.map((item) -> {
-                _gm_strip_nulls(item, false)
-            })
-        },
+        let items: baml.json.json[] => { items.map((item) -> { _gm_strip_nulls(item, false) }) },
         _ => value,
     }
 }
@@ -303,7 +299,8 @@ function _gm_strip_nulls(value: baml.json.json, opaque: bool) -> baml.json.json 
 /// the ones that are simply illegal in a query. Values that need more than this
 /// (raw UTF-8, control characters) should be encoded by the caller.
 function _gm_encode_query(value: string) -> string {
-    value.replace_all("%", "%25")
+    value
+        .replace_all("%", "%25")
         .replace_all(" ", "%20")
         .replace_all("\"", "%22")
         .replace_all("#", "%23")
@@ -322,13 +319,8 @@ function _gm_apply_query(url: string, params: map<string, string>?) -> string {
     if let items: map<string, string> = params {
         let out = url;
         for (let name in items.keys()) {
-            let separator = if (out.includes("?")) {
-                "&"
-            } else {
-                "?"
-            };
-            out
-                = `${out}${separator}${_gm_encode_query(name)}=${_gm_encode_query(items.get(name) ?? "")}`;
+            let separator = if (out.includes("?")) { "&" } else { "?" };
+            out = `${out}${separator}${_gm_encode_query(name)}=${_gm_encode_query(items.get(name) ?? "")}`;
         }
         out
     } else {
@@ -431,8 +423,8 @@ function _gm_mime_for_uri(url: string, mime: string) -> string? {
 /// media defaults: the Gemini Developer API has no server-side URL fetch, so an
 /// http(s) URL is downloaded and inlined (`true`), while Vertex takes the URL
 /// through as `fileData.fileUri` (`false`) — which also keeps large media out
-/// of the inline request-size cap. Local files always become base64 and
-/// existing base64 is retained on both backends, and a `_gm_is_provider_uri`
+/// of the inline request-size cap. Existing base64, which is what media built
+/// from a file holds, is retained on both backends, and a `_gm_is_provider_uri`
 /// URL is passed through even when `fetch_url` is set.
 function _gm_media_part(media: ai.MediaPart, fetch_url: bool, preview: bool = false) -> GmPart {
     let source = _gm_media_url(media);
@@ -450,16 +442,18 @@ function _gm_media_part(media: ai.MediaPart, fetch_url: bool, preview: bool = fa
         throw ai.errors.PreviewUnsupported {
             provider: "google",
             detail: "the Gemini Developer API requires downloaded URL media bytes during request preview",
-        }
+        };
     }
     if let url: string = resolved.url {
-        GmPart.of_file_data(
-            GmFileData { mimeType: _gm_mime_for_uri(url, resolved.mime_type), fileUri: url },
-        )
+        GmPart.of_file_data(GmFileData {
+            mimeType: _gm_mime_for_uri(url, resolved.mime_type),
+            fileUri: url,
+        })
     } else {
-        GmPart.of_inline_data(
-            GmInlineData { mimeType: resolved.mime_type, data: resolved.base64 ?? "" },
-        )
+        GmPart.of_inline_data(GmInlineData {
+            mimeType: resolved.mime_type,
+            data: resolved.base64 ?? "",
+        })
     }
 }
 
@@ -520,11 +514,17 @@ function lower_prompt(prompt: ai.Prompt, fetch_url: bool = true, preview: bool =
             } else {
                 "user"
             };
-            contents.push(GmContent { role: role, parts: parts });
+            contents.push(GmContent {
+                role: role,
+                parts: parts,
+            });
             null
         };
     }
-    Prompt { system_parts: system_parts, contents: contents }
+    Prompt {
+        system_parts: system_parts,
+        contents: contents,
+    }
 }
 
 /// (internal) ---------------------------------------------------------------------------
@@ -584,7 +584,10 @@ function lower_journal(j: ai.Journal, fetch_url: bool, preview: bool = false) ->
         match (e) {
             let u: ai.events.UserMessage => {
                 if (pending.length() > 0) {
-                    contents.push(GmContent { role: "user", parts: pending });
+                    contents.push(GmContent {
+                        role: "user",
+                        parts: pending,
+                    });
                     pending = [];
                     null
                 } else {
@@ -592,13 +595,19 @@ function lower_journal(j: ai.Journal, fetch_url: bool, preview: bool = false) ->
                 };
                 let parts = _lower_blocks(u.content, fetch_url, preview = preview);
                 if (parts.length() > 0) {
-                    contents.push(GmContent { role: "user", parts: parts });
+                    contents.push(GmContent {
+                        role: "user",
+                        parts: parts,
+                    });
                 }
                 null
             },
             let a: ai.events.AssistantMessage => {
                 if (pending.length() > 0) {
-                    contents.push(GmContent { role: "user", parts: pending });
+                    contents.push(GmContent {
+                        role: "user",
+                        parts: pending,
+                    });
                     pending = [];
                     null
                 } else {
@@ -615,12 +624,13 @@ function lower_journal(j: ai.Journal, fetch_url: bool, preview: bool = false) ->
                             // The `thoughtSignature` Gemini 3 issued with this
                             // call rides its id; replaying the call without it
                             // is a hard 400.
-                            parts.push(
-                                GmPart.of_function_call(
-                                    GmFunctionCall { name: use.name, args: use.args },
-                                    _gm_call_id_signature(use.id),
-                                ),
-                            );
+                            parts.push(GmPart.of_function_call(
+                                GmFunctionCall {
+                                    name: use.name,
+                                    args: use.args,
+                                },
+                                _gm_call_id_signature(use.id),
+                            ));
                             null
                         },
                         // Reasoning replay needs the `thoughtSignature` Gemini
@@ -630,7 +640,10 @@ function lower_journal(j: ai.Journal, fetch_url: bool, preview: bool = false) ->
                     };
                 }
                 if (parts.length() > 0) {
-                    contents.push(GmContent { role: "model", parts: parts });
+                    contents.push(GmContent {
+                        role: "model",
+                        parts: parts,
+                    });
                     null
                 } else {
                     null
@@ -650,41 +663,32 @@ function lower_journal(j: ai.Journal, fetch_url: bool, preview: bool = false) ->
                 }
                 let response: map<string, unknown> = {};
                 let _ = response.set("result", result);
-                let parts: GmPart[]? = if (media.length() > 0) {
-                    media
-                } else {
-                    null
-                };
-                pending.push(
-                    GmPart.of_function_response(
-                        GmFunctionResponse {
-                            name: ai.wire.tool_name(j, c.id) ?? "",
-                            response: response,
-                            parts: parts,
-                        },
-                    ),
-                );
+                let parts: GmPart[]? = if (media.length() > 0) { media } else { null };
+                pending.push(GmPart.of_function_response(GmFunctionResponse {
+                    name: ai.wire.tool_name(j, c.id) ?? "",
+                    response: response,
+                    parts: parts,
+                }));
                 null
             },
             let f: ai.events.ToolFailed => {
                 let response: map<string, unknown> = {};
                 let _ = response.set("error", f.message);
-                pending.push(
-                    GmPart.of_function_response(
-                        GmFunctionResponse {
-                            name: ai.wire.tool_name(j, f.id) ?? "",
-                            response: response,
-                            parts: null,
-                        },
-                    ),
-                );
+                pending.push(GmPart.of_function_response(GmFunctionResponse {
+                    name: ai.wire.tool_name(j, f.id) ?? "",
+                    response: response,
+                    parts: null,
+                }));
                 null
             },
             _ => null,
         };
     }
     if (pending.length() > 0) {
-        contents.push(GmContent { role: "user", parts: pending });
+        contents.push(GmContent {
+            role: "user",
+            parts: pending,
+        });
         null
     } else {
         null
@@ -705,17 +709,18 @@ function lower_journal(j: ai.Journal, fetch_url: bool, preview: bool = false) ->
 /// Developer API inlines http(s) media, Vertex passes the URL through.
 function gemini_build_body(
     input: ai.ModelTurnInput,
-    client_id: string,
+    provider: string,
+    requested_model: string,
     generation_config: GmGenerationConfig?,
     safety_settings: root.SafetySetting[]?,
     request_body: baml.json.json?,
     fetch_url: bool = true,
     preview: bool = false,
 ) -> string {
-    let prompt = input.prompt(ai.internal.build_output_format(input.output_type));
+    let prompt = (input.prompt)(ai.internal.build_output_format(input.output_type));
     let lowered = lower_prompt(prompt, fetch_url = fetch_url, preview = preview);
     let contents = lowered.contents;
-    let journal = ai.wire.sanitize_for_client(input.journal, client_id);
+    let journal = ai.wire.sanitize_for_client(input.journal, provider, requested_model);
     for (let item in lower_journal(journal, fetch_url, preview = preview)) {
         contents.push(item);
     }
@@ -727,10 +732,19 @@ function gemini_build_body(
     let system: GmContent? = null;
     let first_role = contents.at(0)?.role ?? "";
     if (first_role != "user" && lowered.system_parts.length() > 0) {
-        contents = [GmContent { role: "user", parts: lowered.system_parts }].concat(contents);
+        contents = [
+            GmContent {
+                role: "user",
+                parts: lowered.system_parts,
+            },
+        ]
+        .concat(contents);
         null
     } else if (lowered.system_parts.length() > 0) {
-        system = GmContent { role: null, parts: lowered.system_parts };
+        system = GmContent {
+            role: null,
+            parts: lowered.system_parts,
+        };
         null
     } else {
         null
@@ -745,7 +759,7 @@ function gemini_build_body(
             status_code: null,
             detail: "the rendered prompt and journal produced no message content",
             raw_body: null,
-        }
+        };
     }
 
     let tools: GmTool[]? = null;
@@ -753,17 +767,20 @@ function gemini_build_body(
     if (!input.toolbox.is_empty()) {
         let declarations: GmFunctionDeclaration[] = [];
         for (let t in input.toolbox.list()) {
-            declarations.push(
-                GmFunctionDeclaration {
-                    name: t.name,
-                    description: t.description,
-                    parametersJsonSchema: t.input_schema,
-                },
-            );
+            declarations.push(GmFunctionDeclaration {
+                name: t.name,
+                description: t.description,
+                parametersJsonSchema: t.input_schema,
+            });
         }
-        tools = [GmTool { functionDeclarations: declarations }];
-        tool_config
-            = GmToolConfig { functionCallingConfig: GmFunctionCallingConfig { mode: "AUTO" } };
+        tools = [
+            GmTool {
+                functionDeclarations: declarations,
+            },
+        ];
+        tool_config = GmToolConfig {
+            functionCallingConfig: GmFunctionCallingConfig { mode: "AUTO" },
+        };
         null
     } else {
         null
@@ -777,7 +794,7 @@ function gemini_build_body(
         generationConfig: generation_config,
         safetySettings: safety_settings,
     };
-    let base = _gm_strip_nulls(baml.json.to_json(request), false);
+    let base = _gm_strip_nulls(baml.json.from(request), false);
     baml.json.stringify(ai.wire.merge_request_body(base, request_body))
 }
 
@@ -825,15 +842,16 @@ function _gm_is_blocked(finish: string) -> bool {
 function _gm_usage(usage: GmUsageMetadata?) -> ai.events.Usage? {
     if let um: GmUsageMetadata = usage {
         ai.events.Usage {
-            input_tokens: um.promptTokenCount ?? 0,
+            input_tokens: um.promptTokenCount,
             // Gemini reports thinking tokens separately from candidate tokens,
             // so output_tokens is the answer's cost and reasoning_tokens the
             // thinking on top of it.
-            output_tokens: um.candidatesTokenCount ?? 0,
+            output_tokens: um.candidatesTokenCount,
             cached_input_tokens: um.cachedContentTokenCount,
             reasoning_tokens: um.thoughtsTokenCount,
             // promptTokenCount counts the cached share too.
-            uncached_input_tokens: ai.internal.uncached_input_tokens(um.promptTokenCount, um.cachedContentTokenCount),
+            uncached_input_tokens: ai.internal
+                .uncached_input_tokens(um.promptTokenCount, um.cachedContentTokenCount),
         }
     } else {
         null
@@ -851,14 +869,21 @@ function _gm_usage(usage: GmUsageMetadata?) -> ai.events.Usage? {
 /// return "" as a success. `provider` names the backend in that failure.
 function parse(resp: GmResponse, seq: int, provider: string = "google") -> ai.ModelTurn {
     // An error document that reached this far was served with a 2xx status
-    // (`ai.wire.send_as` classifies the non-2xx case). Classify it the same
-    // way rather than reading a turn out of a body that has none.
+    // (`ai.wire.send_as` classifies the non-2xx case). Preserve this
+    // in-band failure rather than reading a turn out of a body that has none.
     if let err: GmError = resp.error {
-        throw ai.errors.classify_http(
-            provider,
-            err.code ?? 0,
-            err.message ?? baml.json.stringify(baml.json.to_json(resp)),
-        )
+        throw ai.errors.ProviderError {
+            provider: provider,
+            message: err.message ?? "the Google request failed",
+            error_type: err.status,
+            error_code: if let code: int = err.code {
+                code.to_string()
+            } else {
+                null
+            },
+            raw_body: baml.json.stringify(resp),
+            status_code: null,
+        };
     }
     let content: ai.content.ModelBlock[] = [];
     let has_call = false;
@@ -872,19 +897,19 @@ function parse(resp: GmResponse, seq: int, provider: string = "google") -> ai.Mo
             if let a: map<string, unknown> = fc.args {
                 args = a;
             }
-            content.push(
-                ai.content.ToolUse {
-                    id: _gm_encode_call_id(`call_${seq}_${call_index}`, p.thoughtSignature),
-                    name: fc.name,
-                    args: args,
-                },
-            );
+            content.push(ai.content.ToolUse {
+                id: _gm_encode_call_id(`call_${seq}_${call_index}`, p.thoughtSignature),
+                name: fc.name,
+                args: args,
+            });
             call_index += 1;
             has_call = true;
             null
         } else if let inline: GmRespInlineData = p.inlineData {
             // Image-out models (gemini-*-image) answer with base64 media parts.
-            content.push(_gm_output_media(inline.mimeType ?? "image/png", inline.data ?? ""));
+            content.push(
+                _gm_output_media(inline.mimeType ?? "image/png", inline.data ?? ""),
+            );
             null
         } else {
             if let t: string = p.text {
@@ -907,10 +932,12 @@ function parse(resp: GmResponse, seq: int, provider: string = "google") -> ai.Mo
     // MAX_TOKENS spent entirely on thinking) IS the provider explaining
     // itself, so those still return an empty turn.
     if (content.length() == 0 && finish == "" && !blocked) {
-        throw ai.errors.ParseFailed {
+        throw ai.errors.InvalidResponse {
             provider: provider,
-            raw_output: baml.json.stringify(baml.json.to_json(resp)),
-        }
+            message: "the response contained no model turn",
+            raw_body: baml.json.stringify(resp),
+            status_code: null,
+        };
     }
     let stop = if (has_call) {
         ai.content.StopReason.ToolUse
@@ -923,73 +950,37 @@ function parse(resp: GmResponse, seq: int, provider: string = "google") -> ai.Mo
     };
     ai.ModelTurn {
         calls: [],
+        child_turns: [],
         content: content,
         stop_reason: stop,
-        usage: _gm_usage(resp.usageMetadata),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Transport helpers — shared by both clients.
 
-/// (internal) `baml.http.send_sse` rejects a non-2xx response by throwing an
-/// `baml.errors.Io` whose message embeds the status and the body
-/// (sys_native/src/io_impls.rs). Recover that status so an SSE failure lands in
-/// the SAME taxonomy as a unary one: a 400 must NOT become a retry-safe
-/// NetworkFailure, or a Retry policy would replay an invalid request forever.
-function _gm_sse_failure(provider: string, error: unknown) -> ai.errors.Failure {
-    // `baml.errors.Io.message` is the raw text; anything else is rendered.
-    // Redacted because Vertex express mode signs the request with `?key=…` in
-    // the URL, and the rendered transport error can carry the URL.
-    let text = ai.wire.redact_url_secrets(
-        match (error) {
-            let io: baml.errors.Io => io.message,
-            _ => error.to_string(),
-        },
-    );
-    let marker = "failed with status ";
-    if let start: int = text.index_of(marker) {
-        let rest = text.slice(start + marker.length(), text.length());
-        let head = rest.split(":").at(0) ?? "";
-        let status = baml.Int.parse(head.trim()) catch_all (e) {
-            _ => 0,
-        };
-        if (status > 0) {
-            let body = if let colon: int = rest.index_of(":") {
-                rest.slice(colon + 1, rest.length()).trim()
-            } else {
-                ""
-            };
-            return ai.errors.classify_http(provider, status, body);
-        }
-    }
-    ai.errors.NetworkFailure {
-        status_code: null,
-        provider: provider,
-        detail: `transport failed before a response arrived: ${text}`,
-        raw_body: null,
-    }
-}
-
 /// (internal) Route failures from the shared Google / Vertex stream opener. Timeout and
 /// cancellation keep their typed control-flow meaning; only transport errors
 /// enter the provider failure taxonomy.
 function _gm_route_sse_open(
     provider: string,
-    open: () -> baml.http.SseStream throws unknown,
+    open: () -> baml.http.SseStream
+        throws baml.errors.Io
+            | baml.errors.Timeout
+            | baml.errors.InvalidArgument
+            | baml.panics.Cancelled,
 ) -> baml.http.SseStream {
     open() catch_all (e) {
         let timeout: baml.errors.Timeout => throw timeout,
         let cancelled: baml.panics.Cancelled => throw cancelled,
-        _ => throw _gm_sse_failure(provider, e),
+        let io: baml.errors.Io => throw ai.wire.sse_failure(provider, io),
+        let invalid: baml.errors.InvalidArgument => throw invalid,
     }
 }
 
 /// (internal) Open the SSE connection, classifying the failure precisely.
 function _gm_open_sse(req: baml.http.Request, provider: string) -> baml.http.SseStream {
-    _gm_route_sse_open(provider, () -> {
-        baml.http.send_sse(req)
-    })
+    _gm_route_sse_open(provider, () -> { baml.http.send_sse(req) })
 }
 
 /// (internal) One SseStream batch -> provider-agnostic stream events.
@@ -1016,16 +1007,32 @@ function _gm_decode_batch(batch: string, provider: string) -> ai.stream.Event[] 
         if (payload == "" || payload == "[DONE]") {
             null
         } else {
-            let resp: GmResponse = baml.json.from_string<GmResponse>(payload) catch_all (e) {
+            let resp: GmResponse = baml.json.decode<GmResponse>(payload) catch_all (e) {
                 _ => {
-                    throw ai.errors.ParseFailed { provider: provider, raw_output: payload }
+                    throw ai.errors.InvalidResponse {
+                        provider: provider,
+                        message: e.to_string(),
+                        raw_body: payload,
+                        status_code: null,
+                    };
                 },
             };
             // A mid-stream `{"error": …}` payload is a real failure: raise
             // it instead of ending the turn silently on whatever text
             // arrived first.
             if let err: GmError = resp.error {
-                throw ai.errors.classify_http(provider, err.code ?? 0, err.message ?? payload)
+                throw ai.errors.ProviderError {
+                    provider: provider,
+                    message: err.message ?? "the Google stream failed",
+                    error_type: err.status,
+                    error_code: if let code: int = err.code {
+                        code.to_string()
+                    } else {
+                        null
+                    },
+                    raw_body: payload,
+                    status_code: null,
+                };
             }
             let cand: GmCandidate? = resp.candidates?.at(0);
             let parts: GmRespPart[] = cand?.content?.parts ?? [];
@@ -1062,20 +1069,11 @@ function _gm_decode_batch(batch: string, provider: string) -> ai.stream.Event[] 
             };
             let usage: GmUsageMetadata? = resp.usageMetadata;
             if (stop != null || usage != null) {
-                out.push(
-                    ai.stream.TurnMeta {
-                        stop_reason: stop,
-                        input_tokens: usage?.promptTokenCount,
-                        output_tokens: usage?.candidatesTokenCount,
-                        cached_input_tokens: usage?.cachedContentTokenCount,
-                        // promptTokenCount counts the cached share too.
-                        uncached_input_tokens: ai.internal.uncached_input_tokens(
-                            usage?.promptTokenCount,
-                            usage?.cachedContentTokenCount,
-                        ),
-                        reasoning_tokens: usage?.thoughtsTokenCount,
-                    },
-                );
+                out.push(ai.stream.TurnMeta {
+                    stop_reason: stop,
+                    usage: _gm_usage(usage),
+                    resolved_model: resp.modelVersion,
+                });
                 null
             } else {
                 null
@@ -1119,7 +1117,8 @@ function _request(
 ) -> baml.http.Request {
     let body = gemini_build_body(
         input,
-        c.id(),
+        "google",
+        c.model,
         _gm_generation_config(
             c.temperature,
             c.max_output_tokens,
@@ -1133,7 +1132,10 @@ function _request(
         preview = preview,
     );
     let base = c.resolved_base_url() ?? "https://generativelanguage.googleapis.com/v1beta";
-    let url = _gm_apply_query(`${base}/models/${c.model}${gemini_method(stream)}`, c.query_params);
+    let url = _gm_apply_query(
+        `${base}/models/${c.model}${gemini_method(stream)}`,
+        c.query_params,
+    );
     let headers: map<string, string> = { "content-type": "application/json" };
     let with_user = _gm_apply_headers(headers, c.headers);
     if (!preview || with_user.get("x-goog-api-key") == null) {
@@ -1144,7 +1146,12 @@ function _request(
         };
         let _ = with_user.set("x-goog-api-key", api_key);
     }
-    baml.http.Request { method: "POST", url: url, headers: with_user, body: body }
+    baml.http.Request {
+        method: "POST",
+        url: url,
+        headers: with_user,
+        body: body,
+    }
 }
 
 /// The one internal entry point: render, send, normalize — one model turn.
@@ -1154,9 +1161,21 @@ function gemini_invoke(c: root.GeminiClient, input: ai.ModelTurnInput) -> ai.Mod
     // from it are stable across re-renders.
     let seq = input.journal.entries().length();
     let req = ai.LlmTimeoutOptions._resolve(c.timeout)._apply(render(c, input));
-    let sent = ai.wire.send_as_with_wire<GmResponse>(req, "google", c.id(), capture_wire = c.capture_wire);
-    let turn = parse(sent.value, seq);
-    ai.ModelTurn { ...turn, calls: [sent.call], model: c.model }
+    let sent = ai.wire.send_as_with_wire<GmResponse>(
+        req,
+        ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        capture_wire = c.capture_wire,
+    );
+    ai.internal.with_own_call(
+        parse(sent.value, seq),
+        sent.call,
+        _gm_usage(sent.value.usageMetadata),
+        c.model,
+        sent.value.modelVersion,
+    )
 }
 
 function _decode_batch(batch: string) -> ai.stream.Event[] {
@@ -1186,13 +1205,16 @@ function gemini_invoke_stream(
         timeout_options = limits,
         dispatched = started,
     );
-    let call = ai.events.LLMCall {
-        client_name: c.id(),
-        provider: "google",
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: null,
-            ttft_ms: null,
+            start_time: started,
+            duration: null,
+            ttft: null,
         },
         http_request: if (c.capture_wire) {
             baml.http.Request {
@@ -1204,17 +1226,15 @@ function gemini_invoke_stream(
         } else {
             null
         },
-        http_response: ai.events.HttpResponse { status: sse.status_code, headers: sse.headers, body: null },
-        usage: null,
-        selected: true,
-        sse_responses: if (c.capture_wire) {
-            []
-        } else {
-            null
+        http_response: ai.events.HttpResponse {
+            status: sse.status_code,
+            headers: sse.headers,
+            body: null,
         },
+        sse_responses: if (c.capture_wire) { [] } else { null },
     };
-    stream._calls = [call];
     stream._wire_call = call;
+    stream._requested_model = c.model;
     stream._call_started = started;
     stream._ttft_from = baml.time.Instant.now();
     stream._capture_sse = c.capture_wire;

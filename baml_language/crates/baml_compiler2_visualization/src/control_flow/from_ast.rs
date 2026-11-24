@@ -173,12 +173,10 @@ impl<'a> AstGraphBuilder<'a> {
             } => {
                 self.visit_match(id, *scrutinee, arms);
             }
-            ast::Expr::Catch { base, clauses } => {
+            ast::Expr::Catch { base, clause } => {
                 self.visit_expr(*base);
-                for clause in clauses {
-                    for arm_id in &clause.arms {
-                        self.visit_expr(self.body.catch_arms[*arm_id].body);
-                    }
+                for arm_id in &clause.arms {
+                    self.visit_expr(self.body.catch_arms[*arm_id].body);
                 }
             }
             ast::Expr::Throw { value } => {
@@ -253,14 +251,7 @@ impl<'a> AstGraphBuilder<'a> {
             ast::Stmt::Expr(expr_id) => {
                 self.visit_expr(*expr_id);
             }
-            ast::Stmt::TypeBinding {
-                value: ast::TypeBindingValue::Runtime(operand),
-                ..
-            } => self.visit_expr(*operand),
-            ast::Stmt::TypeBinding {
-                value: ast::TypeBindingValue::Static(_),
-                ..
-            } => {}
+            ast::Stmt::TypeBinding { operand, .. } => self.visit_expr(*operand),
             ast::Stmt::Throw { value } => {
                 self.visit_expr(*value);
             }
@@ -468,7 +459,12 @@ impl<'a> AstGraphBuilder<'a> {
                 .expect("frame stack should not be empty");
             frame.next_ordinal(&CounterKind::BranchGroup)
         };
-        let label = format!("match ({})", render_expr_compact_ast(self.body, scrutinee));
+        let label = match &self.body.exprs[scrutinee] {
+            ast::Expr::Tuple { .. } => {
+                format!("match {}", render_expr_compact_ast(self.body, scrutinee))
+            }
+            _ => format!("match ({})", render_expr_compact_ast(self.body, scrutinee)),
+        };
         let slug = {
             let slug_base = slugify(&label);
             if slug_base.is_empty() {
@@ -785,6 +781,14 @@ impl<'a> AstGraphBuilder<'a> {
                     field_strs.join(", ")
                 )
             }
+            ast::Pattern::Tuple(elements) => {
+                let parts: Vec<String> = elements.iter().map(|p| self.format_pattern(*p)).collect();
+                if parts.len() == 1 {
+                    format!("({},)", parts[0])
+                } else {
+                    format!("({})", parts.join(", "))
+                }
+            }
             ast::Pattern::Array {
                 prefix,
                 rest,
@@ -923,12 +927,10 @@ fn collect_callee_names_expr(body: &ast::ExprBody, id: ast::ExprId, names: &mut 
             }
         }
         ast::Expr::Is { scrutinee, .. } => collect_callee_names_expr(body, *scrutinee, names),
-        ast::Expr::Catch { base, clauses } => {
+        ast::Expr::Catch { base, clause } => {
             collect_callee_names_expr(body, *base, names);
-            for clause in clauses {
-                for arm_id in &clause.arms {
-                    collect_callee_names_expr(body, body.catch_arms[*arm_id].body, names);
-                }
+            for arm_id in &clause.arms {
+                collect_callee_names_expr(body, body.catch_arms[*arm_id].body, names);
             }
         }
         ast::Expr::Throw { value } => collect_callee_names_expr(body, *value, names),
@@ -953,7 +955,7 @@ fn collect_callee_names_expr(body: &ast::ExprBody, id: ast::ExprId, names: &mut 
                 collect_callee_names_expr(body, spread.expr, names);
             }
         }
-        ast::Expr::Array { elements } => {
+        ast::Expr::Array { elements } | ast::Expr::Tuple { elements } => {
             for element in elements {
                 collect_callee_names_expr(body, *element, names);
             }
@@ -1018,13 +1020,15 @@ fn collect_callee_names_stmt(body: &ast::ExprBody, id: ast::StmtId, names: &mut 
     match &body.stmts[id] {
         ast::Stmt::Expr(expr) => collect_callee_names_expr(body, *expr, names),
         ast::Stmt::TypeBinding {
-            value: ast::TypeBindingValue::Runtime(operand),
+            operand,
+            else_branch,
             ..
-        } => collect_callee_names_expr(body, *operand, names),
-        ast::Stmt::TypeBinding {
-            value: ast::TypeBindingValue::Static(_),
-            ..
-        } => {}
+        } => {
+            collect_callee_names_expr(body, *operand, names);
+            if let Some(else_branch) = else_branch {
+                collect_callee_names_expr(body, *else_branch, names);
+            }
+        }
         ast::Stmt::Defer { body: defer_body } => {
             collect_callee_names_expr(body, *defer_body, names);
         }
@@ -1188,16 +1192,10 @@ fn render_expr_compact_ast(body: &ast::ExprBody, id: ast::ExprId) -> String {
             format!("{}?.({})", callee_str, args_str.join(", "))
         }
         ast::Expr::Throw { value } => format!("throw {}", render_expr_compact_ast(body, *value)),
-        ast::Expr::Catch { base, clauses } => {
+        ast::Expr::Catch { base, clause } => {
             let mut out = render_expr_compact_ast(body, *base);
-            for clause in clauses {
-                let kind = match clause.kind {
-                    ast::CatchClauseKind::Catch => "catch",
-                    ast::CatchClauseKind::CatchAll => "catch_all",
-                    ast::CatchClauseKind::CatchAllPanics => "catch_all_panics",
-                };
-                write!(out, " {kind}(...)").unwrap();
-            }
+            let kind = clause.kind.keyword();
+            write!(out, " {kind}(...)").unwrap();
             out
         }
         ast::Expr::Object {
@@ -1225,6 +1223,17 @@ fn render_expr_compact_ast(body: &ast::ExprBody, id: ast::ExprId) -> String {
                 "[...]".to_string()
             }
         }
+        ast::Expr::Tuple { elements } => {
+            let parts: Vec<_> = elements
+                .iter()
+                .map(|element| render_expr_compact_ast(body, *element))
+                .collect();
+            match parts.as_slice() {
+                [only] => format!("({only},)"),
+                _ => format!("({})", parts.join(", ")),
+            }
+        }
+        ast::Expr::OptionalChain { expr } => render_expr_compact_ast(body, *expr),
         // Rendered in full, as the `Path` spelling of the same reference is:
         // this is a callee name, and eliding it to `...` would leave the CFG
         // node blank for the one call form that must be written out.
@@ -1253,7 +1262,7 @@ fn format_literal_ast(lit: &ast::Literal) -> String {
 
 #[cfg(test)]
 mod tests {
-    use baml_base::TypePath;
+    use baml_base::Path;
     use la_arena::Arena;
 
     use super::*;
@@ -1279,6 +1288,7 @@ mod tests {
             match_arms,
             catch_arms,
             type_annotations: Arena::new(),
+            tag_values: Vec::new(),
             root_expr,
         }
     }
@@ -1303,6 +1313,7 @@ mod tests {
             match_arms: Arena::new(),
             catch_arms: Arena::new(),
             type_annotations: Arena::new(),
+            tag_values: Vec::new(),
             root_expr: None,
         };
         let graph = build_control_flow_graph_from_ast("MyFunc", &body);
@@ -1483,7 +1494,7 @@ mod tests {
     #[test]
     fn match_creates_branch_group_with_arms() {
         let body = make_ast_body(|exprs, _, patterns, match_arms| {
-            let scrutinee = exprs.alloc(ast::Expr::Path(vec!["x".into()]));
+            let scrutinee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("x".into())));
             let pat1 = patterns.alloc(ast::Pattern::Type(
                 ast::TypeExprKind::Literal {
                     value: ast::Literal::Int(1),
@@ -1545,7 +1556,7 @@ mod tests {
         // `let x: int` is now Bind { name: x, subpat: Some(Type(int)) }.
         let body = make_ast_body(|_, _, patterns, _| {
             let int_ty = ast::TypeExprKind::Path {
-                segments: vec!["int".into()],
+                path: baml_base::Path::bare("int".into()),
                 generic_args: vec![],
                 associated_type_bindings: vec![],
             }
@@ -1699,8 +1710,8 @@ mod tests {
     #[test]
     fn call_scope_has_source_expr() {
         let body = make_ast_body(|exprs, _, _, _| {
-            let callee = exprs.alloc(ast::Expr::Path(vec!["Summarize".into()]));
-            let arg = exprs.alloc(ast::Expr::Path(vec!["text".into()]));
+            let callee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Summarize".into())));
+            let arg = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("text".into())));
             let call = exprs.alloc(ast::Expr::Call {
                 callee,
                 type_args: vec![],
@@ -1724,8 +1735,8 @@ mod tests {
     #[test]
     fn named_call_scope_preserves_label() {
         let body = make_ast_body(|exprs, _, _, _| {
-            let callee = exprs.alloc(ast::Expr::Path(vec!["Summarize".into()]));
-            let arg = exprs.alloc(ast::Expr::Path(vec!["text".into()]));
+            let callee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Summarize".into())));
+            let arg = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("text".into())));
             let call = exprs.alloc(ast::Expr::Call {
                 callee,
                 args: vec![ast::CallArg::named("query", arg)],
@@ -1746,8 +1757,8 @@ mod tests {
     #[test]
     fn named_optional_call_scope_preserves_label() {
         let body = make_ast_body(|exprs, _, _, _| {
-            let callee = exprs.alloc(ast::Expr::Path(vec!["client".into()]));
-            let arg = exprs.alloc(ast::Expr::Path(vec!["text".into()]));
+            let callee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("client".into())));
+            let arg = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("text".into())));
             let call = exprs.alloc(ast::Expr::OptionalCall {
                 callee,
                 args: vec![ast::CallArg::named("query", arg)],
@@ -1873,7 +1884,7 @@ mod tests {
         let body = make_ast_body(|exprs, stmts, _, _| {
             let field_val = exprs.alloc(ast::Expr::Literal(ast::Literal::Bool(true)));
             let obj = exprs.alloc(ast::Expr::Object {
-                type_name: TypePath::bare("MyResponse".into()),
+                type_name: Path::bare("MyResponse".into()),
                 type_args: vec![],
                 fields: vec![ast::ObjectExprField::explicit("ok".into(), field_val)],
                 spreads: vec![],
@@ -1907,8 +1918,8 @@ mod tests {
     #[test]
     fn return_call_does_not_double_node() {
         let body = make_ast_body(|exprs, stmts, _, _| {
-            let callee = exprs.alloc(ast::Expr::Path(vec!["Process".into()]));
-            let arg = exprs.alloc(ast::Expr::Path(vec!["input".into()]));
+            let callee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Process".into())));
+            let arg = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("input".into())));
             let call = exprs.alloc(ast::Expr::Call {
                 callee,
                 type_args: vec![],
@@ -1968,7 +1979,7 @@ mod tests {
         let body = make_ast_body(|exprs, stmts, _, _| {
             let one = exprs.alloc(ast::Expr::Literal(ast::Literal::Int(1)));
             let ret = stmts.alloc(ast::Stmt::Return(Some(one)));
-            let callee = exprs.alloc(ast::Expr::Path(vec!["Cleanup".into()]));
+            let callee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Cleanup".into())));
             let call = exprs.alloc(ast::Expr::Call {
                 callee,
                 type_args: vec![],
@@ -1996,7 +2007,7 @@ mod tests {
     fn for_in_loop_creates_loop_node_and_visits_body() {
         // for (let item in items) { //# Inside }
         let body = make_ast_body(|exprs, stmts, patterns, _| {
-            let collection = exprs.alloc(ast::Expr::Path(vec!["items".into()]));
+            let collection = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("items".into())));
             let binding = patterns.alloc(ast::Pattern::Bind {
                 name: "item".into(),
                 subpat: None,
@@ -2039,7 +2050,7 @@ mod tests {
         let body = make_ast_body(|exprs, stmts, _, _| {
             let cond = exprs.alloc(ast::Expr::Literal(ast::Literal::Bool(true)));
             let obj_true = exprs.alloc(ast::Expr::Object {
-                type_name: TypePath::bare("Result".into()),
+                type_name: Path::bare("Result".into()),
                 type_args: vec![],
                 fields: vec![],
                 spreads: vec![],
@@ -2052,7 +2063,7 @@ mod tests {
 
             let err_val = exprs.alloc(ast::Expr::Literal(ast::Literal::Bool(false)));
             let obj_false = exprs.alloc(ast::Expr::Object {
-                type_name: TypePath::bare("Result".into()),
+                type_name: Path::bare("Result".into()),
                 type_args: vec![],
                 fields: vec![ast::ObjectExprField::explicit("err".into(), err_val)],
                 spreads: vec![],
@@ -2092,7 +2103,7 @@ mod tests {
 
         let field_val = exprs.alloc(ast::Expr::Literal(ast::Literal::Bool(true)));
         let obj = exprs.alloc(ast::Expr::Object {
-            type_name: TypePath::bare("Resp".into()),
+            type_name: Path::bare("Resp".into()),
             type_args: vec![],
             fields: vec![ast::ObjectExprField::explicit("ok".into(), field_val)],
             spreads: vec![],
@@ -2105,6 +2116,7 @@ mod tests {
             match_arms,
             catch_arms,
             type_annotations: Arena::new(),
+            tag_values: Vec::new(),
             root_expr: Some(obj),
         };
 
@@ -2139,22 +2151,29 @@ mod tests {
     fn embedded_calls_in_if_condition_surface_in_callee_names() {
         let body = make_ast_body(|exprs, stmts, _, _| {
             // LineTotal(inv.line_items)
-            let line_total_callee = exprs.alloc(ast::Expr::Path(vec!["LineTotal".into()]));
-            let line_items = exprs.alloc(ast::Expr::Path(vec!["inv".into(), "line_items".into()]));
+            let line_total_callee =
+                exprs.alloc(ast::Expr::Path(baml_base::Path::bare("LineTotal".into())));
+            let line_items = exprs.alloc(ast::Expr::Path(baml_base::Path::new(vec![
+                "inv".into(),
+                "line_items".into(),
+            ])));
             let line_total_call = exprs.alloc(ast::Expr::Call {
                 callee: line_total_callee,
                 type_args: vec![],
                 args: vec![ast::CallArg::positional(line_items)],
             });
             // LineTotal(inv.line_items) - inv.total
-            let inv_total = exprs.alloc(ast::Expr::Path(vec!["inv".into(), "total".into()]));
+            let inv_total = exprs.alloc(ast::Expr::Path(baml_base::Path::new(vec![
+                "inv".into(),
+                "total".into(),
+            ])));
             let diff = exprs.alloc(ast::Expr::Binary {
                 op: ast::BinaryOp::Sub,
                 lhs: line_total_call,
                 rhs: inv_total,
             });
             // Abs(...)
-            let abs_callee = exprs.alloc(ast::Expr::Path(vec!["Abs".into()]));
+            let abs_callee = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Abs".into())));
             let abs_call = exprs.alloc(ast::Expr::Call {
                 callee: abs_callee,
                 type_args: vec![],
@@ -2217,20 +2236,127 @@ mod tests {
         );
     }
 
+    fn path(exprs: &mut Arena<ast::Expr>, name: &str) -> ast::ExprId {
+        exprs.alloc(ast::Expr::Path(baml_base::Path::bare(name.into())))
+    }
+
+    fn call0(exprs: &mut Arena<ast::Expr>, name: &str) -> ast::ExprId {
+        let callee = path(exprs, name);
+        exprs.alloc(ast::Expr::Call {
+            callee,
+            type_args: vec![],
+            args: vec![],
+        })
+    }
+
+    #[test]
+    fn tuple_scrutinee_labels_match_with_its_own_delimiters() {
+        let body = make_ast_body(|exprs, _, patterns, match_arms| {
+            let a = path(exprs, "a");
+            let b = path(exprs, "b");
+            let scrutinee = exprs.alloc(ast::Expr::Tuple {
+                elements: vec![a, b],
+            });
+            let pattern = patterns.alloc(ast::Pattern::Wildcard);
+            let arm_body = exprs.alloc(ast::Expr::Null);
+            let arm = match_arms.alloc(ast::MatchArm {
+                pattern,
+                guard: None,
+                body: arm_body,
+            });
+            Some(exprs.alloc(ast::Expr::Match {
+                scrutinee,
+                scrutinee_type: None,
+                arms: vec![arm],
+            }))
+        });
+        let graph = build_control_flow_graph_from_ast("Func", &body);
+        let group = graph
+            .nodes
+            .values()
+            .find(|n| matches!(n.node_type, NodeType::BranchGroup))
+            .expect("should have BranchGroup for the match");
+        assert_eq!(group.label, "match (a, b)");
+    }
+
+    #[test]
+    fn tuples_and_tuple_access_render_compactly() {
+        let mut exprs = Arena::new();
+        let a = path(&mut exprs, "a");
+        let single = exprs.alloc(ast::Expr::Tuple { elements: vec![a] });
+        let zero = exprs.alloc(ast::Expr::Literal(ast::Literal::Int(0)));
+        let one = exprs.alloc(ast::Expr::Literal(ast::Literal::Int(1)));
+        let first = exprs.alloc(ast::Expr::Index {
+            base: single,
+            index: zero,
+        });
+        let nested = exprs.alloc(ast::Expr::Index {
+            base: first,
+            index: one,
+        });
+        let t = path(&mut exprs, "t");
+        let i = path(&mut exprs, "i");
+        let sum = exprs.alloc(ast::Expr::Binary {
+            op: ast::BinaryOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        let computed = exprs.alloc(ast::Expr::Index {
+            base: t,
+            index: sum,
+        });
+        let optional_index = exprs.alloc(ast::Expr::OptionalIndex {
+            base: t,
+            index: zero,
+        });
+        let optional = exprs.alloc(ast::Expr::OptionalChain {
+            expr: optional_index,
+        });
+        let body = make_ast_body(|_, _, _, _| None);
+        let body = ast::ExprBody { exprs, ..body };
+        assert_eq!(render_expr_compact_ast(&body, single), "(a,)");
+        assert_eq!(render_expr_compact_ast(&body, nested), "(a,)[0][1]");
+        assert_eq!(render_expr_compact_ast(&body, computed), "t[i + 1]");
+        assert_eq!(render_expr_compact_ast(&body, optional), "t?.[0]");
+    }
+
+    #[test]
+    fn tuple_access_callees_follow_evaluation_order() {
+        let mut exprs = Arena::new();
+        let f = call0(&mut exprs, "f");
+        let g = call0(&mut exprs, "g");
+        let pair = exprs.alloc(ast::Expr::Tuple {
+            elements: vec![f, g],
+        });
+        let choose = call0(&mut exprs, "choose_index");
+        let access = exprs.alloc(ast::Expr::Index {
+            base: pair,
+            index: choose,
+        });
+        let body = make_ast_body(|_, _, _, _| None);
+        let body = ast::ExprBody { exprs, ..body };
+        assert_eq!(
+            collect_callee_names(&body, access),
+            vec!["f".to_string(), "g".to_string(), "choose_index".to_string()]
+        );
+    }
+
     // Nested calls in call arguments surface on the call's own node too:
     // `Process(Helper(x))` yields calleeNames ["Process", "Helper"] while
     // `callee_name` (singular) remains just "Process".
     #[test]
     fn nested_call_arguments_surface_in_callee_names() {
         let body = make_ast_body(|exprs, _, _, _| {
-            let helper_callee = exprs.alloc(ast::Expr::Path(vec!["Helper".into()]));
-            let x = exprs.alloc(ast::Expr::Path(vec!["x".into()]));
+            let helper_callee =
+                exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Helper".into())));
+            let x = exprs.alloc(ast::Expr::Path(baml_base::Path::bare("x".into())));
             let helper_call = exprs.alloc(ast::Expr::Call {
                 callee: helper_callee,
                 type_args: vec![],
                 args: vec![ast::CallArg::positional(x)],
             });
-            let process_callee = exprs.alloc(ast::Expr::Path(vec!["Process".into()]));
+            let process_callee =
+                exprs.alloc(ast::Expr::Path(baml_base::Path::bare("Process".into())));
             Some(exprs.alloc(ast::Expr::Call {
                 callee: process_callee,
                 type_args: vec![],

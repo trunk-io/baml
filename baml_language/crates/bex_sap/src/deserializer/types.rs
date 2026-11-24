@@ -60,6 +60,12 @@ impl<N: TypeIdent> std::fmt::Debug for BamlValueWithFlags<'_, '_, '_, N> {
                 .field("flags", &self.meta.flags)
                 .field("items", &arr.value)
                 .finish(),
+            BamlValue::Tuple(tuple) => f
+                .debug_struct("Tuple")
+                .field("type", &self.meta.ty.type_name().as_ref())
+                .field("flags", &self.meta.flags)
+                .field("items", &tuple.value)
+                .finish(),
             BamlValue::Map(map) => f
                 .debug_struct("Map")
                 .field("type", &self.meta.ty.type_name().as_ref())
@@ -90,16 +96,27 @@ impl<N: TypeIdent> std::fmt::Debug for BamlValueWithFlags<'_, '_, '_, N> {
                 .debug_struct("StreamState")
                 .field("flags", &self.meta.flags)
                 .finish(),
+            BamlValue::Shaped(shaped) => f
+                .debug_struct("Shaped")
+                .field("name", &shaped.name.to_string())
+                .field("flags", &self.meta.flags)
+                .field("shape", &shaped.value)
+                .finish(),
         }
     }
 }
 
 impl<'s, 'v, 't, N: TypeIdent> BamlValueWithFlags<'s, 'v, 't, N> {
     pub fn is_composite(&self) -> bool {
-        matches!(
-            &self.value,
-            BamlValue::Array(_) | BamlValue::Map(_) | BamlValue::Class(_) | BamlValue::Media(_)
-        )
+        match &self.value {
+            BamlValue::Array(_)
+            | BamlValue::Tuple(_)
+            | BamlValue::Map(_)
+            | BamlValue::Class(_)
+            | BamlValue::Media(_) => true,
+            BamlValue::Shaped(shaped) => shaped.value.is_composite(),
+            _ => false,
+        }
     }
 
     pub fn score(&self) -> i32 {
@@ -112,8 +129,16 @@ impl<'s, 'v, 't, N: TypeIdent> BamlValueWithFlags<'s, 'v, 't, N> {
                     .map(crate::baml_value::ValueWithMeta::score)
                     .sum::<i32>()
             }
+            BamlValue::Tuple(tuple) => {
+                base + tuple
+                    .value
+                    .iter()
+                    .map(crate::baml_value::ValueWithMeta::score)
+                    .sum::<i32>()
+            }
             BamlValue::Map(map) => base + map.value.iter().map(|(_, v)| v.score()).sum::<i32>(),
             BamlValue::Class(cls) => base + cls.value.iter().map(|(_, v)| v.score()).sum::<i32>(),
+            BamlValue::Shaped(shaped) => base + shaped.value.score(),
             _ => base,
         }
     }
@@ -138,11 +163,7 @@ pub trait ParsingErrorToUiJson {
 impl ParsingErrorToUiJson for ParsingError {
     fn to_ui_json(&self) -> serde_json::Value {
         json!({
-            if self.scope.is_empty() {
-                "<root>".to_string()
-            } else {
-                self.scope.join(".")
-            }: self.reason,
+            crate::deserializer::coercer::scope_text(&self.scope): self.reason,
             "causes": self.causes.iter().map(ParsingErrorToUiJson::to_ui_json).collect::<Vec<_>>(),
         })
     }
@@ -187,12 +208,23 @@ impl<N: TypeIdent> BamlValueWithFlags<'_, '_, '_, N> {
                     .join(" | ");
                 Cow::Owned(format!("List[{}:{inner}]", arr.value.len()))
             }
+            BamlValue::Tuple(tuple) => {
+                #[allow(clippy::redundant_closure_for_method_calls)]
+                let inner = tuple
+                    .value
+                    .iter()
+                    .map(|i| i.r#type())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Cow::Owned(format!("Tuple({inner})"))
+            }
             BamlValue::Map(..) => Cow::Borrowed("Map"),
             BamlValue::Enum(e) => Cow::Owned(format!("Enum {}", e.name)),
             BamlValue::Class(c) => Cow::Owned(format!("Class {}", c.name)),
             BamlValue::Null(..) => Cow::Borrowed("Null"),
             BamlValue::Media(..) => Cow::Borrowed("Image"),
             BamlValue::StreamState(..) => Cow::Borrowed("StreamState"),
+            BamlValue::Shaped(shaped) => Cow::Owned(format!("Shaped {}", shaped.name)),
         }
     }
 }
@@ -222,6 +254,12 @@ impl<N: TypeIdent> std::fmt::Display for BamlValueWithFlags<'_, '_, '_, N> {
                     writeln!(f, "  {idx}: {}", item.to_string().replace('\n', "  \n"))?;
                 }
             }
+            BamlValue::Tuple(tuple) => {
+                writeln!(f)?;
+                for (idx, item) in tuple.value.iter().enumerate() {
+                    writeln!(f, "  {idx}: {}", item.to_string().replace('\n', "  \n"))?;
+                }
+            }
             BamlValue::Map(map) => {
                 writeln!(f)?;
                 for (key, val) in &map.value {
@@ -246,6 +284,9 @@ impl<N: TypeIdent> std::fmt::Display for BamlValueWithFlags<'_, '_, '_, N> {
             }
             BamlValue::StreamState(_) => {
                 write!(f, "StreamState")?;
+            }
+            BamlValue::Shaped(shaped) => {
+                write!(f, "{}", shaped.value.to_string().replace('\n', "\n  "))?;
             }
         }
         if !self.meta.flags.flags.is_empty() {

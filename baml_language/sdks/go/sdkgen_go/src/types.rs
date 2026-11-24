@@ -11,11 +11,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use baml_base::{
-    Literal, MediaKind, Name as BaseName,
-    qualified_name::{AI_FUNCTION_SPEC, AI_STREAM_STREAM, BAML_JSON_JSON},
+use baml_base::{ConcreteMediaKind, Literal, Name as BaseName, qualified_name::BAML_JSON_JSON};
+use baml_sdkgen_types::{
+    ClassCrossing, CodegenFunctionParamMode, Name, Symbol, SymbolPool, Ty,
+    is_synthetic_effect_param,
 };
-use baml_sdkgen_types::{CodegenFunctionParamMode, Name, Symbol, SymbolPool, Ty};
 
 /// A canonical, attribute-free Go type identity.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -27,7 +27,7 @@ pub(crate) enum GoTy {
     Bool,
     Null,
     Uint8Array,
-    Media(MediaKind),
+    Media(ConcreteMediaKind),
     /// The exact recursive stdlib alias `baml.json.json`. Its Go surface is
     /// `any`, but unlike a dynamic union its wire decoder accepts only the
     /// canonical JSON value algebra.
@@ -35,9 +35,9 @@ pub(crate) enum GoTy {
     /// A first-class reflected BAML type value (`type`). Its Go surface is the
     /// opaque runtime descriptor `baml_go.BAMLType`.
     ReflectedType,
-    /// Opaque Rust-managed state (`$rust_type`). The native handle table owns
-    /// the underlying value; Go only holds a cloneable lifetime token.
-    RustType,
+    /// A host's own value (`baml.host.Value`): the Go value this process
+    /// sent, which BAML holds by reference.
+    HostValue,
     FunctionSpec {
         output: Box<Self>,
     },
@@ -45,6 +45,14 @@ pub(crate) enum GoTy {
     Stream {
         value: Box<Self>,
     },
+    /// The class whose crossing is `Prompt` (`ai.Prompt`): a rendered prompt,
+    /// carried by its own wire arm. Its Go surface is `baml_go.Prompt`.
+    Prompt(Name),
+    /// A class whose crossing is `Opaque` (`reflect.Session`,
+    /// `sap._ParseCache<T>`, ...) at its type arguments: an instance only the
+    /// engine builds, which Go holds as the reference it crossed as, in the
+    /// class's generated wrapper, and passes back.
+    Opaque(Name, Box<[Self]>),
     /// A Go type parameter projected from the compiler-owned BAML `TypeVar`.
     TypeVar(BaseName),
     Literal(GoLiteral),
@@ -61,6 +69,7 @@ pub(crate) enum GoTy {
     Optional(Box<Self>),
     Function(GoFunctionKey),
     TypedUnion(GoUnionKey),
+    Tuple(GoTupleKey),
     /// Renders as `any`, but deliberately retains every canonical candidate.
     DynamicUnion {
         key: GoUnionKey,
@@ -88,12 +97,88 @@ impl GoUnionKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct GoTupleKey(Box<[GoTy]>);
+
+impl GoTupleKey {
+    pub(crate) fn slots(&self) -> &[GoTy] {
+        &self.0
+    }
+
+    pub(crate) fn is_named(&self) -> bool {
+        !self.0.iter().any(contains_type_var)
+    }
+}
+
 /// The structural identity of a callback exposed to Go.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct GoFunctionKey {
     params: Box<[GoFunctionParamKey]>,
-    ret: Option<Box<GoTy>>,
-    throws: bool,
+    returns: GoCallbackReturn,
+    throws: GoCallbackThrows,
+}
+
+/// What a callback's declared return type becomes on the Go side.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum GoCallbackReturn {
+    /// The Go surface returns a value of this type.
+    Value(Box<GoTy>),
+    /// Declared `null` or `void`: the Go surface returns nothing and the
+    /// adapter returns `null`.
+    Null,
+    /// Declared `never`: the Go surface returns nothing, and a callback that
+    /// returns anyway broke its contract.
+    Never,
+}
+
+/// What a callback's declared `throws` becomes on the Go side: the throws type
+/// its binding states and whether its Go surface returns an `error`.
+///
+/// Whatever the surface, the outcome of a failure is decided by what fails: a
+/// Go error or panic of the host's own is `raised` (the engine builds the
+/// `baml.errors.HostCallable` around it), a BAML error or panic the callback
+/// received and returns (or, without an `error` result, panics with) is
+/// `thrown` on, and the engine holds either to the stated throws type.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum GoCallbackThrows {
+    /// Declared `throws never`. The callback must not fail, so any failure is a
+    /// contract violation, exactly as the declaration says.
+    Never,
+    /// The slot's throws is its open effect parameter, stated `unknown`. The
+    /// Go surface returns no `error`; a failure is an ordinary catchable BAML
+    /// error rather than a contract violation.
+    Open,
+    /// The declared throws is `baml.errors.HostCallable`: a returned Go
+    /// `error` is raised, so the Go surface returns an `error`.
+    HostCallable,
+    /// The declared throws names BAML values. The Go surface returns an
+    /// `error`; a callback throws a value of `thrown`, the declared throws
+    /// type less `baml.errors.HostCallable`, as `baml_go.Throw(value)`.
+    /// `host_callable` is whether the declaration also admits
+    /// `baml.errors.HostCallable`, so a raised Go error fits it.
+    Values {
+        thrown: Box<GoTy>,
+        host_callable: bool,
+    },
+}
+
+impl GoCallbackThrows {
+    /// Whether the Go surface of the callback returns an `error`.
+    pub(crate) fn returns_error(&self) -> bool {
+        match self {
+            Self::HostCallable | Self::Values { .. } => true,
+            Self::Never | Self::Open => false,
+        }
+    }
+
+    /// The Go type a callback throws with `baml_go.Throw`, if its declaration
+    /// names BAML values.
+    pub(crate) fn thrown(&self) -> Option<&GoTy> {
+        match self {
+            Self::Values { thrown, .. } => Some(thrown),
+            Self::Never | Self::Open | Self::HostCallable => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -149,12 +234,31 @@ impl GoFunctionKey {
             .any(|param| param.mode == GoFunctionParamMode::Optional)
     }
 
+    /// The Go type the callback's surface returns, if it returns a value.
     pub(crate) fn ret(&self) -> Option<&GoTy> {
-        self.ret.as_deref()
+        match &self.returns {
+            GoCallbackReturn::Value(ret) => Some(ret),
+            GoCallbackReturn::Null | GoCallbackReturn::Never => None,
+        }
     }
 
-    pub(crate) fn throws(&self) -> bool {
-        self.throws
+    pub(crate) fn returns(&self) -> &GoCallbackReturn {
+        &self.returns
+    }
+
+    pub(crate) fn throws(&self) -> &GoCallbackThrows {
+        &self.throws
+    }
+
+    /// Every Go type the callback's surface spells: its parameters', its
+    /// result's and the type it throws with `baml_go.Throw`. Walks over a
+    /// callback visit these and nothing else.
+    pub(crate) fn component_tys(&self) -> impl Iterator<Item = &GoTy> {
+        self.params
+            .iter()
+            .map(GoFunctionParamKey::ty)
+            .chain(self.ret())
+            .chain(self.throws.thrown())
     }
 }
 
@@ -164,6 +268,7 @@ pub(crate) struct GoTypeProjection<'a> {
     /// Typed unions used by each generated Go package. Placement is a usage
     /// property; identity is exclusively [`GoUnionKey`].
     typed_unions: BTreeMap<BaseName, BTreeSet<GoUnionKey>>,
+    typed_tuples: BTreeMap<BaseName, BTreeSet<GoTupleKey>>,
     callback_options: BTreeMap<BaseName, BTreeSet<GoFunctionKey>>,
 }
 
@@ -173,6 +278,7 @@ impl<'a> GoTypeProjection<'a> {
             pool,
             max_typed_union_arity,
             typed_unions: BTreeMap::new(),
+            typed_tuples: BTreeMap::new(),
             callback_options: BTreeMap::new(),
         };
         projection.collect();
@@ -188,6 +294,13 @@ impl<'a> GoTypeProjection<'a> {
             .get(package)
             .into_iter()
             .flat_map(|unions| unions.iter())
+    }
+
+    pub(crate) fn typed_tuples_in(&self, package: &BaseName) -> impl Iterator<Item = &GoTupleKey> {
+        self.typed_tuples
+            .get(package)
+            .into_iter()
+            .flat_map(|tuples| tuples.iter())
     }
 
     pub(crate) fn callback_options_in(
@@ -234,20 +347,38 @@ impl<'a> GoTypeProjection<'a> {
                 Symbol::Enum(_) => Vec::new(),
             };
             let mut found = BTreeSet::new();
+            let mut tuples = BTreeSet::new();
             let mut callbacks = BTreeSet::new();
             for ty in tys {
                 let projected = self.project(ty);
                 collect_typed_unions(&projected, &mut found);
+                collect_typed_tuples(&projected, &mut tuples);
                 collect_callback_options(&projected, &mut callbacks);
             }
             self.typed_unions
                 .entry(name.package().clone())
                 .or_default()
                 .extend(found);
+            self.typed_tuples
+                .entry(name.package().clone())
+                .or_default()
+                .extend(tuples);
             self.callback_options
                 .entry(name.package().clone())
                 .or_default()
                 .extend(callbacks);
+        }
+    }
+
+    /// How an instance of the class `name` crosses. A class the pool does not
+    /// declare has no crossing of its own, so it crosses by its fields (and
+    /// the support filter omits whatever names it).
+    fn crossing(&self, name: &Name) -> ClassCrossing {
+        match self.pool.get(name) {
+            Some(Symbol::Class(class)) => class.crossing,
+            Some(Symbol::Enum(_) | Symbol::Function(_) | Symbol::TypeAlias(_)) | None => {
+                ClassCrossing::Fields
+            }
         }
     }
 
@@ -260,10 +391,9 @@ impl<'a> GoTypeProjection<'a> {
             Ty::Bool => GoTy::Bool,
             Ty::Null => GoTy::Null,
             Ty::Uint8Array => GoTy::Uint8Array,
-            Ty::Media(MediaKind::Generic) => GoTy::Unsupported,
-            Ty::Media(kind) => GoTy::Media(*kind),
+            // Go has no surface for the open `media` type yet.
+            Ty::Media(kind) => kind.concrete().map_or(GoTy::Unsupported, GoTy::Media),
             Ty::Type => GoTy::ReflectedType,
-            Ty::RustType => GoTy::RustType,
             Ty::Literal(literal, ..) => GoTy::Literal(match literal {
                 Literal::String(value) => GoLiteral::String(value.clone()),
                 Literal::Int(value) => GoLiteral::Int(*value),
@@ -272,28 +402,48 @@ impl<'a> GoTypeProjection<'a> {
                 Literal::Bool(value) => GoLiteral::Bool(*value),
             }),
             Ty::TypeVar(param) => GoTy::TypeVar(param.name().clone()),
-            Ty::Class(name, arguments) => {
-                if is_reflect_kind_type(name) {
-                    GoTy::ReflectedType
-                } else if name.to_string() == AI_FUNCTION_SPEC && arguments.len() == 1 {
-                    GoTy::FunctionSpec {
-                        output: Box::new(self.project_inner(&arguments[0], aliases)),
-                    }
-                } else if name.to_string() == AI_STREAM_STREAM && arguments.len() == 1 {
-                    GoTy::Stream {
-                        value: Box::new(self.project_inner(&arguments[0], aliases)),
-                    }
-                } else {
-                    GoTy::Class(
-                        name.clone(),
-                        arguments
-                            .iter()
-                            .map(|argument| self.project_inner(argument, aliases))
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                    )
-                }
-            }
+            Ty::Class(name, arguments) if is_reflect_kind_type(name) => match arguments.as_ref() {
+                [] => GoTy::ReflectedType,
+                [_, ..] => GoTy::Unsupported,
+            },
+            // How an instance crosses is the compiler's decision, made once per
+            // declaration; the Go surface follows it.
+            Ty::Class(name, arguments) => match (self.crossing(name), arguments.as_ref()) {
+                (ClassCrossing::FunctionSpec, [output]) => GoTy::FunctionSpec {
+                    output: Box::new(self.project_inner(output, aliases)),
+                },
+                (ClassCrossing::Stream, [value]) => GoTy::Stream {
+                    value: Box::new(self.project_inner(value, aliases)),
+                },
+                (ClassCrossing::Prompt, []) => GoTy::Prompt(name.clone()),
+                // A host's own value is the host's handle to it.
+                (ClassCrossing::HostValue, []) => GoTy::HostValue,
+                (ClassCrossing::Opaque, arguments) => GoTy::Opaque(
+                    name.clone(),
+                    arguments
+                        .iter()
+                        .map(|argument| self.project_inner(argument, aliases))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+                (ClassCrossing::Media(kind), []) => GoTy::Media(kind),
+                (ClassCrossing::Fields, arguments) => GoTy::Class(
+                    name.clone(),
+                    arguments
+                        .iter()
+                        .map(|argument| self.project_inner(argument, aliases))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+                (
+                    ClassCrossing::FunctionSpec
+                    | ClassCrossing::Stream
+                    | ClassCrossing::Prompt
+                    | ClassCrossing::HostValue
+                    | ClassCrossing::Media(_),
+                    _,
+                ) => GoTy::Unsupported,
+            },
             Ty::Enum(name) => GoTy::Enum(name.clone()),
             Ty::EnumVariant(name, variant) => GoTy::EnumVariant(name.clone(), variant.clone()),
             Ty::List(inner) => GoTy::List(Box::new(self.project_inner(inner, aliases))),
@@ -324,19 +474,31 @@ impl<'a> GoTypeProjection<'a> {
                 throws,
                 ..
             } => {
-                let throws = if matches!(throws.as_ref(), Ty::Never)
-                    || matches!(
-                        throws.as_ref(),
-                        Ty::TypeVar(name) if name.as_str().starts_with("__effect_param_")
-                    ) {
-                    false
-                } else if self.throws_accepts_host_callable(throws, aliases) {
-                    true
+                let throws = if matches!(throws.as_ref(), Ty::Never) {
+                    GoCallbackThrows::Never
+                } else if matches!(
+                    throws.as_ref(),
+                    Ty::TypeVar(param) if is_synthetic_effect_param(param.name())
+                ) {
+                    GoCallbackThrows::Open
                 } else {
-                    // A Go `error` is encoded as baml.errors.HostCallable. Do
-                    // not generate a signature that falsely promises it can
-                    // construct an arbitrary declared BAML error class.
-                    return GoTy::Unsupported;
+                    let mut thrown = Vec::new();
+                    let mut host_callable = false;
+                    if !self.split_host_callable(throws, aliases, &mut thrown, &mut host_callable) {
+                        return GoTy::Unsupported;
+                    }
+                    let thrown = match thrown.len() {
+                        0 => None,
+                        1 => thrown.pop(),
+                        _ => Some(Ty::Union(thrown.into())),
+                    };
+                    match thrown {
+                        None => GoCallbackThrows::HostCallable,
+                        Some(thrown) => GoCallbackThrows::Values {
+                            thrown: Box::new(self.project_inner(&thrown, aliases)),
+                            host_callable,
+                        },
+                    }
                 };
                 let params = params
                     .iter()
@@ -358,58 +520,74 @@ impl<'a> GoTypeProjection<'a> {
                         }
                     })
                     .collect::<Vec<_>>();
-                let ret = match ret.as_ref() {
-                    Ty::Void | Ty::Never => None,
-                    ret => Some(Box::new(self.project_inner(ret, aliases))),
+                let returns = match ret.as_ref() {
+                    Ty::Never => GoCallbackReturn::Never,
+                    ret if ret.is_unit() => GoCallbackReturn::Null,
+                    ret => GoCallbackReturn::Value(Box::new(self.project_inner(ret, aliases))),
                 };
-                if params
-                    .iter()
-                    .any(|param| callback_component_is_unsupported(&param.ty))
-                    || ret
-                        .as_deref()
-                        .is_some_and(callback_component_is_unsupported)
-                {
+                let key = GoFunctionKey {
+                    params: params.into_boxed_slice(),
+                    returns,
+                    throws,
+                };
+                if key.component_tys().any(callback_component_is_unsupported) {
                     GoTy::Unsupported
                 } else {
-                    GoTy::Function(GoFunctionKey {
-                        params: params.into_boxed_slice(),
-                        ret,
-                        throws,
-                    })
+                    GoTy::Function(key)
+                }
+            }
+            Ty::Tuple(items) => {
+                let slots = items
+                    .iter()
+                    .map(|item| self.project_inner(item, aliases))
+                    .collect::<Vec<_>>();
+                if slots.is_empty() || slots.iter().any(contains_unsupported) {
+                    GoTy::Unsupported
+                } else {
+                    GoTy::Tuple(GoTupleKey(slots.into_boxed_slice()))
                 }
             }
             _ => GoTy::Unsupported,
         }
     }
 
-    fn throws_accepts_host_callable(&self, ty: &Ty, aliases: &mut HashSet<Name>) -> bool {
+    /// Splits a declared throws type into the members a Go callback throws
+    /// with `baml_go.Throw` (`thrown`) and whether it admits
+    /// `baml.errors.HostCallable`, looking through unions and non-recursive
+    /// aliases of unions. Reports false for a declaration Go cannot split (a
+    /// recursive alias).
+    fn split_host_callable(
+        &self,
+        ty: &Ty,
+        aliases: &mut HashSet<Name>,
+        thrown: &mut Vec<Ty>,
+        host_callable: &mut bool,
+    ) -> bool {
         match ty {
-            Ty::Class(name, arguments) => {
-                arguments.is_empty()
-                    && name
-                        == &Name::new(
-                            BaseName::new("baml"),
-                            vec![BaseName::new("errors")],
-                            BaseName::new("HostCallable"),
-                        )
+            Ty::Class(name, arguments) if arguments.is_empty() && is_host_callable_error(name) => {
+                *host_callable = true;
+                true
             }
             Ty::Union(members) => members
                 .iter()
-                .any(|member| self.throws_accepts_host_callable(member, aliases)),
-            Ty::TypeAlias(name) => {
+                .all(|member| self.split_host_callable(member, aliases, thrown, host_callable)),
+            Ty::TypeAlias(name) if !is_baml_json(name) => {
                 if !aliases.insert(name.clone()) {
                     return false;
                 }
-                let accepts = match &self.pool[name] {
+                let split = match &self.pool[name] {
                     Symbol::TypeAlias(alias) if !alias.recursive => {
-                        self.throws_accepts_host_callable(&alias.resolves_to, aliases)
+                        self.split_host_callable(&alias.resolves_to, aliases, thrown, host_callable)
                     }
                     _ => false,
                 };
                 aliases.remove(name);
-                accepts
+                split
             }
-            _ => false,
+            other => {
+                thrown.push(other.clone());
+                true
+            }
         }
     }
 
@@ -534,10 +712,19 @@ fn is_reflect_kind_type(name: &Name) -> bool {
                         | "literal"
                         | "map"
                         | "primitive"
+                        | "tuple"
                         | "union"
                 )
     ) && name.package().as_str() == "baml"
         && name.name().as_str() == "Type"
+}
+
+fn is_host_callable_error(name: &Name) -> bool {
+    name == &Name::new(
+        BaseName::new("baml"),
+        vec![BaseName::new("errors")],
+        BaseName::new("HostCallable"),
+    )
 }
 
 fn is_baml_json(name: &Name) -> bool {
@@ -566,15 +753,17 @@ fn collect_typed_unions(ty: &GoTy, found: &mut BTreeSet<GoUnionKey>) {
                 collect_typed_unions(argument, found);
             }
         }
+        GoTy::Tuple(key) => {
+            for slot in key.slots() {
+                collect_typed_unions(slot, found);
+            }
+        }
         GoTy::FunctionSpec { output } => collect_typed_unions(output, found),
         GoTy::Stream { value } => collect_typed_unions(value, found),
         GoTy::List(inner) | GoTy::Optional(inner) => collect_typed_unions(inner, found),
         GoTy::Function(key) => {
-            for param in key.params() {
-                collect_typed_unions(param.ty(), found);
-            }
-            if let Some(ret) = key.ret() {
-                collect_typed_unions(ret, found);
+            for component in key.component_tys() {
+                collect_typed_unions(component, found);
             }
         }
         GoTy::Map { key, value } => {
@@ -585,15 +774,47 @@ fn collect_typed_unions(ty: &GoTy, found: &mut BTreeSet<GoUnionKey>) {
     }
 }
 
+fn collect_typed_tuples(ty: &GoTy, found: &mut BTreeSet<GoTupleKey>) {
+    match ty {
+        GoTy::Tuple(key) => {
+            if !key.is_named() || found.insert(key.clone()) {
+                for slot in key.slots() {
+                    collect_typed_tuples(slot, found);
+                }
+            }
+        }
+        GoTy::TypedUnion(key) | GoTy::DynamicUnion { key, .. } => {
+            for member in key.members() {
+                collect_typed_tuples(member, found);
+            }
+        }
+        GoTy::Class(_, arguments) => {
+            for argument in arguments {
+                collect_typed_tuples(argument, found);
+            }
+        }
+        GoTy::FunctionSpec { output } => collect_typed_tuples(output, found),
+        GoTy::Stream { value } => collect_typed_tuples(value, found),
+        GoTy::List(inner) | GoTy::Optional(inner) => collect_typed_tuples(inner, found),
+        GoTy::Function(key) => {
+            for component in key.component_tys() {
+                collect_typed_tuples(component, found);
+            }
+        }
+        GoTy::Map { key, value } => {
+            collect_typed_tuples(key, found);
+            collect_typed_tuples(value, found);
+        }
+        _ => {}
+    }
+}
+
 fn collect_callback_options(ty: &GoTy, found: &mut BTreeSet<GoFunctionKey>) {
     match ty {
         GoTy::Function(key) => {
             if key.has_optional_params() && found.insert(key.clone()) {
-                for param in key.params() {
-                    collect_callback_options(param.ty(), found);
-                }
-                if let Some(ret) = key.ret() {
-                    collect_callback_options(ret, found);
+                for component in key.component_tys() {
+                    collect_callback_options(component, found);
                 }
             }
         }
@@ -614,6 +835,11 @@ fn collect_callback_options(ty: &GoTy, found: &mut BTreeSet<GoFunctionKey>) {
                 collect_callback_options(member, found);
             }
         }
+        GoTy::Tuple(key) => {
+            for slot in key.slots() {
+                collect_callback_options(slot, found);
+            }
+        }
         _ => {}
     }
 }
@@ -629,12 +855,8 @@ fn contains_unsupported(ty: &GoTy) -> bool {
         GoTy::TypedUnion(key) | GoTy::DynamicUnion { key, .. } => {
             key.members().iter().any(contains_unsupported)
         }
-        GoTy::Function(key) => {
-            key.params()
-                .iter()
-                .any(|param| contains_unsupported(param.ty()))
-                || key.ret().is_some_and(contains_unsupported)
-        }
+        GoTy::Tuple(key) => key.slots().iter().any(contains_unsupported),
+        GoTy::Function(key) => key.component_tys().any(contains_unsupported),
         _ => false,
     }
 }
@@ -650,21 +872,25 @@ fn contains_type_var(ty: &GoTy) -> bool {
         GoTy::TypedUnion(key) | GoTy::DynamicUnion { key, .. } => {
             key.members().iter().any(contains_type_var)
         }
-        GoTy::Function(key) => {
-            key.params()
-                .iter()
-                .any(|parameter| contains_type_var(parameter.ty()))
-                || key.ret().is_some_and(contains_type_var)
-        }
+        GoTy::Tuple(key) => key.slots().iter().any(contains_type_var),
+        GoTy::Function(key) => key.component_tys().any(contains_type_var),
         _ => false,
     }
 }
 
+// BUG: a callback cannot receive a BAML closure. Any function type inside a
+// callback's parameters or result makes the whole callback `Unsupported`, so a
+// BAML function such as `hof(cb: (f: (x: int) -> int) -> int)` is omitted from
+// the Go SDK entirely. Rendering is direction-blind: a function value BAML
+// hands to the host must surface as `ReturnedFunction[...]` (the decoder the
+// callback adapter would already call), while one the host hands to BAML is a
+// plain Go `func`, and every nested function flips that direction. Lifting this
+// needs that direction threaded through `render_projected_go_type`, the
+// callback options structs, and `supported_go_type`.
+/// Type variables stay: the generated callback adapters are generic over
+/// them.
 fn callback_component_is_unsupported(ty: &GoTy) -> bool {
-    contains_unsupported(ty)
-        || contains_function(ty)
-        || contains_dynamic_union(ty)
-        || contains_type_var(ty)
+    contains_unsupported(ty) || contains_function(ty) || contains_dynamic_union(ty)
 }
 
 fn contains_function(ty: &GoTy) -> bool {
@@ -678,6 +904,7 @@ fn contains_function(ty: &GoTy) -> bool {
         GoTy::TypedUnion(key) | GoTy::DynamicUnion { key, .. } => {
             key.members().iter().any(contains_function)
         }
+        GoTy::Tuple(key) => key.slots().iter().any(contains_function),
         _ => false,
     }
 }
@@ -686,17 +913,13 @@ fn contains_dynamic_union(ty: &GoTy) -> bool {
     match ty {
         GoTy::DynamicUnion { .. } => true,
         GoTy::TypedUnion(key) => key.members().iter().any(contains_dynamic_union),
+        GoTy::Tuple(key) => !key.is_named() || key.slots().iter().any(contains_dynamic_union),
         GoTy::Class(_, arguments) => arguments.iter().any(contains_dynamic_union),
         GoTy::FunctionSpec { output } => contains_dynamic_union(output),
         GoTy::Stream { value } => contains_dynamic_union(value),
         GoTy::List(inner) | GoTy::Optional(inner) => contains_dynamic_union(inner),
         GoTy::Map { key, value } => contains_dynamic_union(key) || contains_dynamic_union(value),
-        GoTy::Function(key) => {
-            key.params()
-                .iter()
-                .any(|param| contains_dynamic_union(param.ty()))
-                || key.ret().is_some_and(contains_dynamic_union)
-        }
+        GoTy::Function(key) => key.component_tys().any(contains_dynamic_union),
         _ => false,
     }
 }
@@ -713,6 +936,7 @@ pub(crate) fn literal_surface(literal: &GoLiteral) -> GoTy {
 
 #[cfg(test)]
 mod tests {
+    use baml_base::MediaKind;
     use baml_sdkgen_types::{CallableParam, Origin, TypeAlias};
     use baml_type::Freshness;
 
@@ -782,11 +1006,91 @@ mod tests {
     }
 
     #[test]
-    fn rust_type_projects_as_one_canonical_opaque_leaf_while_resource_stays_deferred() {
+    fn resource_stays_deferred() {
         let pool = SymbolPool::default();
         let projection = GoTypeProjection::new(&pool, 3);
-        assert_eq!(projection.project(&Ty::RustType), GoTy::RustType);
         assert_eq!(projection.project(&Ty::Resource), GoTy::Unsupported);
+    }
+
+    #[test]
+    fn tuples_project_slots_in_order_and_keep_union_slots_distinct() {
+        let pool = SymbolPool::default();
+        let projection = GoTypeProjection::new(&pool, 3);
+        let tuple = |items: Vec<Ty>| Ty::Tuple(items.into_boxed_slice());
+        let int_string = projection.project(&tuple(vec![Ty::Int, Ty::String]));
+        let GoTy::Tuple(key) = &int_string else {
+            panic!("a tuple of supported slots should project to a Go tuple")
+        };
+        assert_eq!(key.slots(), &[GoTy::Int, GoTy::String]);
+        assert!(key.is_named());
+        assert_ne!(
+            int_string,
+            projection.project(&tuple(vec![Ty::String, Ty::Int]))
+        );
+        let GoTy::Tuple(repeated) = projection.project(&tuple(vec![Ty::Int, Ty::Int])) else {
+            panic!("repeated slots should project to a Go tuple")
+        };
+        assert_eq!(repeated.slots().len(), 2);
+        let product = projection.project(&tuple(vec![union(vec![Ty::Int, Ty::String]), Ty::Bool]));
+        let expanded = projection.project(&union(vec![
+            tuple(vec![Ty::Int, Ty::Bool]),
+            tuple(vec![Ty::String, Ty::Bool]),
+        ]));
+        assert!(matches!(product, GoTy::Tuple(_)));
+        assert!(matches!(expanded, GoTy::TypedUnion(_)));
+        assert_ne!(projection.project(&tuple(vec![Ty::Int])), GoTy::Int);
+    }
+
+    #[test]
+    fn tuples_with_unsupported_slots_fail_closed_and_type_var_slots_fall_back() {
+        let pool = SymbolPool::default();
+        let projection = GoTypeProjection::new(&pool, 3);
+        let unsupported = Ty::Tuple(Box::new([Ty::Int, Ty::Resource]));
+        assert_eq!(projection.project(&unsupported), GoTy::Unsupported);
+        assert!(contains_unsupported(
+            &projection.project(&Ty::List(Box::new(unsupported)))
+        ));
+        let type_var = Ty::TypeVar(baml_sdkgen_types::ParamTy::new(0, BaseName::new("T")));
+        let GoTy::Tuple(key) = projection.project(&Ty::Tuple(Box::new([type_var, Ty::Int]))) else {
+            panic!("a tuple over a type parameter should still project to a Go tuple")
+        };
+        assert!(!key.is_named());
+        assert!(contains_dynamic_union(&GoTy::Tuple(key)));
+    }
+
+    #[test]
+    fn named_tuples_are_collected_per_package_including_nested_slots() {
+        let function = Name::new(BaseName::new("user"), vec![], BaseName::new("Read"));
+        let mut pool = SymbolPool::default();
+        pool.insert(
+            function,
+            Symbol::Function(baml_sdkgen_types::Function {
+                name: BaseName::new("Read"),
+                generic_params: vec![],
+                arguments: vec![],
+                return_type: Ty::Tuple(Box::new([
+                    Ty::Tuple(Box::new([Ty::Int, Ty::String])),
+                    Ty::Bool,
+                ])),
+                throws: None,
+                docstring: None,
+                watchers: vec![],
+                origin: Origin {
+                    source_file_path: "main.baml".to_string(),
+                    span_start: 0,
+                },
+            }),
+        );
+        let projection = GoTypeProjection::new(&pool, 3);
+        let tuples = projection
+            .typed_tuples_in(&BaseName::new("user"))
+            .map(|key| key.slots().len())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tuples.len(),
+            2,
+            "the outer and the nested tuple are both named"
+        );
     }
 
     #[test]
@@ -948,13 +1252,11 @@ mod tests {
     fn concrete_media_kinds_project_canonically_and_generic_media_is_deferred() {
         let pool = SymbolPool::default();
         let projection = GoTypeProjection::new(&pool, 3);
-        for kind in [
-            MediaKind::Image,
-            MediaKind::Audio,
-            MediaKind::Video,
-            MediaKind::Pdf,
-        ] {
-            assert_eq!(projection.project(&Ty::Media(kind)), GoTy::Media(kind));
+        for kind in ConcreteMediaKind::ALL {
+            assert_eq!(
+                projection.project(&Ty::Media(kind.into())),
+                GoTy::Media(kind)
+            );
         }
         assert_eq!(
             projection.project(&Ty::Media(MediaKind::Generic)),
@@ -983,7 +1285,7 @@ mod tests {
         assert_eq!(key.params()[0].ty(), &GoTy::Int);
         assert_eq!(key.params()[1].ty(), &GoTy::List(Box::new(GoTy::String)));
         assert_eq!(key.ret(), Some(&GoTy::Bool));
-        assert!(key.throws());
+        assert_eq!(key.throws(), &GoCallbackThrows::HostCallable);
     }
 
     #[test]
@@ -1056,15 +1358,22 @@ mod tests {
         assert!(matches!(closed_union.params()[0].ty(), GoTy::TypedUnion(_)));
         assert!(matches!(closed_union.ret(), Some(GoTy::TypedUnion(_))));
 
+        let type_var = Ty::TypeVar(baml_sdkgen_types::ParamTy::new(0, BaseName::new("T")));
+        let generic = callable(
+            vec![callable_param(
+                CodegenFunctionParamMode::Required,
+                type_var.clone(),
+            )],
+            type_var,
+            never(),
+        );
+        let GoTy::Function(generic) = projection.project(&generic) else {
+            panic!("a callback over a type parameter should project to a Go function")
+        };
+        assert_eq!(generic.params()[0].ty(), &GoTy::TypeVar(BaseName::new("T")));
+        assert_eq!(generic.ret(), Some(&GoTy::TypeVar(BaseName::new("T"))));
+
         let unsupported = [
-            callable(
-                vec![callable_param(
-                    CodegenFunctionParamMode::Required,
-                    Ty::TypeVar(baml_sdkgen_types::ParamTy::new(0, BaseName::new("T"))),
-                )],
-                Ty::String,
-                never(),
-            ),
             callable(
                 vec![callable_param(
                     CodegenFunctionParamMode::Required,
@@ -1091,35 +1400,144 @@ mod tests {
     }
 
     #[test]
-    fn callback_projection_rejects_incompatible_declared_throws() {
+    fn callback_projection_states_declared_throws_and_what_go_throws() {
         let validation_error = Ty::Class(alias_name("ValidationError"), Box::new([]));
+        let projected_error = GoTy::Class(alias_name("ValidationError"), Box::new([]));
         let pool = SymbolPool::default();
         let projection = GoTypeProjection::new(&pool, 3);
+        let throws_of = |throws: Ty| match projection.project(&callable(
+            vec![callable_param(CodegenFunctionParamMode::Required, Ty::Int)],
+            Ty::String,
+            throws,
+        )) {
+            GoTy::Function(key) => key.throws().clone(),
+            other => panic!("callback should project to a Go function, got {other:?}"),
+        };
+        // A declared BAML error is a value the callback throws with
+        // `baml_go.Throw`; a raised Go error does not fit it.
         assert_eq!(
-            projection.project(&callable(
-                vec![callable_param(CodegenFunctionParamMode::Required, Ty::Int)],
-                Ty::String,
-                validation_error.clone(),
-            )),
-            GoTy::Unsupported
+            throws_of(validation_error.clone()),
+            GoCallbackThrows::Values {
+                thrown: Box::new(projected_error.clone()),
+                host_callable: false,
+            }
         );
-        assert!(matches!(
-            projection.project(&callable(
-                vec![],
-                Ty::String,
-                union(vec![validation_error, host_callable_error()]),
-            )),
-            GoTy::Function(key) if key.throws()
-        ));
+        // Beside `baml.errors.HostCallable`, both fit: the declaration is
+        // stated whole, and Go throws only the BAML members.
+        assert_eq!(
+            throws_of(union(vec![validation_error, host_callable_error()])),
+            GoCallbackThrows::Values {
+                thrown: Box::new(projected_error),
+                host_callable: true,
+            }
+        );
+        assert_eq!(
+            throws_of(host_callable_error()),
+            GoCallbackThrows::HostCallable
+        );
+    }
 
-        assert!(matches!(
-            projection.project(&callable(
-                vec![],
-                Ty::String,
-                Ty::TypeVar(
-                    baml_sdkgen_types::ParamTy::new(0, BaseName::new("__effect_param_0")))
-            )),
-            GoTy::Function(key) if !key.throws()
-        ));
+    #[test]
+    fn classes_project_by_their_declared_crossing() {
+        let declared = |name: &str, crossing: ClassCrossing| {
+            let name = Name::from_dotted_path(name);
+            (
+                name.clone(),
+                Symbol::Class(baml_sdkgen_types::Class {
+                    crossing,
+                    name,
+                    generic_params: vec![],
+                    docstring: None,
+                    properties: vec![],
+                    static_methods: vec![],
+                    instance_methods: vec![],
+                    origin: Origin {
+                        source_file_path: "test.baml".to_string(),
+                        span_start: 0,
+                    },
+                    json_omit_nulls: false,
+                }),
+            )
+        };
+        let pool = SymbolPool::from([
+            declared("reflect.Session", ClassCrossing::Opaque),
+            declared("baml.sap._ParseCache", ClassCrossing::Opaque),
+            declared("ai.Prompt", ClassCrossing::Prompt),
+            declared("ai.FunctionSpec", ClassCrossing::FunctionSpec),
+            declared("user.Plain", ClassCrossing::Fields),
+        ]);
+        let projection = GoTypeProjection::new(&pool, 3);
+        let class = |name: &str, arguments: Vec<Ty>| {
+            projection.project(&Ty::Class(
+                Name::from_dotted_path(name),
+                arguments.into_boxed_slice(),
+            ))
+        };
+        assert_eq!(
+            class("reflect.Session", vec![]),
+            GoTy::Opaque(Name::from_dotted_path("reflect.Session"), Box::new([]))
+        );
+        assert_eq!(
+            class("baml.sap._ParseCache", vec![Ty::Int]),
+            GoTy::Opaque(
+                Name::from_dotted_path("baml.sap._ParseCache"),
+                Box::new([GoTy::Int])
+            )
+        );
+        assert_eq!(
+            class("ai.Prompt", vec![]),
+            GoTy::Prompt(Name::from_dotted_path("ai.Prompt"))
+        );
+        assert_eq!(
+            class("ai.FunctionSpec", vec![Ty::String]),
+            GoTy::FunctionSpec {
+                output: Box::new(GoTy::String)
+            }
+        );
+        assert_eq!(
+            class("user.Plain", vec![]),
+            GoTy::Class(Name::from_dotted_path("user.Plain"), Box::new([]))
+        );
+    }
+
+    #[test]
+    fn callback_projection_distinguishes_never_from_null_returns() {
+        let pool = SymbolPool::default();
+        let projection = GoTypeProjection::new(&pool, 3);
+        let returns_of = |ret: Ty| match projection.project(&callable(vec![], ret, Ty::Never)) {
+            GoTy::Function(key) => key.returns().clone(),
+            other => panic!("callback should project to a Go function, got {other:?}"),
+        };
+        assert_eq!(returns_of(Ty::Never), GoCallbackReturn::Never);
+        assert_eq!(returns_of(Ty::Null), GoCallbackReturn::Null);
+        assert_eq!(
+            returns_of(Ty::Int),
+            GoCallbackReturn::Value(Box::new(GoTy::Int))
+        );
+    }
+
+    #[test]
+    fn callback_projection_keeps_open_effects_open_and_never_closed() {
+        let pool = SymbolPool::default();
+        let projection = GoTypeProjection::new(&pool, 3);
+        let throws_of = |throws: Ty| match projection.project(&callable(vec![], Ty::String, throws))
+        {
+            GoTy::Function(key) => key.throws().clone(),
+            other => panic!("callback should project to a Go function, got {other:?}"),
+        };
+
+        // An omitted `throws` is an open effect parameter: a Go failure must stay
+        // catchable, so the binding states `unknown`, not `never`.
+        assert_eq!(
+            throws_of(Ty::TypeVar(baml_sdkgen_types::ParamTy::new(
+                0,
+                BaseName::new("__effect_param_0")
+            ))),
+            GoCallbackThrows::Open
+        );
+        assert_eq!(throws_of(Ty::Never), GoCallbackThrows::Never);
+        assert!(!GoCallbackThrows::Open.returns_error());
+        assert!(!GoCallbackThrows::Never.returns_error());
+        assert!(GoCallbackThrows::HostCallable.returns_error());
     }
 }

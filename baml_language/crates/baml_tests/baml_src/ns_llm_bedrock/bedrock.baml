@@ -198,6 +198,8 @@ function _failure_label(error: unknown) -> string {
         let e: ai.errors.InvalidRequest => `InvalidRequest/${e.status_code ?? -1}`,
         let e: ai.errors.NetworkFailure => "NetworkFailure",
         let e: ai.errors.ParseFailed => "ParseFailed",
+        let e: ai.errors.InvalidResponse => "InvalidResponse",
+        let e: ai.errors.ProviderError => `ProviderError/${e.error_type ?? ""}`,
         _ => `other/${error.to_string()}`,
     }
 }
@@ -435,7 +437,8 @@ function bedrock_multi_turn() -> string {
     let log: ai.events.Event[] = [
         ai.events.AssistantMessage {
             content: [ai.content.Text { text: "4" }],
-            client_id: `bedrock/${_model()}`,
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: _model() },
+            requested_model: _model(),
         },
         ai.events.UserMessage.new("And 3+3?"),
     ];
@@ -473,7 +476,8 @@ function bedrock_reasoning_only_turn_is_dropped() -> string {
     let log: ai.events.Event[] = [
         ai.events.AssistantMessage {
             content: [ai.content.Reasoning { summary: "thinking about it" }],
-            client_id: `bedrock/${_model()}`,
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: _model() },
+            requested_model: _model(),
         },
         ai.events.UserMessage.new("And 3+3?"),
     ];
@@ -504,12 +508,14 @@ function bedrock_reasoning_only_turn_mid_conversation() -> string {
     let log: ai.events.Event[] = [
         ai.events.AssistantMessage {
             content: [ai.content.Text { text: "4" }],
-            client_id: `bedrock/${_model()}`,
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: _model() },
+            requested_model: _model(),
         },
         ai.events.UserMessage.new("And 3+3?"),
         ai.events.AssistantMessage {
             content: [ai.content.Reasoning { summary: "thinking about it" }],
-            client_id: `bedrock/${_model()}`,
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: _model() },
+            requested_model: _model(),
         },
         ai.events.UserMessage.new("And 4+4?"),
     ];
@@ -538,19 +544,28 @@ test "bedrock_reasoning_only_turn_mid_conversation" {
 // `${picture}` in `BedrockVision`), and Converse rejects an empty `text`
 // member — so a blank part must produce no block at all rather than
 // `{"text":""}`. Exactly the two blocks that carry something survive.
-function bedrock_blank_prompt_parts_are_dropped() -> string {
+function bedrock_blank_prompt_parts_are_dropped() -> json {
     let picture = baml.media.Image.from_base64("SGVsbG8=", "image/png");
     let input = _turn_input(BedrockVision@spec(picture), _empty_journal(), _no_tools());
-    let body = _body(_client(null), input);
-    [
-        `blocks=${_array_len(body, ".messages[0].content")}`,
-        baml.json.path<string>(body, ".messages[0].content[0].text"),
-        `empty_text=${baml.json.stringify(body).includes(`"text":""`)}`,
-    ].join("|")
+    _body(_client(null), input)
 }
 
 test "bedrock_blank_prompt_parts_are_dropped" {
-    assert.equal(bedrock_blank_prompt_parts_are_dropped(), "blocks=2|Look at|empty_text=false")
+    // The whole body: exactly two blocks, and no `{"text":""}` anywhere.
+    assert.equal(
+        bedrock_blank_prompt_parts_are_dropped(),
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "text": "Look at" },
+                        { "image": { "format": "png", "source": { "bytes": "SGVsbG8=" } } },
+                    ],
+                },
+            ],
+        },
+    )
 }
 
 // ─── 5. toolConfig (NET-NEW — neither sys_llm nor the engine sent one) ────────
@@ -578,8 +593,8 @@ test "bedrock_tool_config" {
 }
 
 // The three `toolChoice` shapes. `auto` and `any` are empty objects on the
-// wire, so these assert on the serialized bytes.
-function bedrock_tool_choice_modes() -> string {
+// wire, so these compare the whole `toolChoice` value.
+function bedrock_tool_choice_modes() -> json {
     let auto = aws.BedrockClient.new(model = _model(), region = "us-east-1", tool_choice = "auto");
     let any = aws.BedrockClient.new(model = _model(), region = "us-east-1", tool_choice = "any");
     let named = aws.BedrockClient.new(
@@ -589,17 +604,15 @@ function bedrock_tool_choice_modes() -> string {
     );
     let input = _turn_input(BedrockUserOnly@spec("weather?"), _empty_journal(), _weather_tools());
     [
-        baml.json.stringify(_body(auto, input)),
-        baml.json.stringify(_body(any, input)),
-        baml.json.path<string>(_body(named, input), ".toolConfig.toolChoice.tool.name"),
-    ].join("\n")
+        baml.json.path<json>(_body(auto, input), ".toolConfig.toolChoice"),
+        baml.json.path<json>(_body(any, input), ".toolConfig.toolChoice"),
+        baml.json.path<json>(_body(named, input), ".toolConfig.toolChoice"),
+    ]
 }
 
 test "bedrock_tool_choice_modes" {
-    let got = bedrock_tool_choice_modes();
-    assert.contains(got, "\"toolChoice\":{\"auto\":{}}");
-    assert.contains(got, "\"toolChoice\":{\"any\":{}}");
-    assert.contains(got, "get_weather")
+    let expected: json = [{ "auto": {} }, { "any": {} }, { "tool": { "name": "get_weather" } }];
+    assert.equal(bedrock_tool_choice_modes(), expected)
 }
 
 // A toolbox is only sent when it is non-empty.
@@ -627,7 +640,8 @@ function bedrock_tool_replay() -> string {
                 ai.content.ToolUse { id: "tu_1", name: "get_weather", args: args },
                 ai.content.ToolUse { id: "tu_2", name: "get_weather", args: args },
             ],
-            client_id: `bedrock/${_model()}`,
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: _model() },
+            requested_model: _model(),
         },
         ai.events.ToolCompleted.new("tu_1", "sunny"),
         ai.events.ToolFailed { id: "tu_2", message: "upstream down" },
@@ -665,24 +679,24 @@ test "bedrock_tool_replay" {
 // unset wire member. Request-level null pruning must copy `toolUse.input`
 // verbatim — otherwise a tool schema with nullable parameters sees its explicit
 // nulls vanish from the replayed history on every turn.
-function bedrock_tool_replay_null_arg() -> string {
+function bedrock_tool_replay_null_arg() -> json {
     let args: map<string, unknown> = { "city": "SF", "filter": null };
     let log: ai.events.Event[] = [
         ai.events.AssistantMessage {
             content: [ai.content.ToolUse { id: "tu_1", name: "get_weather", args: args }],
-            client_id: `bedrock/${_model()}`,
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: _model() },
+            requested_model: _model(),
         },
         ai.events.ToolCompleted.new("tu_1", "sunny"),
     ];
     let journal = ai.Journal { log: log };
     let body = _body(_client(null), _turn_input(BedrockUserOnly@spec("go"), journal, _weather_tools()));
-    baml.json.stringify(baml.json.path<json>(body, ".messages[1].content[0].toolUse.input"))
+    baml.json.path<json>(body, ".messages[1].content[0].toolUse.input")
 }
 
 test "bedrock_tool_replay_null_arg" {
-    let got = bedrock_tool_replay_null_arg();
-    assert.contains(got, "\"filter\":null");
-    assert.contains(got, "\"city\":\"SF\"")
+    let expected: json = { "city": "SF", "filter": null };
+    assert.equal(bedrock_tool_replay_null_arg(), expected)
 }
 
 // `ToolResultBlock.status` "is only supported by Amazon Nova and Anthropic
@@ -695,7 +709,8 @@ function _replay_status(model: string) -> string {
     let log: ai.events.Event[] = [
         ai.events.AssistantMessage {
             content: [ai.content.ToolUse { id: "tu_1", name: "get_weather", args: no_args }],
-            client_id: cl.id(),
+            resolved_model: ai.events.ModelKey { provider: "aws-bedrock", model: cl.model },
+            requested_model: cl.model,
         },
         ai.events.ToolFailed { id: "tu_1", message: "upstream down" },
     ];
@@ -726,8 +741,9 @@ test "bedrock_tool_result_status_gating" {
 // ─── 7. cache points ─────────────────────────────────────────────────────────
 //
 // The engine emits `{"cachePoint":{"type":"default"}}`; sys_llm dropped the
-// feature entirely (research G4). Restored here as two client options, because
-// nothing populates `ai.PromptMessage.metadata` yet.
+// feature entirely (research G4). Restored here as two client options, for the
+// two positions a prompt cannot mark itself (the tool list) or that are common
+// enough to want a switch (the end of the system prompt).
 
 function bedrock_cache_points() -> string {
     let cl = aws.BedrockClient.new(
@@ -799,62 +815,49 @@ function _cached_body(spec: ai.FunctionSpec<string>) -> json {
     _body(cl, _turn_input(spec, _empty_journal(), _no_tools()))
 }
 
-function bedrock_cache_delimiter_system() -> string {
-    let body = _cached_body(BedrockCachedSystem@spec("Ada"));
-    [
-        baml.json.stringify(baml.json.path<json>(body, ".system")),
-        baml.json.stringify(baml.json.path<json>(body, ".messages")),
-    ].join("\n")
-}
-
 test "bedrock_cache_delimiter_system" {
-    assert.equal(
-        bedrock_cache_delimiter_system(),
-        `[{"text":"You greet people."},{"cachePoint":{"type":"default"}}]\n[{"role":"user","content":[{"text":"Greet Ada."}]}]`,
-    )
+    let body = _cached_body(BedrockCachedSystem@spec("Ada"));
+    let system: json = [{ "text": "You greet people." }, { "cachePoint": { "type": "default" } }];
+    let messages: json = [{ "role": "user", "content": [{ "text": "Greet Ada." }] }];
+    assert.equal(baml.json.path<json>(body, ".system"), system);
+    assert.equal(baml.json.path<json>(body, ".messages"), messages)
 }
 
 // The text on either side of the delimiter is two blocks, each trimmed where it
-// faces the checkpoint — the bytes v0 sent for the same breakpoint.
-function bedrock_cache_delimiter_mid_turn() -> string {
-    let body = _cached_body(BedrockCachedPrefix@spec("Ada"));
-    [
-        baml.json.stringify(baml.json.path<json>(body, ".system")),
-        baml.json.stringify(baml.json.path<json>(body, ".messages")),
-    ].join("\n")
-}
-
+// faces the checkpoint — the blocks v0 sent for the same breakpoint.
 test "bedrock_cache_delimiter_mid_turn" {
-    assert.equal(
-        bedrock_cache_delimiter_mid_turn(),
-        `[{"text":"You greet people."}]\n[{"role":"user","content":[{"text":"Long stable reference document."},{"cachePoint":{"type":"default"}},{"text":"Greet Ada."}]}]`,
-    )
+    let body = _cached_body(BedrockCachedPrefix@spec("Ada"));
+    let system: json = [{ "text": "You greet people." }];
+    let messages: json = [
+        {
+            "role": "user",
+            "content": [
+                { "text": "Long stable reference document." },
+                { "cachePoint": { "type": "default" } },
+                { "text": "Greet Ada." },
+            ],
+        },
+    ];
+    assert.equal(baml.json.path<json>(body, ".system"), system);
+    assert.equal(baml.json.path<json>(body, ".messages"), messages)
 }
 
 // One logical breakpoint is ONE cachePoint, however many parts precede it, and
 // `ttl` reaches the wire.
-function bedrock_cache_delimiter_media_ttl() -> string {
+test "bedrock_cache_delimiter_media_ttl" {
     let picture = baml.media.Image.from_base64("SGVsbG8=", "image/png");
     let body = _cached_body(BedrockCachedMedia@spec(picture));
-    [
-        _array_len(body, ".messages[0].content").to_string(),
-        baml.json.path<string>(body, ".messages[0].content[0].text"),
-        baml.json.path<string>(body, ".messages[0].content[1].image.format"),
-        baml.json.path<string>(body, ".messages[0].content[2].text"),
-        baml.json.stringify(baml.json.path<json>(body, ".messages[0].content[3]")),
-        baml.json.path<string>(body, ".messages[0].content[4].text"),
-    ].join("|")
+    let checkpoint: json = { "cachePoint": { "type": "default", "ttl": "1h" } };
+    assert.equal(_array_len(body, ".messages[0].content"), 5);
+    assert.equal(baml.json.path<string>(body, ".messages[0].content[0].text"), "Before image.");
+    assert.equal(baml.json.path<string>(body, ".messages[0].content[1].image.format"), "png");
+    assert.equal(baml.json.path<string>(body, ".messages[0].content[2].text"), "After image.");
+    assert.equal(baml.json.path<json>(body, ".messages[0].content[3]"), checkpoint);
+    assert.equal(baml.json.path<string>(body, ".messages[0].content[4].text"), "Describe it.")
 }
 
-test "bedrock_cache_delimiter_media_ttl" {
-    assert.equal(
-        bedrock_cache_delimiter_media_ttl(),
-        `5|Before image.|png|After image.|{"cachePoint":{"type":"default","ttl":"1h"}}|Describe it.`,
-    )
-}
-
-// `args` is not checked, defaulted or rewritten: a null member, a nested
-// value and a non-object all go on the wire as written.
+// A non-null `args` is not checked, defaulted or rewritten: a null member, a
+// nested value and a non-object all go on the wire as written.
 function BedrockCacheArgs(args: json) -> string {
     client: "openai/gpt-4o-mini"
     prompt: `
@@ -865,29 +868,26 @@ function BedrockCacheArgs(args: json) -> string {
     `
 }
 
-function _cache_args_block(args: json) -> string {
+function _cache_args_block(args: json) -> json {
     let body = _cached_body(BedrockCacheArgs@spec(args));
-    baml.json.stringify(baml.json.path<json>(body, ".messages[0].content[1]"))
-}
-
-function bedrock_cache_delimiter_args_as_written() -> string {
-    [
-        _cache_args_block(baml.json.parse(`{"ttl":"1h","type":"default","extra":{"keep":null}}`)),
-        _cache_args_block(baml.json.parse(`{}`)),
-        _cache_args_block(baml.json.parse(`"1h"`)),
-    ].join("|")
+    baml.json.path<json>(body, ".messages[0].content[1]")
 }
 
 test "bedrock_cache_delimiter_args_as_written" {
-    assert.equal(
-        bedrock_cache_delimiter_args_as_written(),
-        `{"cachePoint":{"ttl":"1h","type":"default","extra":{"keep":null}}}|{"cachePoint":{}}|{"cachePoint":"1h"}`,
-    )
+    let object_args: json = { "ttl": "1h", "type": "default", "extra": { "keep": null } };
+    let object_block: json = { "cachePoint": { "ttl": "1h", "type": "default", "extra": { "keep": null } } };
+    assert.equal(_cache_args_block(object_args), object_block);
+
+    let empty_args: json = {};
+    let empty_block: json = { "cachePoint": {} };
+    assert.equal(_cache_args_block(empty_args), empty_block);
+
+    let string_block: json = { "cachePoint": "1h" };
+    assert.equal(_cache_args_block("1h"), string_block)
 }
 
-// Where a delimiter produces NO block: before any content of its message, right
-// after another cachePoint, and with null `args` — which is as if it had not
-// been written, so the text around it stays one block.
+// Where a delimiter produces NO block: before any content of its message, and
+// right after another cachePoint.
 function BedrockCacheLeading(name: string) -> string {
     client: "openai/gpt-4o-mini"
     prompt: `
@@ -911,23 +911,87 @@ function BedrockCacheTwice(name: string) -> string {
     `
 }
 
-function bedrock_cache_delimiter_dropped() -> string {
+test "bedrock_cache_delimiter_dropped" {
     let leading = _cached_body(BedrockCacheLeading@spec("Ada"));
+    let system: json = [{ "text": "You greet people." }];
+    assert.equal(baml.json.path<json>(leading, ".system"), system);
+    let user: json = [{ "text": "Greet Ada." }];
+    assert.equal(baml.json.path<json>(leading, ".messages[0].content"), user);
+
     let twice = _cached_body(BedrockCacheTwice@spec("Ada"));
-    let nulled = _cached_body(BedrockCacheArgs@spec(null));
-    [
-        baml.json.stringify(baml.json.path<json>(leading, ".system")),
-        baml.json.stringify(baml.json.path<json>(leading, ".messages[0].content")),
-        baml.json.stringify(baml.json.path<json>(twice, ".messages[0].content")),
-        baml.json.stringify(baml.json.path<json>(nulled, ".messages[0].content")),
-    ].join("\n")
+    let once: json = [{ "text": "Stable." }, { "cachePoint": { "type": "default" } }, { "text": "Greet Ada." }];
+    assert.equal(baml.json.path<json>(twice, ".messages[0].content"), once)
 }
 
-test "bedrock_cache_delimiter_dropped" {
-    assert.equal(
-        bedrock_cache_delimiter_dropped(),
-        `[{"text":"You greet people."}]\n[{"text":"Greet Ada."}]\n[{"text":"Stable."},{"cachePoint":{"type":"default"}},{"text":"Greet Ada."}]\n[{"text":"Stable.\\n\\nVariable."}]`,
-    )
+// `${cache()}` (and null `args`, which is the same thing) takes the client's
+// default: `{"type": "default"}` for a Claude or Nova model, whatever region
+// prefix or ARN the id is written with. Converse answers 403 to a checkpoint
+// on any other family, so those models get no default and the delimiter is
+// as if it had not been written: the text around it stays one block.
+function BedrockCacheDefault(name: string) -> string {
+    client: "openai/gpt-4o-mini"
+    prompt: `
+        ${role("user")}
+        Stable.
+        ${cache()}
+        Greet ${name}.
+    `
+}
+
+function _default_cache_content(model: string) -> json {
+    let cl = aws.BedrockClient.new(model = model, region = "us-east-1");
+    let body = _body(cl, _turn_input(BedrockCacheDefault@spec("Ada"), _empty_journal(), _no_tools()));
+    baml.json.path<json>(body, ".messages[0].content")
+}
+
+function bedrock_cache_default_by_model() -> json[] {
+    let models = [
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us.meta.llama3-3-70b-instruct-v1:0",
+        "mistral.mistral-large-2402-v1:0",
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+    ];
+    let out: json[] = [];
+    for (let model in models) {
+        let cl = aws.BedrockClient.new(model = model, region = "us-east-1");
+        out.push(cl.default_cache_args());
+    }
+    out
+}
+
+test "bedrock_cache_default_by_model" {
+    let expected: json[] = [
+        { "type": "default" },
+        { "type": "default" },
+        { "type": "default" },
+        { "type": "default" },
+        null,
+        null,
+        null,
+    ];
+    assert.equal(bedrock_cache_default_by_model(), expected)
+}
+
+test "bedrock_cache_default_args" {
+    let marked: json = [{ "text": "Stable." }, { "cachePoint": { "type": "default" } }, { "text": "Greet Ada." }];
+    let unmarked: json = [{ "text": "Stable.\n\nGreet Ada." }];
+    assert.equal(_default_cache_content("us.anthropic.claude-haiku-4-5-20251001-v1:0"), marked);
+    assert.equal(_default_cache_content("us.amazon.nova-lite-v1:0"), marked);
+    assert.equal(_default_cache_content("us.meta.llama3-3-70b-instruct-v1:0"), unmarked);
+    // null `args` is the default
+    let nulled: json = [{ "text": "Stable." }, { "cachePoint": { "type": "default" } }, { "text": "Variable." }];
+    assert.equal(baml.json.path<json>(_cached_body(BedrockCacheArgs@spec(null)), ".messages[0].content"), nulled);
+    // explicit args are sent as written to a model the default skips
+    let llama = aws.BedrockClient.new(model = "us.meta.llama3-3-70b-instruct-v1:0", region = "us-east-1");
+    let explicit = _body(
+        llama,
+        _turn_input(BedrockCacheArgs@spec({ "type": "default" }), _empty_journal(), _no_tools()),
+    );
+    let checkpoint: json = { "cachePoint": { "type": "default" } };
+    assert.equal(baml.json.path<json>(explicit, ".messages[0].content[1]"), checkpoint)
 }
 
 // A system-only prompt folds its system blocks into the leading user message;
@@ -941,19 +1005,16 @@ function BedrockCachedSystemOnly(name: string) -> string {
     `
 }
 
-function bedrock_cache_delimiter_system_folded() -> string {
-    let body = _cached_body(BedrockCachedSystemOnly@spec("Ada"));
-    [
-        _mentions(body, "system").to_string(),
-        baml.json.stringify(baml.json.path<json>(body, ".messages")),
-    ].join("|")
-}
-
 test "bedrock_cache_delimiter_system_folded" {
-    assert.equal(
-        bedrock_cache_delimiter_system_folded(),
-        `false|[{"role":"user","content":[{"text":"Greet Ada."},{"cachePoint":{"type":"default","ttl":"1h"}}]}]`,
-    )
+    let body = _cached_body(BedrockCachedSystemOnly@spec("Ada"));
+    let messages: json = [
+        {
+            "role": "user",
+            "content": [{ "text": "Greet Ada." }, { "cachePoint": { "type": "default", "ttl": "1h" } }],
+        },
+    ];
+    assert.is_true(!_mentions(body, "system"));
+    assert.equal(baml.json.path<json>(body, ".messages"), messages)
 }
 
 // ─── 8. passthrough: additionalModelRequestFields + request_body ─────────────
@@ -962,7 +1023,7 @@ function bedrock_additional_model_request_fields() -> string {
     let cl = aws.BedrockClient.new(
         model = _model(),
         region = "us-east-1",
-        additional_model_request_fields = baml.json.parse(`{"top_k":50,"nulled":null}`),
+        additional_model_request_fields = { "top_k": 50, "nulled": null },
     );
     let body = _body(cl, _turn_input(BedrockUserOnly@spec("hi"), _empty_journal(), _no_tools()));
     [
@@ -985,9 +1046,10 @@ function bedrock_request_body_merge() -> string {
         region = "us-east-1",
         max_tokens = 100,
         temperature = 0.3,
-        request_body = baml.json.parse(
-            `{"inferenceConfig":{"temperature":null,"topP":0.9},"guardrailConfig":{"guardrailIdentifier":"g1"}}`,
-        ),
+        request_body = {
+            "inferenceConfig": { "temperature": null, "topP": 0.9 },
+            "guardrailConfig": { "guardrailIdentifier": "g1" },
+        },
     );
     let body = _body(cl, _turn_input(BedrockUserOnly@spec("hi"), _empty_journal(), _no_tools()));
     [
@@ -1172,25 +1234,57 @@ test "bedrock_local_rejection_identity" {
 // were bugs: the hardcoded `cached_input_tokens: None` (G3) and the
 // "no text blocks" error, which made a tool-only turn unrepresentable.
 
-function _parse(raw: string) -> ai.ModelTurn {
-    aws.internal.parse_response(baml.json.from_string<aws.internal.ConverseResponse>(raw))
+function _parse(raw: json) -> ai.ModelTurn {
+    aws.internal.parse_response(baml.json.to<aws.internal.ConverseResponse>(raw))
+}
+
+function _parse_usage(raw: json) -> ai.events.Usage? {
+    aws.internal.converse_usage(baml.json.to<aws.internal.ConverseResponse>(raw).usage)
+}
+
+/// The usage a turn billed to the mocked Bedrock model.
+function _bedrock_usage(turn: ai.ModelTurn) -> ai.events.Usage? {
+    ai.events.usage_for(ai.events.call_usage(turn.calls), ai.events.ModelKey { provider: "aws-bedrock", model: _model() })
+}
+
+// A one-text-block response with the given `stopReason`.
+function _with_stop(stop: string) -> json {
+    { "output": { "message": { "content": [{ "text": "x" }] } }, "stopReason": stop }
 }
 
 function bedrock_parse_text_and_usage() -> string {
-    let raw = `{"output":{"message":{"role":"assistant","content":[{"text":"First part. "},{"text":"Second part."}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":15,"totalTokens":25,"cacheReadInputTokens":7,"cacheWriteInputTokens":3},"metrics":{"latencyMs":42}}`;
+    let raw: json = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{ "text": "First part. " }, { "text": "Second part." }],
+            },
+        },
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 10,
+            "outputTokens": 15,
+            "totalTokens": 25,
+            "cacheReadInputTokens": 7,
+            "cacheWriteInputTokens": 3,
+        },
+        "metrics": { "latencyMs": 42 },
+    };
     let turn = _parse(raw);
+    let usage = _parse_usage(raw);
     [
         turn.terminal_text() ?? "",
         _stop_label(turn),
-        (turn.usage?.input_tokens ?? -1).to_string(),
-        (turn.usage?.output_tokens ?? -1).to_string(),
-        (turn.usage?.cached_input_tokens ?? -1).to_string(),
+        (usage?.input_tokens ?? -1).to_string(),
+        (usage?.output_tokens ?? -1).to_string(),
+        (usage?.cached_input_tokens ?? -1).to_string(),
         turn.content.length().to_string(),
     ].join("|")
 }
 
 test "bedrock_parse_text_and_usage" {
-    assert.equal(bedrock_parse_text_and_usage(), "Second part.|Complete|10|15|7|2")
+    // input_tokens counts the cache reads and writes: 10 + 7 + 3.
+    assert.equal(bedrock_parse_text_and_usage(), "Second part.|Complete|20|15|7|2")
 }
 
 // A turn whose stop reason means the generation was cut short or is unusable
@@ -1198,19 +1292,18 @@ test "bedrock_parse_text_and_usage" {
 // a clean final answer. Only `end_turn`, `stop_sequence` and genuinely unknown
 // future values fall through to `Complete`.
 function bedrock_parse_stop_reasons() -> string {
-    let shell = `{"output":{"message":{"content":[{"text":"x"}]}},"stopReason":`;
     [
-        _stop_label(_parse(shell + "\"end_turn\"}")),
-        _stop_label(_parse(shell + "\"stop_sequence\"}")),
-        _stop_label(_parse(shell + "\"max_tokens\"}")),
+        _stop_label(_parse(_with_stop("end_turn"))),
+        _stop_label(_parse(_with_stop("stop_sequence"))),
+        _stop_label(_parse(_with_stop("max_tokens"))),
         // prompt + output overflowed the context window: the twin of max_tokens
-        _stop_label(_parse(shell + "\"model_context_window_exceeded\"}")),
-        _stop_label(_parse(shell + "\"tool_use\"}")),
-        _stop_label(_parse(shell + "\"content_filtered\"}")),
-        _stop_label(_parse(shell + "\"guardrail_intervened\"}")),
-        _stop_label(_parse(shell + "\"something_new\"}")),
+        _stop_label(_parse(_with_stop("model_context_window_exceeded"))),
+        _stop_label(_parse(_with_stop("tool_use"))),
+        _stop_label(_parse(_with_stop("content_filtered"))),
+        _stop_label(_parse(_with_stop("guardrail_intervened"))),
+        _stop_label(_parse(_with_stop("something_new"))),
         // stopReason absent entirely
-        _stop_label(_parse(`{"output":{"message":{"content":[{"text":"x"}]}}}`)),
+        _stop_label(_parse({ "output": { "message": { "content": [{ "text": "x" }] } } })),
     ].join("|")
 }
 
@@ -1227,8 +1320,7 @@ test "bedrock_parse_stop_reasons" {
 // raw response) rather than returning a turn; the pure mapper keeps them
 // non-Complete too, for any direct caller.
 function _stop_or_failure(raw: string) -> string {
-    let body = `{"output":{"message":{"content":[{"text":"x"}]}},"stopReason":"${raw}"}`;
-    _stop_label(_parse(body)) catch_all (e) {
+    _stop_label(_parse(_with_stop(raw))) catch_all (e) {
         _ => _failure_label(e),
     }
 }
@@ -1245,32 +1337,52 @@ function bedrock_parse_malformed_stop() -> string {
 test "bedrock_parse_malformed_stop" {
     assert.equal(
         bedrock_parse_malformed_stop(),
-        "ParseFailed|ParseFailed|Refused|Refused",
+        "ProviderError/malformed_model_output|ProviderError/malformed_tool_use|Refused|Refused",
     )
 }
 
 // A tool-only turn parses cleanly — sys_llm errored on it
 // (`parse_response/bedrock.rs:89-104`), which would have made tool calling
 // impossible.
-function bedrock_parse_tool_use() -> string {
-    let raw = `{"output":{"message":{"role":"assistant","content":[{"text":"Checking."},{"toolUse":{"toolUseId":"tu_1","name":"get_weather","input":{"city":"SF"}}}]}},"stopReason":"tool_use"}`;
+test "bedrock_parse_tool_use" {
+    let raw: json = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "text": "Checking." },
+                    {
+                        "toolUse": { "toolUseId": "tu_1", "name": "get_weather", "input": { "city": "SF" } },
+                    },
+                ],
+            },
+        },
+        "stopReason": "tool_use",
+    };
     let turn = _parse(raw);
     let uses = turn.tool_uses();
-    [
-        _stop_label(turn),
-        uses.length().to_string(),
-        uses.at(0)?.id ?? "",
-        uses.at(0)?.name ?? "",
-        baml.json.stringify(baml.json.to_json(uses.at(0)?.args)),
-    ].join("|")
-}
-
-test "bedrock_parse_tool_use" {
-    assert.equal(bedrock_parse_tool_use(), "ToolUse|1|tu_1|get_weather|{\"city\":\"SF\"}")
+    let args: json = { "city": "SF" };
+    assert.equal(_stop_label(turn), "ToolUse");
+    assert.equal(uses.length(), 1);
+    assert.equal(uses.at(0)?.id ?? "", "tu_1");
+    assert.equal(uses.at(0)?.name ?? "", "get_weather");
+    assert.equal(baml.json.from(uses.at(0)?.args), args)
 }
 
 function bedrock_parse_reasoning() -> string {
-    let raw = `{"output":{"message":{"content":[{"reasoningContent":{"reasoningText":{"text":"thinking…","signature":"sig"}}},{"text":"answer"}]}},"stopReason":"end_turn"}`;
+    let raw: json = {
+        "output": {
+            "message": {
+                "content": [
+                    {
+                        "reasoningContent": { "reasoningText": { "text": "thinking…", "signature": "sig" } },
+                    },
+                    { "text": "answer" },
+                ],
+            },
+        },
+        "stopReason": "end_turn",
+    };
     let turn = _parse(raw);
     [turn.content.length().to_string(), turn.terminal_text() ?? ""].join("|")
 }
@@ -1282,22 +1394,21 @@ test "bedrock_parse_reasoning" {
 // Empty content is not an error (an empty turn is a legitimate, if unhelpful,
 // answer); a missing `output.message` is, because that response is malformed.
 function bedrock_parse_empty_and_malformed() -> string {
-    let empty = _parse(`{"output":{"message":{"role":"assistant","content":[]}},"stopReason":"end_turn"}`);
-    let malformed = _stop_label(_parse(`{"output":{},"stopReason":"end_turn"}`)) catch_all (e) {
+    let empty = _parse({ "output": { "message": { "role": "assistant", "content": [] } }, "stopReason": "end_turn" });
+    let malformed = _stop_label(_parse({ "output": {}, "stopReason": "end_turn" })) catch_all (e) {
         _ => _failure_label(e),
     };
     [empty.content.length().to_string(), malformed].join("|")
 }
 
 test "bedrock_parse_empty_and_malformed" {
-    assert.equal(bedrock_parse_empty_and_malformed(), "0|ParseFailed")
+    assert.equal(bedrock_parse_empty_and_malformed(), "0|InvalidResponse")
 }
 
 // Usage is optional on the wire; its absence is not a parse failure
 // (`test_parse_no_usage`, :306-322).
 function bedrock_parse_no_usage() -> string {
-    let turn = _parse(`{"output":{"message":{"content":[{"text":"hi"}]}},"stopReason":"end_turn"}`);
-    match (turn.usage) {
+    match (_parse_usage({ "output": { "message": { "content": [{ "text": "hi" }] } }, "stopReason": "end_turn" })) {
         null => "no-usage",
         _ => "usage",
     }
@@ -1321,7 +1432,7 @@ function bedrock_invoke_against_mock() -> string {
             let sent = mock.last_request();
             [
                 turn.terminal_text() ?? "",
-                (turn.usage?.cached_input_tokens ?? -1).to_string(),
+                (_bedrock_usage(turn)?.cached_input_tokens ?? -1).to_string(),
                 sent.method,
                 sent.path(),
                 baml.json.path<string>(sent.json(), ".messages[0].content[0].text"),
@@ -1371,6 +1482,31 @@ test "bedrock_request_is_signed" {
     assert.contains(got, "/us-east-1/bedrock/aws4_request");
     assert.contains(got, "Signature=");
     assert.contains(got, "|dated|no-token")
+}
+
+// The static credentials are `ai.Credential`s, read when the request is
+// signed: here the key id is `env.PATH`, which any string can stand in for,
+// and the signature's credential scope names the value it read.
+function bedrock_request_is_signed_with_late_bound_keys() -> string {
+    let canned = `{"output":{"message":{"content":[{"text":"ok"}]}},"stopReason":"end_turn"}`;
+    root.llm_mock.mock_json_serve([root.llm_mock.MockResponse.ok(canned)], (
+        mock: root.llm_mock.MockJsonServer,
+    ) -> {
+        let cl = aws.BedrockClient.new(
+            model = _model(),
+            region = "us-east-1",
+            access_key_id = env.PATH,
+            secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            endpoint_url = mock.base_url(),
+        );
+        let _ = cl.invoke(_turn_input(BedrockEcho@spec("hi"), _empty_journal(), _no_tools()));
+        mock.last_request().header("authorization") ?? "MISSING"
+    })
+}
+
+test "bedrock_request_is_signed_with_late_bound_keys" {
+    let path = baml.env.get("PATH") ?? baml.sys.panic("PATH is unset");
+    assert.contains(bedrock_request_is_signed_with_late_bound_keys(), `AWS4-HMAC-SHA256 Credential=${path}/`)
 }
 
 // ─── 13. error taxonomy ──────────────────────────────────────────────────────
@@ -1426,7 +1562,7 @@ function bedrock_garbage_body() -> string {
 }
 
 test "bedrock_garbage_body" {
-    assert.equal(bedrock_garbage_body(), "ParseFailed")
+    assert.equal(bedrock_garbage_body(), "InvalidResponse")
 }
 
 // ─── 13. streaming (ConverseStream) ──────────────────────────────────────────
@@ -1499,7 +1635,7 @@ function bedrock_stream_event_model() -> string {
             },
             let e: aws.internal.ContentBlockStopEvent => `block_stop:${e.contentBlockIndex ?? -1}`,
             let e: aws.internal.MessageStopEvent => {
-                `stop:${e.stopReason ?? "-"}:${baml.json.path_or<int>(e.additionalModelResponseFields ?? baml.json.parse("{}"), ".k", -1)}`
+                `stop:${e.stopReason ?? "-"}:${baml.json.path_or<int>(e.additionalModelResponseFields ?? {}, ".k", -1)}`
             },
             let e: aws.internal.ConverseStreamMetadataEvent => {
                 `metadata:${e.usage?.totalTokens ?? -1}:${e.metrics?.latencyMs ?? -1}:${e.performanceConfig?.latency ?? "-"}:${e.trace != null}`
@@ -1508,8 +1644,8 @@ function bedrock_stream_event_model() -> string {
         };
         out.push(label);
     }
-    let failure = baml.json.from_string<aws.internal.ModelStreamErrorException>(
-        `{"message":"boom","originalStatusCode":424,"originalMessage":"upstream"}`,
+    let failure = baml.json.to<aws.internal.ModelStreamErrorException>(
+        { "message": "boom", "originalStatusCode": 424, "originalMessage": "upstream" },
     );
     out.push(`exception:${failure.message ?? "-"}:${failure.originalStatusCode ?? -1}:${failure.originalMessage ?? "-"}`);
     out.join("|")
@@ -1565,7 +1701,7 @@ function bedrock_stream_text() -> string {
                 deltas.join("+"),
                 turn.terminal_text() ?? "",
                 _stop_label(turn),
-                `${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}`,
+                `${_bedrock_usage(turn)?.input_tokens ?? -1}/${_bedrock_usage(turn)?.output_tokens ?? -1}`,
                 sent.path(),
                 sent.header("accept") ?? "",
                 `${(sent.header("authorization") ?? "").starts_with("AWS4-HMAC-SHA256")}`,
@@ -1631,8 +1767,7 @@ test "bedrock_stream_truncated" {
     assert.equal(bedrock_stream_truncated(), "NetworkFailure")
 }
 
-// A modeled exception frame mid-stream fails the turn with the identity the
-// same HTTP status gets on `invoke`.
+// A modeled exception frame mid-stream retains its native provider identity.
 function bedrock_stream_exception(exception_type: string) -> string {
     let frames = [
         root.llm_mock.eventstream_event("messageStart", `{"role":"assistant"}`),
@@ -1662,7 +1797,7 @@ test "bedrock_stream_exceptions" {
             bedrock_stream_exception("modelStreamErrorException"),
             bedrock_stream_exception("serviceUnavailableException"),
         ].join("|"),
-        "RateLimited|InvalidRequest/400|InvalidRequest/424|NetworkFailure",
+        "ProviderError/throttlingException|ProviderError/validationException|ProviderError/modelStreamErrorException|ProviderError/serviceUnavailableException",
     )
 }
 

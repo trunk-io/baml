@@ -26,10 +26,11 @@ use std::{
     sync::Arc,
 };
 
-use baml_type::{Name, TypeName, normalize::TypeContext};
+use baml_type::normalize::TypeContext;
+use bex_heap::TlabHolder;
 use bex_str::BexStr;
 use bex_vm_types::{
-    HeapPtr, RealizedTy, ValueKind,
+    Field, HeapPtr, RealizedTy, RootHaver, RootVisitor, ValueKind,
     errors::VmInternalError,
     types::{LockedContainer, LockedReadGuard, Object, Type, Value},
 };
@@ -115,24 +116,24 @@ impl BamlNamespaceOps for PackageBamlImpl {
     // (an operand erased to a union / interface-existential / type variable), so
     // the impl is selected from the operands' runtime types.
     fn __union_add(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
-        drive_binary_op(vm, "Add", "add", *a, *b)
+        drive_binary_op(vm, crate::lang_items::BAML_OPS_ADD, "add", *a, *b)
     }
     fn __union_sub(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
-        drive_binary_op(vm, "Subtract", "sub", *a, *b)
+        drive_binary_op(vm, crate::lang_items::BAML_OPS_SUBTRACT, "sub", *a, *b)
     }
     fn __union_mul(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
-        drive_binary_op(vm, "Multiply", "mul", *a, *b)
+        drive_binary_op(vm, crate::lang_items::BAML_OPS_MULTIPLY, "mul", *a, *b)
     }
     fn __union_div(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
-        drive_binary_op(vm, "Divide", "div", *a, *b)
+        drive_binary_op(vm, crate::lang_items::BAML_OPS_DIVIDE, "div", *a, *b)
     }
     fn __union_rem(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
-        drive_binary_op(vm, "Remainder", "rem", *a, *b)
+        drive_binary_op(vm, crate::lang_items::BAML_OPS_REMAINDER, "rem", *a, *b)
     }
     fn __union_neg(vm: &mut BexVm, a: &Value) -> NativeCallResult {
         // Negation is single dispatch on `a` (`Negate` has no `Rhs`), so the
         // interface request carries no args.
-        dispatch_op(vm, "Negate", "neg", vec![*a], &[])
+        dispatch_op(vm, crate::lang_items::BAML_OPS_NEGATE, "neg", vec![*a], &[])
     }
 }
 
@@ -142,7 +143,7 @@ impl BamlNamespaceOps for PackageBamlImpl {
 /// *both* operand types.
 fn drive_binary_op(
     vm: &mut BexVm,
-    iface: &str,
+    iface: baml_base::LangItem,
     method: &str,
     a: Value,
     b: Value,
@@ -163,40 +164,31 @@ fn drive_binary_op(
 /// invariant break, surfaced as an internal error.
 fn dispatch_op(
     vm: &mut BexVm,
-    iface: &str,
+    iface: baml_base::LangItem,
     method: &str,
     args: Vec<Value>,
     iface_args: &[RealizedTy],
 ) -> NativeCallResult {
-    let op_qtn = TypeName::new(Name::new("baml"), vec![Name::new("ops")], Name::new(iface));
-    // A stdlib FQN constant is one of the three places a name legitimately
-    // becomes a head; it resolves once, off the declaration.
-    let Some(op_head) = vm.declaration_head(&op_qtn) else {
+    // The operator interface by identity; `None` only in a program without
+    // the stdlib, where no operator body can be running.
+    let Some(op_head) = vm.lang_head(iface) else {
         return NativeCallResult::from(unresolved_op(iface, method));
     };
     let Some(self_ty) = vm.value_concrete_ty(args[0]) else {
         return NativeCallResult::from(unresolved_op(iface, method));
     };
     let resolver = resolve::ImplResolver::for_value(vm, args[0]);
-    let Some((rule, bound_args)) =
-        resolver.resolve_implements_rule(&self_ty.into(), op_head, iface_args)
+    let Some(implementation) =
+        resolver.resolve_implementation(&self_ty.into(), op_head, iface_args)
     else {
         return NativeCallResult::from(unresolved_op(iface, method));
     };
-    let resolved = match resolver.rule_method_impl(&rule, method) {
+    let (callee, type_args) = match resolver.implementation_method(&implementation, method) {
         Ok(resolved) => resolved,
         Err(e) => return NativeCallResult::from(e),
     };
-    // The resolved impl's frame realizes fully against its bound args; a failure
-    // is a broken compiler/VM invariant, surfaced rather than swallowed.
-    let type_args = match resolver.realize_frame(&resolved.method.frame, &bound_args) {
-        Ok(type_args) => type_args,
-        Err(e) => return NativeCallResult::from(e),
-    };
     NativeCallResult::YieldToCall {
-        // `fqn` is the resolved callee's heap pointer (provided row or adopted
-        // interface default).
-        callee: resolved.method.fqn,
+        callee,
         args,
         type_args,
         // The operator's value *is* the impl method's return value — forward it.
@@ -207,9 +199,9 @@ fn dispatch_op(
 /// The internal error for an operator dispatch the type checker promised could
 /// not miss: no concrete receiver type, or no applicable impl. (Resolving the
 /// method off a found rule reports its own, finer-grained errors.)
-fn unresolved_op(iface: &str, method: &str) -> VmInternalError {
+fn unresolved_op(iface: baml_base::LangItem, method: &str) -> VmInternalError {
     VmInternalError::UnresolvedVirtualCall {
-        method: format!("baml.ops.{iface}.{method}"),
+        method: format!("{iface}.{method}"),
     }
 }
 
@@ -305,6 +297,22 @@ fn resolve_cells(vm: &BexVm, mut v: Value) -> Option<Value> {
 struct EqualsDriver {
     stack: Vec<(Value, Value)>,
     visited: HashSet<(HeapPtr, HeapPtr)>,
+    visited_log: Vec<(HeapPtr, HeapPtr)>,
+    map_entries: Vec<MapEntryComparison>,
+    key_branches: Vec<MapKeyBranch>,
+}
+
+struct MapEntryComparison {
+    key: Value,
+    value: Value,
+    candidates: Vec<(Value, Value)>,
+}
+
+struct MapKeyBranch {
+    entry: MapEntryComparison,
+    candidate_value: Value,
+    map_entries: Vec<MapEntryComparison>,
+    visited_checkpoint: usize,
 }
 
 impl EqualsDriver {
@@ -312,17 +320,46 @@ impl EqualsDriver {
         Self {
             stack: vec![(a, b)],
             visited: HashSet::new(),
+            visited_log: Vec::new(),
+            map_entries: Vec::new(),
+            key_branches: Vec::new(),
         }
     }
 
     /// Drain the worklist: `Done(true)` if the stack empties with everything equal,
     /// `Done(false)` on the first unequal pair, or a `YieldToCall` (with `self` as the
     /// continuation) when a pair needs a user `Equals.eq` — resumed by [`Continuation::call`].
-    fn drive(mut self, vm: &BexVm) -> NativeCallResult {
-        while let Some((a, b)) = self.stack.pop() {
+    fn drive(mut self, vm: &mut BexVm) -> NativeCallResult {
+        loop {
+            let Some((a, b)) = self.stack.pop() else {
+                let Some(mut entry) = self.map_entries.pop() else {
+                    if self.finish_map_key(true) {
+                        continue;
+                    }
+                    return NativeCallResult::Done(Value::bool(true));
+                };
+                let Some((key, candidate_value)) = entry.candidates.pop() else {
+                    if self.finish_map_key(false) {
+                        continue;
+                    }
+                    return NativeCallResult::Done(Value::bool(false));
+                };
+                self.stack.push((entry.key, key));
+                self.key_branches.push(MapKeyBranch {
+                    entry,
+                    candidate_value,
+                    map_entries: std::mem::take(&mut self.map_entries),
+                    visited_checkpoint: self.visited_log.len(),
+                });
+                continue;
+            };
             match self.compare_one(vm, a, b) {
                 Cmp::Continue => {}
-                Cmp::NotEqual => return NativeCallResult::Done(Value::bool(false)),
+                Cmp::NotEqual => {
+                    if !self.finish_map_key(false) {
+                        return NativeCallResult::Done(Value::bool(false));
+                    }
+                }
                 Cmp::Error(e) => return NativeCallResult::from(e),
                 Cmp::Yield {
                     callee,
@@ -338,7 +375,26 @@ impl EqualsDriver {
                 }
             }
         }
-        NativeCallResult::Done(Value::bool(true))
+    }
+
+    fn finish_map_key(&mut self, equal: bool) -> bool {
+        let Some(branch) = self.key_branches.pop() else {
+            return false;
+        };
+        self.stack.clear();
+        self.map_entries = branch.map_entries;
+        // Keep ancestor cycle facts, but never reuse a candidate's tentative
+        // equality facts when trying another key in the same hash bucket.
+        while self.visited_log.len() > branch.visited_checkpoint {
+            self.visited.remove(&self.visited_log.pop().unwrap());
+        }
+        if equal {
+            self.stack
+                .push((branch.entry.value, branch.candidate_value));
+        } else {
+            self.map_entries.push(branch.entry);
+        }
+        true
     }
 
     /// Compare one popped pair: a leaf decides equality directly; a structural
@@ -364,6 +420,14 @@ impl EqualsDriver {
             }
             (ValueKind::Int(x), ValueKind::Int(y)) => step(x == y),
             (ValueKind::Bool(x), ValueKind::Bool(y)) => step(x == y),
+            // Floats compare by value, reflexively (`NaN == NaN`, `-0.0 == 0.0`).
+            // An inline float against a boxed one is compared by value too,
+            // though the canonical encoding means such a pair is never equal.
+            (ValueKind::Float(_), ValueKind::Float(_) | ValueKind::Object(_))
+            | (ValueKind::Object(_), ValueKind::Float(_)) => match (a.as_float(), b.as_float()) {
+                (Some(x), Some(y)) => step(bex_vm_types::float_order::eq(x, y)),
+                _ => Cmp::NotEqual,
+            },
             (ValueKind::Object(pa), ValueKind::Object(pb)) => {
                 // `pa != pb` here: identical pointers were settled by the
                 // reflexivity short-circuit above.
@@ -377,6 +441,7 @@ impl EqualsDriver {
                     // Non-back-edge content was/will be checked on first visit.
                     return Cmp::Continue;
                 }
+                self.visited_log.push(key);
                 self.compare_objects(vm, pa, pb)
             }
             // Mismatched value kinds are never equal. Every kind is listed explicitly
@@ -388,10 +453,42 @@ impl EqualsDriver {
                 | ValueKind::OmittedArg
                 | ValueKind::Int(_)
                 | ValueKind::Bool(_)
+                | ValueKind::Float(_)
                 | ValueKind::Object(_),
                 _,
             ) => Cmp::NotEqual,
         }
+    }
+
+    /// Two instances: unequal across classes or instantiations, then the
+    /// class's own `Equals.eq` if it has one, else field by field.
+    fn compare_instances(&mut self, vm: &BexVm, pa: HeapPtr, pb: HeapPtr) -> Cmp {
+        let x = vm.get_instance(pa).expect("an instance pointer");
+        let y = vm.get_instance(pb).expect("an instance pointer");
+        if x.class() != y.class()
+            || !resolve::ImplResolver::new(vm).ty_args_equivalent(x.type_args(), y.type_args())
+        {
+            return Cmp::NotEqual;
+        }
+        match value_concrete_ty(vm, pa).map(|ty| resolve_equals_eq(vm, Value::object(pa), &ty)) {
+            Some(Ok(Some((callee, type_args)))) => {
+                return Cmp::Yield {
+                    callee,
+                    args: vec![Value::object(pa), Value::object(pb)],
+                    type_args,
+                };
+            }
+            Some(Err(e)) => return Cmp::Error(e),
+            Some(Ok(None)) | None => {}
+        }
+        for (fx, fy) in x.fields().zip(y.fields()) {
+            match (fx, fy) {
+                (Field::Value(fx), Field::Value(fy)) => self.stack.push((fx, fy)),
+                (Field::Float(fx), Field::Float(fy)) if bex_vm_types::float_order::eq(fx, fy) => {}
+                _ => return Cmp::NotEqual,
+            }
+        }
+        Cmp::Continue
     }
 
     /// Compare two *distinct* heap objects (`pa != pb` — [`Self::compare_one`]
@@ -433,17 +530,36 @@ impl EqualsDriver {
             }
             (Object::Array(_), _) => Cmp::NotEqual,
 
+            (Object::Tuple(x), Object::Tuple(y)) => {
+                if x.len() != y.len() {
+                    return Cmp::NotEqual;
+                }
+                self.stack.extend(x.slot_values().zip(y.slot_values()));
+                Cmp::Continue
+            }
+            (Object::Tuple(_), _) => Cmp::NotEqual,
+
             (Object::Map(x), Object::Map(y)) => {
                 let (xs, ys) = lock_pair_ordered(pa, &x.data, pb, &y.data);
                 if xs.len() != ys.len() {
                     return Cmp::NotEqual;
                 }
-                // Order-insensitive: same keys, equal values.
-                for (k, xv) in &**xs {
-                    match ys.get(k) {
-                        Some(yv) => self.stack.push((*xv, *yv)),
-                        None => return Cmp::NotEqual,
-                    }
+                let mut buckets: HashMap<u64, Vec<(Value, Value)>> = HashMap::new();
+                for (_, entry) in ys.entries() {
+                    buckets
+                        .entry(entry.hash)
+                        .or_default()
+                        .push((entry.key, entry.value));
+                }
+                for (_, entry) in xs.entries() {
+                    let Some(candidates) = buckets.get(&entry.hash) else {
+                        return Cmp::NotEqual;
+                    };
+                    self.map_entries.push(MapEntryComparison {
+                        key: entry.key,
+                        value: entry.value,
+                        candidates: candidates.clone(),
+                    });
                 }
                 Cmp::Continue
             }
@@ -472,53 +588,41 @@ impl EqualsDriver {
                 step(x.index == y.index)
             }
             (Object::Variant(_), _) => Cmp::NotEqual,
-            (Object::Instance(x), Object::Instance(y)) => {
-                // Different concrete type (class or generic instantiation) ⇒ never equal.
-                // `Equals.eq(self, other: Self)` requires the same `Self`, so differing
-                // `class_type_args` (`Box<int>` vs `Box<string>`) is unequal up front.
-                // Compared with `ty_args_equivalent`, not `==`, so union args match
-                // order-insensitively (`Box<int | string>` is the same `Self` as
-                // `Box<string | int>`) — the same notion of "same instantiation" the
-                // resolver and reflection use.
-                if x.class != y.class
-                    || !resolve::ImplResolver::new(vm)
-                        .ty_args_equivalent(&x.class_type_args, &y.class_type_args)
-                    || x.fields.len() != y.fields.len()
-                {
-                    return Cmp::NotEqual;
-                }
-                // Same concrete type: dispatch to the class's custom `Equals.eq` if it has
-                // one, else compare structurally (field by field).
-                match value_concrete_ty(vm, pa)
-                    .map(|ty| resolve_equals_eq(vm, Value::object(pa), &ty))
-                {
-                    Some(Ok(Some((callee, type_args)))) => {
-                        return Cmp::Yield {
-                            callee,
-                            args: vec![Value::object(pa), Value::object(pb)],
-                            type_args,
-                        };
-                    }
-                    Some(Err(e)) => return Cmp::Error(e),
-                    Some(Ok(None)) | None => {}
-                }
-                for (fx, fy) in x.fields.iter().zip(y.fields.iter()) {
-                    self.stack.push((fx.load(), fy.load()));
-                }
-                Cmp::Continue
-            }
-            (Object::Instance(_), _) => Cmp::NotEqual,
+            (Object::Instance, Object::Instance) => self.compare_instances(vm, pa, pb),
+            (Object::Instance, _) => Cmp::NotEqual,
 
             (Object::BoundMethod(x), Object::BoundMethod(y)) => {
-                // must be the same *value* not just equivalent.
-                step(x.function == y.function && x.receiver == y.receiver)
+                // The same *value*, not an equivalent one: the same method on
+                // the same receiver at the same instantiation. `h.pick<int>`
+                // and `h.pick<string>` are distinct specializations
+                // (`TYPE_SYSTEM.md`, "Generics on Functions").
+                step(
+                    x.function == y.function
+                        && x.receiver == y.receiver
+                        && resolve::ImplResolver::new(vm)
+                            .ty_args_equivalent(&x.type_args, &y.type_args),
+                )
             }
             (Object::BoundMethod(_), _) => Cmp::NotEqual,
-            (Object::GenericFunction(x), Object::GenericFunction(y)) => step(
-                x.function == y.function
-                    && x.type_args == y.type_args
-                    && x.runtime_package == y.runtime_package,
-            ),
+            (Object::GenericFunction(x), Object::GenericFunction(y)) => {
+                // A hot swapped body names a function through its patch's own
+                // slot, which holds the same function as the running one.
+                let same_function = (x.function == y.function
+                    && x.runtime_package == y.runtime_package)
+                    || (vm.hotswap_enabled()
+                        && matches!(
+                            (
+                                vm.generic_function_authored_ptr(x),
+                                vm.generic_function_authored_ptr(y),
+                            ),
+                            (Ok(a), Ok(b)) if a == b
+                        ));
+                step(
+                    same_function
+                        && resolve::ImplResolver::new(vm)
+                            .ty_args_equivalent(&x.type_args, &y.type_args),
+                )
+            }
             (Object::GenericFunction(_), _) => Cmp::NotEqual,
             (Object::HostClosure(x), Object::HostClosure(y)) => {
                 step(Arc::ptr_eq(&x.handle, &y.handle))
@@ -540,15 +644,121 @@ impl EqualsDriver {
             #[cfg(feature = "heap_debug")]
             (Object::Sentinel(_), _) => Cmp::NotEqual,
 
-            (Object::RustData(x), Object::RustData(y)) => {
-                match (
-                    x.downcast_ref::<bex_vm_types::trace::SpanId>(),
-                    y.downcast_ref::<bex_vm_types::trace::SpanId>(),
-                ) {
-                    (Some(x), Some(y)) => step(x == y),
-                    _ => step(pa == pb),
+            (Object::Tombstone, _) => Object::tombstone_reached(),
+
+            (Object::RustInstance(x), Object::RustInstance(y)) => {
+                // The same concrete type, as for `Instance`: `Equals.eq(self,
+                // other: Self)` needs one `Self`.
+                if x.class != y.class
+                    || !resolve::ImplResolver::new(vm)
+                        .ty_args_equivalent(&x.class_type_args, &y.class_type_args)
+                {
+                    return Cmp::NotEqual;
+                }
+                // A custom `Equals.eq` decides; else the payloads compare.
+                match value_concrete_ty(vm, pa)
+                    .map(|ty| resolve_equals_eq(vm, Value::object(pa), &ty))
+                {
+                    Some(Ok(Some((callee, type_args)))) => {
+                        return Cmp::Yield {
+                            callee,
+                            args: vec![Value::object(pa), Value::object(pb)],
+                            type_args,
+                        };
+                    }
+                    Some(Err(e)) => return Cmp::Error(e),
+                    Some(Ok(None)) | None => {}
+                }
+                match (&x.payload, &y.payload) {
+                    // A span ID is the span it names, wherever it was read.
+                    (
+                        bex_vm_types::RustPayload::SpanId(x),
+                        bex_vm_types::RustPayload::SpanId(y),
+                    ) => step(x == y),
+                    // A host's value is the host's value it names: every
+                    // arrival of one registration shares one `Arc`.
+                    (
+                        bex_vm_types::RustPayload::HostValue(x),
+                        bex_vm_types::RustPayload::HostValue(y),
+                    ) => step(std::sync::Arc::ptr_eq(x, y)),
+                    // A token is the cancellation it controls: every instance
+                    // built from one host body's token shares its state.
+                    (
+                        bex_vm_types::RustPayload::CancelToken(x),
+                        bex_vm_types::RustPayload::CancelToken(y),
+                    ) => step(std::sync::Arc::ptr_eq(x, y)),
+                    // Immutable data compares by value: the same media, the
+                    // same rendered prompt, the same pattern in the same
+                    // dialect, the same record read at the same place.
+                    (bex_vm_types::RustPayload::Image(x), bex_vm_types::RustPayload::Image(y))
+                    | (bex_vm_types::RustPayload::Audio(x), bex_vm_types::RustPayload::Audio(y))
+                    | (bex_vm_types::RustPayload::Pdf(x), bex_vm_types::RustPayload::Pdf(y))
+                    | (bex_vm_types::RustPayload::Video(x), bex_vm_types::RustPayload::Video(y)) => {
+                        step(x == y)
+                    }
+                    (
+                        bex_vm_types::RustPayload::Prompt(x),
+                        bex_vm_types::RustPayload::Prompt(y),
+                    ) => step(x == y),
+                    (bex_vm_types::RustPayload::Regex(x), bex_vm_types::RustPayload::Regex(y)) => {
+                        step(x == y)
+                    }
+                    (
+                        bex_vm_types::RustPayload::CsvRecord(x),
+                        bex_vm_types::RustPayload::CsvRecord(y),
+                    ) => step(x == y),
+                    // Every other kind has no value apart from its identity
+                    // (mutable state, a key, a live resource), and `pa != pb`
+                    // here.
+                    (
+                        bex_vm_types::RustPayload::Foreign(_)
+                        | bex_vm_types::RustPayload::DefaultHasher(_)
+                        | bex_vm_types::RustPayload::Sha256(_)
+                        | bex_vm_types::RustPayload::Aes256GcmSiv(_)
+                        | bex_vm_types::RustPayload::Aes128GcmSiv(_)
+                        | bex_vm_types::RustPayload::ChaCha20Poly1305(_)
+                        | bex_vm_types::RustPayload::XChaCha20Poly1305(_)
+                        | bex_vm_types::RustPayload::Regex(_)
+                        | bex_vm_types::RustPayload::CsvRecord(_)
+                        | bex_vm_types::RustPayload::Semaphore(_)
+                        | bex_vm_types::RustPayload::Permit(_)
+                        | bex_vm_types::RustPayload::Ticket(_)
+                        | bex_vm_types::RustPayload::CancelToken(_)
+                        | bex_vm_types::RustPayload::SpanId(_)
+                        | bex_vm_types::RustPayload::TraceOptions(_)
+                        | bex_vm_types::RustPayload::ReservedSpan(_)
+                        | bex_vm_types::RustPayload::File(_)
+                        | bex_vm_types::RustPayload::Glob(_)
+                        | bex_vm_types::RustPayload::OutputFormat(_)
+                        | bex_vm_types::RustPayload::Lock(_)
+                        | bex_vm_types::RustPayload::TcpStream(_)
+                        | bex_vm_types::RustPayload::TcpListener(_)
+                        | bex_vm_types::RustPayload::UdpSocket(_)
+                        | bex_vm_types::RustPayload::Xoshiro256PlusPlus(_)
+                        | bex_vm_types::RustPayload::ChaCha20(_)
+                        | bex_vm_types::RustPayload::InterfaceWitness(_)
+                        | bex_vm_types::RustPayload::CsvReader(_)
+                        | bex_vm_types::RustPayload::CsvWriter(_)
+                        | bex_vm_types::RustPayload::ClassBuilder(_)
+                        | bex_vm_types::RustPayload::ChildProcess(_)
+                        | bex_vm_types::RustPayload::ReadPipe(_)
+                        | bex_vm_types::RustPayload::WritePipe(_)
+                        | bex_vm_types::RustPayload::WebSocket(_)
+                        | bex_vm_types::RustPayload::HttpBody(_)
+                        | bex_vm_types::RustPayload::SseStream(_)
+                        | bex_vm_types::RustPayload::HttpServer(_)
+                        | bex_vm_types::RustPayload::TlsKeys(_)
+                        | bex_vm_types::RustPayload::HostValue(_)
+                        | bex_vm_types::RustPayload::Image(_)
+                        | bex_vm_types::RustPayload::Audio(_)
+                        | bex_vm_types::RustPayload::Pdf(_)
+                        | bex_vm_types::RustPayload::Video(_)
+                        | bex_vm_types::RustPayload::Prompt(_),
+                        _,
+                    ) => Cmp::NotEqual,
                 }
             }
+            (Object::RustInstance(_), _) => Cmp::NotEqual,
 
             // By reference:
             (Object::Function(_), Object::Function(_))
@@ -567,21 +777,76 @@ impl EqualsDriver {
                 | Object::Closure(_)
                 | Object::Class(_)
                 | Object::Enum(_)
-                | Object::TypeAlias(_)
-                | Object::RustData(_),
+                | Object::TypeAlias(_),
                 _,
             ) => Cmp::NotEqual,
         }
     }
 }
 
+impl RootHaver for MapEntryComparison {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            key,
+            value,
+            candidates,
+        } = self;
+        key.visit_roots(visitor);
+        value.visit_roots(visitor);
+        candidates.visit_roots(visitor);
+    }
+}
+
+impl RootHaver for MapKeyBranch {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            entry,
+            candidate_value,
+            map_entries,
+            visited_checkpoint: _,
+        } = self;
+        entry.visit_roots(visitor);
+        candidate_value.visit_roots(visitor);
+        map_entries.visit_roots(visitor);
+    }
+}
+
+impl RootHaver for EqualsDriver {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            stack,
+            visited,
+            visited_log,
+            map_entries,
+            key_branches,
+        } = self;
+        stack.visit_roots(visitor);
+        map_entries.visit_roots(visitor);
+        key_branches.visit_roots(visitor);
+        // The cycle set is keyed by the pointers themselves: walk the log it is
+        // built from, keep the `(min, max)` ordering the insert side uses so a
+        // re-encountered pair still matches, and rebuild the set from it.
+        for pair in visited_log.iter_mut() {
+            pair.visit_roots(visitor);
+            if pair.0 > pair.1 {
+                *pair = (pair.1, pair.0);
+            }
+        }
+        *visited = visited_log.iter().copied().collect();
+    }
+}
+
 impl Continuation for EqualsDriver {
-    /// Resume after a user `Equals.eq` returns: `false` → the whole comparison is
-    /// `false`; `true` → that pair is equal, keep draining the remaining stack.
-    fn call(self: Box<Self>, vm: &mut BexVm, value: Value) -> NativeCallResult {
+    fn call(mut self: Box<Self>, vm: &mut BexVm, value: Value) -> NativeCallResult {
         match value.as_bool() {
             Some(true) => (*self).drive(vm),
-            Some(false) => NativeCallResult::Done(Value::bool(false)),
+            Some(false) => {
+                if self.finish_map_key(false) {
+                    (*self).drive(vm)
+                } else {
+                    NativeCallResult::Done(Value::bool(false))
+                }
+            }
             // `eq` is typed `-> bool throws never`, so a non-bool return is a compiler/VM
             // invariant break, not a possible runtime value — surface it as an internal
             // engine error rather than silently treating it as "unequal".
@@ -591,41 +856,6 @@ impl Continuation for EqualsDriver {
             }),
         }
     }
-
-    fn gc_roots(&self) -> Vec<HeapPtr> {
-        let mut roots = Vec::new();
-        for (a, b) in &self.stack {
-            roots.extend(a.as_object_ptr());
-            roots.extend(b.as_object_ptr());
-        }
-        for (pa, pb) in &self.visited {
-            roots.push(*pa);
-            roots.push(*pb);
-        }
-        roots
-    }
-
-    fn apply_forwarding(&mut self, forwarding: &HashMap<HeapPtr, HeapPtr>) {
-        let fwd = |p: HeapPtr| forwarding.get(&p).copied().unwrap_or(p);
-        for (a, b) in &mut self.stack {
-            if let Some(p) = a.as_object_ptr() {
-                *a = Value::object(fwd(p));
-            }
-            if let Some(p) = b.as_object_ptr() {
-                *b = Value::object(fwd(p));
-            }
-        }
-        // Re-key the cycle set on the forwarded pointers, preserving the `(min, max)`
-        // ordering the insert side uses so a re-encountered pair still matches.
-        self.visited = self
-            .visited
-            .iter()
-            .map(|&(pa, pb)| {
-                let (na, nb) = (fwd(pa), fwd(pb));
-                if na < nb { (na, nb) } else { (nb, na) }
-            })
-            .collect();
-    }
 }
 
 /// The concrete runtime `RealizedTy` of the class instance or enum value at `ptr` — `Class` with
@@ -633,15 +863,16 @@ impl Continuation for EqualsDriver {
 /// `None` for any other object kind (only instances/enums implement `Equals`).
 fn value_concrete_ty(vm: &BexVm, ptr: HeapPtr) -> Option<RealizedTy> {
     match vm.get_object(ptr) {
-        Object::Instance(inst) => {
-            let (class_ptr, type_args) = (inst.class, inst.class_type_args.to_vec());
-            match vm.get_object(class_ptr) {
-                Object::Class(class) => Some(RealizedTy::Class(
-                    bex_vm_types::TypeHead::new(class_ptr, class.type_tag),
-                    type_args.into(),
-                )),
-                _ => None,
-            }
+        Object::RustInstance(inst) => match vm.get_object(inst.class) {
+            Object::Class(class) => Some(RealizedTy::Class(
+                bex_vm_types::TypeHead::new(inst.class, class.type_tag),
+                Box::from(inst.class_type_args.as_slice()),
+            )),
+            _ => None,
+        },
+        Object::Instance => {
+            let inst = vm.get_instance(ptr)?;
+            Some(RealizedTy::Class(inst.head(), inst.type_args().into()))
         }
         Object::Variant(v) => match vm.get_object(v.enm) {
             Object::Enum(e) => Some(RealizedTy::Enum(bex_vm_types::TypeHead::new(
@@ -669,15 +900,22 @@ fn resolve_equals_eq(
     // `Equals` is non-generic — no interface args to select on; off the resolved
     // rule, `eq` is the concrete method (the impl's own, or the adopted default),
     // invoked with its frame realized against the impl's bound type args.
-    let Some(equals_head) = vm.declaration_head(&equals_qtn()) else {
-        return Ok(None);
+    let Some(equals_head) = vm.lang_head(crate::lang_items::BAML_OPS_EQUALS) else {
+        // The `baml` package is required at load; `Equals` missing from it is
+        // the stdlib and the runtime out of step, never "no custom eq".
+        return Err(unresolved_op(crate::lang_items::BAML_OPS_EQUALS, "eq"));
     };
     let resolver = resolve::ImplResolver::for_value(vm, value);
     let Some((rule, bound_args)) = resolver.resolve_implements_rule(concrete, equals_head, &[])
     else {
         return Ok(None);
     };
-    let method = resolver.rule_method_impl(&rule, "eq")?.method;
+    let resolved = resolver.rule_method_impl(&rule, "eq")?;
+    // Keep defaults in this worklist so cyclic graphs share its visited set.
+    if resolved.is_default {
+        return Ok(None);
+    }
+    let method = resolved.method;
     // `fqn` is the resolved callee's heap pointer (the impl method or adopted
     // default) — invoke it directly. Its frame realizes fully against the bound
     // args (every projection reduced through the impl registry); a failure is
@@ -687,13 +925,153 @@ fn resolve_equals_eq(
     Ok(Some((callee, type_args)))
 }
 
-/// The `baml.ops.Equals` interface name.
-fn equals_qtn() -> TypeName {
-    TypeName::new(
-        Name::new("baml"),
-        vec![Name::new("ops")],
-        Name::new("Equals"),
-    )
+pub(super) fn equals_structural_default(vm: &mut BexVm, a: Value, b: Value) -> NativeCallResult {
+    EqualsDriver::new(a, b).drive(vm)
+}
+
+/// `a == b` for the pairs [`EqualsDriver`] decides without a worklist or
+/// user code: `Some(equal)`, or `None` when the driver has to run. Where it
+/// answers, it answers what the driver would; `OpCode::CallEquals` calls the
+/// driver for the rest.
+///
+/// It decides identical values (reflexivity, as in `compare_one`), every
+/// pair of non-object values, an object against a non-object, two strings,
+/// two floats, and two variants of one enum whose equality is the structural
+/// default (see [`enum_equality_is_structural`]).
+///
+/// Kept out of line: inlined into the dispatch loop it grows that function
+/// and costs unrelated opcodes more than the call saves here.
+#[inline(never)]
+pub(crate) fn equals_without_driver(vm: &mut BexVm, a: Value, b: Value) -> Option<bool> {
+    // `Value` equality is bit equality: the same primitive or the same object.
+    if a == b {
+        return Some(true);
+    }
+    match (a.kind(), b.kind()) {
+        (ValueKind::Object(pa), ValueKind::Object(pb)) => equals_objects_without_driver(vm, pa, pb),
+        // Floats compare by value, reflexively (`NaN == NaN`, `-0.0 == 0.0`),
+        // so two inline floats with different bits can still be equal.
+        (ValueKind::Float(x), ValueKind::Float(y)) => Some(bex_vm_types::float_order::eq(x, y)),
+        (ValueKind::Object(ptr), _) => object_against_non_object(vm, ptr, b),
+        (_, ValueKind::Object(ptr)) => object_against_non_object(vm, ptr, a),
+        // The remaining non-object encodings are canonical, so two of them
+        // with different bits are different values, of one kind or of two.
+        // Every kind is listed, as in `compare_one`, so a new `ValueKind`
+        // must be classified here.
+        (
+            ValueKind::Null
+            | ValueKind::OmittedArg
+            | ValueKind::Int(_)
+            | ValueKind::Bool(_)
+            | ValueKind::Float(_),
+            _,
+        ) => Some(false),
+    }
+}
+
+/// [`equals_without_driver`] for the object at `ptr` against the non-object
+/// `other`. The driver loads a cell before comparing, so a cell goes to it;
+/// a boxed float compares by value against an inline one, as in
+/// `compare_one`; any other object is a different kind, so unequal.
+fn object_against_non_object(vm: &BexVm, ptr: HeapPtr, other: Value) -> Option<bool> {
+    match vm.get_object(ptr) {
+        Object::Cell(_) => None,
+        Object::Float(boxed) => Some(match other.kind() {
+            ValueKind::Float(x) => bex_vm_types::float_order::eq(*boxed, x),
+            _ => false,
+        }),
+        _ => Some(false),
+    }
+}
+
+/// [`equals_without_driver`] for two distinct heap objects.
+fn equals_objects_without_driver(vm: &mut BexVm, pa: HeapPtr, pb: HeapPtr) -> Option<bool> {
+    let (enm, index_a, index_b) = match (vm.get_object(pa), vm.get_object(pb)) {
+        (Object::Variant(x), Object::Variant(y)) => {
+            // Different enums ⇒ never equal, with or without a custom `eq`.
+            if x.enm != y.enm {
+                return Some(false);
+            }
+            (x.enm, x.index, y.index)
+        }
+        (Object::String(x), Object::String(y)) => return Some(x == y),
+        (Object::Float(x), Object::Float(y)) => {
+            return Some(bex_vm_types::float_order::eq(*x, *y));
+        }
+        _ => return None,
+    };
+    enum_equality_is_structural(vm, enm, pa).then_some(index_a == index_b)
+}
+
+/// Whether `==` on the variants of `enm` (of which `variant` is one) is the
+/// structural default, compared by variant, rather than a custom
+/// `Equals.eq`: the question [`EqualsDriver`] asks [`resolve_equals_eq`] on
+/// every comparison, memoized per VM.
+///
+/// An `Equals` impl can arrive after the comparison was compiled (a
+/// registered witness, a published graft), so the memo is keyed on the
+/// engine's resolution generation, which every such change bumps. It is
+/// kept only for a compile-time enum compared from static code: there the
+/// resolver's world holds no runtime package, so the answer depends on the
+/// enum and the rule tables alone; and the enum never moves or dies, so the
+/// memo holds no pointer a collection must visit. Everything else answers
+/// `false`, which sends the pair to the driver.
+fn enum_equality_is_structural(vm: &mut BexVm, enm: HeapPtr, variant: HeapPtr) -> bool {
+    if !vm.heap.is_compile_time_ptr(enm) || !vm.current_runtime_package().is_null() {
+        return false;
+    }
+    let generation = vm.dynamic_dispatch.generation();
+    if let Some(structural) = vm.enum_equals_memo.get(generation, enm) {
+        return structural;
+    }
+    // `Ok(None)` is no custom `eq`. A custom one, or an error the driver
+    // reports, is not structural.
+    let structural = matches!(
+        value_concrete_ty(vm, variant).map(|ty| resolve_equals_eq(vm, Value::object(variant), &ty)),
+        Some(Ok(None))
+    );
+    // An answer computed across a generation bump is not stored.
+    if vm.dynamic_dispatch.generation() == generation {
+        vm.enum_equals_memo.insert(generation, enm, structural);
+    }
+    structural
+}
+
+/// Per-VM memo for [`enum_equality_is_structural`]: for each compile-time
+/// enum asked about since the resolution generation last moved, whether its
+/// equality is the structural default. A program compares few enums, so a
+/// short list is the whole table.
+#[derive(Debug, Default)]
+pub(crate) struct EnumEqualsMemo {
+    generation: u64,
+    entries: Vec<(HeapPtr, bool)>,
+}
+
+impl EnumEqualsMemo {
+    /// More distinct enums than this empty the memo before the next insert.
+    const CAPACITY: usize = 16;
+
+    fn get(&mut self, generation: u64, enm: HeapPtr) -> Option<bool> {
+        if self.generation != generation {
+            self.generation = generation;
+            self.entries.clear();
+            return None;
+        }
+        self.entries
+            .iter()
+            .find_map(|&(entry, structural)| (entry == enm).then_some(structural))
+    }
+
+    fn insert(&mut self, generation: u64, enm: HeapPtr, structural: bool) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.entries.clear();
+        }
+        if self.entries.len() >= Self::CAPACITY {
+            self.entries.clear();
+        }
+        self.entries.push((enm, structural));
+    }
 }
 
 /// Read a `baml.ops.Ordering` value back as a Rust [`std::cmp::Ordering`].
@@ -716,5 +1094,287 @@ pub(super) fn ordering_from_value(vm: &BexVm, value: Value) -> Option<std::cmp::
         "Equal" => Some(std::cmp::Ordering::Equal),
         "Greater" => Some(std::cmp::Ordering::Greater),
         _ => None,
+    }
+}
+
+// ── Compare (structural tuple default) ─────────────────────────────────────
+
+/// One pending step of a [`CompareDriver`] walk.
+enum CompareStep {
+    Pair(Value, Value),
+    Decided(std::cmp::Ordering),
+}
+
+struct CompareDriver {
+    stack: Vec<CompareStep>,
+    visited: HashSet<(HeapPtr, HeapPtr)>,
+}
+
+enum SlotOrder {
+    Decided(std::cmp::Ordering),
+    Tuple(Vec<Value>, Vec<Value>),
+    Dispatch {
+        callee: HeapPtr,
+        args: Vec<Value>,
+        type_args: Vec<RealizedTy>,
+    },
+}
+
+impl CompareDriver {
+    fn drive(mut self: Box<Self>, vm: &mut BexVm) -> NativeCallResult {
+        while let Some(step) = self.stack.pop() {
+            let (a, b) = match step {
+                CompareStep::Decided(std::cmp::Ordering::Equal) => continue,
+                CompareStep::Decided(ordering) => return ordering_result(vm, ordering),
+                CompareStep::Pair(a, b) => (a, b),
+            };
+            match order_slots(vm, a, b, &mut self.visited) {
+                Ok(SlotOrder::Decided(std::cmp::Ordering::Equal)) => {}
+                Ok(SlotOrder::Decided(ordering)) => return ordering_result(vm, ordering),
+                Ok(SlotOrder::Tuple(xs, ys)) => {
+                    self.stack
+                        .push(CompareStep::Decided(xs.len().cmp(&ys.len())));
+                    self.stack.extend(
+                        xs.into_iter()
+                            .zip(ys)
+                            .rev()
+                            .map(|(x, y)| CompareStep::Pair(x, y)),
+                    );
+                }
+                Ok(SlotOrder::Dispatch {
+                    callee,
+                    args,
+                    type_args,
+                }) => {
+                    return NativeCallResult::YieldToCall {
+                        callee,
+                        args,
+                        type_args,
+                        continuation: self,
+                    };
+                }
+                Err(e) => return NativeCallResult::from(e),
+            }
+        }
+        ordering_result(vm, std::cmp::Ordering::Equal)
+    }
+}
+
+fn order_slots(
+    vm: &BexVm,
+    a: Value,
+    b: Value,
+    visited: &mut HashSet<(HeapPtr, HeapPtr)>,
+) -> Result<SlotOrder, VmInternalError> {
+    let (Some(a), Some(b)) = (resolve_cells(vm, a), resolve_cells(vm, b)) else {
+        return Err(unresolved_op(crate::lang_items::BAML_OPS_COMPARE, "cmp"));
+    };
+    match (a.kind(), b.kind()) {
+        (ValueKind::Int(x), ValueKind::Int(y)) => return Ok(SlotOrder::Decided(x.cmp(&y))),
+        (ValueKind::Bool(x), ValueKind::Bool(y)) => return Ok(SlotOrder::Decided(x.cmp(&y))),
+        (ValueKind::Object(pa), ValueKind::Object(pb)) => {
+            match (vm.get_object(pa), vm.get_object(pb)) {
+                (Object::Float(x), Object::Float(y)) => {
+                    return Ok(SlotOrder::Decided(bex_vm_types::float_order::cmp(*x, *y)));
+                }
+                (Object::String(x), Object::String(y)) => {
+                    return Ok(SlotOrder::Decided(x.as_str().cmp(y.as_str())));
+                }
+                (Object::Bigint(x), Object::Bigint(y)) => return Ok(SlotOrder::Decided(x.cmp(y))),
+                (Object::Tuple(x), Object::Tuple(y)) => {
+                    if !visited.insert((pa, pb)) {
+                        return Ok(SlotOrder::Decided(std::cmp::Ordering::Equal));
+                    }
+                    return Ok(SlotOrder::Tuple(
+                        x.slot_values().collect(),
+                        y.slot_values().collect(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let compare = vm
+        .lang_head(crate::lang_items::BAML_OPS_COMPARE)
+        .ok_or_else(|| unresolved_op(crate::lang_items::BAML_OPS_COMPARE, "cmp"))?;
+    let self_ty = vm
+        .value_concrete_ty(a)
+        .map(RealizedTy::from)
+        .ok_or_else(|| unresolved_op(crate::lang_items::BAML_OPS_COMPARE, "cmp"))?;
+    let resolver = resolve::ImplResolver::for_value(vm, a);
+    let implementation = resolver
+        .resolve_implementation(&self_ty, compare, &[])
+        .ok_or_else(|| unresolved_op(crate::lang_items::BAML_OPS_COMPARE, "cmp"))?;
+    let (callee, type_args) = resolver.implementation_method(&implementation, "cmp")?;
+    Ok(SlotOrder::Dispatch {
+        callee,
+        args: vec![a, b],
+        type_args,
+    })
+}
+
+fn ordering_result(vm: &mut BexVm, ordering: std::cmp::Ordering) -> NativeCallResult {
+    let name = match ordering {
+        std::cmp::Ordering::Less => "Less",
+        std::cmp::Ordering::Equal => "Equal",
+        std::cmp::Ordering::Greater => "Greater",
+    };
+    let enm = vm.lang_object(crate::lang_items::BAML_OPS_ORDERING);
+    let index = match vm.get_object(enm) {
+        Object::Enum(e) => e.variants.iter().position(|v| v.name == name),
+        _ => None,
+    }
+    .unwrap_or_else(|| unreachable!("`baml.ops.Ordering` declares the variant `{name}`"));
+    NativeCallResult::Done(Value::object(vm.alloc_variant(enm, index)))
+}
+
+impl RootHaver for CompareDriver {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        for step in &mut self.stack {
+            if let CompareStep::Pair(a, b) = step {
+                a.visit_roots(visitor);
+                b.visit_roots(visitor);
+            }
+        }
+        let mut pairs: Vec<_> = self.visited.drain().collect();
+        for pair in &mut pairs {
+            pair.visit_roots(visitor);
+        }
+        self.visited.extend(pairs);
+    }
+}
+
+impl Continuation for CompareDriver {
+    fn call(self: Box<Self>, vm: &mut BexVm, value: Value) -> NativeCallResult {
+        match ordering_from_value(vm, value) {
+            Some(std::cmp::Ordering::Equal) => self.drive(vm),
+            Some(ordering) => ordering_result(vm, ordering),
+            None => NativeCallResult::from(VmInternalError::TypeError {
+                expected: Type::Object(bex_vm_types::ObjectType::Variant),
+                got: vm.type_of(&value),
+            }),
+        }
+    }
+}
+
+pub(super) fn compare_structural_default(vm: &mut BexVm, a: Value, b: Value) -> NativeCallResult {
+    Box::new(CompareDriver {
+        stack: vec![CompareStep::Pair(a, b)],
+        visited: HashSet::new(),
+    })
+    .drive(vm)
+}
+
+#[cfg(test)]
+mod tests {
+    use baml_type::{Name, typetag::TypeTag};
+    use bex_vm_types::types::{Enum, EnumVariant, LocalName, Owner};
+
+    use super::*;
+    use crate::vm::tests::test_vm;
+
+    fn enum_object(name: &str, tag: i64) -> Object {
+        let variant = |name: &str| EnumVariant {
+            name: name.into(),
+            description: None,
+            alias: None,
+            docstring: None,
+            other: indexmap::IndexMap::default(),
+            skip: false,
+            json_rename: None,
+        };
+        Object::Enum(Box::new(Enum {
+            path: LocalName::new(Vec::new(), Name::new(name)),
+            type_tag: TypeTag::from_i64(baml_type::typetag::CLASS_BASE + tag),
+            variants: vec![variant("A"), variant("B")],
+            description: None,
+            alias: None,
+            docstring: None,
+            other: indexmap::IndexMap::default(),
+            owner: Owner::anonymous(),
+            telemetry_definition: bex_vm_types::DefinitionCell::default(),
+            shared_variants: Box::default(),
+        }))
+    }
+
+    #[test]
+    fn the_heap_shares_one_object_per_compile_time_variant() {
+        let vm = test_vm(vec![enum_object("Left", 0), enum_object("Right", 1)]);
+        for index in 0..2 {
+            let enm = vm.heap.compile_time_ptr(index);
+            let Object::Enum(declaration) = vm.get_object(enm) else {
+                panic!("slot {index} holds an enum");
+            };
+            assert_eq!(declaration.shared_variants.len(), 2);
+            for (variant_index, &ptr) in declaration.shared_variants.iter().enumerate() {
+                assert!(vm.heap.is_compile_time_ptr(ptr));
+                let Object::Variant(variant) = vm.get_object(ptr) else {
+                    panic!("a shared variant is an `Object::Variant`");
+                };
+                assert_eq!((variant.enm, variant.index), (enm, variant_index));
+            }
+        }
+    }
+
+    #[test]
+    fn equals_without_driver_answers_only_what_the_driver_would() {
+        let mut vm = test_vm(vec![enum_object("Left", 0), enum_object("Right", 1)]);
+        let (left, right) = (vm.heap.compile_time_ptr(0), vm.heap.compile_time_ptr(1));
+        let mut eq = |a: Value, b: Value| equals_without_driver(&mut vm, a, b);
+
+        assert_eq!(eq(Value::int(3), Value::int(3)), Some(true));
+        assert_eq!(eq(Value::int(3), Value::int(4)), Some(false));
+        assert_eq!(eq(Value::NULL, Value::NULL), Some(true));
+        assert_eq!(eq(Value::NULL, Value::int(0)), Some(false));
+        assert_eq!(eq(Value::bool(true), Value::int(1)), Some(false));
+
+        let ab = Value::object(vm.tlab.alloc_string("ab".to_string()));
+        let ab_again = Value::object(vm.tlab.alloc_string("ab".to_string()));
+        let ac = Value::object(vm.tlab.alloc_string("ac".to_string()));
+        let left_a = Value::object(vm.tlab.alloc_variant(left, 0));
+        let left_a_again = Value::object(vm.tlab.alloc_variant(left, 0));
+        let right_a = Value::object(vm.tlab.alloc_variant(right, 0));
+
+        // Floats compare by value: different bits can be equal, and a
+        // boxed float (NaN) against itself boxed separately is equal too.
+        let zero = vm.tlab.float_value(0.0);
+        let negative_zero = vm.tlab.float_value(-0.0);
+        let one = vm.tlab.float_value(1.0);
+        let nan = vm.tlab.float_value(f64::NAN);
+        let nan_again = vm.tlab.float_value(f64::NAN);
+        let mut eq = |a: Value, b: Value| equals_without_driver(&mut vm, a, b);
+        assert_eq!(eq(negative_zero, zero), Some(true));
+        assert_eq!(eq(zero, one), Some(false));
+        assert_eq!(eq(nan, nan_again), Some(true));
+        assert_eq!(eq(nan, one), Some(false));
+        assert_eq!(eq(one, Value::int(1)), Some(false));
+
+        assert_eq!(eq(ab, ab_again), Some(true));
+        assert_eq!(eq(ab, ac), Some(false));
+        assert_eq!(eq(ab, Value::NULL), Some(false));
+        assert_eq!(eq(left_a, left_a), Some(true));
+        // Different enums are unequal whatever their `Equals`.
+        assert_eq!(eq(left_a, right_a), Some(false));
+        // Without the stdlib there is no `Equals` to resolve, so whether
+        // `Left` has a custom `eq` is unknown: the driver decides.
+        assert_eq!(eq(left_a, left_a_again), None);
+    }
+
+    #[test]
+    fn the_enum_memo_forgets_its_answers_when_the_generation_moves() {
+        let vm = test_vm(vec![enum_object("Left", 0), enum_object("Right", 1)]);
+        let (left, right) = (vm.heap.compile_time_ptr(0), vm.heap.compile_time_ptr(1));
+        let mut memo = EnumEqualsMemo::default();
+
+        assert_eq!(memo.get(0, left), None);
+        memo.insert(0, left, true);
+        assert_eq!(memo.get(0, left), Some(true));
+        assert_eq!(memo.get(0, right), None);
+
+        assert_eq!(memo.get(1, left), None);
+        memo.insert(1, right, false);
+        assert_eq!(memo.get(1, right), Some(false));
+        assert_eq!(memo.get(1, left), None);
     }
 }

@@ -45,5 +45,16 @@ function SleepMs(ms: int) -> null throws baml.errors.Io {
 function SleepThenMarkMs(ms: int, entry_path: string, later_path: string) -> null throws baml.errors.Io {
   baml.fs.write(entry_path, "entered");
   baml.sys.sleep(baml.time.Duration.from_nanoseconds(ms * 1000000n));
-  baml.fs.write(later_path, "later")
+  baml.fs.write(later_path, "later");
+}
+
+// Inferred contract holding two same-named stdlib errors:
+// `baml.errors.ParseError` (from `int.parse`) and `baml.json.ParseError`.
+function ParseIntOrJson(s: string, as_int: bool) -> int {
+  if (as_int) {
+    int.parse(s)
+  } else {
+    baml.json.parse(s);
+    0
+  }
 }

@@ -3,10 +3,12 @@
 //! Identity and timing functions are pure. Value functions resolve CAS
 //! blobs lazily through the current query's context: a query that never
 //! evaluates `type_args`, `input_args`, `output_value`, `error_value` or
-//! `network_event_values` reads no blob. Within one query,
-//! hydration outcomes (including missing and corrupt blobs) are memoized
-//! under entry and byte limits; the next query starts empty and can find a
-//! blob that arrived in between.
+//! `network_event_values` reads no blob. A path reads only the blobs it
+//! crosses; rendering or comparing a whole value reads every blob it reaches,
+//! within the render and comparison limits. Within one query, hydration
+//! outcomes (including missing and corrupt blobs) and presented results are
+//! memoized under entry and byte limits; the next query starts empty and can
+//! find a blob that arrived in between.
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
@@ -14,16 +16,17 @@ use std::{
     time::Instant,
 };
 
-use btel_reader::{
-    cas::{CasOutcome, CasStore},
-    evidence::ArgumentNames,
-    timing::{Clock, Conversion, EpochStatus, TimingState, UtcAnchor, format_unix_ns},
-    value::{
-        self, CmpOp, Kind, Nav, Operand, RenderLimits, Root, Scalar, Segment, Unavailable, equality,
+use btel_core::{
+    cas::{CasId, DecodedBlob, DecodedValue},
+    reader::{
+        evidence::ArgumentNames,
+        store::{CasStore, CasUnavailable},
+        timing::{Clock, Conversion, EpochStatus, TimingState, UtcAnchor, format_unix_ns},
+        value::{
+            self, BlobSource, CmpOp, Composer, Kind, Nav, Operand, RenderLimits, Root, Scalar,
+            Segment, equality,
+        },
     },
-};
-use btel_snapshot::{
-    DecodedObject, DecodedRoot, DecodedSnapshot, DecodedValue, Limit, SnapshotId, TypeDescription,
 };
 use rusqlite::{
     Connection, Error as SqlError,
@@ -32,10 +35,6 @@ use rusqlite::{
 };
 use serde::Serialize;
 
-/// Function names are reserved: user SQL containing this prefix is rejected
-/// before translation, so only the translator and catalog views call them.
-pub const PREFIX: &str = "__btel_";
-
 #[derive(Clone, Copy, Debug)]
 pub struct ValueLimits {
     /// Decoded snapshots kept for the rest of the query.
@@ -43,7 +42,10 @@ pub struct ValueLimits {
     /// Approximate encoded bytes of cached snapshots.
     pub max_cached_bytes: u64,
     /// Navigation results kept for render/kind pairs and repeated paths.
+    /// All are forgotten when another would pass this or the byte limit.
     pub max_cached_results: usize,
+    /// Bytes of those results' handles and text.
+    pub max_cached_result_bytes: usize,
     pub render: RenderLimits,
     pub comparison: equality::Limits,
 }
@@ -53,6 +55,7 @@ impl Default for ValueLimits {
             max_cached_blobs: 4096,
             max_cached_bytes: 256 << 20,
             max_cached_results: 16_384,
+            max_cached_result_bytes: 64 << 20,
             render: RenderLimits::default(),
             comparison: equality::Limits::default(),
         }
@@ -72,9 +75,10 @@ pub struct ValueMetrics {
 }
 
 struct CacheState {
-    blobs: HashMap<[u8; 16], CasOutcome>,
+    blobs: HashMap<[u8; 16], Result<Arc<DecodedBlob>, CasUnavailable>>,
     blob_bytes: u64,
     results: HashMap<Vec<u8>, (Scalar, Kind)>,
+    result_bytes: usize,
     unavailable_seen: HashSet<Vec<u8>>,
     metrics: ValueMetrics,
 }
@@ -97,6 +101,7 @@ impl QueryContext {
                 blobs: HashMap::new(),
                 blob_bytes: 0,
                 results: HashMap::new(),
+                result_bytes: 0,
                 unavailable_seen: HashSet::new(),
                 metrics: ValueMetrics::default(),
             }),
@@ -117,39 +122,31 @@ impl QueryContext {
         Ok(())
     }
 
-    fn load(&self, state: &mut CacheState, id: [u8; 16]) -> CasOutcome {
-        if let Some(outcome) = state.blobs.get(&id) {
-            state.metrics.cas_cache_hits += 1;
-            return outcome.clone();
+    /// The snapshot a handle reads and the path to follow in it, or the
+    /// code of why it is unavailable: its CAS blob or the inline one at its
+    /// own path, or for a network span's events, the list `events` builds.
+    fn load_handle<'h>(&self, handle: &'h Handle) -> Loaded<'h> {
+        if handle.kind == EVENTS {
+            return self.events(handle);
         }
-        let load = self.cas.load(SnapshotId::from_bytes(id));
-        state.metrics.cas_loads += 1;
-        state.metrics.cas_bytes_read += load.bytes_read;
-        if state.blobs.len() < self.limits.max_cached_blobs
-            && state.blob_bytes + load.bytes_read <= self.limits.max_cached_bytes
-        {
-            state.blob_bytes += load.bytes_read;
-            state.blobs.insert(id, load.outcome.clone());
+        let snapshot = match &handle.inline {
+            Some(blob) => btel_core::cas::decode_blob(blob, &self.cas.limits().decode)
+                .map(Arc::new)
+                .map_err(CasUnavailable::Corrupt),
+            None => BlobSource::load(self, CasId::from_bytes(handle.cas)),
+        };
+        match snapshot {
+            Ok(snapshot) => Ok((snapshot, Cow::Borrowed(&handle.path[..]))),
+            Err(unavailable) => Err(unavailable.code()),
         }
-        load.outcome
     }
 
-    /// The snapshot a handle reads and the path to follow in it, or why it
-    /// is unavailable: its CAS blob or the inline one at its own path, or
-    /// for a network span's events, what `events` finds.
-    fn load_handle<'h>(&self, state: &mut CacheState, handle: &'h Handle) -> Loaded<'h> {
-        let outcome = match &handle.inline {
-            _ if handle.kind == EVENTS => return self.events(state, handle),
-            Some(blob) => match btel_snapshot::decode_blob(blob, &self.cas.limits().decode) {
-                Ok(snapshot) => CasOutcome::Available(Arc::new(snapshot)),
-                Err(error) => CasOutcome::Corrupt(error),
-            },
-            None => self.load(state, handle.cas),
-        };
-        match outcome {
-            CasOutcome::Available(snapshot) => Ok((snapshot, Cow::Borrowed(&handle.path))),
-            outcome => Err(outcome.code()),
-        }
+    fn evaluation(&self) {
+        self.state
+            .lock()
+            .expect("value state")
+            .metrics
+            .value_evaluations += 1;
     }
 
     /// A network span's events as `[{event_name, payload, timestamp}]`. A
@@ -157,12 +154,23 @@ impl QueryContext {
     /// other path reads a list built here, with the payloads the path ends
     /// on (every one for the whole list, its own for one event) and null
     /// for the rest, which the path never reaches.
-    fn events<'h>(&self, state: &mut CacheState, handle: &'h Handle) -> Loaded<'h> {
+    fn events<'h>(&self, handle: &'h Handle) -> Loaded<'h> {
         let events = handle
             .inline
             .as_deref()
             .and_then(decode_events)
             .expect("Handle::decode validated the events");
+        let load = |cas| {
+            BlobSource::load(self, CasId::from_bytes(cas)).map_err(|unavailable| unavailable.code())
+        };
+        // A reader knows a blob by its ID, so what is built here needs one
+        // of its own: what the handle says is what is built from it.
+        let id = {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            hasher.update(b"baml.query.events\0");
+            hasher.update(&handle.encode());
+            CasId::from_bytes(hasher.digest128().to_le_bytes())
+        };
         let mut path = handle.path.clone();
         // A negative index counts from the end.
         if let Some(Segment::Index(index)) = path.first_mut()
@@ -174,33 +182,25 @@ impl QueryContext {
             Some(Segment::Index(index)) => {
                 usize::try_from(*index).ok().filter(|at| *at < events.len())
             }
-            _ => None,
+            Some(Segment::Key(_)) | None => None,
         };
         if let (Some(at), Some(Segment::Key(key))) = (at, path.get(1))
             && key == "payload"
         {
             let rest = path.split_off(2);
-            return match events[at].payload {
-                Some(cas) => match self.load(state, cas) {
-                    CasOutcome::Available(snapshot) => Ok((snapshot, Cow::Owned(rest))),
-                    outcome => Err(outcome.code()),
-                },
-                None => Ok((
-                    Arc::new(Composer::default().finish(DecodedValue::Null)),
-                    Cow::Owned(rest),
-                )),
+            let snapshot = match events[at].payload {
+                Some(cas) => load(cas)?,
+                None => Composer::default().finish(id, DecodedValue::Null),
             };
+            return Ok((snapshot, Cow::Owned(rest)));
         }
         let shown = |event: usize| path.is_empty() || (path.len() == 1 && at == Some(event));
         let mut composer = Composer::default();
         let mut items = Vec::with_capacity(events.len());
         for (position, event) in events.iter().enumerate() {
             let payload = match event.payload {
-                Some(cas) if shown(position) => match self.load(state, cas) {
-                    CasOutcome::Available(snapshot) => composer.embed(&snapshot)?,
-                    outcome => return Err(outcome.code()),
-                },
-                _ => DecodedValue::Null,
+                Some(cas) if shown(position) => composer.embed(&*load(cas)?)?,
+                Some(_) | None => DecodedValue::Null,
             };
             let timestamp = event
                 .timestamp
@@ -216,18 +216,14 @@ impl QueryContext {
             ])?);
         }
         let list = composer.list(items)?;
-        Ok((Arc::new(composer.finish(list)), Cow::Owned(path)))
+        Ok((composer.finish(id, list), Cow::Owned(path)))
     }
 
     /// Report `code` once per distinct `key` (a handle, or a handle plus an
     /// operation marker).
     fn note(&self, key: &[u8], code: &str) {
         let mut state = self.state.lock().expect("value state");
-        Self::unavailable(&mut state, key, code);
-    }
-
-    fn unavailable(state: &mut CacheState, handle: &[u8], code: &str) {
-        if state.unavailable_seen.insert(handle.to_vec()) {
+        if state.unavailable_seen.insert(key.to_vec()) {
             *state
                 .metrics
                 .unavailable
@@ -236,47 +232,88 @@ impl QueryContext {
         }
     }
 
-    /// Navigate a handle and present the result as a SQL scalar.
-    fn resolve(&self, handle: &[u8]) -> rusqlite::Result<(Scalar, Kind)> {
-        self.check_deadline()?;
-        let mut state = self.state.lock().expect("value state");
-        state.metrics.value_evaluations += 1;
-        if let Some(result) = state.results.get(handle) {
-            let result = result.clone();
-            state.metrics.result_cache_hits += 1;
-            return Ok(result);
-        }
+    /// What a handle names, or `None` with the reason reported.
+    fn find(&self, handle: &[u8]) -> rusqlite::Result<Option<(Handle, Nav)>> {
         let parsed =
             Handle::decode(handle).ok_or_else(|| user_error("invalid BAML value handle"))?;
         if parsed.pending {
-            Self::unavailable(&mut state, handle, parsed.pending_code());
-            return Ok((Scalar::Null, Kind::Unavailable));
+            self.note(handle, parsed.pending_code());
+            return Ok(None);
         }
-        let result = match self.load_handle(&mut state, &parsed) {
-            Ok((snapshot, path)) => {
-                let nav = value::navigate(&snapshot, parsed.root(), parsed.names.as_ref(), &path);
-                if let Nav::Unavailable(reason) = nav {
-                    Self::unavailable(&mut state, handle, reason.code());
-                }
-                value::to_scalar(&snapshot, nav, parsed.names.as_ref(), &self.limits.render)
-            }
+        let nav = match self.load_handle(&parsed) {
+            Ok((snapshot, path)) => value::navigate(
+                self,
+                &snapshot,
+                parsed.root(),
+                parsed.names.as_ref(),
+                &path,
+                self.limits.render.max_blobs,
+            ),
             Err(code) => {
-                Self::unavailable(&mut state, handle, code);
-                (Scalar::Null, Kind::Unavailable)
+                self.note(handle, code);
+                return Ok(None);
             }
         };
-        if state.results.len() < self.limits.max_cached_results {
-            state.results.insert(handle.to_vec(), result.clone());
+        if let Nav::Unavailable(reason) = &nav {
+            self.note(handle, reason.code());
+            return Ok(None);
+        }
+        Ok(Some((parsed, nav)))
+    }
+
+    /// Navigate a handle and present the result as a SQL scalar.
+    fn resolve(&self, handle: &[u8]) -> rusqlite::Result<(Scalar, Kind)> {
+        self.check_deadline()?;
+        {
+            let mut state = self.state.lock().expect("value state");
+            state.metrics.value_evaluations += 1;
+            if let Some(result) = state.results.get(handle) {
+                let result = result.clone();
+                state.metrics.result_cache_hits += 1;
+                return Ok(result);
+            }
+        }
+        let result = match self.find(handle)? {
+            Some((parsed, nav)) => {
+                let presented =
+                    value::to_scalar(self, &nav, parsed.names.as_ref(), &self.limits.render);
+                if let Some(reason) = presented.incomplete {
+                    self.note(handle, reason.code());
+                }
+                if presented.cut {
+                    let mut key = handle.to_vec();
+                    key.extend_from_slice(b"\xffrender");
+                    self.note(&key, RENDER_LIMIT);
+                }
+                (presented.scalar, presented.kind)
+            }
+            None => (Scalar::Null, Kind::Unavailable),
+        };
+        let bytes = handle.len()
+            + match &result.0 {
+                Scalar::Text(text) => text.len(),
+                Scalar::Null | Scalar::Integer(_) | Scalar::Real(_) => 0,
+            };
+        let mut state = self.state.lock().expect("value state");
+        // The newest result stays, so the kind asked next finds its rendering.
+        if state.results.len() >= self.limits.max_cached_results
+            || state.result_bytes.saturating_add(bytes) > self.limits.max_cached_result_bytes
+        {
+            state.results.clear();
+            state.result_bytes = 0;
+        }
+        if state
+            .results
+            .insert(handle.to_vec(), result.clone())
+            .is_none()
+        {
+            state.result_bytes += bytes;
         }
         Ok(result)
     }
 
     /// Navigate and hand the result to `f` (comparisons need the leaf).
-    fn with_nav<T>(
-        &self,
-        handle: &[u8],
-        f: impl FnOnce(Nav<'_>) -> T,
-    ) -> rusqlite::Result<Option<T>> {
+    fn with_nav<T>(&self, handle: &[u8], f: impl FnOnce(&Nav) -> T) -> rusqlite::Result<Option<T>> {
         self.with_value(handle, |value| f(value.nav))
     }
 
@@ -286,80 +323,65 @@ impl QueryContext {
         f: impl FnOnce(equality::Captured<'_>) -> T,
     ) -> rusqlite::Result<Option<T>> {
         self.check_deadline()?;
-        let mut state = self.state.lock().expect("value state");
-        state.metrics.value_evaluations += 1;
-        let parsed =
-            Handle::decode(handle).ok_or_else(|| user_error("invalid BAML value handle"))?;
-        if parsed.pending {
-            Self::unavailable(&mut state, handle, parsed.pending_code());
-            return Ok(None);
-        }
-        match self.load_handle(&mut state, &parsed) {
-            Ok((snapshot, path)) => {
-                let nav = value::navigate(&snapshot, parsed.root(), parsed.names.as_ref(), &path);
-                if let Nav::Unavailable(reason) = nav {
-                    Self::unavailable(&mut state, handle, reason.code());
-                    return Ok(None);
-                }
-                drop(state);
-                Ok(Some(f(equality::Captured {
-                    snapshot: &snapshot,
-                    nav,
-                    names: parsed.names.as_ref(),
-                })))
-            }
-            Err(code) => {
-                Self::unavailable(&mut state, handle, code);
-                Ok(None)
-            }
-        }
-    }
-
-    /// `__btel_body_text`: the text of a recorded body, which is a whole
-    /// body (a string), one server-sent event's `data`, or a request
-    /// snapshot's `request.body`. NULL for anything else, such as bytes or a
-    /// cut body. A blob that cannot be read is reported.
-    fn body_text(&self, cas: [u8; 16]) -> rusqlite::Result<Option<String>> {
-        self.check_deadline()?;
-        let mut state = self.state.lock().expect("value state");
-        state.metrics.value_evaluations += 1;
-        let snapshot = match self.load(&mut state, cas) {
-            CasOutcome::Available(snapshot) => snapshot,
-            outcome => {
-                let mut key = cas.to_vec();
-                key.extend_from_slice(b"\xffbody");
-                Self::unavailable(&mut state, &key, outcome.code());
-                return Ok(None);
-            }
-        };
-        let key = |key: &str| Segment::Key(key.to_owned());
-        for path in [vec![], vec![key("data")], vec![key("request"), key("body")]] {
-            if let Nav::Value(DecodedValue::String(text)) =
-                value::navigate(&snapshot, Root::Value, None, &path)
-            {
-                return Ok(Some(text.to_string()));
-            }
-        }
-        Ok(None)
+        self.evaluation();
+        Ok(self.find(handle)?.map(|(parsed, nav)| {
+            f(equality::Captured {
+                nav: &nav,
+                names: parsed.names.as_ref(),
+            })
+        }))
     }
 
     /// `baml_value_state`: what the path finds, without reporting it as
     /// unavailable evidence (the caller asked for exactly this answer).
     fn state(&self, handle: &[u8]) -> rusqlite::Result<String> {
         self.check_deadline()?;
-        let mut state = self.state.lock().expect("value state");
-        state.metrics.value_evaluations += 1;
+        self.evaluation();
         let parsed =
             Handle::decode(handle).ok_or_else(|| user_error("invalid BAML value handle"))?;
         if parsed.pending {
             return Ok(parsed.pending_code().to_owned());
         }
-        Ok(match self.load_handle(&mut state, &parsed) {
-            Ok((snapshot, path)) => {
-                value::state(&snapshot, parsed.root(), parsed.names.as_ref(), &path).to_owned()
-            }
+        Ok(match self.load_handle(&parsed) {
+            Ok((snapshot, path)) => value::state(
+                self,
+                &snapshot,
+                parsed.root(),
+                parsed.names.as_ref(),
+                &path,
+                self.limits.render.max_blobs,
+            )
+            .to_owned(),
             Err(code) => code.to_owned(),
         })
+    }
+}
+
+/// Blobs a value continues in come from the query's cache, then the CAS.
+/// The state lock is held for bookkeeping only, never while reading a blob
+/// or walking a value.
+impl BlobSource for QueryContext {
+    fn load(&self, id: CasId) -> Result<Arc<DecodedBlob>, CasUnavailable> {
+        let key = *id.as_bytes();
+        {
+            let mut state = self.state.lock().expect("value state");
+            if let Some(snapshot) = state.blobs.get(&key) {
+                let snapshot = snapshot.clone();
+                state.metrics.cas_cache_hits += 1;
+                return snapshot;
+            }
+        }
+        let load = self.cas.load(id);
+        let mut state = self.state.lock().expect("value state");
+        state.metrics.cas_loads += 1;
+        state.metrics.cas_bytes_read += load.bytes_read;
+        if state.blobs.len() < self.limits.max_cached_blobs
+            && state.blob_bytes + load.bytes_read <= self.limits.max_cached_bytes
+        {
+            state.blob_bytes += load.bytes_read;
+            state.blobs.insert(key, load.snapshot.clone());
+        }
+        load.snapshot
     }
 }
 
@@ -368,6 +390,8 @@ const PENDING: &str = "capture_pending";
 
 /// Structured ordering and opaque-value equality are unsupported.
 const COMPARISON_UNSUPPORTED: &str = "comparison_unsupported";
+/// Code of a rendering cut by its depth, node or text limit.
+const RENDER_LIMIT: &str = "render_limit";
 
 /// Compare two leaves; an unanswerable comparison involving a structured
 /// value is reported rather than left as an unexplained NULL.
@@ -410,132 +434,7 @@ fn comparison_result(
 
 /// What a handle reads: a snapshot and the path to follow in it, or the
 /// code of why it is unavailable.
-type Loaded<'h> = Result<(Arc<DecodedSnapshot>, Cow<'h, [Segment]>), &'static str>;
-
-/// A snapshot assembled in memory: values the index builds, around
-/// payload graphs copied in from their own snapshots.
-#[derive(Default)]
-struct Composer {
-    objects: Vec<DecodedObject>,
-    limited: bool,
-}
-
-impl Composer {
-    /// Reading never looks at a built container's types.
-    fn untyped() -> TypeDescription {
-        TypeDescription {
-            encoded: Box::new([]),
-            decoded: None,
-        }
-    }
-
-    fn push(&mut self, object: DecodedObject) -> Result<DecodedValue, &'static str> {
-        let id = u32::try_from(self.objects.len())
-            .map_err(|_| Unavailable::Truncated(Limit::Objects).code())?;
-        self.objects.push(object);
-        Ok(DecodedValue::Object(id))
-    }
-
-    fn map(&mut self, entries: Vec<(&str, DecodedValue)>) -> Result<DecodedValue, &'static str> {
-        let original_len = entries.len() as u64;
-        self.push(DecodedObject::Map {
-            key_type: Self::untyped(),
-            value_type: Self::untyped(),
-            entries: entries
-                .into_iter()
-                .map(|(key, value)| (key.into(), value))
-                .collect(),
-            original_len,
-        })
-    }
-
-    fn list(&mut self, items: Vec<DecodedValue>) -> Result<DecodedValue, &'static str> {
-        let original_len = items.len() as u64;
-        self.push(DecodedObject::List {
-            element_type: Self::untyped(),
-            items,
-            original_len,
-        })
-    }
-
-    /// Copy a value snapshot's graph in, renumbering its objects after the
-    /// ones already here; returns its root.
-    fn embed(&mut self, snapshot: &DecodedSnapshot) -> Result<DecodedValue, &'static str> {
-        let DecodedRoot::Value(root) = &snapshot.root else {
-            return Err(Unavailable::WrongRoot.code());
-        };
-        let too_many = Unavailable::Truncated(Limit::Objects).code();
-        let offset = u32::try_from(self.objects.len()).map_err(|_| too_many)?;
-        u32::try_from(self.objects.len() + snapshot.objects.len()).map_err(|_| too_many)?;
-        let shift = |value: &DecodedValue| match value {
-            DecodedValue::Object(id) => DecodedValue::Object(id + offset),
-            DecodedValue::Enum {
-                declaration,
-                variant,
-                name,
-            } => DecodedValue::Enum {
-                declaration: declaration + offset,
-                variant: *variant,
-                name: name.clone(),
-            },
-            other => other.clone(),
-        };
-        let entries = |entries: &btel_snapshot::Entries| -> btel_snapshot::Entries {
-            entries
-                .iter()
-                .map(|(key, value)| (key.clone(), shift(value)))
-                .collect()
-        };
-        for object in &snapshot.objects {
-            self.objects.push(match object {
-                DecodedObject::List {
-                    element_type,
-                    items,
-                    original_len,
-                } => DecodedObject::List {
-                    element_type: element_type.clone(),
-                    items: items.iter().map(shift).collect(),
-                    original_len: *original_len,
-                },
-                DecodedObject::Map {
-                    key_type,
-                    value_type,
-                    entries: map,
-                    original_len,
-                } => DecodedObject::Map {
-                    key_type: key_type.clone(),
-                    value_type: value_type.clone(),
-                    entries: entries(map),
-                    original_len: *original_len,
-                },
-                DecodedObject::Instance {
-                    type_arguments,
-                    declaration,
-                    fields,
-                    original_len,
-                } => DecodedObject::Instance {
-                    type_arguments: type_arguments.clone(),
-                    declaration: declaration + offset,
-                    fields: entries(fields),
-                    original_len: *original_len,
-                },
-                DecodedObject::Cell(value) => DecodedObject::Cell(shift(value)),
-                other => other.clone(),
-            });
-        }
-        self.limited |= snapshot.limited;
-        Ok(shift(root))
-    }
-
-    fn finish(self, root: DecodedValue) -> DecodedSnapshot {
-        DecodedSnapshot {
-            id: SnapshotId::from_bytes([0; 16]),
-            limited: self.limited,
-            root: DecodedRoot::Value(root),
-            objects: self.objects,
-        }
-    }
-}
+type Loaded<'h> = Result<(Arc<DecodedBlob>, Cow<'h, [Segment]>), &'static str>;
 
 /// Where the functions find the current query's context.
 pub type ContextSlot = Arc<Mutex<Option<Arc<QueryContext>>>>;
@@ -820,7 +719,7 @@ fn u64_from_blob(bytes: &[u8]) -> Option<u64> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    btel_reader::discovery::hex(bytes)
+    btel_core::reader::discovery::hex(bytes)
 }
 
 /// Clock facts from view columns: conversion (NULL multiplier means the
@@ -1023,6 +922,19 @@ pub fn register(conn: &Connection, slot: &ContextSlot) -> rusqlite::Result<()> {
         Ok(Some(current(&s)?.resolve(handle)?.1.label()))
     })?;
     let s = slot.clone();
+    conn.create_scalar_function("__btel_code", 1, io, move |ctx| {
+        let Some(handle) = opt_blob(ctx, 0)? else {
+            return Ok(None);
+        };
+        let cx = current(&s)?;
+        Ok(cx
+            .with_nav(handle, |nav| match nav {
+                Nav::Value(found) => value::render_code(&*cx, found, &cx.limits.render),
+                Nav::Arguments(_) | Nav::Missing | Nav::Unavailable(_) => None,
+            })?
+            .flatten())
+    })?;
+    let s = slot.clone();
     conn.create_scalar_function("__btel_is_null", 1, io, move |ctx| {
         let Some(handle) = opt_blob(ctx, 0)? else {
             // No capture at all: null-like.
@@ -1083,7 +995,7 @@ pub fn register(conn: &Connection, slot: &ContextSlot) -> rusqlite::Result<()> {
         let context = current(&s)?;
         let result = context.with_value(left, |a| {
             context.with_value(right, |b| {
-                equality::captured(a, op, b, &context.limits.comparison)
+                equality::captured(&*context, a, op, b, &context.limits.comparison)
             })
         })?;
         let result = match result {
@@ -1108,7 +1020,7 @@ pub fn register(conn: &Connection, slot: &ContextSlot) -> rusqlite::Result<()> {
         })?;
         let context = current(&s)?;
         let result = context.with_value(handle, |left| {
-            equality::json(left, op, &json, &context.limits.comparison)
+            equality::json(&*context, left, op, &json, &context.limits.comparison)
         })?;
         context.check_deadline()?;
         Ok(comparison_result(&context, handle, result))
@@ -1120,36 +1032,28 @@ pub fn register(conn: &Connection, slot: &ContextSlot) -> rusqlite::Result<()> {
         };
         current(&s)?.state(handle)
     })?;
-    let s = slot.clone();
-    conn.create_scalar_function("__btel_body_text", 1, io, move |ctx| {
-        let Some(cas) = opt_blob(ctx, 0)? else {
-            return Ok(None);
-        };
-        let cas = <[u8; 16]>::try_from(cas).map_err(|_| user_error("invalid CAS id"))?;
-        current(&s)?.body_text(cas)
-    })?;
     register_identity_and_time(conn)?;
     register_final_tables(conn)?;
     let _ = Null;
     Ok(())
 }
 
-/// A profiler node's identity: its parent's, the name of the function it
-/// reached and the edge that reached it (1 call, 2 spawn). The same code
-/// reached the same way has the same node in every process.
-pub(crate) fn node_hash(parent: Option<i64>, name: &str, edge: i64) -> i64 {
-    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    match parent {
-        None => hasher.update(&[0]),
-        Some(parent) => {
-            hasher.update(&[1]);
-            hasher.update(&parent.to_be_bytes());
-        }
-    }
-    hasher.update(&(name.len() as u64).to_be_bytes());
-    hasher.update(name.as_bytes());
-    hasher.update(&edge.to_be_bytes());
-    hasher.digest().cast_signed()
+/// A stored usage entry as a column value's map.
+fn usage_inline(entry: &crate::usage::ModelUsage) -> Inline {
+    let int = |n: Option<i64>| n.map_or(Inline::Null, Inline::Int);
+    Inline::Map(vec![
+        ("provider".into(), Inline::Text(entry.provider.clone())),
+        (
+            "model".into(),
+            entry.model.clone().map_or(Inline::Null, Inline::Text),
+        ),
+        ("calls".into(), Inline::Int(entry.calls)),
+        ("input_tokens".into(), int(entry.input_tokens)),
+        ("output_tokens".into(), int(entry.output_tokens)),
+        ("cache_read_tokens".into(), int(entry.cache_read_tokens)),
+        ("cache_write_tokens".into(), int(entry.cache_write_tokens)),
+        ("reasoning_tokens".into(), int(entry.reasoning_tokens)),
+    ])
 }
 
 /// A value the index builds rather than reads from the CAS.
@@ -1157,20 +1061,24 @@ pub(crate) fn node_hash(parent: Option<i64>, name: &str, edge: i64) -> i64 {
 pub(crate) enum Inline {
     Null,
     Int(i64),
-    Float(f64),
     Text(String),
     Map(Vec<(String, Inline)>),
     List(Vec<Inline>),
 }
 
-/// An inline value's handle: its snapshot travels inside the handle.
+/// An inline value's handle: its snapshot travels inside the handle, which
+/// carries one blob, so the value is kept whole.
 pub(crate) fn inline_handle(value: &Inline) -> Vec<u8> {
-    let pool = btel_snapshot::SnapshotPool::new(1, btel_snapshot::Limits::default());
+    let pool = btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default());
     let mut builder = pool.try_acquire().expect("a fresh pool has a slot");
     let root = build_inline(&mut builder, value);
-    let snapshot = builder.finish_value(root);
+    let mut whole = btel_snapshot::Shaper::new(btel_snapshot::ShapePolicy::Whole);
+    let snapshot = builder.finish(root, &mut whole);
     let mut blob = Vec::new();
-    snapshot.write_blob(&mut blob).expect("writing to memory");
+    snapshot
+        .root_blob()
+        .write(&mut btel_snapshot::BlobScratch::default(), &mut blob)
+        .expect("writing to memory");
     Handle {
         kind: INLINE,
         pending: false,
@@ -1182,166 +1090,37 @@ pub(crate) fn inline_handle(value: &Inline) -> Vec<u8> {
     .encode()
 }
 
-/// Children first: each container's values form one contiguous range.
+/// Children first: a container's items are written in one run.
 fn build_inline(b: &mut btel_snapshot::Builder, value: &Inline) -> btel_snapshot::SnapshotValue {
-    use btel_snapshot::{Limit, OwnedType, SnapshotObject, SnapshotValue};
-    let text = |b: &mut btel_snapshot::Builder, text: &str| {
-        b.string(&btel_snapshot::BexStr::from(text)).map_or(
-            SnapshotValue::Truncated(Limit::Bytes),
-            SnapshotValue::String,
-        )
-    };
-    match value {
-        Inline::Null => SnapshotValue::Null,
-        Inline::Int(n) => SnapshotValue::Int(*n),
-        Inline::Float(f) => SnapshotValue::Float(*f),
-        Inline::Text(t) => text(b, t),
+    use btel_snapshot::{BexStr, Limit, OwnedType, SnapshotValue};
+    let object = match value {
+        Inline::Null => return SnapshotValue::Null,
+        Inline::Int(n) => return SnapshotValue::Int(*n),
+        Inline::Text(text) => return b.leaves().string_value(&BexStr::from(text.as_str())),
         Inline::Map(entries) => {
             let values: Vec<SnapshotValue> =
                 entries.iter().map(|(_, v)| build_inline(b, v)).collect();
-            let Some(id) = b.reserve_object() else {
-                return SnapshotValue::Truncated(Limit::Objects);
-            };
-            let key_type = b.push_type(OwnedType::string());
-            let value_type = b.push_type(OwnedType::unknown());
-            let start = b.entry_start();
-            b.reserve_entries(entries.len().min(b.remaining_entries()));
-            for ((key, _), value) in entries.iter().zip(values) {
-                if b.remaining_entries() == 0 || !b.content(key.len(), false) {
-                    break;
-                }
-                b.entry(&btel_snapshot::BexStr::from(key.as_str()), value);
-            }
-            let range = b.entry_range(start);
-            b.set_object(
-                id,
-                SnapshotObject::Map {
-                    key_type,
-                    value_type,
-                    entries: range,
-                    original_len: entries.len(),
+            let key_type = b.leaves().ty(OwnedType::string());
+            let value_type = b.leaves().ty(OwnedType::unknown());
+            b.map(
+                key_type,
+                value_type,
+                entries.iter().zip(values),
+                |leaves, ((key, _), value)| {
+                    (leaves.string_value(&BexStr::from(key.as_str())), value)
                 },
-            );
-            SnapshotValue::Object(id)
+            )
         }
         Inline::List(items) => {
             let values: Vec<SnapshotValue> = items.iter().map(|v| build_inline(b, v)).collect();
-            let Some(id) = b.reserve_object() else {
-                return SnapshotValue::Truncated(Limit::Objects);
-            };
-            let element_type = b.push_type(OwnedType::unknown());
-            let start = b.value_start();
-            b.reserve_values(values.len().min(b.remaining_values()));
-            for value in values {
-                if b.remaining_values() == 0 {
-                    break;
-                }
-                b.push_value(value);
-            }
-            let range = b.value_range(start);
-            b.set_object(
-                id,
-                SnapshotObject::List {
-                    element_type,
-                    items: range,
-                    original_len: items.len(),
-                },
-            );
-            SnapshotValue::Object(id)
+            let element_type = b.leaves().ty(OwnedType::unknown());
+            b.list(element_type, values.into_iter(), |_, value| value)
         }
-    }
-}
-
-/// Model usage summed per span: `(model, input, output, cache_read,
-/// cache_write, reasoning)` rows in, one `temporary_projections` map out.
-#[derive(Default)]
-struct Usage {
-    /// Model turns recorded against the span.
-    calls: i64,
-    models: Vec<String>,
-    unnamed: bool,
-    input: i64,
-    output: i64,
-    cache_read: Option<i64>,
-    cache_write: Option<i64>,
-    reasoning: Option<i64>,
-    /// `None` once any turn's model has no price.
-    cost: Option<f64>,
-}
-
-struct UsageSum;
-impl Aggregate<Option<Usage>, Option<Vec<u8>>> for UsageSum {
-    fn init(&self, _: &mut Context<'_>) -> rusqlite::Result<Option<Usage>> {
-        Ok(None)
-    }
-    fn step(&self, ctx: &mut Context<'_>, acc: &mut Option<Usage>) -> rusqlite::Result<()> {
-        let model: Option<String> = ctx.get(0)?;
-        let input = opt_i64(ctx, 1)?.unwrap_or(0);
-        let output = opt_i64(ctx, 2)?.unwrap_or(0);
-        let (cache_read, cache_write, reasoning) =
-            (opt_i64(ctx, 3)?, opt_i64(ctx, 4)?, opt_i64(ctx, 5)?);
-        let usage = acc.get_or_insert_with(|| Usage {
-            cost: Some(0.0),
-            ..Usage::default()
-        });
-        let add = |sum: Option<i64>, n: Option<i64>| match (sum, n) {
-            (sum, None) => sum,
-            (sum, Some(n)) => Some(sum.unwrap_or(0).saturating_add(n)),
-        };
-        usage.cost = usage
-            .cost
-            .zip(crate::pricing::cost(
-                model.as_deref(),
-                input,
-                output,
-                cache_read,
-                cache_write,
-            ))
-            .map(|(a, b)| a + b);
-        match model {
-            Some(model) if !usage.models.contains(&model) => usage.models.push(model),
-            Some(_) => {}
-            None => usage.unnamed = true,
-        }
-        usage.calls += 1;
-        usage.input = usage.input.saturating_add(input);
-        usage.output = usage.output.saturating_add(output);
-        usage.cache_read = add(usage.cache_read, cache_read);
-        usage.cache_write = add(usage.cache_write, cache_write);
-        usage.reasoning = add(usage.reasoning, reasoning);
-        Ok(())
-    }
-    fn finalize(
-        &self,
-        _: &mut Context<'_>,
-        acc: Option<Option<Usage>>,
-    ) -> rusqlite::Result<Option<Vec<u8>>> {
-        let Some(usage) = acc.flatten() else {
-            return Ok(None);
-        };
-        let int = |n: Option<i64>| n.map_or(Inline::Null, Inline::Int);
-        let model = if usage.models.is_empty() {
-            Inline::Null
-        } else {
-            Inline::Text(usage.models.join(", "))
-        };
-        Ok(Some(inline_handle(&Inline::Map(vec![
-            ("model_name".into(), model),
-            ("model_calls".into(), Inline::Int(usage.calls)),
-            ("input_tokens".into(), Inline::Int(usage.input)),
-            ("output_tokens".into(), Inline::Int(usage.output)),
-            ("cache_read_tokens".into(), int(usage.cache_read)),
-            ("cache_write_tokens".into(), int(usage.cache_write)),
-            ("reasoning_tokens".into(), int(usage.reasoning)),
-            (
-                "cost".into(),
-                usage
-                    .cost
-                    .filter(|_| !usage.unnamed)
-                    .map_or(Inline::Null, Inline::Float),
-            ),
-        ]))))
-    }
+    };
+    b.leaves().object(object).map_or(
+        SnapshotValue::Truncated(Limit::Objects),
+        SnapshotValue::Object,
+    )
 }
 
 /// A network span's events, `(at_ticks, seq, name, timestamp, payload_cas)`
@@ -1392,31 +1171,6 @@ impl Aggregate<Vec<(Option<i64>, i64, Event)>, Vec<u8>> for EventList {
     }
 }
 
-/// `%XX` escapes decoded; a malformed one is kept as it is.
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let escaped = (bytes[at] == b'%')
-            .then(|| bytes.get(at + 1..at + 3))
-            .flatten()
-            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
-            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
-        match escaped {
-            Some(byte) => {
-                out.push(byte);
-                at += 3;
-            }
-            None => {
-                out.push(bytes[at]);
-                at += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn utc_text(ns: Option<i64>) -> Option<String> {
     ns.and_then(|ns| format_unix_ns(i128::from(ns)))
 }
@@ -1434,6 +1188,18 @@ fn register_final_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function("__btel_empty_map", 0, pure, |_| {
         Ok(inline_handle(&Inline::Map(Vec::new())))
     })?;
+    // A stored usage list as a column value: one map per provider and model,
+    // in the stored order. NULL is the empty list.
+    conn.create_scalar_function("__btel_usage_value", 1, pure, |ctx| {
+        let usage = match ctx.get::<Option<String>>(0)? {
+            Some(text) => crate::usage::parse(&text)
+                .map_err(|e| user_error(&format!("invalid stored usage: {e}")))?,
+            None => Vec::new(),
+        };
+        Ok(inline_handle(&Inline::List(
+            usage.iter().map(usage_inline).collect(),
+        )))
+    })?;
     // `(started_ns, final status or NULL, ended_ns)`: running, then the end.
     conn.create_scalar_function("__btel_status_history", 3, pure, |ctx| {
         let entry = |status: &str, ns: Option<i64>| {
@@ -1450,22 +1216,6 @@ fn register_final_tables(conn: &Connection) -> rusqlite::Result<()> {
             history.push(entry(&status, opt_i64(ctx, 2)?));
         }
         Ok(inline_handle(&Inline::List(history)))
-    })?;
-    conn.create_aggregate_function("__btel_usage", 6, pure, UsageSum)?;
-    // `(url, marker)`: the path segment right after the first `marker`, up
-    // to the next '/', ':', '?' or '#', percent-decoded. The model in
-    // `.../models/gemini-2.5-pro:generateContent` or `/model/<id>/converse`.
-    conn.create_scalar_function("__btel_path_segment", 2, pure, |ctx| {
-        let (Some(url), Some(marker)) =
-            (ctx.get::<Option<String>>(0)?, ctx.get::<Option<String>>(1)?)
-        else {
-            return Ok(None);
-        };
-        let Some((_, rest)) = url.split_once(marker.as_str()) else {
-            return Ok(None);
-        };
-        let segment = rest.split(['/', ':', '?', '#']).next().unwrap_or_default();
-        Ok((!segment.is_empty()).then(|| percent_decode(segment)))
     })?;
     conn.create_aggregate_function("__btel_events", 5, pure, EventList)
 }

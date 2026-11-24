@@ -1,154 +1,166 @@
 use std::mem::size_of;
 
 use baml_type::{DeclarationName, Name, Package};
+use num_bigint::BigInt;
 
-use crate::{OwnedType, Snapshot, SnapshotObject, Storage, TypeIdentity};
+use crate::{OwnedType, Snapshot, TypeIdentity, pool::Storage, walk::bigint_limb_bytes};
 
 impl Snapshot {
-    /// Conservative retained allocation bytes for this snapshot, including its
-    /// owner, arena capacities, and heap-backed leaves. Shared backing is charged
-    /// in full for every reference. The shared pool infrastructure and idle
-    /// storage, allocator metadata, and transient encoding buffers are excluded.
+    /// Allocation bytes this snapshot retains, including its owner, arena
+    /// capacities, and heap-backed leaves. Shared backing is charged in full
+    /// for every reference. The shared pool infrastructure and idle storage,
+    /// allocator metadata, and transient encoding buffers are excluded.
     ///
-    /// Returns `None` on overflow or when backing cannot be bounded through safe
-    /// APIs. In particular, `num_bigint::BigInt` hides its limb capacity, so both
-    /// bigint values and bigint type literals are unaccountable. Bounded delivery
-    /// must reject these snapshots, not treat `None` as zero or logical size.
-    pub fn retained_bytes(&self) -> Option<usize> {
-        let s = &self.0;
-        if !s.bigints.is_empty() {
-            return None;
-        }
-        let mut bytes = size_of::<Self>().checked_add(size_of::<Storage>())?;
-        macro_rules! arena {
-            ($($field:ident),+ $(,)?) => {
-                $(bytes = bytes.checked_add(capacity_bytes(&s.$field)?)?;)+
-            };
-        }
-        arena!(
-            values,
-            objects,
-            entries,
-            bytes,
-            strings,
-            bigints,
-            types,
-            string_hashes,
-            bigint_hashes,
-            type_hashes,
-            object_hashes,
-        );
-        for string in &s.strings {
-            bytes = bytes.checked_add(string.retained_heap_bytes()?)?;
-        }
-        for entry in &s.entries {
-            bytes = bytes.checked_add(entry.key.retained_heap_bytes()?)?;
-        }
-        for object in &s.objects {
-            if let SnapshotObject::Declaration { name, .. } = object {
-                bytes = bytes.checked_add(declaration_bytes(name)?)?;
-            }
-        }
-        for ty in &s.types {
-            bytes = bytes.checked_add(type_bytes(ty)?)?;
-        }
-        Some(bytes)
+    /// Conservative except for bigints, as values or as type literals:
+    /// `num_bigint::BigInt` hides its spare capacity, so one is charged its
+    /// limbs. Saturates on overflow.
+    pub fn retained_bytes(&self) -> usize {
+        let storage: &Storage = &self.0;
+        let graph = &storage.graph;
+        let leaves = graph
+            .strings
+            .iter()
+            .chain(graph.labels.iter())
+            .map(string_bytes)
+            .chain(graph.fields.iter().map(|entry| string_bytes(&entry.key)))
+            .chain(graph.bigints.iter().map(|bigint| {
+                // The shared allocation: its two counts and the bigint.
+                (2 * size_of::<usize>() + size_of::<BigInt>())
+                    .saturating_add(bigint_limb_bytes(&bigint.value))
+            }))
+            .chain(
+                graph
+                    .names
+                    .iter()
+                    .map(|declared| declaration_bytes(&declared.name)),
+            )
+            .chain(graph.types.iter().map(|ty| type_bytes(&ty.ty)))
+            .chain(graph.definitions.iter().map(|group| {
+                // The shared allocation: its two counts, the blob and its
+                // bytes and child list.
+                (2 * size_of::<usize>() + size_of::<btel_types::DefinitionBlob>())
+                    .saturating_add(group.bytes().len())
+                    .saturating_add(array_bytes::<usize>(group.children().len()))
+            }));
+        leaves.fold(
+            size_of::<Self>().saturating_add(storage.capacity_bytes()),
+            usize::saturating_add,
+        )
     }
 }
 
-fn capacity_bytes<T>(values: &Vec<T>) -> Option<usize> {
-    array_bytes::<T>(values.capacity())
+impl Snapshot {
+    /// Bytes the capture's items occupy in its arenas, without spare capacity
+    /// or the leaves' own backing.
+    pub fn live_arena_bytes(&self) -> usize {
+        let graph = &self.0.graph;
+        let shape = &self.0.shape;
+        size_of_val(&*graph.objects)
+            + size_of_val(&*graph.values)
+            + size_of_val(&*graph.entries)
+            + size_of_val(&*graph.fields)
+            + size_of_val(&*graph.bytes)
+            + size_of_val(&*graph.strings)
+            + size_of_val(&*graph.labels)
+            + size_of_val(&*graph.bigints)
+            + size_of_val(&*graph.types)
+            + size_of_val(&*graph.names)
+            + size_of_val(&*graph.definitions)
+            + shape.live_bytes()
+    }
 }
 
-fn array_bytes<T>(capacity: usize) -> Option<usize> {
-    capacity.checked_mul(size_of::<T>())
+/// A string's backing, which reports `None` only when its size overflows.
+fn string_bytes(text: &bex_str::BexStr) -> usize {
+    text.retained_heap_bytes().unwrap_or(usize::MAX)
 }
 
-fn name_bytes(name: &Name) -> Option<usize> {
+fn array_bytes<T>(capacity: usize) -> usize {
+    capacity.saturating_mul(size_of::<T>())
+}
+
+fn name_bytes(name: &Name) -> usize {
     // SmolStr 0.3 stores heap names in a tight Arc<str>. Allow its two
     // reference counts and trailing alignment padding; inline/static names
     // can safely be charged the same amount.
     name.len()
-        .checked_add(2 * size_of::<usize>())?
-        .checked_add(std::mem::align_of::<usize>() - 1)
+        .saturating_add(2 * size_of::<usize>())
+        .saturating_add(std::mem::align_of::<usize>() - 1)
 }
 
-fn declaration_bytes(name: &DeclarationName) -> Option<usize> {
+fn declaration_bytes(name: &DeclarationName) -> usize {
     match name {
         DeclarationName::Anonymous(name) => name_bytes(name),
         DeclarationName::Declared(name) => {
-            let mut bytes =
-                capacity_bytes(name.namespace())?.checked_add(name_bytes(name.name())?)?;
-            if let Package::Dep(package) = name.key() {
-                bytes = bytes.checked_add(name_bytes(package)?)?;
-            }
-            for segment in name.namespace() {
-                bytes = bytes.checked_add(name_bytes(segment)?)?;
-            }
-            Some(bytes)
+            let package = if let Package::Dep(package) = name.key() {
+                name_bytes(package)
+            } else {
+                0
+            };
+            name.namespace().iter().map(name_bytes).fold(
+                array_bytes::<Name>(name.namespace().capacity())
+                    .saturating_add(name_bytes(name.name()))
+                    .saturating_add(package),
+                usize::saturating_add,
+            )
         }
     }
 }
 
-fn identity_bytes(identity: &TypeIdentity) -> Option<usize> {
+fn identity_bytes(identity: &TypeIdentity) -> usize {
     match identity {
         TypeIdentity::Resolved(name) => declaration_bytes(name.name()),
-        TypeIdentity::Unresolved(_) => Some(0),
+        TypeIdentity::Unresolved(_) => 0,
+        TypeIdentity::Defined(_) => 0,
     }
 }
 
-fn type_bytes(root: &OwnedType) -> Option<usize> {
+fn type_bytes(root: &OwnedType) -> usize {
     let mut bytes = 0usize;
+    let mut add = |more: usize| bytes = bytes.saturating_add(more);
     let mut pending = vec![root];
     while let Some(ty) = pending.pop() {
         use baml_type::RealizedTy::{
             Bigint, Bool, Class, Enum, EnumVariant, Float, Function, Future, Int, Interface, List,
-            Literal, Map, Media, Never, Null, PromptAst, Resource, RustType, String, Type,
-            TypeAlias, Uint8Array, Union, Unknown, Void,
+            Literal, Map, Media, Never, Null, PromptAst, Resource, String, Tuple, Type, TypeAlias,
+            Uint8Array, Union, Unknown,
         };
         match ty {
-            Int | Bigint | Float | String | Bool | Null | Uint8Array | Media(..) | RustType
-            | Type | Resource | PromptAst | Void | Unknown | Never => {}
-            Literal(literal, ..) => {
-                bytes = bytes.checked_add(match literal {
-                    baml_type::Literal::Bigint(_) => return None,
-                    baml_type::Literal::String(value) | baml_type::Literal::Float(value) => {
-                        value.capacity()
-                    }
-                    baml_type::Literal::Int(_) | baml_type::Literal::Bool(_) => 0,
-                })?;
-            }
-            Enum(identity) | TypeAlias(identity) => {
-                bytes = bytes.checked_add(identity_bytes(identity)?)?;
-            }
+            Int | Bigint | Float | String | Bool | Null | Uint8Array | Media(..) | Type
+            | Resource | PromptAst | Unknown | Never => {}
+            Literal(literal, ..) => add(match literal {
+                baml_type::Literal::Bigint(value) => bigint_limb_bytes(value),
+                baml_type::Literal::String(value) | baml_type::Literal::Float(value) => {
+                    value.capacity()
+                }
+                baml_type::Literal::Int(_) | baml_type::Literal::Bool(_) => 0,
+            }),
+            Enum(identity) | TypeAlias(identity) => add(identity_bytes(identity)),
             EnumVariant(identity, name) => {
-                bytes = bytes
-                    .checked_add(identity_bytes(identity)?)?
-                    .checked_add(name_bytes(name)?)?;
+                add(identity_bytes(identity));
+                add(name_bytes(name));
             }
             Class(identity, args) => {
-                bytes = bytes
-                    .checked_add(identity_bytes(identity)?)?
-                    .checked_add(args.len().checked_mul(size_of::<OwnedType>())?)?;
+                add(identity_bytes(identity));
+                add(array_bytes::<OwnedType>(args.len()));
                 pending.extend(args.iter());
             }
             Interface(identity, args, bindings) => {
-                bytes = bytes
-                    .checked_add(identity_bytes(identity)?)?
-                    .checked_add(args.len().checked_mul(size_of::<OwnedType>())?)?
-                    .checked_add(bindings.len().checked_mul(size_of::<(Name, OwnedType)>())?)?;
+                add(identity_bytes(identity));
+                add(array_bytes::<OwnedType>(args.len()));
+                add(array_bytes::<(Name, OwnedType)>(bindings.len()));
                 pending.extend(args.iter());
                 for (name, ty) in bindings {
-                    bytes = bytes.checked_add(name_bytes(name)?)?;
+                    add(name_bytes(name));
                     pending.push(ty);
                 }
             }
-            Union(args) => {
-                bytes = bytes.checked_add(args.len().checked_mul(size_of::<OwnedType>())?)?;
+            Union(args) | Tuple(args) => {
+                add(array_bytes::<OwnedType>(args.len()));
                 pending.extend(args.iter());
             }
             List(inner) => {
-                bytes = bytes.checked_add(size_of::<OwnedType>())?;
+                add(size_of::<OwnedType>());
                 pending.push(inner);
             }
             Map {
@@ -157,7 +169,7 @@ fn type_bytes(root: &OwnedType) -> Option<usize> {
                 ..
             }
             | Future(left, right) => {
-                bytes = bytes.checked_add(2usize.checked_mul(size_of::<OwnedType>())?)?;
+                add(array_bytes::<OwnedType>(2));
                 pending.extend([left.as_ref(), right.as_ref()]);
             }
             Function {
@@ -166,22 +178,21 @@ fn type_bytes(root: &OwnedType) -> Option<usize> {
                 throws,
                 ..
             } => {
-                bytes = bytes
-                    .checked_add(params.len().checked_mul(size_of::<
-                        baml_type::RealizedFunctionParamTy<TypeIdentity>,
-                    >())?)?
-                    .checked_add(2usize.checked_mul(size_of::<OwnedType>())?)?;
+                add(array_bytes::<
+                    baml_type::RealizedFunctionParamTy<TypeIdentity>,
+                >(params.len()));
+                add(array_bytes::<OwnedType>(2));
                 pending.extend([ret.as_ref(), throws.as_ref()]);
                 for param in params {
                     if let Some(name) = &param.name {
-                        bytes = bytes.checked_add(name_bytes(name)?)?;
+                        add(name_bytes(name));
                     }
                     pending.push(&param.ty);
                 }
             }
         }
     }
-    Some(bytes)
+    bytes
 }
 
 #[cfg(test)]
@@ -192,61 +203,78 @@ mod tests {
     fn scalar(pool: &SnapshotPool) -> Snapshot {
         pool.try_acquire()
             .unwrap()
-            .finish_value(SnapshotValue::Null)
+            .finish(SnapshotValue::Null, &mut crate::Shaper::default())
     }
 
     #[test]
     fn accounts_unused_arena_capacity() {
-        let pool = SnapshotPool::new(1, Limits::default());
+        let pool = SnapshotPool::unbounded(Limits::default());
         let mut snapshot = scalar(&pool);
-        let before = snapshot.retained_bytes().unwrap();
-        let old_capacity = snapshot.0.bytes.capacity();
-        snapshot.0.bytes.reserve(old_capacity + 4096);
-        assert_eq!(
-            snapshot.retained_bytes().unwrap() - before,
-            snapshot.0.bytes.capacity() - old_capacity,
-        );
-        assert!(before > snapshot.live_arena_bytes());
+        let before = snapshot.retained_bytes();
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        let old_capacity = graph.bytes.capacity_bytes();
+        graph.bytes.reserve(old_capacity + 4096, meter);
+        let grown = graph.bytes.capacity_bytes() - old_capacity;
+        assert!(grown >= 4096);
+        assert_eq!(snapshot.retained_bytes() - before, grown);
     }
 
     #[test]
     fn accounts_full_shared_slice_parents_for_values_and_keys() {
-        let pool = SnapshotPool::new(1, Limits::default());
+        let pool = SnapshotPool::unbounded(Limits::default());
         let source = bex_str::BexStr::from("a".repeat(100_000));
-        let slice = source.substring(0, 100);
+        let slice = source.byte_slice(0..100);
         let mut snapshot = scalar(&pool);
-        snapshot.0.strings.reserve(1);
-        snapshot.0.entries.reserve(1);
-        let before = snapshot.retained_bytes().unwrap();
-        snapshot.0.strings.push(slice.clone());
-        snapshot.0.entries.push(crate::MapEntry {
-            key: slice,
-            value: SnapshotValue::Null,
-        });
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        graph.strings.reserve(1, meter);
+        graph.fields.reserve(1, meter);
+        let before = snapshot.retained_bytes();
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        graph.strings.push(slice.clone(), meter);
+        graph.fields.push(
+            crate::FieldEntry {
+                key: slice,
+                value: SnapshotValue::Null,
+            },
+            meter,
+        );
         assert_eq!(
-            snapshot.retained_bytes().unwrap() - before,
-            2 * source.retained_heap_bytes().unwrap(),
+            snapshot.retained_bytes() - before,
+            2 * string_bytes(&source),
         );
     }
 
     #[test]
-    fn refuses_bigints_even_when_logical_value_is_small() {
-        let pool = SnapshotPool::new(1, Limits::default());
-        let mut builder = pool.try_acquire().unwrap();
-        let id = builder
-            .bigint(&std::sync::Arc::new(num_bigint::BigInt::from(0)))
-            .unwrap();
-        assert!(
-            builder
-                .finish_value(SnapshotValue::Bigint(id))
-                .retained_bytes()
-                .is_none()
+    fn a_bigint_is_charged_its_limbs_as_a_value_and_as_a_type_literal() {
+        let pool = SnapshotPool::unbounded(Limits::default());
+        let before = scalar(&pool).retained_bytes();
+        // 200 bits: four limbs of eight bytes.
+        let big = num_bigint::BigInt::from(1) << 199_u32;
+        let mut snapshot = scalar(&pool);
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        graph.bigints.reserve(1, meter);
+        let reserved = snapshot.retained_bytes();
+        assert!(reserved > before);
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        graph.bigints.push(
+            crate::graph::Bigint {
+                digest: crate::hash::bigint(&big),
+                value: std::sync::Arc::new(big.clone()),
+            },
+            meter,
+        );
+        assert_eq!(
+            snapshot.retained_bytes() - reserved,
+            2 * size_of::<usize>() + size_of::<BigInt>() + 32,
         );
         let literal = OwnedType::Literal(
-            baml_type::Literal::Bigint(num_bigint::BigInt::from(0)),
+            baml_type::Literal::Bigint(big),
             baml_type::Freshness::Regular,
         );
-        assert!(type_bytes(&OwnedType::list(literal)).is_none());
+        assert_eq!(
+            type_bytes(&OwnedType::list(literal)),
+            size_of::<OwnedType>() + 32
+        );
     }
 
     #[test]
@@ -258,7 +286,7 @@ mod tests {
             baml_type::Literal::String(value),
             baml_type::Freshness::Regular,
         ));
-        assert_eq!(type_bytes(&ty), Some(size_of::<OwnedType>() + capacity));
+        assert_eq!(type_bytes(&ty), size_of::<OwnedType>() + capacity);
     }
 
     #[test]
@@ -271,23 +299,28 @@ mod tests {
             namespace,
             Name::new("t".repeat(1000)),
         ));
-        assert!(declaration_bytes(&declaration).unwrap() >= capacity * size_of::<Name>() + 3000);
-        let pool = SnapshotPool::new(1, Limits::default());
+        assert!(declaration_bytes(&declaration) >= capacity * size_of::<Name>() + 3000);
+        let pool = SnapshotPool::unbounded(Limits::default());
         let mut snapshot = scalar(&pool);
-        snapshot.0.objects.reserve(1);
-        let before = snapshot.retained_bytes().unwrap();
-        let charge = declaration_bytes(&declaration).unwrap();
-        snapshot.0.objects.push(SnapshotObject::Declaration {
-            name: declaration,
-            tag: baml_type::typetag::TypeTag::of_static_index(0),
-            is_enum: false,
-        });
-        assert_eq!(snapshot.retained_bytes().unwrap() - before, charge);
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        graph.names.reserve(1, meter);
+        let before = snapshot.retained_bytes();
+        let charge = declaration_bytes(&declaration);
+        let Storage { graph, meter, .. } = &mut *snapshot.0;
+        graph.names.push(
+            crate::graph::Declared {
+                name: declaration,
+                definition: None,
+            },
+            meter,
+        );
+        assert_eq!(snapshot.retained_bytes() - before, charge);
     }
 
     #[test]
-    fn checked_array_size_rejects_overflow() {
-        assert_eq!(array_bytes::<u64>(usize::MAX), None);
-        assert_eq!(array_bytes::<u8>(usize::MAX), Some(usize::MAX));
+    fn an_array_size_saturates() {
+        assert_eq!(array_bytes::<u64>(usize::MAX), usize::MAX);
+        assert_eq!(array_bytes::<u8>(usize::MAX), usize::MAX);
+        assert_eq!(array_bytes::<u64>(3), 24);
     }
 }

@@ -11,15 +11,23 @@ use baml_compiler2_hir::{
         interface_data, let_data,
     },
     loc::{DeclRef, FunctionLoc, LetLoc},
+    package::edge_table,
 };
-use baml_compiler2_hir_ty::{lower::qualify_def, package_interface::export_interface};
-use baml_compiler2_mir::{RuntimeLowering, definition_link_name};
+use baml_compiler2_hir_ty::{
+    cleanup::{CleanupMethod, cleanup_method},
+    lower::qualify_def,
+    package_interface::{COMPILER_VERSION, export_interface, interface_digest},
+};
+use baml_compiler2_mir::{RuntimeLowering, definition_display_name};
 use baml_linker_types::{
     CompilationUnit, EmittedPackage, ExportTable, InitTail, LocalRef, PackageRecord,
     ProgramImplRuleFrag, ProgramMethodImplFrag, SessionInitializer,
 };
 use bex_vm_types::{
     ClassMethodDef, DeclPath, Function, GlobalIndex, Object, ObjectIndex, ObjectPool,
+    identity::{
+        CompilationUnitHasher, PackageInterfaceHash, PackageMetadata, normalize_for_unit_hash,
+    },
 };
 
 use super::{
@@ -33,7 +41,6 @@ use crate::{
         impl_rule_target,
     },
     refs::{LocalTables, Own, PackageRefs, item_path},
-    topological_sort_lets,
 };
 
 /// Everything after the code pass: the backfills that needed the bodies
@@ -73,7 +80,6 @@ pub(super) fn finish<'db>(
     fill_class_methods(db, &files, &tables, &mut classes, &placed);
     let mut refs = refs.attach(db, root, scope.own(&tables));
     let impl_rules = bake_rules(db, root, &files, &offsets, &mut refs);
-    let record = package_record(db, root);
     let (tail, initializers) = match emit_tail(db, class_fields, root, &files, &lets, opt, scope)? {
         Some(parts) => (
             Some(seal_tail(db, (parts.tail, parts.refs))),
@@ -82,25 +88,21 @@ pub(super) fn finish<'db>(
         None => (None, Vec::new()),
     };
 
-    Ok((
-        EmittedPackage {
-            unit: CompilationUnit {
-                dependencies: crate::refs::dependency_locators(db, &refs.deps),
-                classes,
-                enums,
-                interfaces,
-                type_alias_objects: aliases,
-                code: code.into_iter().collect(),
-                object_imports: refs.imports.objects.into_entries(),
-                global_imports: refs.imports.globals.into_entries(),
-                exports,
-                impl_rules,
-            },
-            record,
-            tail,
-        },
-        initializers,
-    ))
+    let unit = CompilationUnit {
+        dependencies: crate::refs::dependency_locators(db, &refs.deps),
+        classes,
+        enums,
+        interfaces,
+        type_alias_objects: aliases,
+        code: code.into_iter().collect(),
+        object_imports: refs.imports.objects.into_entries(),
+        global_imports: refs.imports.globals.into_entries(),
+        exports,
+        impl_rules,
+    };
+    let record = package_record(db, root, &unit, tail.as_ref());
+
+    Ok((EmittedPackage { unit, record, tail }, initializers))
 }
 
 /// Where each compiled function sits in the unit's object space.
@@ -159,15 +161,37 @@ fn fill_interface_defaults<'db>(
                     .iter_mut()
                     .find(|method| method.name == *name)
                     .unwrap_or_else(|| {
-                        unreachable!("interface `{}` declares no method `{name}`", def.name)
+                        unreachable!("interface `{}` declares no method `{name}`", def.path)
                     });
                 method.default = Some(object);
+            }
+            let head = baml_compiler2_hir_ty::lower::interface_qualified_name(db, interface);
+            if let Some(kind) = baml_compiler2_hir_ty::impls::structural_interface(db, &head) {
+                let native = baml_compiler2_hir_ty::callable::lang_function(
+                    db,
+                    baml_base::LangPackage::Baml,
+                    &[],
+                    kind.native_function(),
+                )
+                .expect("a structural interface has its native implementation");
+                let baml_compiler2_hir::loc::DeclRef::Source(native) = native else {
+                    unreachable!("a structural interface and its native body compile together");
+                };
+                def.structural_default = Some(bex_vm_types::types::StructuralDefault {
+                    kind,
+                    function: placed
+                        .get(native)
+                        .expect("the structural native implementation was compiled"),
+                    function_ptr: bex_vm_types::HeapPtr::null(),
+                });
             }
         }
     }
 }
 
-/// Each class's inherent method table, over the bodies this unit compiled.
+/// Each class's inherent method table, over the bodies this unit compiled,
+/// and the position of its BEP-042 finalizer in that table — the checker
+/// decides which method is the finalizer; this records where it sits.
 fn fill_class_methods<'db>(
     db: &'db dyn crate::Db,
     files: &[SourceFile],
@@ -183,15 +207,23 @@ fn fill_class_methods<'db>(
             };
             for &method in &class_data(db, class).methods {
                 let Some(function) = placed.get(method) else {
+                    debug_assert!(
+                        cleanup_method(db, method) != Some(CleanupMethod::Finalizer),
+                        "a class's finalizer is a method this unit placed"
+                    );
                     continue;
                 };
-                object.methods.insert(
+                let (position, _) = object.methods.insert_full(
                     function_data(db, method).name.clone(),
                     ClassMethodDef {
                         function,
                         function_ptr: bex_vm_types::HeapPtr::null(),
                     },
                 );
+                if cleanup_method(db, method) == Some(CleanupMethod::Finalizer) {
+                    debug_assert!(object.cleanup.is_none(), "a class has one finalizer");
+                    object.cleanup = Some(position);
+                }
             }
         }
     }
@@ -259,8 +291,13 @@ fn seal_tail(db: &dyn crate::Db, (mut tail, tail_refs): (InitTail, RefTables)) -
 }
 
 /// The whole-package product beside the unit: the interface a dependent
-/// compiles against.
-fn package_record(db: &dyn crate::Db, root: SourceRoot) -> PackageRecord {
+/// compiles against, and what the compile records about the package.
+fn package_record(
+    db: &dyn crate::Db,
+    root: SourceRoot,
+    unit: &CompilationUnit,
+    tail: Option<&InitTail>,
+) -> PackageRecord {
     // Runtime compilers already own the exact stdlib sources, so only
     // mountable packages need to carry a serialized compiler surface.
     let interface_blob = if root.kind(db) == SourceRootKind::Stdlib {
@@ -272,7 +309,53 @@ fn package_record(db: &dyn crate::Db, root: SourceRoot) -> PackageRecord {
         )
         .expect("PackageInterface artifact serialization into Vec is infallible")
     };
-    PackageRecord { interface_blob }
+    PackageRecord {
+        interface_blob,
+        metadata: Some(package_metadata(db, root, unit, tail)),
+    }
+}
+
+/// `root`'s metadata for this compile (BEP-085): the hash of the interface
+/// its dependents bind, the hash of the output emitted here, the interfaces
+/// it reaches, and its claim.
+fn package_metadata(
+    db: &dyn crate::Db,
+    root: SourceRoot,
+    unit: &CompilationUnit,
+    tail: Option<&InitTail>,
+) -> PackageMetadata {
+    let package_interface = PackageInterfaceHash(interface_digest(db, root));
+    // Hashed in a normalized form, which costs a copy of the output.
+    let mut content = (unit.clone(), tail.cloned());
+    for objects in [
+        &mut content.0.classes,
+        &mut content.0.enums,
+        &mut content.0.interfaces,
+        &mut content.0.type_alias_objects,
+        &mut content.0.code,
+    ] {
+        normalize_for_unit_hash(objects);
+    }
+    if let Some(tail) = &mut content.1 {
+        normalize_for_unit_hash(&mut tail.objects);
+    }
+    let mut hasher = CompilationUnitHasher::new(package_interface);
+    borsh::BorshSerialize::serialize(&content, &mut hasher)
+        .unwrap_or_else(|_| unreachable!("hashing a compiled package cannot fail"));
+    let mut dependencies = Vec::new();
+    for &(_, dependency) in edge_table(db, root) {
+        let reached = PackageInterfaceHash(interface_digest(db, dependency));
+        if !dependencies.contains(&reached) {
+            dependencies.push(reached);
+        }
+    }
+    PackageMetadata {
+        compilation_unit_hash: hasher.finish(),
+        package_interface,
+        dependencies,
+        claimed: root.claim(db),
+        compiler_version: COMPILER_VERSION.to_owned(),
+    }
 }
 
 /// A tail before its tables are sealed, with what a submission's tail
@@ -308,37 +391,31 @@ fn emit_tail<'db>(
         (index, slot)
     };
 
-    // The init part: one helper per `let` in dependency order, then `$init`.
-    let bindings: Vec<(String, LetLoc<'db>, SourceFile)> = lets
-        .iter()
-        .map(|&binding| {
-            (
-                definition_link_name(db, Definition::Let(binding)),
-                binding,
-                binding.file(db),
-            )
-        })
-        .collect();
-    let sorted = topological_sort_lets(db, &bindings)?;
+    // The init part: one helper per `let` in dependency order (see
+    // `baml_compiler2_hir_ty::globals`), then `$init`. A cycle is a reported
+    // compile error; its members are still placed, so emit never fails on one.
+    let sorted: Vec<(String, LetLoc<'db>)> =
+        baml_compiler2_hir_ty::globals::plan_global_init(db, lets)
+            .order
+            .into_iter()
+            .map(|binding| {
+                (
+                    definition_display_name(db, Definition::Let(binding)),
+                    binding,
+                )
+            })
+            .collect();
     let mut init = None;
     let mut initializers = Vec::new();
     if !sorted.is_empty() {
         let mut steps = Vec::with_capacity(sorted.len());
-        for (ordinal, (fq_name, binding, _)) in sorted.iter().enumerate() {
-            let helper = compile_let_helper(
-                db,
-                *binding,
-                ordinal,
-                &mut refs,
-                class_fields,
-                &mut objects,
-                0,
-                opt,
-            )?;
+        for (fq_name, binding) in &sorted {
+            let helper =
+                compile_let_helper(db, *binding, &mut refs, class_fields, &mut objects, 0, opt)?;
             let (_, helper_slot) = pool(&mut objects, &mut slot_objects, helper);
             match scope {
                 Scope::Package => {
-                    let target = refs.let_global(*binding);
+                    let target = refs.let_global(DeclRef::Source(*binding));
                     steps.push(InitStep {
                         helper: GlobalIndex::from_raw(helper_slot as usize),
                         target,

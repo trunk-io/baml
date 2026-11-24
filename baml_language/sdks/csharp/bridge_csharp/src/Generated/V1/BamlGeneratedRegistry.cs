@@ -18,19 +18,26 @@ public interface IBamlGeneratedCodec<T>
     T Decode(BamlGeneratedCodecContext context, BamlGeneratedValue value);
 }
 
+/// <summary>
+/// What one encode may spend. How deep a value may nest is the wire's to say,
+/// and the encoder measures it exactly once the value is built; this budget
+/// only keeps the codecs' own recursion on the stack, refuses a cyclic graph
+/// and bounds the node count.
+/// </summary>
 internal sealed class BamlGeneratedEncodeBudget
 {
     private readonly HashSet<object> activeReferences =
         new(ReferenceEqualityComparer.Instance);
-    private int depth;
     private int nodes;
 
     internal IDisposable Enter<T>(T value, Type declaredType)
     {
         ArgumentNullException.ThrowIfNull(declaredType);
-        if (depth > global::Baml.BamlValueLimits.MaxDepth)
+        // A codec level costs several frames; a graph too deep for the stack
+        // that is left is far deeper than the wire carries.
+        if (!System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
         {
-            throw Limit(declaredType, nameof(global::Baml.BamlValueLimits.MaxDepth));
+            throw Limit(declaredType, "the stack available to encode it");
         }
         if (++nodes > global::Baml.BamlValueLimits.MaxNodes)
         {
@@ -54,16 +61,15 @@ internal sealed class BamlGeneratedEncodeBudget
                 declaredType,
                 "dynamic value",
                 "$",
-                $"The CLR value graph for {declaredType} contains a reference cycle.");
+                $"The CLR value graph for {declaredType} contains a reference cycle.",
+                fault: BamlTypeMappingFault.ExceedsLimit);
         }
 
-        depth++;
         return new Scope(this, tracked ? reference : null);
     }
 
     private void Exit(object? reference)
     {
-        depth--;
         if (reference is not null && !activeReferences.Remove(reference))
         {
             throw new InvalidOperationException(
@@ -76,7 +82,8 @@ internal sealed class BamlGeneratedEncodeBudget
             declaredType,
             "dynamic value",
             "$",
-            $"The CLR value graph exceeded {limit}.");
+            $"The CLR value graph exceeded {limit}.",
+            fault: BamlTypeMappingFault.ExceedsLimit);
 
     private sealed class Scope(BamlGeneratedEncodeBudget owner, object? reference) : IDisposable
     {
@@ -386,6 +393,12 @@ public sealed class BamlGeneratedRegistry
     private readonly IReadOnlyDictionary<Type, TypeDeclaration> genericBindings;
     private readonly IReadOnlyDictionary<Type, GenericTypeFactoryDeclaration> genericTypeFactories;
     private readonly ConcurrentDictionary<Type, IResolvedGeneratedType> dynamicTypes = [];
+    // Slot-built tuple types, keyed by CLR type and declared tuple type:
+    // tuples whose slots erase in C# share a CLR type (`(T, "a")` and
+    // `(T, string)` are both `(T, string)`), so these never enter
+    // `dynamicTypes`.
+    private readonly ConcurrentDictionary<(Type, string), IResolvedGeneratedType> slotTupleTypes = [];
+    private readonly ConcurrentDictionary<int, IResolvedGeneratedType> slotTupleTypesById = [];
     private BamlGeneratedProgram? program;
     private int nextDynamicTypeId;
 
@@ -456,6 +469,60 @@ public sealed class BamlGeneratedRegistry
         }
 
         BamlDynamicCodecRegistry.Register(this, typed, GetCodec(typed));
+        return new BamlGeneratedType<T>(owner, typed);
+    }
+
+    /// <summary>
+    /// The type of a tuple in a generic signature, stated as the tuple of
+    /// <paramref name="slots"/> (each bound by the call): a native
+    /// <c>ValueTuple</c> over the slots. It crosses as the declared tuple
+    /// type, so the engine checks each slot, including one whose BAML type
+    /// erases in C# (a literal is a <c>string</c>, yet its slot token states
+    /// the literal). <paramref name="encode"/> and
+    /// <paramref name="decode"/> convert between <typeparamref name="T"/> and
+    /// one carrier per slot, in slot order.
+    /// </summary>
+    public BamlGeneratedType<T> ResolveTupleType<T>(
+        string position,
+        BamlGeneratedTypeArgument[] slots,
+        Func<BamlGeneratedCodecContext, T, IReadOnlyList<BamlGeneratedValue>> encode,
+        Func<BamlGeneratedCodecContext, IReadOnlyList<BamlGeneratedValue>, T> decode)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(position);
+        ArgumentNullException.ThrowIfNull(slots);
+        ArgumentNullException.ThrowIfNull(encode);
+        ArgumentNullException.ThrowIfNull(decode);
+        var slotMetadata = new byte[slots.Length][];
+        for (int index = 0; index < slots.Length; index++)
+        {
+            slotMetadata[index] = RequireTypeArgumentMetadata(slots[index]);
+        }
+
+        byte[] metadata = BamlGeneratedTypeMetadata.Tuple(slotMetadata);
+        IResolvedGeneratedType resolved = slotTupleTypes.GetOrAdd(
+            (typeof(T), Convert.ToHexString(metadata)),
+            _ =>
+            {
+                var declaration = new TypeDeclaration<T>(
+                    Interlocked.Decrement(ref nextDynamicTypeId),
+                    BamlGeneratedTypeMetadata.Describe(metadata, position),
+                    metadata);
+                var created = new ResolvedGeneratedType<T>(
+                    declaration,
+                    new CodecBox<T>(new BamlGeneratedSlotTupleCodec<T>(
+                        metadata,
+                        slots.Length,
+                        encode,
+                        decode)));
+                slotTupleTypesById[declaration.Id] = created;
+                return created;
+            });
+        if (resolved.Declaration is not TypeDeclaration<T> typed)
+        {
+            throw new InvalidOperationException(
+                $"Generated tuple type resolution for {typeof(T)} is contradictory.");
+        }
+
         return new BamlGeneratedType<T>(owner, typed);
     }
 
@@ -572,7 +639,11 @@ public sealed class BamlGeneratedRegistry
             || (!types.TryGetValue(type.Declaration.Id, out TypeDeclaration? stored)
                 || !ReferenceEquals(stored, type.Declaration))
             && (!dynamicTypes.TryGetValue(typeof(T), out IResolvedGeneratedType? dynamic)
-                || !ReferenceEquals(dynamic.Declaration, type.Declaration)))
+                || !ReferenceEquals(dynamic.Declaration, type.Declaration))
+            && (!slotTupleTypesById.TryGetValue(
+                    type.Declaration.Id,
+                    out IResolvedGeneratedType? slotTuple)
+                || !ReferenceEquals(slotTuple.Declaration, type.Declaration)))
         {
             throw new InvalidOperationException(
                 "The generated type token does not belong to this registry.");
@@ -707,6 +778,13 @@ public sealed class BamlGeneratedRegistry
             && dynamic.Codec is CodecBox<T> dynamicCodec)
         {
             return dynamicCodec;
+        }
+
+        if (slotTupleTypesById.TryGetValue(declaration.Id, out IResolvedGeneratedType? slotTuple)
+            && ReferenceEquals(slotTuple.Declaration, declaration)
+            && slotTuple.Codec is CodecBox<T> slotTupleCodec)
+        {
+            return slotTupleCodec;
         }
 
         throw new InvalidOperationException(
@@ -992,8 +1070,7 @@ public sealed class BamlGeneratedRegistry
             metadata);
         var codec = new CodecBox<global::Baml.BamlFunctionSpec<TFinal>>(
             new BamlGeneratedFunctionSpecCodec<TFinal>(
-                new BamlGeneratedType<TFinal>(owner, finalDeclaration),
-                metadata));
+                new BamlGeneratedType<TFinal>(owner, finalDeclaration)));
         return new ResolvedGeneratedType<global::Baml.BamlFunctionSpec<TFinal>>(
             declaration,
             codec);

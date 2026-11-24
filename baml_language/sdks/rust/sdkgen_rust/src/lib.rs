@@ -1,8 +1,9 @@
 //! Rust SDK code generator for BAML.
 //!
 //! Consumes the language-agnostic [`baml_sdkgen_types::SymbolPool`] and
-//! emits a standalone Cargo crate — the generated `baml_sdk` — whose code
-//! links against the `baml_bridge` runtime crate.
+//! emits a standalone Cargo crate — the generated SDK, `baml_sdk` unless
+//! configured otherwise — whose code links against the `baml_bridge` runtime
+//! crate.
 //!
 //! The emitter surface mirrors `sdkgen_python_pydantic2` /
 //! `sdkgen_typescript_node`: one entry point returning a map of
@@ -17,7 +18,9 @@
 //! (directory + `mod.rs`) per namespace, user symbols from the crate root
 //! down, stdlib under `baml/`, vendor packages under `vendor/<pkg>/`.
 //! Container modules only re-export their children as modules — symbols
-//! are never flattened into a parent.
+//! are never flattened into a parent. The crate root also declares items of
+//! its own (`init`, the `baml_bridge` re-export, `BamlOptions`, and the
+//! `experimental` and `invocation` modules); root BAML names yield to them.
 //!
 //! Symbols that reference BAML types the Rust SDK cannot represent yet are
 //! skipped rather than failing codegen: each skip is reported through
@@ -39,20 +42,24 @@ mod effect_rename;
 mod emit;
 mod host_types;
 mod idents;
-mod routing;
+mod names;
 mod translate_ty;
 mod unions;
+mod wire_ty;
 
 /// Caller-provided knobs for the generated crate.
 pub struct RustGenOptions {
-    /// Only [`NamingConvention::PreserveCase`] is wired up (same as the
-    /// python and typescript emitters); the entry point asserts this.
+    /// How BAML names are spelled in Rust; the wire keeps the BAML names
+    /// under either convention.
     pub naming_convention: NamingConvention,
-    /// Cargo package name for the generated crate. The library target is
-    /// always named `baml_sdk` (import-name parity with the python/TS
-    /// SDKs) regardless of the package name, so callers can de-collide
-    /// package names without changing how user code imports the SDK.
+    /// Cargo package name for the generated crate.
     pub package_name: String,
+    /// Library target name: the name user code imports the SDK by. Kept
+    /// separate from `package_name` so callers can de-collide package names
+    /// without changing how user code imports the SDK. `baml generate` sets
+    /// both to the generator's `package_name` ([`DEFAULT_LIB_NAME`] unless
+    /// configured).
+    pub lib_name: String,
     /// Dependency spec for the `baml_bridge` runtime crate, verbatim TOML
     /// to the right of the `=`: e.g. `"1.2.3"` or
     /// `{ path = "../../sdks/rust/bridge_rust" }`.
@@ -66,15 +73,44 @@ pub struct RustGenOptions {
     pub edition: String,
 }
 
+/// Library name of a generated SDK whose generator sets no `package_name`.
+pub const DEFAULT_LIB_NAME: &str = baml_sdkgen_types::DEFAULT_PACKAGE_NAME;
+
+/// Crates a generated SDK cannot share a name with: the sysroot crates every
+/// crate can name, and the crates the generated manifest depends on.
+const RESERVED_CRATE_NAMES: &[&str] = &[
+    "std",
+    "core",
+    "alloc",
+    "proc_macro",
+    "baml_bridge",
+    "baml_rs",
+    "serde",
+];
+
+/// Keywords `syn` accepts as identifiers but newer editions reserve. The
+/// crate's edition is configurable (default 2024, where `gen` is reserved),
+/// and the name must work for consumers on any edition.
+const NEWER_EDITION_KEYWORDS: &[&str] = &["gen"];
+
+/// Whether `name` can name a generated SDK crate (its Cargo package and
+/// library): `[a-z_][a-z0-9_]*`, not a Rust keyword, and not a crate the SDK
+/// itself depends on.
+pub fn is_valid_crate_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        // syn refuses keywords (and `_`) in identifier position.
+        && syn::parse_str::<proc_macro2::Ident>(name).is_ok()
+        && !NEWER_EDITION_KEYWORDS.contains(&name)
+        && !RESERVED_CRATE_NAMES.contains(&name)
+}
+
 /// A symbol the emitter skipped because it references a BAML type the Rust
 /// SDK cannot represent yet (media, non-null unions, generics, …).
-#[derive(Debug)]
-pub struct SkipWarning {
-    /// Fully qualified BAML name of the skipped symbol.
-    pub fqn: String,
-    /// Human-readable reason, e.g. `unsupported type: media`.
-    pub reason: String,
-}
+pub use baml_sdkgen_types::SkipWarning;
 
 /// Contents of one generated file. Nearly everything is text; the
 /// embedded bytecode ships as a sibling binary file so the source module
@@ -164,24 +200,18 @@ fn to_source_code_with_optional_metadata(
     embedded_baml_toml: Option<&str>,
     options: &RustGenOptions,
 ) -> Generated {
-    assert!(
-        matches!(options.naming_convention, NamingConvention::PreserveCase),
-        "only NamingConvention::PreserveCase is supported"
-    );
-
     // Give each callback's synthetic effect param a readable Rust name before
     // anything else looks at the pool, so the generic, its error union, and
     // that union's variant all read `CbError` rather than `__effect_param_0`.
     let pool = effect_rename::rename_effect_params(pool);
     let pool = &host_types::lower_unrepresentable_literals(&pool);
 
-    let (analysis, mut warnings) = analyze::analyze(pool);
+    let (analysis, mut warnings) = analyze::analyze(pool, options.naming_convention);
     let union_registry = unions::collect(pool, &analysis);
 
     // Items per module path, keyed for a deterministic tree. Iterate the
     // pool in Name order so both output and warnings are stable. Placement
-    // uses the *renamed* module paths (collision renames cascade to every
-    // symbol under a renamed namespace).
+    // uses the projected module paths (see `names`).
     let mut leaves: BTreeMap<Vec<String>, Vec<LeafItem>> = BTreeMap::new();
     // The stdlib module always exists, even when everything in it is
     // currently skipped — structural parity with the python emitter.
@@ -192,16 +222,14 @@ fn to_source_code_with_optional_metadata(
     // whose contents aren't representable yet.
     for name in pool.keys() {
         leaves
-            .entry(analysis.renamed(&routing::route(name).segments).to_vec())
+            .entry(analysis.names.module_path(name).to_vec())
             .or_default();
     }
 
     let mut symbols: Vec<_> = pool.iter().collect();
     symbols.sort_by_key(|(name, _)| *name);
     for (name, symbol) in symbols {
-        let placement = |analysis: &analyze::Analysis| {
-            analysis.renamed(&routing::route(name).segments).to_vec()
-        };
+        let placement = |analysis: &analyze::Analysis| analysis.names.module_path(name).to_vec();
         match symbol {
             Symbol::Function(function) => {
                 let leaf = placement(&analysis);
@@ -255,6 +283,10 @@ fn to_source_code_with_optional_metadata(
                 }
             }
             Symbol::Enum(enum_) => {
+                if !analysis.is_emitted(name) {
+                    // Skip warning already recorded by the analysis.
+                    continue;
+                }
                 leaves
                     .entry(placement(&analysis))
                     .or_default()
@@ -262,7 +294,7 @@ fn to_source_code_with_optional_metadata(
                         rank: 0,
                         source_file_path: enum_.origin.source_file_path.clone(),
                         span_start: enum_.origin.span_start,
-                        tokens: emit::enum_::emit(name, enum_),
+                        tokens: emit::enum_::emit(name, enum_, &analysis.names),
                     });
             }
             Symbol::TypeAlias(alias) => {
@@ -337,7 +369,82 @@ fn to_source_code_with_optional_metadata(
         }
     }
 
+    let has_invocation_types = analysis
+        .emitted
+        .iter()
+        .any(|name| name.to_string() == "baml.spawn.CancelToken")
+        && analysis
+            .emitted
+            .iter()
+            .any(|name| name.to_string() == "trace.Options");
+    let invocation_root = if has_invocation_types {
+        quote! {
+            mod _invocation;
+            pub use _invocation::BamlOptions;
+            pub use vendor::trace;
+            /// Experimental APIs: these may change independently of the stable SDK.
+            pub mod experimental {
+                pub use ::baml_bridge::dynamic::{Arguments, Input, Target, Type, TypeBindings, Value};
+                /// Call a BAML function or method chosen at runtime, binding its type
+                /// parameters from `types`.
+                pub async fn invoke(target: Target, args: Arguments, types: TypeBindings, baml: impl ::std::convert::Into<crate::BamlOptions>) -> ::std::result::Result<Value, ::baml_bridge::Error<Value>> {
+                    crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
+                    ::baml_bridge::dynamic::invoke(target, args, types, ::std::convert::Into::<crate::BamlOptions>::into(baml).into()).await
+                }
+                /// The blocking twin of [`invoke`].
+                pub fn invoke_sync(target: Target, args: Arguments, types: TypeBindings, baml: impl ::std::convert::Into<crate::BamlOptions>) -> ::std::result::Result<Value, ::baml_bridge::Error<Value>> {
+                    crate::_runtime::ensure_init().map_err(::baml_bridge::Error::Sdk)?;
+                    ::baml_bridge::dynamic::invoke_sync(target, args, types, ::std::convert::Into::<crate::BamlOptions>::into(baml).into())
+                }
+            }
+            pub mod invocation {
+                #[derive(Clone)]
+                pub struct Invocation(::baml_bridge::host_value::Invocation);
+                /// The invocation the running host callback was called in, captured so work it
+                /// spawns can inherit it; `None` outside a callback.
+                ///
+                /// # Errors
+                ///
+                /// The runtime refused to capture the callback's invocation (it shut down).
+                pub fn current() -> ::std::result::Result<::std::option::Option<Invocation>, ::baml_bridge::SdkError> {
+                    ::baml_bridge::host_value::Invocation::current().map(|current| current.map(Invocation))
+                }
+                impl Invocation {
+                    /// The invocation's effective cancel token.
+                    ///
+                    /// # Errors
+                    ///
+                    /// The token's handle could not be cloned (the runtime shut down).
+                    pub fn cancel(&self) -> ::std::result::Result<crate::baml::spawn::CancelToken, ::baml_bridge::DecodeError> { self.0.cancel() }
+                    pub fn run<T>(&self, body: impl FnOnce() -> T) -> T { self.0.run(body) }
+                    pub fn scope<F: ::std::future::Future>(&self, future: F) -> impl ::std::future::Future<Output = F::Output> + use<F> { self.0.scope(future) }
+                }
+            }
+        }
+    } else {
+        // Minimal unit-test pools omit bundled stdlib declarations.
+        quote! { pub type BamlOptions = ::baml_bridge::invocation::InvocationOptions; }
+    };
+    if has_invocation_types {
+        let trace_leaf = vec!["vendor".to_string(), "trace".to_string()];
+        leaves.entry(trace_leaf).or_default().push(LeafItem {
+            rank: 0, source_file_path: String::new(), span_start: 0,
+            tokens: quote! {
+                #[derive(Debug, Clone)]
+                pub enum Selection { Options(Options), ReservedSpan(ReservedSpan) }
+                impl From<Options> for Selection { fn from(value: Options) -> Self { Self::Options(value) } }
+                impl From<ReservedSpan> for Selection { fn from(value: ReservedSpan) -> Self { Self::ReservedSpan(value) } }
+            },
+        });
+    }
     let mut files = HashMap::new();
+    if has_invocation_types {
+        files.insert(
+            PathBuf::from("src/_invocation.rs"),
+            FileContent::Text(include_str!("invocation_facade.rs").to_string()),
+        );
+    }
+
     files.insert(
         PathBuf::from("Cargo.toml"),
         FileContent::Text(render_manifest(options)),
@@ -377,20 +484,30 @@ fn to_source_code_with_optional_metadata(
         let (file_path, tokens) = if path.is_empty() {
             (
                 PathBuf::from("src/lib.rs"),
+                // BAML names keep their spelling, and docstrings are copied
+                // verbatim from BAML sources: their prose need not follow
                 quote! {
-                    #![allow(non_camel_case_types, non_snake_case)]
+                    #![allow(
+                        non_camel_case_types,
+                        non_snake_case,
+                        clippy::doc_lazy_continuation,
+                        clippy::type_complexity
+                    )]
 
-                    // BUG: `_inlinedbaml`/`_runtime` are not reserved against
-                    // user symbols. A root-level BAML class/enum named
-                    // `_inlinedbaml` or `_runtime` would emit a same-named
-                    // item that collides with these modules in Rust's type
-                    // namespace. The collision-rename machinery (`analyze.rs`)
-                    // handles namespace-vs-type collisions but not these
-                    // internal module names.
+                    // Root BAML names yield to every name this root binds
+                    // itself (`names::ROOT_TYPE_NAMES`,
+                    // `names::ROOT_VALUE_NAMES`), and root BAML types also to
+                    // the modules dependencies live in (`baml`, `vendor`, ...).
                     mod _inlinedbaml;
                     mod _runtime;
 
                     pub use _runtime::init;
+                    /// The `baml_bridge` runtime this SDK calls into. Name the bridge types in
+                    /// this SDK's signatures (`Error`, `OptionalArg`, …) through this re-export,
+                    /// so they always match the bridge the SDK was built with.
+                    #[doc(inline)]
+                    pub use ::baml_bridge;
+                    #invocation_root
 
                     #(#mod_decls)*
                     #(#item_tokens)*
@@ -487,6 +604,7 @@ fn render_manifest(options: &RustGenOptions) -> String {
     let RustGenOptions {
         naming_convention: _,
         package_name,
+        lib_name,
         runtime_dep,
         manifest_extra,
         edition,
@@ -500,9 +618,12 @@ name = "{package_name}"
 version = "0.1.0"
 edition = "{edition}"
 publish = false
+# A BAML namespace `bin` is the module `src/bin/`, which Cargo would
+# otherwise build as binaries.
+autobins = false
 
 [lib]
-name = "baml_sdk"
+name = "{lib_name}"
 path = "src/lib.rs"
 doctest = false
 
@@ -515,6 +636,19 @@ doctest = false
 
 [dependencies]
 baml_bridge = {runtime_dep}
+serde = {{ version = "1", features = ["derive"], optional = true }}
+
+[features]
+# `serde::Serialize` and `serde::Deserialize` for the generated classes,
+# enums and unions, in the JSON shape of BAML's own `baml.json`: keys are
+# the `@json.rename` or BAML field names, an enum is its variant name, and a
+# union is untagged (deserializing takes the first arm that fits, or the arm
+# whose literals match when the union has a `@json.fallback` member). A
+# `baml.ToJson` or `baml.FromJson` override on one of your classes is not
+# applied: `@json` attributes are. BAML standard-library classes, and any class holding a `bigint`,
+# `uint8array`, function or handle, directly or nested, get no impls; the
+# class docs name the field.
+serde = ["dep:serde"]
 "#
     );
     if let Some(extra) = manifest_extra {
@@ -538,6 +672,7 @@ mod tests {
         RustGenOptions {
             naming_convention: NamingConvention::PreserveCase,
             package_name: "baml_sdk".to_string(),
+            lib_name: DEFAULT_LIB_NAME.to_string(),
             runtime_dep: "{ path = \"../bridge_rust\" }".to_string(),
             manifest_extra: None,
             edition: "2024".to_string(),
@@ -598,6 +733,7 @@ mod tests {
         instance_methods: Vec<Function>,
     ) -> Symbol {
         Symbol::Class(baml_sdkgen_types::Class {
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
             name: n.clone(),
             generic_params: Vec::new(),
             docstring: None,
@@ -608,6 +744,7 @@ mod tests {
                 source_file_path: "main.baml".to_string(),
                 span_start: 0,
             },
+            json_omit_nulls: false,
         })
     }
 
@@ -615,6 +752,7 @@ mod tests {
     /// methods).
     fn generic_class(n: &Name, params: &[&str], properties: Vec<(&str, Ty)>) -> Symbol {
         Symbol::Class(baml_sdkgen_types::Class {
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
             name: n.clone(),
             generic_params: params.iter().map(|p| baml_base::Name::new(*p)).collect(),
             docstring: None,
@@ -624,6 +762,9 @@ mod tests {
                     name: baml_base::Name::new(field),
                     docstring: None,
                     ty,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
                 })
                 .collect(),
             static_methods: Vec::new(),
@@ -632,6 +773,7 @@ mod tests {
                 source_file_path: "main.baml".to_string(),
                 span_start: 0,
             },
+            json_omit_nulls: false,
         })
     }
 
@@ -639,6 +781,10 @@ mod tests {
     /// assertions stay stable against the pretty-printer's line wrapping.
     fn flat(src: &str) -> String {
         src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    fn tight(src: &str) -> String {
+        flat(src).replace(",)", ")").replace(",>", ">")
     }
 
     #[test]
@@ -708,6 +854,7 @@ mod tests {
         let pool = SymbolPool::from([(
             a.clone(),
             Symbol::Class(baml_sdkgen_types::Class {
+                crossing: baml_sdkgen_types::ClassCrossing::Fields,
                 name: a,
                 generic_params: Vec::new(),
                 docstring: None,
@@ -715,6 +862,9 @@ mod tests {
                     name: baml_base::Name::new("x"),
                     docstring: None,
                     ty: union_field,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
                 }],
                 static_methods: Vec::new(),
                 instance_methods: Vec::new(),
@@ -722,6 +872,7 @@ mod tests {
                     source_file_path: "main.baml".to_string(),
                     span_start: 0,
                 },
+                json_omit_nulls: false,
             }),
         )]);
         let generated = to_source_code_with_bytecode(&pool, &[], &options());
@@ -729,6 +880,558 @@ mod tests {
         let lib = text(&generated, "src/lib.rs");
         assert!(
             lib.contains("pub x: ::std::boxed::Box<crate::AOrInt>"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn recursion_through_a_type_alias_boxes_the_alias_reference() {
+        // type Part = Text | Extra; type Outer = Part
+        // class Extra { part Part, maybe Part?, alt Part | string, outer Outer, parts Part[] }
+        // class Holder { part Part } -- outside the cycle
+        let part = name("user", &[], "Part");
+        let outer = name("user", &[], "Outer");
+        let text_class = name("user", &[], "Text");
+        let extra = name("user", &[], "Extra");
+        let holder = name("user", &[], "Holder");
+        let alias = |n: &Name, resolves_to| {
+            Symbol::TypeAlias(baml_sdkgen_types::TypeAlias {
+                name: n.clone(),
+                resolves_to,
+                recursive: false,
+                origin: Origin {
+                    source_file_path: "main.baml".to_string(),
+                    span_start: 0,
+                },
+            })
+        };
+        let field = |field: &str, ty| baml_sdkgen_types::ClassProperty {
+            name: baml_base::Name::new(field),
+            docstring: None,
+            ty,
+            json_fallback: false,
+            json_flatten: false,
+            json_rename: None,
+        };
+        let part_ref = Ty::TypeAlias(part.clone());
+        let pool = SymbolPool::from([
+            (
+                part.clone(),
+                alias(
+                    &part,
+                    Ty::Union(Box::new([
+                        Ty::Class(text_class.clone(), Box::new([])),
+                        Ty::Class(extra.clone(), Box::new([])),
+                    ])),
+                ),
+            ),
+            (outer.clone(), alias(&outer, part_ref.clone())),
+            (
+                text_class.clone(),
+                class_symbol(
+                    &text_class,
+                    vec![field("text", Ty::String)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                extra.clone(),
+                class_symbol(
+                    &extra,
+                    vec![
+                        field("part", part_ref.clone()),
+                        field("maybe", Ty::Union(Box::new([part_ref.clone(), Ty::Null]))),
+                        field("alt", Ty::Union(Box::new([part_ref.clone(), Ty::String]))),
+                        field("outer", Ty::TypeAlias(outer.clone())),
+                        field("parts", Ty::List(Box::new(part_ref.clone()))),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                holder.clone(),
+                class_symbol(
+                    &holder,
+                    vec![field("part", part_ref)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        for expected in [
+            "pubstructExtra{pubpart:::std::boxed::Box<crate::Part>,\
+             pubmaybe:::std::option::Option<::std::boxed::Box<crate::Part>>,\
+             pubalt:::std::boxed::Box<crate::PartOrString>,\
+             pubouter:::std::boxed::Box<crate::Outer>,\
+             pubparts:::std::vec::Vec<crate::Part>,}",
+            "pubstructHolder{pubpart:crate::Part,}",
+        ] {
+            assert!(lib.contains(expected), "missing `{expected}` in:\n{lib}");
+        }
+    }
+
+    #[test]
+    fn recursion_through_a_tuple_boxes_the_inline_element() {
+        let node = name("user", &[], "Node");
+        let node_ty = Ty::Class(node.clone(), Box::new([]));
+        let next = Ty::Union(Box::new([
+            Ty::Tuple(Box::new([node_ty.clone(), Ty::Int])),
+            Ty::Null,
+        ]));
+        let kids = Ty::Tuple(Box::new([Ty::List(Box::new(node_ty))]));
+        let pool = SymbolPool::from([(
+            node.clone(),
+            class_symbol(
+                &node,
+                vec![
+                    baml_sdkgen_types::ClassProperty {
+                        name: baml_base::Name::new("next"),
+                        docstring: None,
+                        ty: next,
+                        json_fallback: false,
+                        json_flatten: false,
+                        json_rename: None,
+                    },
+                    baml_sdkgen_types::ClassProperty {
+                        name: baml_base::Name::new("kids"),
+                        docstring: None,
+                        ty: kids,
+                        json_fallback: false,
+                        json_flatten: false,
+                        json_rename: None,
+                    },
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let flat = flat(lib);
+        assert!(
+            flat.contains(
+                "pubnext:::std::option::Option<(::std::boxed::Box<crate::Node>,::core::primitive::i64),>"
+            ),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("pub kids: (::std::vec::Vec<crate::Node>,)"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn recursion_through_a_tuple_union_arm_boxes_the_enum_reference() {
+        let a = name("user", &[], "A");
+        let union_field = Ty::Union(Box::new([
+            Ty::Tuple(Box::new([Ty::Class(a.clone(), Box::new([])), Ty::String])),
+            Ty::Int,
+        ]));
+        let pool = SymbolPool::from([(
+            a.clone(),
+            class_symbol(
+                &a,
+                vec![baml_sdkgen_types::ClassProperty {
+                    name: baml_base::Name::new("x"),
+                    docstring: None,
+                    ty: union_field,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        assert!(
+            lib.contains("pub x: ::std::boxed::Box<crate::AStringTupleOrInt>"),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("AStringTuple((crate::A, ::std::string::String))"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn recursion_through_a_nullable_tuple_element_boxes_the_enum_reference() {
+        let a = name("user", &[], "A");
+        let union_field = Ty::Union(Box::new([
+            Ty::Tuple(Box::new([
+                Ty::Union(Box::new([Ty::Class(a.clone(), Box::new([])), Ty::Null])),
+                Ty::Int,
+            ])),
+            Ty::Bool,
+        ]));
+        let pool = SymbolPool::from([(
+            a.clone(),
+            class_symbol(
+                &a,
+                vec![baml_sdkgen_types::ClassProperty {
+                    name: baml_base::Name::new("x"),
+                    docstring: None,
+                    ty: union_field,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        assert!(
+            flat(lib).contains("pubx:::std::boxed::Box<crate::AIntTupleOrBool>"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn a_null_tuple_element_in_a_union_arm_is_unit() {
+        let n = name("user", &[], "f");
+        let arg = Ty::Union(Box::new([Ty::Tuple(Box::new([Ty::Null])), Ty::Int]));
+        let pool = SymbolPool::from([(n.clone(), Symbol::Function(unary_fn(&n, arg, Ty::String)))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        assert!(flat(lib).contains("NullTuple(((),))"), "{lib}");
+    }
+
+    #[test]
+    fn tuples_wider_than_std_impls_are_native_tuples() {
+        for arity in [13, 20, crate::translate_ty::MAX_BRIDGE_TUPLE_ARITY] {
+            let n = name("user", &[], "f");
+            let mut slots = vec![Ty::Int; arity - 1];
+            slots.push(Ty::String);
+            let arg = Ty::Tuple(slots.into_boxed_slice());
+            let pool =
+                SymbolPool::from([(n.clone(), Symbol::Function(unary_fn(&n, arg.clone(), arg)))]);
+            let generated = to_source_code_with_bytecode(&pool, &[], &options());
+            assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+            let lib = tight(text(&generated, "src/lib.rs"));
+            let native = format!(
+                "({}::std::string::String)",
+                "::core::primitive::i64,".repeat(arity - 1)
+            );
+            assert!(lib.contains(&format!("u:{native}")), "{lib}");
+            assert!(!lib.contains("structTuple"), "{lib}");
+        }
+    }
+
+    #[test]
+    fn a_tuple_wider_than_the_bridge_skips_its_symbol() {
+        let n = name("user", &[], "f");
+        let arity = crate::translate_ty::MAX_BRIDGE_TUPLE_ARITY + 1;
+        let arg = Ty::Tuple(vec![Ty::Int; arity].into_boxed_slice());
+        let pool = SymbolPool::from([(n.clone(), Symbol::Function(unary_fn(&n, arg, Ty::String)))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert_eq!(generated.warnings.len(), 1, "{:?}", generated.warnings);
+        assert!(
+            generated.warnings[0]
+                .reason
+                .contains(&format!("tuple of {arity} slots")),
+            "{:?}",
+            generated.warnings
+        );
+        let wide = name("user", &[], "Wide");
+        let pool = SymbolPool::from([(
+            wide.clone(),
+            class_symbol(
+                &wide,
+                vec![baml_sdkgen_types::ClassProperty {
+                    name: baml_base::Name::new("t"),
+                    docstring: None,
+                    ty: Ty::Tuple(vec![Ty::Int; arity].into_boxed_slice()),
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(
+            generated
+                .warnings
+                .iter()
+                .any(|w| w.fqn == "user.Wide" && w.reason.contains("tuple of")),
+            "{:?}",
+            generated.warnings
+        );
+    }
+
+    #[test]
+    fn a_class_with_a_wide_tuple_field_derives_only_clone() {
+        let wide = name("user", &[], "Wide");
+        let outer = name("user", &[], "Outer");
+        let narrow = name("user", &[], "Narrow");
+        let field = |field: &str, ty: Ty| baml_sdkgen_types::ClassProperty {
+            name: baml_base::Name::new(field),
+            docstring: None,
+            ty,
+            json_fallback: false,
+            json_flatten: false,
+            json_rename: None,
+        };
+        let pool = SymbolPool::from([
+            (
+                wide.clone(),
+                class_symbol(
+                    &wide,
+                    vec![field("t", Ty::Tuple(vec![Ty::Int; 13].into_boxed_slice()))],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                outer.clone(),
+                class_symbol(
+                    &outer,
+                    vec![field(
+                        "w",
+                        Ty::List(Box::new(Ty::Class(wide.clone(), Box::new([])))),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                narrow.clone(),
+                class_symbol(
+                    &narrow,
+                    vec![field("t", Ty::Tuple(vec![Ty::Int; 12].into_boxed_slice()))],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        let serde =
+            "#[cfg_attr(feature=\"serde\",derive(::serde::Serialize,::serde::Deserialize))]";
+        assert!(
+            lib.contains(&format!("#[derive(Clone)]{serde}pubstructWide{{")),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("field`t`holdsatupleofmorethan12slots"),
+            "{lib}"
+        );
+        assert!(lib.contains("#[derive(Clone)]"), "{lib}");
+        assert!(lib.contains("pubstructOuter{"), "{lib}");
+        assert!(
+            !lib.contains("#[derive(Debug,Clone,PartialEq)]#[cfg_attr(feature=\"serde\",derive(::serde::Serialize,::serde::Deserialize))]pubstructOuter"),
+            "{lib}"
+        );
+        assert!(
+            lib.contains(&format!(
+                "#[derive(Debug,Clone,PartialEq)]{serde}pubstructNarrow{{"
+            )),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn a_tuple_wider_than_serde_impls_has_no_serde_form() {
+        let wide = name("user", &[], "Wide");
+        let pool = SymbolPool::from([(
+            wide.clone(),
+            class_symbol(
+                &wide,
+                vec![baml_sdkgen_types::ClassProperty {
+                    name: baml_base::Name::new("t"),
+                    docstring: None,
+                    ty: Ty::Tuple(vec![Ty::Int; 17].into_boxed_slice()),
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        assert!(!lib.contains("derive(::serde::Serialize"), "{lib}");
+        assert!(lib.contains("tupleofmorethan16slots"), "{lib}");
+    }
+
+    #[test]
+    fn a_union_with_a_wide_tuple_arm_derives_only_clone() {
+        let n = name("user", &[], "f");
+        let wide = Ty::Tuple(vec![Ty::Bool; 13].into_boxed_slice());
+        let ret = Ty::Union(Box::new([wide, Ty::Int]));
+        let narrow = Ty::Union(Box::new([
+            Ty::Tuple(vec![Ty::Bool; 12].into_boxed_slice()),
+            Ty::String,
+        ]));
+        let pool = SymbolPool::from([(n.clone(), Symbol::Function(unary_fn(&n, narrow, ret)))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        let wide_arm = format!("{}Tuple", "Bool".repeat(13));
+        assert!(
+            lib.contains(&format!("#[derive(Clone)]pubenum{wide_arm}OrInt{{")),
+            "{lib}"
+        );
+        assert!(
+            lib.contains(&format!("arm`{wide_arm}`holdsatupleofmorethan12slots")),
+            "{lib}"
+        );
+        let narrow_arm = format!("{}Tuple", "Bool".repeat(12));
+        assert!(
+            lib.contains(&format!(
+                "#[derive(Debug,Clone,PartialEq)]pubenum{narrow_arm}OrString{{"
+            )),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn wide_and_native_tuples_nest_in_each_other_and_in_unions() {
+        let n = name("user", &[], "f");
+        let a = name("user", &[], "A");
+        let a_ty = Ty::Class(a.clone(), Box::new([]));
+        let mut slots = vec![
+            Ty::Tuple(Box::new([Ty::Int, Ty::String])),
+            Ty::Union(Box::new([Ty::Int, Ty::String, Ty::Null])),
+            a_ty,
+        ];
+        slots.extend(vec![Ty::Bool; 10]);
+        let wide = Ty::Tuple(slots.into_boxed_slice());
+        let arg = Ty::Tuple(Box::new([wide, Ty::Int]));
+        let pool = SymbolPool::from([
+            (
+                a.clone(),
+                class_symbol(&a, Vec::new(), Vec::new(), Vec::new()),
+            ),
+            (n.clone(), Symbol::Function(unary_fn(&n, arg, Ty::String))),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = tight(text(&generated, "src/lib.rs"));
+        assert!(
+            lib.contains(&format!(
+                "u:(((::core::primitive::i64,::std::string::String),\
+                 ::std::option::Option<crate::IntOrString>,crate::A,{}::core::primitive::bool),\
+                 ::core::primitive::i64)",
+                "::core::primitive::bool,".repeat(9)
+            )),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn recursion_through_a_wide_tuple_boxes_the_inline_element() {
+        let node = name("user", &[], "Node");
+        let mut slots = vec![Ty::Class(node.clone(), Box::new([]))];
+        slots.extend(vec![Ty::Int; 12]);
+        let next = Ty::Union(Box::new([Ty::Tuple(slots.into_boxed_slice()), Ty::Null]));
+        let pool = SymbolPool::from([(
+            node.clone(),
+            class_symbol(
+                &node,
+                vec![baml_sdkgen_types::ClassProperty {
+                    name: baml_base::Name::new("next"),
+                    docstring: None,
+                    ty: next,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = tight(text(&generated, "src/lib.rs"));
+        assert!(
+            lib.contains(&format!(
+                "pubnext:::std::option::Option<(::std::boxed::Box<crate::Node>,{}::core::primitive::i64)>",
+                "::core::primitive::i64,".repeat(11)
+            )),
+            "{lib}"
+        );
+        assert!(lib.contains("#[derive(Clone)]"), "{lib}");
+        assert!(!lib.contains("#[derive(Debug,Clone,PartialEq)]"), "{lib}");
+    }
+
+    #[test]
+    fn a_tuple_slot_follows_the_slot_types_own_rules() {
+        let unsupported = [
+            Ty::Unknown,
+            Ty::Media(baml_base::MediaKind::Image),
+            Ty::Tuple(Box::new([])),
+        ];
+        for slot in unsupported {
+            for arg in [
+                Ty::Tuple(Box::new([Ty::Int, slot.clone()])),
+                Ty::Tuple(Box::new([Ty::Tuple(Box::new([slot.clone()])), Ty::Int])),
+                Ty::List(Box::new(Ty::Tuple(Box::new([slot.clone(), Ty::Int])))),
+                Ty::Union(Box::new([
+                    Ty::Tuple(Box::new([slot.clone(), Ty::Int])),
+                    Ty::String,
+                ])),
+            ] {
+                let n = name("user", &[], "f");
+                let pool = SymbolPool::from([(
+                    n.clone(),
+                    Symbol::Function(unary_fn(&n, arg, Ty::String)),
+                )]);
+                let generated = to_source_code_with_bytecode(&pool, &[], &options());
+                assert_eq!(
+                    generated.warnings.len(),
+                    1,
+                    "{slot}: {:?}",
+                    generated.warnings
+                );
+                assert_eq!(generated.warnings[0].fqn, "user.f");
+                let lib = flat(text(&generated, "src/lib.rs"));
+                assert!(!lib.contains("dynamic::Value>"), "{lib}");
+            }
+            let n = name("user", &[], "f");
+            let pool = SymbolPool::from([(
+                n.clone(),
+                Symbol::Function(unary_fn(&n, Ty::List(Box::new(slot)), Ty::String)),
+            )]);
+            let generated = to_source_code_with_bytecode(&pool, &[], &options());
+            assert!(
+                matches!(&generated.warnings[..], [w] if w.fqn == "user.f"),
+                "{:?}",
+                generated.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unions_inside_tuples_register_in_the_leaf() {
+        let n = name("user", &[], "f");
+        let arg = Ty::Tuple(Box::new([
+            Ty::Union(Box::new([Ty::Int, Ty::String])),
+            Ty::Bool,
+        ]));
+        let pool = SymbolPool::from([(n.clone(), Symbol::Function(unary_fn(&n, arg, Ty::String)))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        assert!(lib.contains("pub enum IntOrString"), "{lib}");
+        assert!(
+            lib.contains("(crate::IntOrString, ::core::primitive::bool)"),
             "{lib}"
         );
     }
@@ -756,7 +1459,234 @@ mod tests {
         );
         let lib = text(&generated, "src/lib.rs");
         assert!(lib.contains("pub mod baml;"));
+        assert!(lib.contains("pub use ::baml_bridge;"));
         assert!(lib.contains("pub use _runtime::init;"));
+    }
+
+    /// The stdlib declarations that turn on the root's invocation API.
+    fn facade_pool() -> SymbolPool {
+        [
+            name("baml", &["spawn"], "CancelToken"),
+            name("trace", &[], "Options"),
+        ]
+        .into_iter()
+        .map(|n| {
+            let class = class_symbol(&n, Vec::new(), Vec::new(), Vec::new());
+            (n, class)
+        })
+        .collect()
+    }
+
+    /// One of Rust's namespaces.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum RustNamespace {
+        /// Types, modules and crates.
+        Type,
+        /// Functions and constructors.
+        Value,
+    }
+
+    /// The namespace each import of the generated crate root binds its name
+    /// in, which the syntax does not say. Written out here rather than read
+    /// from `names`, whose tables these tests check.
+    const ROOT_IMPORTS: &[(&str, RustNamespace)] = &[
+        ("init", RustNamespace::Value),
+        ("baml_bridge", RustNamespace::Type),
+        ("BamlOptions", RustNamespace::Type),
+        ("trace", RustNamespace::Type),
+    ];
+
+    /// A name the generated crate root binds.
+    #[derive(Debug)]
+    enum RootName {
+        /// An item: the root's own, or a root BAML symbol's.
+        Item(RustNamespace, String),
+        /// A namespace's module: a file module with a `mod.rs` of its own.
+        Namespace(String),
+    }
+
+    fn root_names(generated: &Generated) -> Vec<RootName> {
+        use syn::ext::IdentExt;
+
+        fn imports(tree: &syn::UseTree, names: &mut Vec<RootName>) {
+            let ident = match tree {
+                syn::UseTree::Path(path) => return imports(&path.tree, names),
+                syn::UseTree::Group(group) => {
+                    for tree in &group.items {
+                        imports(tree, names);
+                    }
+                    return;
+                }
+                syn::UseTree::Name(name) => name.ident.unraw().to_string(),
+                syn::UseTree::Rename(rename) => rename.rename.unraw().to_string(),
+                syn::UseTree::Glob(glob) => panic!("the root glob-imports: {}", quote!(#glob)),
+            };
+            let (_, namespace) = ROOT_IMPORTS
+                .iter()
+                .find(|(name, _)| *name == ident)
+                .unwrap_or_else(|| panic!("add the root's import `{ident}` to `ROOT_IMPORTS`"));
+            names.push(RootName::Item(*namespace, ident));
+        }
+
+        let lib: syn::File = syn::parse_str(text(generated, "src/lib.rs")).expect("lib.rs parses");
+        let mut names = Vec::new();
+        for item in &lib.items {
+            let bind = |namespace, ident: &syn::Ident| {
+                RootName::Item(namespace, ident.unraw().to_string())
+            };
+            match item {
+                syn::Item::Mod(module) => {
+                    let ident = module.ident.unraw().to_string();
+                    let own_file = PathBuf::from(format!("src/{ident}/mod.rs"));
+                    names.push(
+                        if module.content.is_none() && generated.files.contains_key(&own_file) {
+                            RootName::Namespace(ident)
+                        } else {
+                            RootName::Item(RustNamespace::Type, ident)
+                        },
+                    );
+                }
+                syn::Item::Struct(syn_struct) => {
+                    names.push(bind(RustNamespace::Type, &syn_struct.ident));
+                    // A tuple or unit struct's constructor is a value.
+                    if !matches!(syn_struct.fields, syn::Fields::Named(_)) {
+                        names.push(bind(RustNamespace::Value, &syn_struct.ident));
+                    }
+                }
+                syn::Item::Enum(syn_enum) => names.push(bind(RustNamespace::Type, &syn_enum.ident)),
+                syn::Item::Type(alias) => names.push(bind(RustNamespace::Type, &alias.ident)),
+                syn::Item::Fn(function) => {
+                    names.push(bind(RustNamespace::Value, &function.sig.ident));
+                }
+                syn::Item::Const(constant) => {
+                    names.push(bind(RustNamespace::Value, &constant.ident));
+                }
+                syn::Item::Static(statik) => names.push(bind(RustNamespace::Value, &statik.ident)),
+                syn::Item::Use(import) => imports(&import.tree, &mut names),
+                syn::Item::Impl(_) => {}
+                other => panic!("unexpected root item: {}", quote!(#other)),
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn the_root_reserves_every_name_it_binds_itself() {
+        // The root's own names, and the namespaces it declares modules for.
+        let own_names = |pool: &SymbolPool| {
+            let generated = to_source_code_with_bytecode(pool, &[], &options());
+            let mut items = BTreeSet::new();
+            let mut namespaces = Vec::new();
+            for root_name in root_names(&generated) {
+                match root_name {
+                    RootName::Item(namespace, name) => {
+                        items.insert((namespace, name));
+                    }
+                    RootName::Namespace(name) => namespaces.push(name),
+                }
+            }
+            (items, namespaces)
+        };
+        let reserved: BTreeSet<(RustNamespace, String)> = [
+            (RustNamespace::Type, names::ROOT_TYPE_NAMES),
+            (RustNamespace::Value, names::ROOT_VALUE_NAMES),
+        ]
+        .into_iter()
+        .flat_map(|(namespace, table)| table.iter().map(move |name| (namespace, name.to_string())))
+        .collect();
+
+        let (items, namespaces) = own_names(&facade_pool());
+        assert_eq!(namespaces, ["baml", "vendor"]);
+        assert_eq!(items, reserved);
+        // Without the stdlib's invocation types the root binds fewer names.
+        let (items, namespaces) = own_names(&SymbolPool::default());
+        assert_eq!(namespaces, ["baml"]);
+        assert!(items.is_subset(&reserved), "{items:?}");
+    }
+
+    #[test]
+    fn root_names_never_clash_with_the_roots_own() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Declared {
+            Class,
+            Function,
+            Namespace,
+        }
+        // Spelled like a name the root binds itself, a dependency's module,
+        // or a module name rustc treats specially.
+        let spellings: Vec<&str> = names::ROOT_TYPE_NAMES
+            .iter()
+            .chain(names::ROOT_VALUE_NAMES)
+            .copied()
+            .chain(baml_sdkgen_types::dependency_root_segments())
+            .chain(["lib", "main"])
+            .collect();
+        for naming_convention in [NamingConvention::PreserveCase, NamingConvention::Language] {
+            let options = RustGenOptions {
+                naming_convention,
+                ..options()
+            };
+            for &spelling in &spellings {
+                for declared in [Declared::Class, Declared::Function, Declared::Namespace] {
+                    if declared == Declared::Namespace
+                        && baml_sdkgen_types::dependency_root_segments()
+                            .any(|root| root == spelling)
+                    {
+                        // BUG: a local namespace spelled like a dependency's
+                        // module merges into it (see `namespace_segments`).
+                        continue;
+                    }
+                    let mut pool = facade_pool();
+                    match declared {
+                        Declared::Class | Declared::Namespace => {
+                            let n = if declared == Declared::Class {
+                                name("user", &[], spelling)
+                            } else {
+                                name("user", &[spelling], "Thing")
+                            };
+                            let class = class_symbol(&n, Vec::new(), Vec::new(), Vec::new());
+                            pool.insert(n, class);
+                        }
+                        Declared::Function => {
+                            let n = name("user", &[], spelling);
+                            let function = nullary_string_fn(&n);
+                            pool.insert(n, Symbol::Function(function));
+                        }
+                    }
+                    let case = format!("{naming_convention}: {declared:?} `{spelling}`");
+                    let generated = to_source_code_with_bytecode(&pool, &[], &options);
+                    assert!(generated.warnings.is_empty(), "{case}");
+
+                    let mut bound = BTreeMap::<_, usize>::new();
+                    for root_name in root_names(&generated) {
+                        let key = match root_name {
+                            RootName::Item(namespace, name) => (namespace, name),
+                            RootName::Namespace(name) => {
+                                assert!(
+                                    !["lib", "main"].contains(&name.as_str()),
+                                    "{case}: `mod {name};`"
+                                );
+                                (RustNamespace::Type, name)
+                            }
+                        };
+                        *bound.entry(key).or_default() += 1;
+                    }
+                    let clashes: Vec<_> =
+                        bound.into_iter().filter(|(_, count)| *count > 1).collect();
+                    assert!(clashes.is_empty(), "{case}: {clashes:?}");
+                    // The root's own paths into the stdlib still reach its types.
+                    assert!(
+                        text(&generated, "src/baml/spawn/mod.rs")
+                            .contains("pub struct CancelToken"),
+                        "{case}"
+                    );
+                    assert!(
+                        text(&generated, "src/vendor/trace/mod.rs").contains("pub struct Options"),
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -766,8 +1696,8 @@ mod tests {
         let generated = to_source_code_with_bytecode(&pool, &[], &options());
         assert!(generated.warnings.is_empty());
         let lib = text(&generated, "src/lib.rs");
-        assert!(lib.contains("pub fn hello_world()"), "{lib}");
-        assert!(lib.contains("pub async fn hello_world_async()"), "{lib}");
+        assert!(lib.contains("pub async fn hello_world()"), "{lib}");
+        assert!(lib.contains("pub fn hello_world_sync()"), "{lib}");
         assert!(lib.contains(r#""user.hello_world""#), "{lib}");
     }
 
@@ -791,7 +1721,7 @@ mod tests {
         let lib = text(&generated, "src/lib.rs");
         assert_eq!(
             lib.matches("#[allow(clippy::too_many_arguments)]").count(),
-            2,
+            4,
             "both sync and async wrappers need the generated-code allowance:\n{lib}"
         );
     }
@@ -816,7 +1746,7 @@ mod tests {
         let lib = text(&generated, "src/lib.rs");
         assert_eq!(
             lib.matches("#[allow(clippy::too_many_arguments)]").count(),
-            4,
+            6,
             "the sync/async stream bindings and their options variants need the allowance:\n{lib}"
         );
     }
@@ -854,7 +1784,7 @@ mod tests {
         // Exactly the sync + async bindings of `takes_one` carry the note;
         // `takes_none` has no arguments to mutate, so a count of 2 also
         // proves its absence there.
-        assert_eq!(lib.matches(note_head).count(), 2, "{lib}");
+        assert_eq!(lib.matches(note_head).count(), 4, "{lib}");
     }
 
     fn typevar(index: u32, name: &str) -> Ty {
@@ -862,6 +1792,101 @@ mod tests {
             index,
             baml_base::Name::new(name),
         ))
+    }
+
+    #[test]
+    fn same_named_union_arms_are_qualified_by_namespace_until_unique() {
+        let errors = name("baml", &["errors"], "ParseError");
+        let json = name("baml", &["json"], "ParseError");
+        let root = name("user", &[], "ParseError");
+        let item = name("user", &[], "Item");
+        let f = name("user", &[], "f");
+        let mut function = unary_fn(
+            &f,
+            Ty::Union(Box::new([
+                Ty::Class(root.clone(), Box::new([])),
+                Ty::Class(item.clone(), Box::new([])),
+            ])),
+            Ty::String,
+        );
+        function.throws = Some(Ty::Union(Box::new([
+            Ty::Class(errors.clone(), Box::new([])),
+            Ty::Class(json.clone(), Box::new([])),
+            Ty::Class(root.clone(), Box::new([])),
+        ])));
+        let pool = SymbolPool::from([
+            (errors.clone(), generic_class(&errors, &[], vec![])),
+            (json.clone(), generic_class(&json, &[], vec![])),
+            (root.clone(), generic_class(&root, &[], vec![])),
+            (item.clone(), generic_class(&item, &[], vec![])),
+            (f, Symbol::Function(function)),
+        ]);
+
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        // Only clashing arms are qualified, and only as far as needed: the
+        // root `ParseError` has no namespace to add and keeps its short name.
+        assert!(
+            lib.contains(
+                "pubenumErrorsParseErrorOrJsonParseErrorOrParseError{\
+                 ErrorsParseError(crate::baml::errors::ParseError),\
+                 JsonParseError(crate::baml::json::ParseError),\
+                 ParseError(crate::ParseError),"
+            ),
+            "{lib}"
+        );
+        // A union without a clash keeps short names.
+        assert!(lib.contains("pubenumParseErrorOrItem{"), "{lib}");
+    }
+
+    #[test]
+    fn qualification_continues_past_a_namespace_segment_that_renders_empty() {
+        // `_` renders as an empty prefix; the segment above it separates the arms.
+        let a = name("user", &["a", "_"], "Foo");
+        let b = name("user", &["b", "_"], "Foo");
+        let f = name("user", &[], "f");
+        let union = Ty::Union(Box::new([
+            Ty::Class(a.clone(), Box::new([])),
+            Ty::Class(b.clone(), Box::new([])),
+        ]));
+        let pool = SymbolPool::from([
+            (a.clone(), generic_class(&a, &[], vec![])),
+            (b.clone(), generic_class(&b, &[], vec![])),
+            (f.clone(), Symbol::Function(unary_fn(&f, union, Ty::String))),
+        ]);
+
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        assert!(lib.contains("pubenumAFooOrBFoo{"), "{lib}");
+    }
+
+    #[test]
+    fn union_arms_still_clashing_when_fully_qualified_skip_fail_closed() {
+        // `a_b` and `aB` both render as the `AB` prefix.
+        let snake = name("user", &["a_b"], "Foo");
+        let camel = name("user", &["aB"], "Foo");
+        let f = name("user", &[], "f");
+        let union = Ty::Union(Box::new([
+            Ty::Class(snake.clone(), Box::new([])),
+            Ty::Class(camel.clone(), Box::new([])),
+        ]));
+        let pool = SymbolPool::from([
+            (snake.clone(), generic_class(&snake, &[], vec![])),
+            (camel.clone(), generic_class(&camel, &[], vec![])),
+            (f.clone(), Symbol::Function(unary_fn(&f, union, Ty::String))),
+        ]);
+
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert_eq!(generated.warnings.len(), 1, "{:?}", generated.warnings);
+        assert!(
+            generated.warnings[0]
+                .reason
+                .contains("duplicate variant name `ABFoo`, even when qualified by namespace"),
+            "{}",
+            generated.warnings[0].reason
+        );
     }
 
     #[test]
@@ -917,11 +1942,11 @@ mod tests {
         // The TypeVar becomes a `BamlValue`-bounded Rust generic on both the
         // sync and async bindings; the arg and return position resolve to it.
         assert!(
-            flat.contains("pubfnidentity<T:::baml_bridge::BamlValue>"),
+            flat.contains("pubasyncfnidentity<T:::baml_bridge::BamlValue>"),
             "{lib}"
         );
         assert!(
-            flat.contains("pubasyncfnidentity_async<T:::baml_bridge::BamlValue>"),
+            flat.contains("pubfnidentity_sync<T:::baml_bridge::BamlValue>"),
             "{lib}"
         );
         assert!(
@@ -933,7 +1958,7 @@ mod tests {
                 "->::std::result::Result<T,::baml_bridge::Error<::core::convert::Infallible>>"
             )
             .count(),
-            2,
+            4,
             "return resolves to the type param on both bindings:\n{lib}"
         );
         // The concrete binding is sent explicitly, keyed by the TypeVar
@@ -942,7 +1967,7 @@ mod tests {
             "::baml_bridge::encode::type_args(::std::vec![(\"T\",",
             "<Tas::baml_bridge::baml_value::internal::__BamlValuePrivate>::baml_ty()"
         );
-        assert_eq!(flat.matches(type_arg).count(), 2, "{lib}");
+        assert_eq!(flat.matches(type_arg).count(), 4, "{lib}");
     }
 
     #[test]
@@ -960,7 +1985,7 @@ mod tests {
         let flat = flat(text(&generated, "src/lib.rs"));
         assert!(
             flat.contains(
-                "pubfntwo_type_args<A:::baml_bridge::BamlValue,B:::baml_bridge::BamlValue>()"
+                "pubasyncfntwo_type_args<A:::baml_bridge::BamlValue,B:::baml_bridge::BamlValue>()"
             ),
             "{flat}"
         );
@@ -1101,14 +2126,166 @@ mod tests {
             ),
             "{lib}"
         );
-        // The instance carries its concrete type arg on the wire, in both
-        // the value encoding and the type descriptor.
+        // The type descriptor carries the concrete type arg; an instance is
+        // stated with the type args of the slot it fills (which defaults to
+        // that descriptor), and its `T` field fills the slot of the first.
         let type_args = concat!(
             "::std::vec![<Tas::baml_bridge::baml_value::internal::__BamlValuePrivate>",
             "::baml_ty()]"
         );
-        // once in encode::class (to_baml) and once in class_ty (baml_ty).
-        assert_eq!(flat.matches(type_args).count(), 2, "{lib}");
+        assert_eq!(flat.matches(type_args).count(), 1, "{lib}");
+        assert!(
+            flat.contains(concat!(
+                "let__baml_type_args=::baml_bridge::baml_value::internal::class_slot_args::",
+                "<Self,>(slot,\"user.GenericBox\",1usize);"
+            )),
+            "{lib}"
+        );
+        assert!(flat.contains("&__baml_type_args[0usize].clone(),"), "{lib}");
+    }
+
+    /// A literal or enum-variant type translates to its base Rust type, but
+    /// a value is stated under the type its slot declares: `"a"[]` is a
+    /// `Vec<String>` stated `"a"[]`, never `string[]`, which a value of the
+    /// slot's type does not inhabit.
+    #[test]
+    fn literal_and_variant_slots_are_stated_as_declared() {
+        let color = name("user", &[], "Color");
+        let generic_box = name("user", &[], "Box");
+        let tagged = name("user", &[], "Tagged");
+        let f = name("user", &[], "f");
+        let lit_a = || {
+            Ty::Literal(
+                baml_base::Literal::String("a".into()),
+                baml_sdkgen_types::Freshness::Regular,
+            )
+        };
+        let lit_a_list = || Ty::List(Box::new(lit_a()));
+        let red = Ty::EnumVariant(color.clone(), baml_base::Name::new("Red"));
+        let variant = |variant: &str| baml_sdkgen_types::EnumVariant {
+            name: baml_base::Name::new(variant),
+            docstring: None,
+            value: variant.to_string(),
+            json_rename: None,
+        };
+        let mut function = nullary_string_fn(&f);
+        function.arguments = vec![
+            arg("tags", lit_a_list()),
+            arg("reds", Ty::List(Box::new(red.clone()))),
+            arg("boxed", Ty::Class(generic_box.clone(), Box::new([lit_a()]))),
+            arg(
+                "choice",
+                Ty::Union(Box::new([Ty::List(Box::new(red)), Ty::Int])),
+            ),
+            arg(
+                "cb",
+                Ty::Function {
+                    params: Box::new([]),
+                    ret: Box::new(lit_a_list()),
+                    throws: Box::new(Ty::Never),
+                },
+            ),
+        ];
+        let pool = SymbolPool::from([
+            (
+                color.clone(),
+                Symbol::Enum(baml_sdkgen_types::Enum {
+                    name: color,
+                    docstring: None,
+                    variants: vec![variant("Red"), variant("Green")],
+                    origin: Origin {
+                        source_file_path: "main.baml".to_string(),
+                        span_start: 0,
+                    },
+                }),
+            ),
+            (
+                generic_box.clone(),
+                generic_class(&generic_box, &["T"], vec![("value", typevar(0, "T"))]),
+            ),
+            (
+                tagged.clone(),
+                generic_class(&tagged, &[], vec![("tags", lit_a_list())]),
+            ),
+            (f, Symbol::Function(function)),
+        ]);
+
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(
+            generated.warnings.is_empty(),
+            "{:?}",
+            generated.warnings.first().map(|w| &w.reason)
+        );
+        let lib = text(&generated, "src/lib.rs");
+        // The pretty-printer adds a trailing comma wherever it wraps a list.
+        let canonical = |src: &str| {
+            flat(src)
+                .replace(",)", ")")
+                .replace(",]", "]")
+                .replace(",>", ">")
+        };
+        let flat = canonical(lib);
+        let internal = "::baml_bridge::baml_value::internal::";
+        let literal_a = format!(
+            "{internal}literal_ty(::baml_bridge::wire::baml_ty_literal::Literal::StringValue(\"a\".to_string()))"
+        );
+        let literal_a_list = format!("{internal}list_ty({literal_a})");
+        let red_list =
+            format!("{internal}list_ty({internal}enum_variant_ty(\"user.Color\",\"Red\"))");
+        // The Rust types are the base types.
+        assert!(
+            flat.contains("tags:::std::vec::Vec<::std::string::String>"),
+            "{lib}"
+        );
+        assert!(flat.contains("reds:::std::vec::Vec<crate::Color>"), "{lib}");
+        assert!(
+            flat.contains("boxed:impl::std::borrow::Borrow<crate::Box<::std::string::String>>"),
+            "{lib}"
+        );
+        // Each argument is stated as declared.
+        // A class-typed parameter is taken by `Borrow` and encoded through it.
+        for (param, value, slot) in [
+            ("tags", "&tags".to_string(), literal_a_list.clone()),
+            ("reds", "&reds".to_string(), red_list.clone()),
+            (
+                "boxed",
+                "::std::borrow::Borrow::<crate::Box<::std::string::String>>::borrow(&boxed)"
+                    .to_string(),
+                format!("{internal}class_ty(\"user.Box\",::std::vec![{literal_a}])"),
+            ),
+            (
+                "choice",
+                "&choice".to_string(),
+                format!("{internal}union_ty(::std::vec![{red_list},{internal}primitive_ty("),
+            ),
+        ] {
+            assert!(
+                flat.contains(&canonical(&format!(
+                    "__baml_arguments.value(\"{param}\",{value},&{slot}"
+                ))),
+                "`{param}` is not stated as declared:\n{lib}"
+            );
+        }
+        // The callback states its declared return type, which its results fill.
+        assert!(
+            flat.contains(&canonical(&format!(
+                "__baml_arguments.callable(\"cb\",cb,&[],::baml_bridge::host_value::CallableTy::new(::std::vec![],{literal_a_list},"
+            ))),
+            "{lib}"
+        );
+        // A field is stated as declared, and a union arm is its declared type.
+        assert!(
+            flat.contains(&canonical(&format!(
+                "(\"tags\",{internal}__BamlValuePrivate::to_baml_in(&self.tags,&{literal_a_list},encoder,)?,)"
+            ))),
+            "{lib}"
+        );
+        assert!(
+            flat.contains(&canonical(&format!(
+                "::baml_bridge::decode::selected_type_matches(&{red_list},&selected_type)"
+            ))),
+            "{lib}"
+        );
     }
 
     #[test]
@@ -1178,9 +2355,87 @@ mod tests {
             "{flat}"
         );
         assert!(
-            flat.contains("x:crate::GenericBox<::core::primitive::i64>"),
+            flat.contains("x:impl::std::borrow::Borrow<crate::GenericBox<::core::primitive::i64>>"),
             "{flat}"
         );
+    }
+
+    #[test]
+    fn class_arguments_accept_a_value_or_a_reference() {
+        // class Client { url string; merge(self, other: Client) -> string }
+        // call(client: Client, n: int, s: string, many: Client[],
+        //      maybe: Client?, fallback: Client = <expr>) -> string
+        let c = name("user", &[], "Client");
+        let client = Ty::Class(c.clone(), Box::new([]));
+        let mut merge = nullary_string_fn(&name("user", &[], "merge"));
+        merge.arguments = vec![arg("other", client.clone())];
+        let mut call = nullary_string_fn(&name("user", &[], "call"));
+        let mut fallback = arg("fallback", client.clone());
+        fallback.default =
+            Some(baml_sdkgen_types::FunctionArgumentDefault::Expression { source: None });
+        call.arguments = vec![
+            arg("client", client.clone()),
+            arg("n", Ty::Int),
+            arg("s", Ty::String),
+            arg("many", Ty::List(Box::new(client.clone()))),
+            arg("maybe", Ty::Union(Box::new([client, Ty::Null]))),
+            fallback,
+        ];
+        let pool = SymbolPool::from([
+            (
+                c.clone(),
+                class_symbol(
+                    &c,
+                    vec![baml_sdkgen_types::ClassProperty {
+                        name: baml_base::Name::new("url"),
+                        docstring: None,
+                        ty: Ty::String,
+                        json_fallback: false,
+                        json_flatten: false,
+                        json_rename: None,
+                    }],
+                    Vec::new(),
+                    vec![merge],
+                ),
+            ),
+            (name("user", &[], "call"), Symbol::Function(call)),
+        ]);
+
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty());
+        let lib = text(&generated, "src/lib.rs");
+        let flat = flat(lib);
+        // A direct class parameter takes `impl Borrow<Class>` and is encoded
+        // through it, on all four bindings of the function and the method.
+        for param in ["client", "other"] {
+            assert_eq!(
+                flat.matches(&format!("{param}:impl::std::borrow::Borrow<crate::Client>"))
+                    .count(),
+                4,
+                "{lib}"
+            );
+            assert_eq!(
+                flat.matches(&format!(
+                    "(\"{param}\",::std::borrow::Borrow::<crate::Client>::borrow(&{param}),"
+                ))
+                .count(),
+                4,
+                "{lib}"
+            );
+        }
+        // Everything else keeps its shape: primitives, strings, lists and
+        // optionals by value; defaulted parameters through `OptionalArg`.
+        for param in [
+            "n:::core::primitive::i64",
+            "s:::std::string::String",
+            "many:::std::vec::Vec<crate::Client>",
+            "maybe:::std::option::Option<crate::Client>",
+            "fallback:impl::std::convert::Into<::baml_bridge::OptionalArg<crate::Client>>",
+        ] {
+            assert_eq!(flat.matches(param).count(), 4, "{param}:\n{lib}");
+        }
+        // Nothing else borrows: 8 parameters plus 8 encodings.
+        assert_eq!(flat.matches("::std::borrow::Borrow").count(), 16, "{lib}");
     }
 
     #[test]
@@ -1215,9 +2470,9 @@ mod tests {
             flat.contains("impl<T:::baml_bridge::BamlValue>GenericBox<T>{"),
             "{lib}"
         );
-        assert!(flat.contains("pubfnget(&self"), "{lib}");
+        assert!(flat.contains("pubasyncfnget(&self"), "{lib}");
         assert!(
-            flat.contains("pubfnpair_with<U:::baml_bridge::BamlValue>(&self,other:U"),
+            flat.contains("pubasyncfnpair_with<U:::baml_bridge::BamlValue>(&self,other:U"),
             "{lib}"
         );
         // `pair_with` binds the class `T` first, then its own `U`.
@@ -1230,7 +2485,7 @@ mod tests {
         );
         // `get` has no own params but still binds the class `T`:
         // 2 bindings each (sync + async) for `get` and `pair_with`.
-        assert_eq!(flat.matches("(\"T\",<Tas").count(), 4, "{lib}");
+        assert_eq!(flat.matches("(\"T\",<Tas").count(), 8, "{lib}");
     }
 
     #[test]
@@ -1257,7 +2512,7 @@ mod tests {
         let lib = text(&generated, "src/lib.rs");
         let flat = flat(lib);
         assert!(
-            flat.contains("pubfnmake_box<V:::baml_bridge::BamlValue>(value:V"),
+            flat.contains("pubasyncfnmake_box<V:::baml_bridge::BamlValue>(value:V"),
             "{lib}"
         );
         assert!(
@@ -1265,7 +2520,7 @@ mod tests {
             "the static's own param instantiates the return:\n{lib}"
         );
         // Sync + async each bind exactly `V`; the class `T` is never sent.
-        assert_eq!(flat.matches("(\"V\",<Vas").count(), 2, "{lib}");
+        assert_eq!(flat.matches("(\"V\",<Vas").count(), 4, "{lib}");
         assert_eq!(flat.matches("(\"T\",<Tas").count(), 0, "{lib}");
     }
 
@@ -1347,6 +2602,9 @@ mod tests {
                     name: baml_base::Name::new("name"),
                     docstring: None,
                     ty: Ty::String,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
                 }],
                 vec![create],
                 vec![who, greet],
@@ -1365,23 +2623,19 @@ mod tests {
         let flat = flat(lib);
         // Static: plain associated fn. Instance: `&self` receiver.
         assert!(
-            flat.contains("pubfncreate(name:::std::string::String"),
+            flat.contains("pubasyncfncreate(name:::std::string::String"),
             "{lib}"
         );
-        assert!(flat.contains("pubasyncfncreate_async("), "{lib}");
-        assert!(flat.contains("pubfnwho(&self"), "{lib}");
-        assert!(flat.contains("pubasyncfnwho_async(&self"), "{lib}");
+        assert!(flat.contains("pubfncreate_sync("), "{lib}");
+        assert!(flat.contains("pubasyncfnwho(&self"), "{lib}");
+        assert!(flat.contains("pubfnwho_sync(&self"), "{lib}");
         assert!(
-            flat.contains("pubfngreet(&self,greeting:::std::string::String"),
+            flat.contains("pubasyncfngreet(&self,greeting:::std::string::String"),
             "{lib}"
         );
-        // The receiver rides the wire as the `"self"` kwarg, encoded by
+        // The receiver rides the wire as the `"self"` argument, encoded by
         // value like every other argument.
-        assert!(
-            flat.contains(r#"("self",::std::option::Option::Some"#),
-            "{lib}"
-        );
-        assert!(flat.contains("to_baml(self)"), "{lib}");
+        assert!(flat.contains("__baml_arguments.receiver(self)?;"), "{lib}");
         // Instance methods carry the receiver-aware by-value note (even
         // with no non-receiver arguments); the static factory gets the
         // arguments wording.
@@ -1393,6 +2647,537 @@ mod tests {
             lib.contains("/// Arguments are passed to the BAML runtime by value:"),
             "{lib}"
         );
+    }
+
+    fn optional(ty: Ty) -> Ty {
+        Ty::Union(Box::new([ty, Ty::Null]))
+    }
+
+    /// The generated `lib.rs` for one class, flattened, asserting no
+    /// warnings.
+    fn class_lib(class: Symbol, convention: NamingConvention) -> String {
+        let Symbol::Class(ref decl) = class else {
+            unreachable!("`class_lib` takes a class");
+        };
+        let pool = SymbolPool::from([(decl.name.clone(), class)]);
+        let generated = to_source_code_with_bytecode(
+            &pool,
+            &[],
+            &RustGenOptions {
+                naming_convention: convention,
+                ..options()
+            },
+        );
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        text(&generated, "src/lib.rs").to_string()
+    }
+
+    #[test]
+    fn constructor_takes_required_fields_and_leaves_optionals_none() {
+        // class CreateSetupLinkRequest {
+        //   projectId string, maxDeployments int?, name string, type string?
+        // }
+        let n = name("user", &[], "CreateSetupLinkRequest");
+        let lib = class_lib(
+            class_symbol(
+                &n,
+                vec![
+                    property("projectId", Ty::String),
+                    property("maxDeployments", optional(Ty::Int)),
+                    property("name", Ty::String),
+                    property("type", optional(Ty::String)),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+            NamingConvention::Language,
+        );
+        let flat_lib = flat(&lib);
+        // Required fields in declaration order under their Rust names;
+        // every optional field `None`.
+        assert!(
+            flat_lib.contains(concat!(
+                "implCreateSetupLinkRequest{",
+                "///A`CreateSetupLinkRequest`fromitsrequiredfields,indeclarationorder,",
+                "everyoptionalfield`None`.",
+            )),
+            "{lib}"
+        );
+        assert!(
+            flat_lib.contains(concat!(
+                "pubfnnew(project_id:::std::string::String,name:::std::string::String)->Self{",
+                "Self{project_id,name,",
+                "max_deployments:::std::option::Option::None,",
+                "r#type:::std::option::Option::None,}}",
+            )),
+            "{lib}"
+        );
+        // The doc shows the struct-update pattern with the real names.
+        assert!(
+            lib.contains(
+                "/// let value = CreateSetupLinkRequest { max_deployments: Some(/* ... */), \
+                 ..CreateSetupLinkRequest::new(project_id, name) };"
+            ),
+            "{lib}"
+        );
+        // No `Default`: a forgotten required field must not compile.
+        assert!(!lib.contains("Default"), "{lib}");
+        assert!(!lib.contains("new_without_default"), "{lib}");
+    }
+
+    #[test]
+    fn constructor_of_an_all_optional_class_takes_no_arguments() {
+        let n = name("user", &[], "Filters");
+        let lib = class_lib(
+            class_symbol(
+                &n,
+                vec![
+                    property("limit", optional(Ty::Int)),
+                    property("cursor", optional(Ty::String)),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+            NamingConvention::PreserveCase,
+        );
+        let flat_lib = flat(&lib);
+        assert!(
+            flat_lib.contains(concat!(
+                "#[allow(clippy::new_without_default)]pubfnnew()->Self{Self{",
+                "limit:::std::option::Option::None,cursor:::std::option::Option::None,}}",
+            )),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("/// let value = Filters { limit: Some(/* ... */), ..Filters::new() };"),
+            "{lib}"
+        );
+        assert!(!lib.contains("impl ::std::default::Default"), "{lib}");
+        assert!(!lib.contains("derive(Default"), "{lib}");
+    }
+
+    #[test]
+    fn constructor_of_an_all_required_class_takes_every_field() {
+        let n = name("user", &[], "Point");
+        let empty = name("user", &[], "Empty");
+        let lib = class_lib(
+            class_symbol(
+                &n,
+                vec![
+                    property("x", Ty::Int),
+                    property("label", Ty::String),
+                    // A `json` field admits null but is no `Option`.
+                    property(
+                        "meta",
+                        Ty::TypeAlias(Name::from_dotted_path(
+                            baml_base::qualified_name::BAML_JSON_JSON,
+                        )),
+                    ),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+            NamingConvention::PreserveCase,
+        );
+        let flat_lib = flat(&lib);
+        assert!(
+            flat_lib.contains(concat!(
+                "pubfnnew(x:::core::primitive::i64,label:::std::string::String,",
+                "meta:::baml_bridge::Json,)->Self{Self{x,label,meta}}",
+            )),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("/// A `Point` from its fields, in declaration order."),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("/// let value = Point::new(x, label, meta);"),
+            "{lib}"
+        );
+        assert!(!lib.contains("new_without_default"), "{lib}");
+
+        // A field-less class gets the no-argument constructor too.
+        let lib = class_lib(
+            class_symbol(&empty, Vec::new(), Vec::new(), Vec::new()),
+            NamingConvention::PreserveCase,
+        );
+        assert!(
+            flat(&lib).contains("#[allow(clippy::new_without_default)]pubfnnew()->Self{Self{}}"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn constructor_leaves_unboxed_nullable_alias_fields_none() {
+        // type MaybeInt = int?; type AlsoMaybeInt = MaybeInt; type Label = string
+        // class Holder { a MaybeInt, b AlsoMaybeInt, c Label }
+        // type MaybeNode = Node?; class Node { value int, next MaybeNode }
+        let alias = |n: &Name, resolves_to| {
+            (
+                n.clone(),
+                Symbol::TypeAlias(baml_sdkgen_types::TypeAlias {
+                    name: n.clone(),
+                    resolves_to,
+                    recursive: false,
+                    origin: Origin {
+                        source_file_path: "main.baml".to_string(),
+                        span_start: 0,
+                    },
+                }),
+            )
+        };
+        let maybe_int = name("user", &[], "MaybeInt");
+        let also_maybe_int = name("user", &[], "AlsoMaybeInt");
+        let label = name("user", &[], "Label");
+        let holder = name("user", &[], "Holder");
+        let maybe_node = name("user", &[], "MaybeNode");
+        let node = name("user", &[], "Node");
+        let pool = SymbolPool::from([
+            alias(&maybe_int, optional(Ty::Int)),
+            alias(&also_maybe_int, Ty::TypeAlias(maybe_int.clone())),
+            alias(&label, Ty::String),
+            (
+                holder.clone(),
+                class_symbol(
+                    &holder,
+                    vec![
+                        property("a", Ty::TypeAlias(maybe_int.clone())),
+                        property("b", Ty::TypeAlias(also_maybe_int.clone())),
+                        property("c", Ty::TypeAlias(label.clone())),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            alias(&maybe_node, optional(Ty::Class(node.clone(), Box::new([])))),
+            (
+                node.clone(),
+                class_symbol(
+                    &node,
+                    vec![
+                        property("value", Ty::Int),
+                        property("next", Ty::TypeAlias(maybe_node.clone())),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let flat_lib = flat(lib);
+        assert!(
+            flat_lib.contains(concat!(
+                "pubfnnew(c:crate::Label)->Self{Self{c,",
+                "a:::std::option::Option::None,b:::std::option::Option::None,}}",
+            )),
+            "{lib}"
+        );
+        // A boxed alias field is a `Box<_>`, never `None`.
+        assert!(
+            flat_lib.contains("pubnext:::std::boxed::Box<crate::MaybeNode>"),
+            "{lib}"
+        );
+        assert!(
+            flat_lib.contains("next:::std::boxed::Box<crate::MaybeNode>,)->Self{Self{value,next}}"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn constructor_of_a_wide_class_allows_the_clippy_lint() {
+        let n = name("user", &[], "Wide");
+        let lib = class_lib(
+            class_symbol(
+                &n,
+                (0..8)
+                    .map(|index| property(&format!("f{index}"), Ty::String))
+                    .chain([property("extra", optional(Ty::String))])
+                    .collect(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            NamingConvention::PreserveCase,
+        );
+        assert!(
+            flat(&lib).contains("#[allow(clippy::too_many_arguments)]pubfnnew(f0:"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn generic_class_constructor_is_on_the_generic_impl() {
+        // Page<T> { items T[], next T? }
+        let n = name("user", &[], "Page");
+        let lib = class_lib(
+            generic_class(
+                &n,
+                &["T"],
+                vec![
+                    ("items", Ty::List(Box::new(typevar(0, "T")))),
+                    ("next", optional(typevar(0, "T"))),
+                ],
+            ),
+            NamingConvention::PreserveCase,
+        );
+        assert!(
+            flat(&lib).contains("impl<T:::baml_bridge::BamlValue>Page<T>{"),
+            "{lib}"
+        );
+        assert!(
+            flat(&lib).contains(concat!(
+                "pubfnnew(items:::std::vec::Vec<T>)->Self{",
+                "Self{items,next:::std::option::Option::None,}}",
+            )),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn constructor_yields_new_to_a_baml_method_spelled_new() {
+        // class Account { new string, id string?
+        //   static function new(...) -> Account; function new_(...) }
+        // A field `new` is in the struct's field namespace, so it does not
+        // move the constructor; a method binding `new` is in the `impl`
+        // namespace, so the BAML method keeps `new` and the constructor
+        // takes the next free spelling.
+        let n = name("user", &[], "Account");
+        let mut factory = nullary_string_fn(&name("user", &[], "new"));
+        factory.return_type = Ty::Class(n.clone(), Box::new([]));
+        let instance = nullary_string_fn(&name("user", &[], "new_"));
+        let lib = class_lib(
+            class_symbol(
+                &n,
+                vec![
+                    property("new", Ty::String),
+                    property("id", optional(Ty::String)),
+                ],
+                vec![factory],
+                vec![instance],
+            ),
+            NamingConvention::PreserveCase,
+        );
+        let flat_lib = flat(&lib);
+        assert!(
+            flat_lib.contains("pubasyncfnnew()->::std::result::Result<"),
+            "{lib}"
+        );
+        assert!(flat_lib.contains("pubasyncfnnew_(&self"), "{lib}");
+        assert!(
+            flat_lib.contains(concat!(
+                "pubfnnew__(new:::std::string::String)->Self{",
+                "Self{new,id:::std::option::Option::None,}}",
+            )),
+            "{lib}"
+        );
+        assert!(
+            lib.contains("..Account::new__(new) };"),
+            "the doc names the allocated spelling:\n{lib}"
+        );
+
+        // Without a method in the way, a `new` field leaves `new` free.
+        let plain = name("user", &[], "Plain");
+        let lib = class_lib(
+            class_symbol(
+                &plain,
+                vec![property("new", Ty::String)],
+                Vec::new(),
+                Vec::new(),
+            ),
+            NamingConvention::PreserveCase,
+        );
+        assert!(
+            flat(&lib).contains("pubfnnew(new:::std::string::String)->Self{Self{new}}"),
+            "{lib}"
+        );
+    }
+
+    /// A `reflect.Package`-shaped pool under `crossing`: the declared
+    /// `_inner: unknown` field, a static factory, an instance method, and a
+    /// user function taking and returning the class.
+    fn package_pool(crossing: baml_sdkgen_types::ClassCrossing) -> SymbolPool {
+        let package = name("reflect", &[], "Package");
+        let package_ty = Ty::Class(package.clone(), Box::new([]));
+        let mut current = nullary_string_fn(&name("reflect", &[], "current"));
+        current.return_type = package_ty.clone();
+        let diagnostics = nullary_string_fn(&name("reflect", &[], "diagnostics"));
+        let Symbol::Class(class) = class_symbol(
+            &package,
+            vec![baml_sdkgen_types::ClassProperty {
+                name: baml_base::Name::new("_inner"),
+                docstring: None,
+                ty: Ty::Unknown,
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
+            }],
+            vec![current],
+            vec![diagnostics],
+        ) else {
+            unreachable!("class_symbol builds a class")
+        };
+        let rt = name("user", &[], "rt");
+        SymbolPool::from([
+            (
+                package,
+                Symbol::Class(baml_sdkgen_types::Class { crossing, ..class }),
+            ),
+            (
+                rt.clone(),
+                Symbol::Function(unary_fn(&rt, package_ty.clone(), package_ty)),
+            ),
+        ])
+    }
+
+    #[test]
+    fn opaque_classes_emit_a_handle_wrapper_without_fields() {
+        let generated = to_source_code_with_bytecode(
+            &package_pool(baml_sdkgen_types::ClassCrossing::Opaque),
+            &[],
+            &options(),
+        );
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let reflect = text(&generated, "src/reflect/mod.rs");
+        let flat_reflect = flat(reflect);
+        // A private engine handle: no public constructor, no fields (the
+        // declared `_inner` is the runtime's own).
+        assert!(
+            flat_reflect.contains(
+                "pubstructPackage(::baml_bridge::baml_value::internal::RuntimeInstance);"
+            ),
+            "{reflect}"
+        );
+        // Equal and hashed as the instance it references.
+        assert!(
+            flat_reflect.contains("impl::std::cmp::PartialEqforPackage{fneq(&self,other:&Self)->bool{self.0==other.0}}"),
+            "{reflect}"
+        );
+        assert!(!reflect.contains("_inner"), "{reflect}");
+        assert!(!flat_reflect.contains("pubfnnew("), "{reflect}");
+        // Decodes the `ADT_RUNTIME_VALUE` handle naming the class, encodes
+        // as the handle.
+        assert!(
+            flat_reflect.contains(
+                r#"::baml_bridge::baml_value::internal::RuntimeInstance::decode(v,"reflect.Package""#
+            ),
+            "{reflect}"
+        );
+        assert!(
+            flat_reflect.contains("{self.0.to_baml(encoder)}"),
+            "{reflect}"
+        );
+        assert!(!reflect.contains("encode::class"), "{reflect}");
+        assert!(!reflect.contains("ClassFields"), "{reflect}");
+        // Methods bind as on any class; the receiver is sent as the handle.
+        assert!(flat_reflect.contains("pubasyncfncurrent()"), "{reflect}");
+        assert!(
+            flat_reflect.contains("pubasyncfndiagnostics(&self"),
+            "{reflect}"
+        );
+        assert!(flat_reflect.contains(".receiver(self)?;"), "{reflect}");
+        // A typed position names the wrapper, taken by `Borrow` as any class is.
+        let lib = flat(text(&generated, "src/lib.rs"));
+        assert!(
+            lib.contains("u:impl::std::borrow::Borrow<crate::reflect::Package>"),
+            "{lib}"
+        );
+    }
+
+    /// A generic opaque class with an instance method over `T`, and a
+    /// function returning one at its own `T`.
+    fn generic_cache_pool(crossing: baml_sdkgen_types::ClassCrossing) -> SymbolPool {
+        let cache = name("user", &[], "Cache");
+        let mut get = nullary_string_fn(&name("user", &[], "get"));
+        get.return_type = typevar(0, "T");
+        let Symbol::Class(class) = class_symbol(&cache, Vec::new(), Vec::new(), vec![get]) else {
+            unreachable!("class_symbol builds a class")
+        };
+        let make = name("user", &[], "make");
+        let mut make_fn = nullary_string_fn(&make);
+        make_fn.generic_params.push(baml_base::Name::new("T"));
+        make_fn.return_type = Ty::Class(cache.clone(), Box::new([typevar(0, "T")]));
+        SymbolPool::from([
+            (
+                cache,
+                Symbol::Class(baml_sdkgen_types::Class {
+                    crossing,
+                    generic_params: vec![baml_base::Name::new("T")],
+                    ..class
+                }),
+            ),
+            (make, Symbol::Function(make_fn)),
+        ])
+    }
+
+    #[test]
+    fn a_generic_opaque_class_is_a_wrapper_at_its_type_arguments() {
+        let generated = to_source_code_with_bytecode(
+            &generic_cache_pool(baml_sdkgen_types::ClassCrossing::Opaque),
+            &[],
+            &options(),
+        );
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let flat_lib = flat(lib);
+        let type_arg = "<Tas::baml_bridge::baml_value::internal::__BamlValuePrivate>::baml_ty()";
+        for expected in [
+            // The parameter names what the instance is; the wrapper holds no `T`.
+            "pubstructCache<T:::baml_bridge::BamlValue>(::baml_bridge::baml_value::internal::RuntimeInstance,::std::marker::PhantomData<fn()->(T,)>,);".to_string(),
+            // Decodes the handle naming the class, and states its type arguments.
+            r#"RuntimeInstance::decode(v,"user.Cache""#.to_string(),
+            format!(r#"class_ty("user.Cache",::std::vec![{type_arg}],)"#),
+            // Its methods bind `T` from the receiver's Rust type.
+            "impl<T:::baml_bridge::BamlValue>Cache<T>{".to_string(),
+            "pubasyncfnget(&self".to_string(),
+            "pubfnget_sync(&self".to_string(),
+        ] {
+            assert!(flat_lib.contains(&expected), "missing {expected} in:\n{lib}");
+        }
+    }
+
+    /// Negative control: a generic class crossing by its fields with no field
+    /// over `T` cannot be a Rust struct, so it skips.
+    #[test]
+    fn a_generic_class_of_fields_needs_a_field_over_each_parameter() {
+        let generated = to_source_code_with_bytecode(
+            &generic_cache_pool(baml_sdkgen_types::ClassCrossing::Fields),
+            &[],
+            &options(),
+        );
+        assert!(
+            generated
+                .warnings
+                .iter()
+                .any(|warning| warning.fqn == "user.Cache"
+                    && warning.reason.contains("generic type parameter `T`")),
+            "{:?}",
+            generated.warnings
+        );
+    }
+
+    /// Negative control: the same declaration crossing by its fields keeps
+    /// the field-by-field shape, so the crossing alone selects the opaque
+    /// one (here its `unknown` field is unrepresentable, which skips it).
+    #[test]
+    fn the_crossing_selects_the_opaque_shape() {
+        let generated = to_source_code_with_bytecode(
+            &package_pool(baml_sdkgen_types::ClassCrossing::Fields),
+            &[],
+            &options(),
+        );
+        assert!(
+            generated
+                .warnings
+                .iter()
+                .any(|warning| warning.fqn == "reflect.Package"
+                    && warning.reason.contains("field `_inner`")),
+            "{:?}",
+            generated.warnings
+        );
+        let reflect = text(&generated, "src/reflect/mod.rs");
+        assert!(!reflect.contains("RuntimeInstance"), "{reflect}");
     }
 
     #[test]
@@ -1414,10 +3199,10 @@ mod tests {
         let lib = text(&generated, "src/lib.rs");
         assert!(lib.contains("pub struct Widget"), "{lib}");
         let flat = flat(lib);
-        assert!(flat.contains("pubfnok(&self"), "{lib}");
-        assert!(!flat.contains("pubfnsnap"), "{lib}");
+        assert!(flat.contains("pubasyncfnok(&self"), "{lib}");
+        assert!(!flat.contains("fnsnap"), "{lib}");
         assert!(
-            flat.contains("pubfnpick<T:::baml_bridge::BamlValue>(&self"),
+            flat.contains("pubasyncfnpick<T:::baml_bridge::BamlValue>(&self"),
             "{lib}"
         );
         assert_eq!(generated.warnings.len(), 1, "{:?}", generated.warnings);
@@ -1443,6 +3228,9 @@ mod tests {
                     name: baml_base::Name::new("next"),
                     docstring: None,
                     ty: next_field,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
                 }],
                 Vec::new(),
                 vec![next_or_self],
@@ -1496,8 +3284,114 @@ mod tests {
         let pool = SymbolPool::from([(n.clone(), Symbol::Function(nullary_string_fn(&n)))]);
         let generated = to_source_code_with_bytecode(&pool, &[], &options());
         assert!(text(&generated, "src/a/mod.rs").contains("pub mod b;"));
-        assert!(text(&generated, "src/a/b/mod.rs").contains("pub fn f()"));
+        assert!(text(&generated, "src/a/b/mod.rs").contains("pub async fn f()"));
         assert!(text(&generated, "src/lib.rs").contains("pub mod a;"));
+    }
+
+    #[test]
+    fn language_naming_respells_bindings_and_keeps_wire_names() {
+        let page = name("user", &["deploymentGroups"], "page_result");
+        let status = name("user", &["deploymentGroups"], "Status");
+        let create_token = name("user", &["deploymentGroups"], "createToken");
+        let mut function = nullary_string_fn(&create_token);
+        function
+            .arguments
+            .push(baml_sdkgen_types::FunctionArgument {
+                injected: false,
+                name: baml_base::Name::new("groupId"),
+                docstring: None,
+                ty: Ty::String,
+                default: None,
+            });
+        function.return_type = Ty::Class(page.clone(), Box::new([]));
+        let mut refresh = nullary_string_fn(&name("user", &[], "refreshToken"));
+        refresh.return_type = Ty::Enum(status.clone());
+        let pool = SymbolPool::from([
+            (create_token, Symbol::Function(function)),
+            (
+                page.clone(),
+                class_symbol(
+                    &page,
+                    vec![
+                        property("nextCursor", Ty::Union(Box::new([Ty::String, Ty::Null]))),
+                        property("type", Ty::String),
+                    ],
+                    Vec::new(),
+                    vec![refresh],
+                ),
+            ),
+            (
+                status.clone(),
+                Symbol::Enum(baml_sdkgen_types::Enum {
+                    name: status,
+                    docstring: None,
+                    variants: vec![baml_sdkgen_types::EnumVariant {
+                        name: baml_base::Name::new("NOT_FOUND"),
+                        docstring: None,
+                        value: "NOT_FOUND".to_string(),
+                        json_rename: None,
+                    }],
+                    origin: Origin {
+                        source_file_path: "main.baml".to_string(),
+                        span_start: 0,
+                    },
+                }),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(
+            &pool,
+            &[],
+            &RustGenOptions {
+                naming_convention: NamingConvention::Language,
+                ..options()
+            },
+        );
+        assert!(text(&generated, "src/lib.rs").contains("pub mod deployment_groups;"));
+        let module = flat(text(&generated, "src/deployment_groups/mod.rs"));
+
+        // Bindings take Rust casing; the wire keeps every BAML name.
+        assert!(
+            module.contains("pubasyncfncreate_token(group_id:"),
+            "{module}"
+        );
+        assert!(module.contains("pubfncreate_token_sync("), "{module}");
+        assert!(
+            module.contains("pubasyncfncreate_token_with_options("),
+            "{module}"
+        );
+        assert!(
+            module.contains("invoke_sync_with_options(\"user.deploymentGroups.createToken\""),
+            "{module}"
+        );
+        assert!(module.contains(".value(\"groupId\",&group_id,"), "{module}");
+        assert!(
+            module.contains("->::std::result::Result<crate::deployment_groups::PageResult,"),
+            "{module}"
+        );
+
+        assert!(module.contains("pubstructPageResult{"), "{module}");
+        assert!(
+            module.contains(
+                "#[cfg_attr(feature=\"serde\",serde(rename=\"nextCursor\"))]pubnext_cursor:"
+            ),
+            "{module}"
+        );
+        assert!(module.contains("pubr#type:"), "{module}");
+        assert!(module.contains("(\"nextCursor\","), "{module}");
+        assert!(
+            module.contains("next_cursor:fields.take(\"nextCursor\")?"),
+            "{module}"
+        );
+        assert!(
+            module.contains("pubasyncfnrefresh_token(&self,"),
+            "{module}"
+        );
+
+        assert!(
+            module.contains("#[cfg_attr(feature=\"serde\",serde(rename=\"NOT_FOUND\"))]NotFound"),
+            "{module}"
+        );
+        assert!(module.contains("Self::NotFound=>\"NOT_FOUND\""), "{module}");
     }
 
     #[test]
@@ -1537,10 +3431,905 @@ mod tests {
     }
 
     #[test]
+    fn manifest_names_the_library_after_lib_name() {
+        let default = render_manifest(&options());
+        assert!(
+            default.contains("[lib]\nname = \"baml_sdk\"\n"),
+            "{default}"
+        );
+
+        let manifest = render_manifest(&RustGenOptions {
+            package_name: "alien-api".to_string(),
+            lib_name: "alien_api".to_string(),
+            ..options()
+        });
+        assert!(
+            manifest.contains("[package]\nname = \"alien-api\"\n"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("[lib]\nname = \"alien_api\"\n"),
+            "{manifest}"
+        );
+        assert!(!manifest.contains("baml_sdk"), "{manifest}");
+    }
+
+    #[test]
+    fn crate_names_exclude_keywords_and_the_crates_the_sdk_depends_on() {
+        for valid in ["alien_api", "_private", "sdk2", "baml_sdk"] {
+            assert!(is_valid_crate_name(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "_",
+            "AlienApi",
+            "alien-api",
+            "2sdk",
+            "type",
+            "crate",
+            "self",
+            "async",
+            "gen",
+            "std",
+            "core",
+            "alloc",
+            "baml_bridge",
+            "baml_rs",
+            "serde",
+        ] {
+            assert!(!is_valid_crate_name(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
     fn manifest_extra_is_appended_with_trailing_newline() {
         let mut opts = options();
         opts.manifest_extra = Some("[dev-dependencies]\ntokio = \"1\"".to_string());
         let manifest = render_manifest(&opts);
         assert!(manifest.ends_with("[dev-dependencies]\ntokio = \"1\"\n"));
+    }
+
+    fn json_ref() -> Ty {
+        Ty::TypeAlias(Name::from_dotted_path(
+            baml_base::qualified_name::BAML_JSON_JSON,
+        ))
+    }
+
+    /// A recursive alias symbol `name = null | bool | … | name[] | map<string, name>`,
+    /// the shape of the stdlib's `json`.
+    fn json_shaped_alias(name: &Name) -> Symbol {
+        let this = Ty::TypeAlias(name.clone());
+        Symbol::TypeAlias(baml_sdkgen_types::TypeAlias {
+            name: name.clone(),
+            resolves_to: Ty::Union(Box::new([
+                Ty::Null,
+                Ty::Bool,
+                Ty::Int,
+                Ty::Bigint,
+                Ty::Float,
+                Ty::String,
+                Ty::List(Box::new(this.clone())),
+                Ty::Map {
+                    key: Box::new(Ty::String),
+                    value: Box::new(this),
+                },
+            ])),
+            recursive: true,
+            origin: Origin {
+                source_file_path: "json.baml".to_string(),
+                span_start: 0,
+            },
+        })
+    }
+
+    fn property(field: &str, ty: Ty) -> baml_sdkgen_types::ClassProperty {
+        baml_sdkgen_types::ClassProperty {
+            name: baml_base::Name::new(field),
+            docstring: None,
+            ty,
+            json_fallback: false,
+            json_flatten: false,
+            json_rename: None,
+        }
+    }
+
+    #[test]
+    fn canonical_json_emits_as_bridge_json_in_fields_and_signatures() {
+        let json_alias = Name::from_dotted_path(baml_base::qualified_name::BAML_JSON_JSON);
+        let event = name("user", &[], "Event");
+        let echo = name("user", &[], "echo");
+        let rt = name("user", &[], "rt");
+        let count = name("user", &[], "count");
+        let event_ty = Ty::Class(event.clone(), Box::new([]));
+        let pool = SymbolPool::from([
+            (json_alias.clone(), json_shaped_alias(&json_alias)),
+            (
+                event.clone(),
+                class_symbol(
+                    &event,
+                    vec![
+                        property("payload", json_ref()),
+                        property("items", Ty::List(Box::new(json_ref()))),
+                        property(
+                            "attrs",
+                            Ty::Map {
+                                key: Box::new(Ty::String),
+                                value: Box::new(json_ref()),
+                            },
+                        ),
+                        property("maybe", Ty::Union(Box::new([json_ref(), Ty::Null]))),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                echo.clone(),
+                Symbol::Function(unary_fn(&echo, event_ty.clone(), event_ty)),
+            ),
+            (
+                rt.clone(),
+                Symbol::Function(unary_fn(&rt, json_ref(), json_ref())),
+            ),
+            (
+                count.clone(),
+                Symbol::Function(unary_fn(&count, Ty::List(Box::new(json_ref())), Ty::Int)),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(
+            generated.warnings.is_empty(),
+            "nothing may be skipped: {:?}",
+            generated.warnings
+        );
+
+        let lib = flat(text(&generated, "src/lib.rs"));
+        for expected in [
+            "pubpayload:::baml_bridge::Json,",
+            "pubitems:::std::vec::Vec<::baml_bridge::Json>,",
+            "pubattrs:::baml_bridge::Map<::std::string::String,::baml_bridge::Json>,",
+            "pubmaybe:::std::option::Option<::baml_bridge::Json>,",
+            "pubasyncfnecho(u:impl::std::borrow::Borrow<crate::Event>,)->::std::result::Result<crate::Event,",
+            "pubasyncfnrt(u:::baml_bridge::Json,)->::std::result::Result<::baml_bridge::Json,",
+            "pubasyncfncount(u:::std::vec::Vec<::baml_bridge::Json>,)->::std::result::Result<::core::primitive::i64,",
+        ] {
+            assert!(lib.contains(expected), "missing `{expected}` in:\n{lib}");
+        }
+        let json_mod = text(&generated, "src/baml/json/mod.rs");
+        assert!(
+            flat(json_mod).contains("pubtypejson=::baml_bridge::Json;"),
+            "{json_mod}"
+        );
+    }
+
+    #[test]
+    fn json_fields_read_a_missing_key_as_null_through_aliases() {
+        let json_alias = Name::from_dotted_path(baml_base::qualified_name::BAML_JSON_JSON);
+        let blob = name("user", &[], "Blob");
+        let event = name("user", &[], "Event");
+        let pool = SymbolPool::from([
+            (json_alias.clone(), json_shaped_alias(&json_alias)),
+            (
+                blob.clone(),
+                Symbol::TypeAlias(baml_sdkgen_types::TypeAlias {
+                    name: blob.clone(),
+                    resolves_to: json_ref(),
+                    recursive: false,
+                    origin: Origin {
+                        source_file_path: "main.baml".to_string(),
+                        span_start: 0,
+                    },
+                }),
+            ),
+            (
+                event.clone(),
+                class_symbol(
+                    &event,
+                    vec![
+                        property("payload", json_ref()),
+                        property("aliased", Ty::TypeAlias(blob)),
+                        property("maybe", Ty::Union(Box::new([json_ref(), Ty::Null]))),
+                        property("count", Ty::Int),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(
+            generated.warnings.is_empty(),
+            "nothing may be skipped: {:?}",
+            generated.warnings
+        );
+        let lib = flat(text(&generated, "src/lib.rs"));
+        let default = "#[cfg_attr(feature=\"serde\",serde(default))]";
+        for field in ["payload", "aliased"] {
+            assert!(
+                lib.contains(&format!("{default}pub{field}:")),
+                "`{field}` must read a missing key as null:\n{lib}"
+            );
+        }
+        // `Option` reads a missing key as `None` on its own; a scalar must be present.
+        assert_eq!(lib.matches("serde(default)").count(), 2, "{lib}");
+    }
+
+    #[test]
+    fn canonical_json_needs_no_alias_item_in_the_pool() {
+        let rt = name("user", &[], "rt");
+        let pool = SymbolPool::from([(
+            rt.clone(),
+            Symbol::Function(unary_fn(&rt, json_ref(), json_ref())),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        assert!(
+            flat(text(&generated, "src/lib.rs")).contains("pubasyncfnrt(u:::baml_bridge::Json,)"),
+            "{}",
+            text(&generated, "src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn user_aliases_of_canonical_json_resolve_to_bridge_json() {
+        let alias = name("user", &[], "Payload");
+        let pool = SymbolPool::from([(
+            alias.clone(),
+            Symbol::TypeAlias(baml_sdkgen_types::TypeAlias {
+                name: alias,
+                resolves_to: json_ref(),
+                recursive: false,
+                origin: Origin {
+                    source_file_path: "main.baml".to_string(),
+                    span_start: 0,
+                },
+            }),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        assert!(
+            flat(text(&generated, "src/lib.rs")).contains("pubtypePayload=::baml_bridge::Json;"),
+            "{}",
+            text(&generated, "src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn json_shaped_user_aliases_keep_the_recursive_alias_skip() {
+        // Only the stdlib FQN is special: a user alias with the same name
+        // and expansion is an ordinary recursive alias.
+        let look_alike = name("user", &["json"], "json");
+        let holder = name("user", &[], "Holder");
+        let pool = SymbolPool::from([
+            (look_alike.clone(), json_shaped_alias(&look_alike)),
+            (
+                holder.clone(),
+                class_symbol(
+                    &holder,
+                    vec![property("value", Ty::TypeAlias(look_alike.clone()))],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        let reasons: Vec<_> = generated
+            .warnings
+            .iter()
+            .map(|warning| (warning.fqn.as_str(), warning.reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                (
+                    "user.json.json",
+                    "recursive type aliases are not representable as a plain Rust `type` yet"
+                ),
+                (
+                    "user.Holder",
+                    "references skipped or unknown type `user.json.json`"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_json_beside_other_union_arms_skips_fail_closed() {
+        let f = name("user", &[], "f");
+        let union = Ty::Union(Box::new([json_ref(), Ty::Int]));
+        let pool = SymbolPool::from([(f.clone(), Symbol::Function(unary_fn(&f, union, Ty::Int)))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert_eq!(generated.warnings.len(), 1, "{:?}", generated.warnings);
+        assert_eq!(generated.warnings[0].fqn, "user.f");
+        assert!(
+            generated.warnings[0]
+                .reason
+                .contains("overlaps them on the wire"),
+            "{}",
+            generated.warnings[0].reason
+        );
+    }
+
+    #[test]
+    fn json_container_arms_stay_discriminable_union_arms() {
+        let f = name("user", &[], "f");
+        let union = Ty::Union(Box::new([Ty::List(Box::new(json_ref())), Ty::String]));
+        let pool = SymbolPool::from([(
+            f.clone(),
+            Symbol::Function(unary_fn(&f, union.clone(), union)),
+        )]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = flat(text(&generated, "src/lib.rs"));
+        assert!(
+            lib.contains("pubenumjsonListOrString{jsonList(::std::vec::Vec<::baml_bridge::Json>),String(::std::string::String),}"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn serde_is_an_opt_in_feature_of_the_generated_crate() {
+        let manifest = render_manifest(&options());
+        assert!(
+            manifest.contains(
+                "serde = { version = \"1\", features = [\"derive\"], optional = true }\n\n"
+            ),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("[features]\n#") && manifest.contains("\nserde = [\"dep:serde\"]\n"),
+            "{manifest}"
+        );
+    }
+
+    fn string_literal(value: &str) -> Ty {
+        Ty::Literal(
+            baml_base::Literal::String(value.to_string()),
+            baml_sdkgen_types::Freshness::Regular,
+        )
+    }
+
+    #[test]
+    fn json_attributes_shape_the_serde_impls() {
+        let vpc = name("user", &[], "Vpc");
+        let other = name("user", &[], "Other");
+        let config = name("user", &[], "Config");
+        let vpc_id = baml_sdkgen_types::ClassProperty {
+            json_rename: Some("vpc_id".to_string()),
+            ..property("vpcId", Ty::String)
+        };
+        let mut vpc_symbol = class_symbol(
+            &vpc,
+            vec![
+                property("type", string_literal("byo-vpc")),
+                vpc_id,
+                property("note", Ty::Union(vec![Ty::String, Ty::Null].into())),
+            ],
+            vec![],
+            vec![],
+        );
+        if let Symbol::Class(class) = &mut vpc_symbol {
+            class.json_omit_nulls = true;
+        }
+        let raw = baml_sdkgen_types::ClassProperty {
+            json_fallback: true,
+            ..property(
+                "raw",
+                Ty::Map {
+                    key: Box::new(Ty::String),
+                    value: Box::new(json_ref()),
+                },
+            )
+        };
+        let extra = baml_sdkgen_types::ClassProperty {
+            name: baml_base::Name::new("extra"),
+            json_flatten: true,
+            json_fallback: false,
+            ..raw.clone()
+        };
+        let network = Ty::Union(
+            vec![
+                Ty::Class(vpc.clone(), Vec::new().into()),
+                Ty::Class(other.clone(), Vec::new().into()),
+            ]
+            .into(),
+        );
+        let pool = SymbolPool::from([
+            (vpc, vpc_symbol),
+            (
+                other.clone(),
+                class_symbol(
+                    &other,
+                    vec![property("type", string_literal("UNKNOWN")), raw],
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                config.clone(),
+                class_symbol(
+                    &config,
+                    vec![
+                        property("id", Ty::String),
+                        property("network", network),
+                        extra,
+                    ],
+                    vec![],
+                    vec![],
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        let lib = flat(text(&generated, "src/lib.rs"));
+        for expected in [
+            // A rename, and an optional field of a `@@json.omit_nulls` class.
+            "serde(rename=\"vpc_id\")",
+            "serde(default=\"::std::default::Default::default\",skip_serializing_if=\"::std::option::Option::is_none\")",
+            // A literal is checked.
+            "serde(deserialize_with=\"__baml_literal_3_Vpc_type\")",
+            "fn__baml_literal_3_Vpc_type",
+            // `@json.flatten` reads with serde and writes declared keys first.
+            "serde(flatten)",
+            "declared.push(\"id\");declared.push(\"network\");",
+            // `@json.fallback` reads and writes the whole object.
+            "::serde::Serialize::serialize(&self.raw,serializer)",
+            "raw:__baml_raw",
+            "__baml_raw.get(\"type\").is_some_and(::baml_bridge::serde_json::Value::is_string)",
+            // The union picks by tag, and the fallback takes the rest.
+            "ifjson.is_object(){matchjson.get(\"type\"){",
+        ] {
+            assert!(lib.contains(expected), "missing {expected}: {lib}");
+        }
+    }
+
+    #[test]
+    fn serde_impls_follow_baml_json_behind_the_serde_feature() {
+        let doc = name("user", &[], "Doc");
+        let shade = name("user", &[], "Shade");
+        let variant = |variant: &str| baml_sdkgen_types::EnumVariant {
+            name: baml_base::Name::new(variant),
+            docstring: None,
+            value: variant.to_string(),
+            json_rename: None,
+        };
+        let pool = SymbolPool::from([
+            (
+                doc.clone(),
+                class_symbol(
+                    &doc,
+                    vec![
+                        property("title", Ty::String),
+                        property("type", Ty::String),
+                        property("crate", Ty::Int),
+                        property("shade", Ty::Enum(shade.clone())),
+                        property(
+                            "speed",
+                            Ty::Union(Box::new([string_literal("fast"), Ty::Int, Ty::Null])),
+                        ),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                shade.clone(),
+                Symbol::Enum(baml_sdkgen_types::Enum {
+                    name: shade,
+                    docstring: None,
+                    variants: vec![variant("Light"), variant("Self")],
+                    origin: Origin {
+                        source_file_path: "main.baml".to_string(),
+                        span_start: 0,
+                    },
+                }),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let flat = flat(lib);
+        let derive =
+            "#[cfg_attr(feature=\"serde\",derive(::serde::Serialize,::serde::Deserialize))]";
+
+        // Class keys are the BAML field names: a rename only where the Rust
+        // name differs.
+        assert!(
+            flat.contains(&format!(
+                "#[derive(Debug,Clone,PartialEq)]{derive}pubstructDoc{{pubtitle:"
+            )),
+            "{lib}"
+        );
+        assert!(
+            flat.contains("#[cfg_attr(feature=\"serde\",serde(rename=\"type\"))]pubr#type:"),
+            "{lib}"
+        );
+        assert!(
+            flat.contains("#[cfg_attr(feature=\"serde\",serde(rename=\"crate\"))]pubcrate_:"),
+            "{lib}"
+        );
+        // An enum is its variant name.
+        assert!(
+            flat.contains(&format!(
+                "#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]{derive}pubenumShade{{Light,\
+                 #[cfg_attr(feature=\"serde\",serde(rename=\"Self\"))]Self_,}}"
+            )),
+            "{lib}"
+        );
+        assert_eq!(flat.matches("serde(rename=").count(), 3, "{lib}");
+        // A union is untagged: arms serialize as themselves, and
+        // deserializing tries them in declaration order.
+        assert!(
+            flat.contains(
+                "#[cfg(feature=\"serde\")]impl::serde::SerializeforFastOrInt{\
+                 fnserialize<__S:::serde::Serializer>(&self,serializer:__S,)\
+                 ->::std::result::Result<__S::Ok,__S::Error>{matchself{\
+                 Self::Fast=>serializer.serialize_str(\"fast\"),\
+                 Self::Int(value)=>::serde::Serialize::serialize(value,serializer),}}}"
+            ),
+            "{lib}"
+        );
+        let fast = flat.find("ifjson.as_str()==::std::option::Option::Some(\"fast\")");
+        let int = flat.find("<::core::primitive::i64as::serde::Deserialize<'de");
+        assert!(fast.is_some() && int.is_some() && fast < int, "{lib}");
+        assert!(
+            flat.contains(
+                "#[cfg(feature=\"serde\")]impl<'de>::serde::Deserialize<'de>forFastOrInt"
+            ),
+            "{lib}"
+        );
+        // Each impl exactly once: a second copy is a compile error in the
+        // generated crate, not a generator warning.
+        assert_eq!(
+            flat.matches("impl::serde::SerializeforFastOrInt").count(),
+            1,
+            "{lib}"
+        );
+        assert_eq!(
+            flat.matches("::serde::Deserialize<'de>forFastOrInt")
+                .count(),
+            1,
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn types_without_a_baml_json_form_get_no_serde_impls() {
+        let bytes = name("user", &[], "Bytes");
+        let holder = name("user", &[], "Holder");
+        let tree = name("user", &[], "Tree");
+        let plain_date = name("baml", &["time"], "PlainDate");
+        let dated = name("user", &[], "Dated");
+        let tree_ty = Ty::Class(tree.clone(), Box::new([]));
+        let class = |n: &Name, properties| class_symbol(n, properties, Vec::new(), Vec::new());
+        let pool = SymbolPool::from([
+            (
+                bytes.clone(),
+                class(
+                    &bytes,
+                    vec![property("id", Ty::Int), property("data", Ty::Uint8Array)],
+                ),
+            ),
+            // Lacks impls through `Bytes`, inside a union arm.
+            (
+                holder.clone(),
+                class(
+                    &holder,
+                    vec![property(
+                        "item",
+                        Ty::Union(Box::new([Ty::Class(bytes, Box::new([])), Ty::Bigint])),
+                    )],
+                ),
+            ),
+            (
+                plain_date.clone(),
+                class(&plain_date, vec![property("_days", Ty::Int)]),
+            ),
+            (
+                dated.clone(),
+                class(
+                    &dated,
+                    vec![property("on", Ty::Class(plain_date, Box::new([])))],
+                ),
+            ),
+            // Recursion alone keeps them.
+            (
+                tree.clone(),
+                class(
+                    &tree,
+                    vec![
+                        property("children", Ty::List(Box::new(tree_ty.clone()))),
+                        property("parent", Ty::Union(Box::new([tree_ty, Ty::Null]))),
+                    ],
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let time = flat(text(&generated, "src/baml/time/mod.rs"));
+        let flat = flat(lib);
+        let note = |field: &str| {
+            format!(
+                "#[cfg_attr(feature=\"serde\",doc=\"\",doc=\"Notserializablewiththe`serde`feature:\
+                 field`{field}`holdsa`bigint`,`uint8array`,function,handle,BAMLstandard-libraryclass,\
+                 ortupleofmorethan16slots.\")]"
+            )
+        };
+        assert!(
+            flat.contains(&format!("{}pubstructBytes", note("data"))),
+            "{lib}"
+        );
+        assert!(
+            flat.contains(&format!("{}pubstructHolder", note("item"))),
+            "{lib}"
+        );
+        assert!(
+            flat.contains(&format!("{}pubstructDated", note("on"))),
+            "{lib}"
+        );
+        assert!(
+            flat.contains(
+                "#[cfg_attr(feature=\"serde\",derive(::serde::Serialize,::serde::Deserialize))]pubstructTree"
+            ),
+            "{lib}"
+        );
+        assert_eq!(flat.matches("::serde::Serialize").count(), 1, "{lib}");
+        // A standard-library class may render through a `baml.ToJson`
+        // override, which a derive cannot follow.
+        assert!(
+            time.contains(
+                "#[cfg_attr(feature=\"serde\",doc=\"\",doc=\"Notserializablewiththe`serde`feature:\
+                 BAMLstandard-libraryclasseshavenoserdeimpls.\")]pubstructPlainDate"
+            ),
+            "{time}"
+        );
+    }
+
+    #[test]
+    fn generic_unions_need_only_the_bounds_serde_derive_infers() {
+        // ContainerShapes<T> { mixed: T | string | null }: serde's derive
+        // bounds the class's `T` by `Deserialize<'de>`, so the union must
+        // not ask for more.
+        let c = name("user", &[], "ContainerShapes");
+        let mixed = Ty::Union(Box::new([typevar(0, "T"), Ty::String, Ty::Null]));
+        let pool =
+            SymbolPool::from([(c.clone(), generic_class(&c, &["T"], vec![("mixed", mixed)]))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let flat = flat(lib);
+        assert!(
+            flat.contains(
+                "impl<T:::baml_bridge::BamlValue+::serde::Serialize>::serde::SerializeforTOrString<T>"
+            ),
+            "{lib}"
+        );
+        assert!(
+            flat.contains("impl<'de,T:::baml_bridge::BamlValue+::serde::Deserialize<'de>,>")
+                && flat.contains(",>::serde::Deserialize<'de>forTOrString<T>"),
+            "{lib}"
+        );
+    }
+
+    #[test]
+    fn json_values_have_serde_impls() {
+        // `baml_bridge::Json` is `serde_json::Value`. The stdlib alias item's
+        // expansion has a `bigint` arm, which must not count against it.
+        let json_alias = Name::from_dotted_path(baml_base::qualified_name::BAML_JSON_JSON);
+        let payload = name("user", &[], "Payload");
+        let event = name("user", &[], "Event");
+        let pool = SymbolPool::from([
+            (json_alias.clone(), json_shaped_alias(&json_alias)),
+            (
+                payload.clone(),
+                Symbol::TypeAlias(baml_sdkgen_types::TypeAlias {
+                    name: payload.clone(),
+                    resolves_to: json_ref(),
+                    recursive: false,
+                    origin: Origin {
+                        source_file_path: "main.baml".to_string(),
+                        span_start: 0,
+                    },
+                }),
+            ),
+            (
+                event.clone(),
+                class_symbol(
+                    &event,
+                    vec![
+                        property("payload", json_ref()),
+                        property("maybe", Ty::Union(Box::new([json_ref(), Ty::Null]))),
+                        property(
+                            "items",
+                            Ty::Union(Box::new([Ty::List(Box::new(json_ref())), Ty::String])),
+                        ),
+                        property("aliased", Ty::TypeAlias(payload)),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let lib = text(&generated, "src/lib.rs");
+        let flat = flat(lib);
+        assert!(
+            flat.contains(
+                "#[cfg_attr(feature=\"serde\",derive(::serde::Serialize,::serde::Deserialize))]pubstructEvent"
+            ),
+            "{lib}"
+        );
+        assert!(
+            flat.contains("#[cfg(feature=\"serde\")]impl::serde::SerializeforjsonListOrString"),
+            "{lib}"
+        );
+    }
+
+    /// A callback's open effect is the caller's closure's to decide: its
+    /// function type states the effect `unknown`, while the outer binding's
+    /// error type is still the closure's.
+    #[test]
+    fn a_callbacks_open_effect_is_stated_unknown() {
+        let n = name("user", &[], "apply");
+        let effect = typevar(0, "__effect_param_0");
+        let mut f = nullary_string_fn(&n);
+        f.return_type = Ty::Int;
+        f.throws = Some(effect.clone());
+        f.arguments = vec![baml_sdkgen_types::FunctionArgument {
+            injected: false,
+            name: baml_base::Name::new("cb"),
+            docstring: None,
+            ty: Ty::Function {
+                params: Box::new([]),
+                ret: Box::new(Ty::Int),
+                throws: Box::new(effect),
+            },
+            default: None,
+        }];
+        let pool = SymbolPool::from([(n, Symbol::Function(f))]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        // The pretty-printer adds a trailing comma wherever it wraps a list.
+        let lib = flat(text(&generated, "src/lib.rs")).replace(",)", ")");
+        let internal = "::baml_bridge::baml_value::internal::";
+        assert!(
+            lib.contains(&format!(
+                "::baml_bridge::host_value::CallableTy::new(::std::vec![],{internal}primitive_ty(::baml_bridge::wire::BamlTyPrimitiveKind::BamlTyPrimitiveInt),{internal}leaf_ty(::baml_bridge::wire::baml_ty::Ty::Unknown(::baml_bridge::wire::BamlTyUnknown{{}})))"
+            )),
+            "{lib}"
+        );
+        assert!(lib.contains("Throws=CbError"), "{lib}");
+    }
+
+    /// A host's own value is the `baml_bridge::HostValue` handle, stated as the
+    /// `baml.host.Value` class, and its class emits nothing.
+    #[test]
+    fn host_value_class_is_the_host_value_handle() {
+        let host_value = name("baml", &["host"], "Value");
+        let holder = name("user", &[], "Holder");
+        let round_trip = name("user", &[], "round_trip");
+        let handle = Ty::Class(host_value.clone(), Box::new([]));
+        let mut f = nullary_string_fn(&round_trip);
+        f.arguments = vec![arg("handle", handle.clone())];
+        f.return_type = handle.clone();
+        let Symbol::Class(class) = generic_class(&host_value, &[], Vec::new()) else {
+            unreachable!("generic_class builds a class");
+        };
+        let pool = SymbolPool::from([
+            (
+                holder.clone(),
+                generic_class(&holder, &[], vec![("handle", handle)]),
+            ),
+            (round_trip, Symbol::Function(f)),
+            (
+                host_value,
+                Symbol::Class(baml_sdkgen_types::Class {
+                    crossing: baml_sdkgen_types::ClassCrossing::HostValue,
+                    ..class
+                }),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        let files = generated
+            .files
+            .into_iter()
+            .filter_map(|(path, file)| match file {
+                FileContent::Text(text) => Some((path, text)),
+                FileContent::Binary(_) => None,
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let flat_lib = flat(&files[std::path::Path::new("src/lib.rs")]);
+        assert!(
+            flat_lib.contains("pubhandle:::baml_bridge::HostValue"),
+            "{flat_lib}"
+        );
+        assert!(
+            flat_lib.contains("class_ty(\"baml.host.Value\""),
+            "{flat_lib}"
+        );
+        let host = &files[std::path::Path::new("src/baml/host/mod.rs")];
+        assert!(!flat(host).contains("structValue"), "{host}");
+    }
+
+    /// A class with a crossing of its own emits nothing: a capability is the
+    /// `baml_bridge` type wherever a type names it (and a class holding one
+    /// is emitted), and a media wrapper, which no Rust type represents yet,
+    /// skips with its referrers.
+    #[test]
+    fn classes_with_a_crossing_of_their_own_emit_nothing() {
+        let stream = name("ai", &["stream"], "Stream");
+        let pdf = name("baml", &["media"], "Pdf");
+        let holder = name("user", &[], "Holder");
+        let media_holder = name("user", &[], "MediaHolder");
+        let class = |n: &Name, crossing, params: &[&str], properties: Vec<(&str, Ty)>| {
+            let Symbol::Class(class) = generic_class(n, params, properties) else {
+                unreachable!("generic_class builds a class");
+            };
+            Symbol::Class(baml_sdkgen_types::Class { crossing, ..class })
+        };
+        let pool = SymbolPool::from([
+            (
+                stream.clone(),
+                class(
+                    &stream,
+                    baml_sdkgen_types::ClassCrossing::Stream,
+                    &["T"],
+                    Vec::new(),
+                ),
+            ),
+            (
+                pdf.clone(),
+                class(
+                    &pdf,
+                    baml_sdkgen_types::ClassCrossing::Media(baml_base::ConcreteMediaKind::Pdf),
+                    &[],
+                    Vec::new(),
+                ),
+            ),
+            (
+                holder.clone(),
+                class(
+                    &holder,
+                    baml_sdkgen_types::ClassCrossing::Fields,
+                    &[],
+                    vec![("stream", Ty::Class(stream.clone(), Box::new([Ty::String])))],
+                ),
+            ),
+            (
+                media_holder.clone(),
+                class(
+                    &media_holder,
+                    baml_sdkgen_types::ClassCrossing::Fields,
+                    &[],
+                    vec![("pdf", Ty::Class(pdf.clone(), Box::new([])))],
+                ),
+            ),
+        ]);
+        let generated = to_source_code_with_bytecode(&pool, &[], &options());
+        let all: String = generated
+            .files
+            .values()
+            .filter_map(|file| match file {
+                FileContent::Text(text) => Some(flat(text)),
+                FileContent::Binary(_) => None,
+            })
+            .collect();
+        assert!(!all.contains("pubstructStream"), "{all}");
+        assert!(!all.contains("pubstructPdf"), "{all}");
+        assert!(
+            all.contains("pubstream:::baml_bridge::Stream<::std::string::String>"),
+            "{all}"
+        );
+        assert!(!all.contains("pubstructMediaHolder"), "{all}");
+        let skipped: Vec<_> = generated
+            .warnings
+            .iter()
+            .map(|warning| warning.fqn.as_str())
+            .collect();
+        assert!(skipped.contains(&"baml.media.Pdf"), "{skipped:?}");
+        assert!(skipped.contains(&"user.MediaHolder"), "{skipped:?}");
+        assert!(!skipped.contains(&"ai.stream.Stream"), "{skipped:?}");
     }
 }

@@ -45,11 +45,11 @@ function merge_issue(
     pr: string,
     mode: HandleMode = HandleMode.Live,
     max_rounds: int = 3,
-    /// The store's issue the PR belongs to, for the merge_rounds rows.
+    // The store's issue the PR belongs to, for the merge_rounds rows.
     issue_id: string? = null,
-    /// A Slack thread that hears the start, every round and the result.
+    // A Slack thread that hears the start, every round and the result.
     thread: SlackRef? = null,
-    /// A Slack user id to @mention on the result line (the requester).
+    // A Slack user id to @mention on the result line (the requester).
     mention: string? = null,
 ) -> MergeResult {
     let started = baml.time.Instant.now();
@@ -274,8 +274,8 @@ function round_outcome(branch: string, round: int) -> string {
     let raw = baml.fs.read(path);
     baml.fs.mkdir(merge_dir(branch), baml.fs.MkdirOptions { recursive: true });
     baml.fs.write(merge_dir(branch) + "/round-" + round.to_string() + ".outcome.json", raw);
-    let o = baml.json.parse(raw) catch (_) {
-        _ => baml.json.parse("{}"),
+    let o: json = baml.json.parse(raw) catch (_) {
+        _ => ({}),
     };
     baml.json.path_or<string>(o, ".kind", "agent_stopped")
 }
@@ -460,7 +460,7 @@ function parse_checks(s: string) -> CheckRow[] {
     if (s.trim().length() == 0) {
         return [];
     };
-    baml.json.from_string<CheckRow[]>(s) catch (_) {
+    baml.json.decode<CheckRow[]>(s) catch (_) {
         _ => [],
     }
 }
@@ -469,7 +469,7 @@ function parse_comments(s: string) -> ReviewComment[] {
     if (s.trim().length() == 0) {
         return [];
     };
-    baml.json.from_string<ReviewComment[]>(s) catch (_) {
+    baml.json.decode<ReviewComment[]>(s) catch (_) {
         _ => [],
     }
 }
@@ -568,14 +568,14 @@ function read_merge_state(branch: string) -> MergeState {
     if (!baml.fs.exists(path)) {
         return MergeState { rounds: 0, handled_ids: [] };
     };
-    baml.json.from_string<MergeState>(baml.fs.read(path)) catch (_) {
+    baml.json.decode<MergeState>(baml.fs.read(path)) catch (_) {
         _ => MergeState { rounds: 0, handled_ids: [] },
     }
 }
 
 function write_merge_state(branch: string, s: MergeState) -> null {
     baml.fs.mkdir(merge_dir(branch), baml.fs.MkdirOptions { recursive: true });
-    baml.fs.write(merge_state_path(branch), baml.json.stringify_pretty(s.to_json()));
+    baml.fs.write(merge_state_path(branch), baml.json.stringify(s.to_json(), indent = 2));
     null
 }
 
@@ -721,8 +721,7 @@ function request_merge(pr: string, thread: SlackRef? = null) -> int {
             },
             "requested_by": "baml run",
             "dataset": dataset(),
-        }
-            .to_json(),
+        },
     );
     baml.json.path_or<int>(row, ".id", 0)
 }
@@ -746,9 +745,7 @@ function claim_merge_request(runner: string) -> MergeRequest? {
     let claimed = supabase_send(
         "PATCH",
         "babysit_requests?id=eq." + r.id.to_string() + "&status=eq.queued",
-        baml.json.stringify(
-            { "status": "running", "claimed_by": runner, "claimed_at": "now()" }.to_json(),
-        ),
+        baml.json.stringify({ "status": "running", "claimed_by": runner, "claimed_at": "now()" }),
         "return=representation",
     );
     if (rows_of(claimed).length() == 0) {
@@ -781,9 +778,7 @@ function finish_merge_request(id: int, runner: string, status: string, result: j
                 + "&claimed_by="
                 + eq(runner)
                 + "&status=eq.running",
-            baml.json.stringify(
-                { "status": status, "result": result, "finished_at": "now()" }.to_json(),
-            ),
+            baml.json.stringify({ "status": status, "result": result, "finished_at": "now()" }),
             "return=representation",
         ),
     );
@@ -812,7 +807,7 @@ function reclaim_stale_requests(after_s: int) -> int {
                 + baml.json.path_or<int>(r, ".id", 0).to_string()
                 + "&status=eq.running&claimed_by="
                 + eq(baml.json.path_or<string>(r, ".claimed_by", "")),
-            { "status": "queued", "claimed_by": null, "claimed_at": null }.to_json(),
+            { "status": "queued", "claimed_by": null, "claimed_at": null },
         );
     }
     stale.length()
@@ -1115,16 +1110,26 @@ testset "merge_requests" {
 
     test "a request row reads back; a queued-by-hand request has no thread" {
         let r = request_from_row(
-            baml.json.parse(
-                `{"id":7,"pr":"https://github.com/o/r/pull/1","channel":"","thread_ts":"","requested_by":null,"status":"queued"}`,
-            ),
+            {
+                "id": 7,
+                "pr": "https://github.com/o/r/pull/1",
+                "channel": "",
+                "thread_ts": "",
+                "requested_by": null,
+                "status": "queued",
+            },
         );
         assert.equal(r.id, 7);
         assert.equal(merge_request_thread(r) == null, true);
         let s = request_from_row(
-            baml.json.parse(
-                `{"id":8,"pr":"https://github.com/o/r/pull/2","channel":"C1","thread_ts":"1.2","requested_by":"U1","status":"queued"}`,
-            ),
+            {
+                "id": 8,
+                "pr": "https://github.com/o/r/pull/2",
+                "channel": "C1",
+                "thread_ts": "1.2",
+                "requested_by": "U1",
+                "status": "queued",
+            },
         );
         assert.equal(merge_request_thread(s)?.ts ?? "", "1.2");
     }

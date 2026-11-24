@@ -5,9 +5,10 @@
 // envelopes whose fields are optional wherever the API may omit them, and typed
 // SSE event classes. `baml.json.json` appears only where the shape is genuinely
 // the caller's: a tool's `parameters` (an arbitrary JSON Schema), the
-// `request_body` passthrough, and the per-message directives carried verbatim
-// from `ai.PromptMessage.metadata`. All three are applied to the SERIALIZED
-// body, after the typed layer's null-prune, so none of them is rewritten.
+// `request_body` passthrough, and the `args` of a `${cache(args)}` in the
+// prompt, carried as written onto a content part. All three are applied to the
+// SERIALIZED body, after the typed layer's null-prune, so none of them is
+// rewritten.
 //
 // Output mode is SAP (the schema rides in the prompt text, tools are native);
 // `text.format` is deliberately never set — see the research report's G15.
@@ -115,9 +116,20 @@ class OaReasoningParams {
     summary: string?,
 }
 
-/// `text` carries `verbosity` only: `text.format` stays unset by design (G15).
+/// `text.verbosity`, and `text.format` when the client sends Structured
+/// Outputs (`ResponsesClient.structured_output`).
 class OaTextParams {
     verbosity: string?,
+    format: OaTextFormat?,
+}
+
+/// `text.format`: `{"type": "json_schema", "name", "strict", "schema"}`.
+class OaTextFormat {
+    type: string,
+    name: string,
+    strict: bool,
+    // The strict JSON Schema of the output type (`StructuredOutput.schema`).
+    schema: baml.json.json,
 }
 
 class OaResponsesRequest {
@@ -138,7 +150,7 @@ class OaResponsesRequest {
 // ---------------------------------------------------------------------------
 // Response envelopes. `from_string` ignores unknown fields, and every field the
 // API may omit is optional — a missing `usage.input_tokens` must not turn a
-// good response into ai.errors.ParseFailed.
+// good response into ai.errors.InvalidResponse.
 
 class OaContentPart {
     type: string?,
@@ -157,6 +169,8 @@ class OaOutputItem {
     // message / reasoning
     content: OaContentPart[]?,
     summary: OaContentPart[]?,
+    // message: "commentary" or "final_answer" on models that split an answer
+    phase: string?,
     // image_generation_call
     result: string?,
     revised_prompt: string?,
@@ -165,6 +179,7 @@ class OaOutputItem {
 
 class OaInputTokenDetails {
     cached_tokens: int?,
+    cache_write_tokens: int?,
 }
 
 class OaOutputTokenDetails {
@@ -368,9 +383,15 @@ function _lower_block(
     match (block) {
         let text: ai.content.Text => {
             if (position == "assistant") {
-                OaOutputText { type: "output_text", text: text.text }
+                OaOutputText {
+                    type: "output_text",
+                    text: text.text,
+                }
             } else {
-                OaInputText { type: "input_text", text: text.text }
+                OaInputText {
+                    type: "input_text",
+                    text: text.text,
+                }
             }
         },
         let media: ai.content.Media => {
@@ -378,14 +399,15 @@ function _lower_block(
             match (media.media) {
                 let image: baml.media.Image => {
                     if (!user_input && position != "system") {
-                        throw _media_role_error("image", position)
+                        throw _media_role_error("image", position);
                     }
                     let resolved = if (preview) {
                         ai.wire.resolve_media_preview(image)
                     } else {
                         ai.wire.resolve_media(image, false)
                     };
-                    let image_url = resolved.url ?? `data:${resolved.mime_type};base64,${resolved.base64 ?? ""}`;
+                    let image_url = resolved.url
+                        ?? `data:${resolved.mime_type};base64,${resolved.base64 ?? ""}`;
                     OaInputImage {
                         type: "input_image",
                         image_url: image_url,
@@ -395,7 +417,7 @@ function _lower_block(
                 },
                 let audio: baml.media.Audio => {
                     if (!user_input) {
-                        throw _media_role_error("audio", position)
+                        throw _media_role_error("audio", position);
                     }
                     // audio has no URL form on the wire: always inline base64.
                     let resolved = if (preview) {
@@ -407,7 +429,7 @@ function _lower_block(
                         throw ai.errors.PreviewUnsupported {
                             provider: "openai",
                             detail: "OpenAI Responses audio input requires downloaded bytes during request preview",
-                        }
+                        };
                     }
                     OaInputAudio {
                         type: "input_audio",
@@ -419,14 +441,14 @@ function _lower_block(
                 },
                 let pdf: baml.media.Pdf => {
                     if (!user_input) {
-                        throw _media_role_error("PDF", position)
+                        throw _media_role_error("PDF", position);
                     }
                     let resolved = if (preview) {
                         ai.wire.resolve_media_preview(pdf)
                     } else {
                         ai.wire.resolve_media(pdf, false)
                     };
-                    let name = _file_name(pdf.file() ?? pdf.url());
+                    let name = _file_name(pdf.name() ?? pdf.url());
                     if let url: string = resolved.url {
                         OaInputFile {
                             type: "input_file",
@@ -451,7 +473,7 @@ function _lower_block(
                         status_code: null,
                         detail: "OpenAI Responses does not support video prompt input",
                         raw_body: null,
-                    }
+                    };
                 },
             }
         },
@@ -470,58 +492,85 @@ function _lower_blocks(
     content
 }
 
+/// (internal) Where one `${cache(args)}` in the prompt lands on the wire: content part
+/// `part` of input item `item`, which gets `prompt_cache_breakpoint: args`.
+class OaCacheBreakpoint {
+    item: int,
+    part: int,
+    args: baml.json.json,
+}
+
 /// Role-less content uses the ordinary user role; `tool` is not a valid
 /// free-standing Responses message role, so authored tool context is user
 /// content (actual tool outputs come from the journal path below).
-function lower_prompt(prompt: ai.Prompt, preview: bool = false) -> OaInputItem[] {
+///
+/// A `${cache(args)}` in a message becomes a cache breakpoint on the content
+/// part before it: the Responses API places a breakpoint ON a part, while the
+/// delimiter sits BETWEEN parts, so everything up to and including that part
+/// is the cached prefix. The typed parts have no slot for it and `args` is
+/// sent as written, so the position is recorded in `breakpoints` and
+/// `_apply_cache_breakpoints` writes the key onto the serialized body. The text
+/// on either side is trimmed where it faces the delimiter
+/// (`ai.wire.prompt_parts`). A `${cache()}` carries `default_cache_args`.
+/// Nothing is recorded when no part precedes the delimiter in its message, or
+/// when the delimiter has no args and there is no default.
+function lower_prompt(
+    prompt: ai.Prompt,
+    breakpoints: OaCacheBreakpoint[],
+    default_cache_args: baml.json.json = null,
+    preview: bool = false,
+) -> OaInputItem[] {
     let items: OaInputItem[] = [];
     for (let message in prompt.messages()) {
         let role = match (message.role) {
             "" | "tool" => "user",
             _ => message.role,
         };
-        items.push(
-            OaMessageItem {
-                role: role,
-                content: _lower_blocks(ai.wire.prompt_blocks(message), role, preview = preview),
-            },
-        );
+        let content: OaInputPart[] = [];
+        for (let part in ai.wire.prompt_parts(message, default_cache_args = default_cache_args)) {
+            match (part) {
+                let text: string => {
+                    let block = ai.content.Text { text: text };
+                    content.push(_lower_block(block, role, preview = preview));
+                    null
+                },
+                let delimiter: ai.CacheDelimiter => {
+                    if (content.length() > 0 && delimiter.args != null) {
+                        breakpoints.push(OaCacheBreakpoint {
+                            item: items.length(),
+                            part: content.length() - 1,
+                            args: delimiter.args,
+                        });
+                    }
+                    null
+                },
+                let media: ai.MediaPart => {
+                    let block = ai.content.Media {
+                        media: media,
+                        provider_id: null,
+                        revised_prompt: null,
+                    };
+                    content.push(_lower_block(block, role, preview = preview));
+                    null
+                },
+            };
+        }
+        items.push(OaMessageItem {
+            role: role,
+            content: content,
+        });
     }
     items
 }
 
-/// Per-message provider directives (`ai.PromptMessage.metadata`, authored as
-/// `${ai.Role { name: "user", metadata: { … } }}`), in prompt order and
-/// aligned one-to-one with the items `lower_prompt` produced — the prompt
-/// items are always the FIRST items of `input`, the journal's are appended after.
-///
-/// The Responses API has no per-message directive slot, so PLAN §5's accepted
-/// placement for this provider is the CONTENT PART: the keys are forwarded
-/// verbatim onto the LAST content item of the message they were authored on
-/// (the same "everything up to and including this block" rule the engine used).
-/// Applied to the SERIALIZED body, after the null-prune, because a directive is
-/// a provider shape: an explicit null in it is the caller's, not an unset field.
-function prompt_metadata(prompt: ai.Prompt) -> map<string, baml.json.json>[] {
-    let out: map<string, baml.json.json>[] = [];
-    for (let message in prompt.messages()) {
-        out.push(message.metadata);
-    }
-    out
-}
-
-function _merge_onto_last_part(
-    item: baml.json.json,
-    directives: map<string, baml.json.json>,
-) -> void {
+function _set_cache_breakpoint(item: baml.json.json, breakpoint: OaCacheBreakpoint) -> void {
     match (item) {
         let message: map<string, baml.json.json> => {
             match (message.get("content")) {
                 let parts: baml.json.json[] => {
-                    match (parts.at(parts.length() - 1)) {
+                    match (parts.at(breakpoint.part)) {
                         let part: map<string, baml.json.json> => {
-                            for (let key in directives.keys()) {
-                                let _ = part.set(key, directives.get(key));
-                            }
+                            let _ = part.set("prompt_cache_breakpoint", breakpoint.args);
                             null
                         },
                         _ => null,
@@ -534,20 +583,24 @@ function _merge_onto_last_part(
     }
 }
 
-function _apply_message_metadata(
+/// (internal) Write each recorded cache breakpoint onto its content part. The prompt's
+/// items are always the FIRST items of `input` (the journal's are appended
+/// after), and the null-prune drops map entries, never array elements, so the
+/// recorded indices still address the same parts.
+///
+/// Applied to the SERIALIZED body, after the null-prune, because `args` is the
+/// caller's own JSON: an explicit null inside it is theirs, not an unset field.
+/// A second breakpoint on the same part replaces the first.
+function _apply_cache_breakpoints(
     body: baml.json.json,
-    metadata: map<string, baml.json.json>[],
+    breakpoints: OaCacheBreakpoint[],
 ) -> baml.json.json {
     match (body) {
         let object: map<string, baml.json.json> => {
             match (object.get("input")) {
                 let items: baml.json.json[] => {
-                    let index = 0;
-                    for (let directives in metadata) {
-                        if (directives.keys().length() > 0) {
-                            _merge_onto_last_part(items.at(index), directives);
-                        }
-                        index += 1;
+                    for (let breakpoint in breakpoints) {
+                        _set_cache_breakpoint(items.at(breakpoint.item), breakpoint);
                     }
                     null
                 },
@@ -577,24 +630,17 @@ function _tool_output(parts: OaInputPart[]) -> string | OaInputPart[] {
 /// ai.Journal -> Responses API input items. Only promptable events lower;
 /// ai.RunStarted, ai.ToolRequested, ai.Usage, and ai.FinalProduced are
 /// journal-only. Callers pass the SANITIZED journal (see _request).
-///
-/// `metadata` is the per-item directive list `_apply_message_metadata` walks:
-/// one map is appended per item produced here (a user turn's own, an empty
-/// one for everything else) so it stays aligned one-to-one with `input`.
-function lower_journal(
-    j: ai.Journal,
-    metadata: map<string, baml.json.json>[],
-    preview: bool = false,
-) -> OaInputItem[] {
+function lower_journal(j: ai.Journal, preview: bool = false) -> OaInputItem[] {
     let items: OaInputItem[] = [];
-    let none: map<string, baml.json.json> = {};
     for (let e in j.entries()) {
         match (e) {
             let u: ai.events.UserMessage => {
                 let content = _lower_blocks(u.content, "user", preview = preview);
                 if (content.length() > 0) {
-                    items.push(OaMessageItem { role: "user", content: content });
-                    metadata.push(u.metadata);
+                    items.push(OaMessageItem {
+                        role: "user",
+                        content: content,
+                    });
                 }
                 null
             },
@@ -602,25 +648,19 @@ function lower_journal(
                 for (let b in a.content) {
                     match (b) {
                         let content: ai.content.Block => {
-                            items.push(
-                                OaMessageItem {
-                                    role: "assistant",
-                                    content: [_lower_block(content, "assistant", preview = preview)],
-                                },
-                            );
-                            metadata.push(none);
+                            items.push(OaMessageItem {
+                                role: "assistant",
+                                content: [_lower_block(content, "assistant", preview = preview)],
+                            });
                             null
                         },
                         let use: ai.content.ToolUse => {
-                            items.push(
-                                OaFunctionCallItem {
-                                    type: "function_call",
-                                    call_id: use.id,
-                                    name: use.name,
-                                    arguments: baml.json.stringify(baml.json.to_json(use.args)),
-                                },
-                            );
-                            metadata.push(none);
+                            items.push(OaFunctionCallItem {
+                                type: "function_call",
+                                call_id: use.id,
+                                name: use.name,
+                                arguments: baml.json.stringify(use.args),
+                            });
                             null
                         },
                         // ai.Reasoning does not round-trip yet: the API wants
@@ -635,27 +675,23 @@ function lower_journal(
                 // `function_call_output.output` carries text, image and file
                 // parts inline; `ai.wire.degrade_tool_media` has already moved
                 // audio out of the result and behind the run of results.
-                items.push(
-                    OaFunctionCallOutputItem {
-                        type: "function_call_output",
-                        call_id: c.id,
-                        output: _tool_output(_lower_blocks(c.content, "tool_result", preview = preview)),
-                    },
-                );
-                metadata.push(none);
+                items.push(OaFunctionCallOutputItem {
+                    type: "function_call_output",
+                    call_id: c.id,
+                    output: _tool_output(
+                        _lower_blocks(c.content, "tool_result", preview = preview),
+                    ),
+                });
                 null
             },
             let f: ai.events.ToolFailed => {
                 let err: map<string, unknown> = {};
                 let _ = err.set("error", f.message);
-                items.push(
-                    OaFunctionCallOutputItem {
-                        type: "function_call_output",
-                        call_id: f.id,
-                        output: baml.json.stringify(baml.json.to_json(err)),
-                    },
-                );
-                metadata.push(none);
+                items.push(OaFunctionCallOutputItem {
+                    type: "function_call_output",
+                    call_id: f.id,
+                    output: baml.json.stringify(err),
+                });
                 null
             },
             _ => null,
@@ -679,18 +715,18 @@ function _wants_image(output_type: reflect.Type) -> bool {
 function _tools(toolbox: ai.tools.Toolbox, wants_image: bool) -> OaTool[]? {
     let tools: OaTool[] = [];
     for (let t in toolbox.list()) {
-        tools.push(
-            OaFunctionTool {
-                type: "function",
-                name: t.name,
-                description: t.description,
-                parameters: baml.json.to_json(t.input_schema),
-                strict: false,
-            },
-        );
+        tools.push(OaFunctionTool {
+            type: "function",
+            name: t.name,
+            description: t.description,
+            parameters: baml.json.from(t.input_schema),
+            strict: false,
+        });
     }
     if (wants_image) {
-        tools.push(OaBuiltinTool { type: "image_generation" });
+        tools.push(OaBuiltinTool {
+            type: "image_generation",
+        });
     }
     if (tools.length() == 0) {
         null
@@ -701,7 +737,9 @@ function _tools(toolbox: ai.tools.Toolbox, wants_image: bool) -> OaTool[]? {
 
 function _tool_choice(tools: OaTool[]?, wants_image: bool) -> (string | OaToolChoiceObject)? {
     if (wants_image) {
-        return OaToolChoiceObject { type: "image_generation" };
+        return OaToolChoiceObject {
+            type: "image_generation",
+        };
     }
     match (tools) {
         null => null,
@@ -713,15 +751,63 @@ function _reasoning(c: root.ResponsesClient) -> OaReasoningParams? {
     if (c.reasoning_effort == null && c.reasoning_summary == null) {
         null
     } else {
-        OaReasoningParams { effort: c.reasoning_effort, summary: c.reasoning_summary }
+        OaReasoningParams {
+            effort: c.reasoning_effort,
+            summary: c.reasoning_summary,
+        }
     }
 }
 
-function _text(c: root.ResponsesClient) -> OaTextParams? {
-    if (c.verbosity == null) {
+function _text(c: root.ResponsesClient, structured: StructuredOutput?) -> OaTextParams? {
+    let format: OaTextFormat? = match (structured) {
+        let plan: StructuredOutput => {
+            OaTextFormat {
+                type: "json_schema",
+                name: plan.name(),
+                strict: true,
+                schema: plan.schema,
+            }
+        },
+        null => null,
+    };
+    if (c.verbosity == null && format == null) {
         null
     } else {
-        OaTextParams { verbosity: c.verbosity }
+        OaTextParams {
+            verbosity: c.verbosity,
+            format: format,
+        }
+    }
+}
+
+/// (internal) Put the output type's schema back over the pruned body, verbatim: the
+/// prune treats a `null` in it as an unset option, which it is not.
+function _restore_format_schema(
+    body: baml.json.json,
+    structured: StructuredOutput?,
+) -> baml.json.json {
+    if let plan: StructuredOutput = structured {
+        if let object: map<string, baml.json.json> = body {
+            if let text: map<string, baml.json.json> = object.get("text") {
+                if let format: map<string, baml.json.json> = text.get("format") {
+                    let _ = format.set("schema", plan.schema);
+                }
+            }
+        }
+    }
+    body
+}
+
+/// (internal) The structured output a request carries: null unless the client turned
+/// structured outputs on.
+function _structured_output(
+    c: root.ResponsesClient,
+    input: ai.ModelTurnInput,
+) -> StructuredOutput? {
+    if (c.structured_output) {
+        structured_output(input.output_type, c.provider())
+    } else {
+        null
     }
 }
 
@@ -751,7 +837,9 @@ function _url(c: root.ResponsesClient) -> string {
     if let params: map<string, string> = c.query_params {
         let pairs: string[] = [];
         for (let key in params.keys()) {
-            pairs.push(`${_percent_encode(key)}=${_percent_encode(params.get(key) ?? "")}`);
+            pairs.push(
+                `${_percent_encode(key)}=${_percent_encode(params.get(key) ?? "")}`,
+            );
         }
         if (pairs.length() > 0) {
             return `${url}?${pairs.join("&")}`;
@@ -762,13 +850,25 @@ function _url(c: root.ResponsesClient) -> string {
 
 /// ai.ModelTurnInput -> one Responses API request.
 function render(c: root.ResponsesClient, input: ai.ModelTurnInput) -> baml.http.Request {
-    _request(c, input, false, preview = false)
+    _request(
+        c,
+        input,
+        _structured_output(c, input),
+        false,
+        preview = false,
+    )
 }
 
-/// The request one `render` would send. This path never reads local media or
-/// downloads URLs; provider-unsupported URL forms return PreviewUnsupported.
+/// The request one `render` would send. This path never downloads URLs;
+/// provider-unsupported URL forms return PreviewUnsupported.
 function preview(c: root.ResponsesClient, input: ai.ModelTurnInput) -> baml.http.Request {
-    _request(c, input, false, preview = true)
+    _request(
+        c,
+        input,
+        _structured_output(c, input),
+        false,
+        preview = true,
+    )
 }
 
 /// (internal) The shared request builder: identical body for both paths, plus the
@@ -776,19 +876,25 @@ function preview(c: root.ResponsesClient, input: ai.ModelTurnInput) -> baml.http
 function _request(
     c: root.ResponsesClient,
     input: ai.ModelTurnInput,
+    structured: StructuredOutput?,
     stream: bool,
     preview: bool = false,
 ) -> baml.http.Request {
-    let prompt = input.prompt(ai.internal.build_output_format(input.output_type));
-    let items = lower_prompt(prompt, preview = preview);
+    let prompt = (input.prompt)(ai.internal.build_output_format(input.output_type));
+    let breakpoints: OaCacheBreakpoint[] = [];
+    let items = lower_prompt(
+        prompt,
+        breakpoints,
+        default_cache_args = c.default_cache_args(),
+        preview = preview,
+    );
     // sanitize BEFORE lowering: foreign reasoning, empty turns and orphaned
     // tool calls are everyone's problem, fixed once in ai.wire.
     let journal = ai.wire.degrade_tool_media(
-        ai.wire.sanitize_for_client(input.journal, c.id()),
+        ai.wire.sanitize_for_client(input.journal, "openai", c.model),
         ["image", "pdf", "video"],
     );
-    let metadata = prompt_metadata(prompt);
-    for (let item in lower_journal(journal, metadata, preview = preview)) {
+    for (let item in lower_journal(journal, preview = preview)) {
         items.push(item);
     }
     let wants_image = _wants_image(input.output_type);
@@ -797,25 +903,27 @@ function _request(
         model: c.model,
         input: items,
         store: c.store,
-        stream: if (stream) {
-            true
-        } else {
-            null
-        },
+        stream: if (stream) { true } else { null },
         temperature: c.temperature,
         top_p: c.top_p,
         max_output_tokens: c.max_output_tokens,
         reasoning: _reasoning(c),
-        text: _text(c),
+        text: _text(c, structured),
         parallel_tool_calls: c.parallel_tool_calls,
         tools: tools,
         tool_choice: _tool_choice(tools, wants_image),
     };
-    // typed request -> json -> drop unset optionals -> put the caller's own
-    // open-ended JSON back (tool schemas, then the per-message directives that
-    // ride on a content part) -> user passthrough LAST.
-    let pruned = _restore_tool_schemas(_prune_nulls(baml.json.to_json(request)), tools);
-    let body = ai.wire.merge_request_body(_apply_message_metadata(pruned, metadata), c.request_body);
+    // typed request -> json -> drop unset optionals -> put the open-ended JSON
+    // back (tool schemas, the output type's schema, then the cache breakpoints
+    // that ride on a content part) -> user passthrough LAST.
+    let pruned = _restore_format_schema(
+        _restore_tool_schemas(_prune_nulls(baml.json.from(request)), tools),
+        structured,
+    );
+    let body = ai.wire.merge_request_body(
+        _apply_cache_breakpoints(pruned, breakpoints),
+        c.request_body,
+    );
     baml.http.Request {
         method: "POST",
         url: _url(c),
@@ -837,54 +945,15 @@ function _image_mime(output_format: string?) -> string {
     }
 }
 
-/// (internal) Error codes that name a TRANSIENT provider-side failure. The Responses API's
-/// own `response.failed` example is `{"code":"server_error", …}` — a 500
-/// delivered inside a 200 body — and the same failure arriving as an HTTP status
-/// classifies as ai.errors.NetworkFailure (ai.errors.classify_http maps >=500
-/// there). Classifying the in-body form as InvalidRequest instead would make it
-/// permanently non-retryable under ai.Retry's default judgment, purely because
-/// of which envelope the provider chose.
-function _transient_code(code: string) -> bool {
-    code.includes("server_error")
-        || code.includes("timeout")
-        || code.includes("timed_out")
-        || code.includes("overloaded")
-        || code.includes("unavailable")
-        || code.includes("try_again")
-}
-
-/// (internal) A provider-reported error becomes the precise ai.errors class, never a
-/// blanket NetworkFailure: a retry-safe classification on a 400-shaped failure
-/// is what makes a Retry policy replay an invalid request forever.
-function _error_failure(err: OaErrorBody) -> ai.errors.Failure {
-    // Billing errors split the signal across `type` ("insufficient_quota")
-    // and `code` ("credit_balance_exhausted"), so classify on both.
-    let code = ((err.code ?? "") + " " + (err.type ?? "")).to_lower_case();
-    let detail = err.message ?? "the OpenAI Responses request failed";
-    let raw = baml.json.stringify(baml.json.to_json(err));
-    if (code.includes("rate_limit") || code.includes("quota") || code.includes("credit_balance")) {
-        ai.errors.RateLimited {
-            status_code: null,
-            provider: "openai",
-            retry_after_ms: null,
-            raw_body: raw,
-        }
-    } else if (code.includes("content_filter") || code.includes("moderation") || code.includes("refusal")) {
-        ai.errors.Refused { provider: "openai", reason: detail, raw_body: raw }
-    } else if (_transient_code(code)) {
-        ai.errors.NetworkFailure {
-            status_code: null,
-            provider: "openai",
-            detail: detail,
-            raw_body: raw,
-        }
-    } else {
-        ai.errors.InvalidRequest {
-            provider: "openai",
-            status_code: null,
-            detail: detail,
-            raw_body: raw,
-        }
+/// (internal) Preserve a valid provider-reported failure as structured data.
+function _error_failure(err: OaErrorBody) -> ai.errors.ProviderError {
+    ai.errors.ProviderError {
+        provider: "openai",
+        message: err.message ?? "the OpenAI Responses request failed",
+        error_type: err.type,
+        error_code: err.code,
+        raw_body: baml.json.stringify(err),
+        status_code: null,
     }
 }
 
@@ -892,12 +961,10 @@ function _response_failure(resp: OaResponse) -> ai.errors.Failure {
     match (resp.error) {
         let err: OaErrorBody => _error_failure(err),
         null => {
-            _error_failure(
-                OaErrorBody {
-                    code: null,
-                    message: `the response ended with status ${resp.status ?? "failed"}`,
-                },
-            )
+            _error_failure(OaErrorBody {
+                code: null,
+                message: `the response ended with status ${resp.status ?? "failed"}`,
+            })
         },
     }
 }
@@ -907,7 +974,7 @@ function parse(resp: OaResponse) -> ai.ModelTurn {
     // A 200 whose response object failed (background mode, and every
     // `response.failed` stream event) is an error, not an empty turn.
     if ((resp.status ?? "") == "failed" || resp.error != null) {
-        throw _response_failure(resp)
+        throw _response_failure(resp);
     }
     let content: ai.content.ModelBlock[] = [];
     let has_call = false;
@@ -924,14 +991,18 @@ function parse(resp: OaResponse) -> ai.ModelTurn {
                     // UnknownError, so it is classified like every other
                     // undecodable provider payload (ai.wire.send_as does the
                     // same for the response body).
-                    args
-                        = baml.json.from_string<map<string, unknown>>(s) catch_all (e) {
-                            _ => throw ai.errors.ParseFailed { provider: "openai", raw_output: s },
-                        };
+                    args = baml.json.decode<map<string, unknown>>(s) catch_all (e) {
+                        _ => throw ai.errors.ParseFailed {
+                            provider: "openai",
+                            raw_output: s,
+                        },
+                    };
                 };
-                content.push(
-                    ai.content.ToolUse { id: item.call_id ?? "", name: item.name ?? "", args: args },
-                );
+                content.push(ai.content.ToolUse {
+                    id: item.call_id ?? "",
+                    name: item.name ?? "",
+                    args: args,
+                });
                 null
             },
             "message" => {
@@ -940,12 +1011,16 @@ function parse(resp: OaResponse) -> ai.ModelTurn {
                     let kind = part.type ?? "";
                     match (kind) {
                         "output_text" => {
-                            content.push(ai.content.Text { text: part.text ?? "" });
+                            content.push(ai.content.Text {
+                                text: part.text ?? "",
+                            });
                             null
                         },
                         "refusal" => {
                             refused = true;
-                            content.push(ai.content.Text { text: part.refusal ?? "" });
+                            content.push(ai.content.Text {
+                                text: part.refusal ?? "",
+                            });
                             null
                         },
                         _ => null,
@@ -970,13 +1045,11 @@ function parse(resp: OaResponse) -> ai.ModelTurn {
                 // content, NOT a tool call the runner has to execute.
                 if let encoded: string = item.result {
                     let mime = _image_mime(item.output_format);
-                    content.push(
-                        ai.content.Media.new(
-                            baml.media.Image.from_base64(encoded, mime),
-                            provider_id = item.id,
-                            revised_prompt = item.revised_prompt,
-                        ),
-                    );
+                    content.push(ai.content.Media.new(
+                        baml.media.Image.from_base64(encoded, mime),
+                        provider_id = item.id,
+                        revised_prompt = item.revised_prompt,
+                    ));
                     null
                 } else {
                     null
@@ -999,27 +1072,134 @@ function parse(resp: OaResponse) -> ai.ModelTurn {
     } else {
         ai.content.StopReason.Complete
     };
-    let usage: ai.events.Usage? = if let u: OaUsage = resp.usage {
+    ai.ModelTurn {
+        calls: [],
+        child_turns: [],
+        content: content,
+        stop_reason: stop,
+    }
+}
+
+/// One decoded response's usage, null when it reported none.
+function usage(resp: OaResponse) -> ai.events.Usage? {
+    if let u: OaUsage = resp.usage {
         ai.events.Usage {
-            input_tokens: u.input_tokens ?? 0,
-            output_tokens: u.output_tokens ?? 0,
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
             cached_input_tokens: u.input_tokens_details?.cached_tokens,
             reasoning_tokens: u.output_tokens_details?.reasoning_tokens,
-            // input_tokens counts the cached share too.
-            uncached_input_tokens: ai.internal.uncached_input_tokens(u.input_tokens, u.input_tokens_details?.cached_tokens),
+            cache_write_input_tokens: u.input_tokens_details?.cache_write_tokens,
+            // input_tokens counts the cached share and the cache writes too.
+            uncached_input_tokens: ai.internal.uncached_input_tokens(
+                u.input_tokens,
+                u.input_tokens_details?.cached_tokens,
+                cache_write = u.input_tokens_details?.cache_write_tokens,
+            ),
         }
     } else {
         null
-    };
-    ai.ModelTurn { calls: [], content: content, stop_reason: stop, usage: usage }
+    }
 }
 
 /// The one internal entry point: render, send, normalize — one model turn.
+/// Whether any text parses as `t`: `string`, or a union with a `string` member
+/// (`string?` included).
+function _accepts_any_text(t: reflect.Type) -> bool {
+    let text = string.type();
+    if (t == text) {
+        return true;
+    }
+    if let union: reflect.Union = t.as_union() {
+        return union.member_types().some((member) -> { member == text });
+    }
+    false
+}
+
+/// `text` parsed into `output_type`, or null when it is blank or does not
+/// parse.
+function _parse_output(output_type: reflect.Type, text: string) -> ai.ParsedOutput? {
+    if (text.trim().is_empty()) {
+        return null;
+    }
+    let value = baml.sap.parse_type(output_type, text) catch_all (e) {
+        _ => {
+            return null;
+        },
+    };
+    ai.ParsedOutput { value: value }
+}
+
+/// The output that a `commentary` message holds, or null.
+///
+/// Models from gpt-5.3-codex on can answer in several messages, labeled by
+/// `phase`: `commentary` messages for the model's next step, then a
+/// `final_answer`. When the output is prompted as text and the response makes
+/// no native tool call, the model writes that step as the commentary (for
+/// example the tool calls of a prompted action schema), then writes the
+/// `final_answer` as if the step had already run. So the first commentary
+/// message that parses into the output type is the turn's output: the runner
+/// takes it and does not parse the final answer.
+///
+/// Null for a text-shaped output type: any text parses as a string, so a
+/// commentary preamble would replace the answer.
+function _commentary_output(resp: OaResponse, output_type: reflect.Type) -> ai.ParsedOutput? {
+    if (_accepts_any_text(output_type)) {
+        return null;
+    }
+    let output: OaOutputItem[] = resp.output ?? [];
+    // With a native tool call, the commentary is the preamble to that call.
+    if (output.some((item) -> { item.type == "function_call" })) {
+        return null;
+    }
+    for (let item in output) {
+        if (item.type == "message" && item.phase == "commentary") {
+            let text = "";
+            for (let part in item.content ?? []) {
+                if ((part.type ?? "") == "output_text") {
+                    text = `${text}${part.text ?? ""}`;
+                }
+            }
+            if let parsed: ai.ParsedOutput = _parse_output(output_type, text) {
+                return parsed;
+            }
+        }
+    }
+    null
+}
+
 function invoke(c: root.ResponsesClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
-    let req = ai.LlmTimeoutOptions._resolve(c.timeout)._apply(render(c, input));
-    let sent = ai.wire.send_as_with_wire<OaResponse>(req, "openai", c.id(), capture_wire = c.capture_wire);
+    let structured = _structured_output(c, input);
+    let req = ai.LlmTimeoutOptions._resolve(c.timeout)._apply(
+        _request(c, input, structured, false, preview = false),
+    );
+    let sent = ai.wire.send_as_with_wire<OaResponse>(
+        req,
+        ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        capture_wire = c.capture_wire,
+    );
     let turn = parse(sent.value);
-    ai.ModelTurn { ...turn, calls: [sent.call], model: c.model }
+    // A structured answer is the JSON in the turn's last text, read strictly.
+    // Without one, a `commentary` message may hold the output (see
+    // `_commentary_output`).
+    let answered = match (structured) {
+        let plan: StructuredOutput => with_structured_output(turn, plan, c.provider()),
+        null => {
+            ai.ModelTurn {
+                ...turn,
+                parsed_output: _commentary_output(sent.value, input.output_type),
+            }
+        },
+    };
+    ai.internal.with_own_call(
+        answered,
+        sent.call,
+        usage(sent.value),
+        c.model,
+        sent.value.model,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,7 +1244,11 @@ class OaStreamState {
     function new() -> OaStreamState {
         let started: map<string, bool> = {};
         let buffered: map<string, string> = {};
-        OaStreamState { model: null, text_started: started, call_arguments: buffered }
+        OaStreamState {
+            model: null,
+            text_started: started,
+            call_arguments: buffered,
+        }
     }
 }
 
@@ -1095,7 +1279,11 @@ function _stream_failure(event: OaStreamEvent) -> ai.errors.Failure {
     if let nested: OaErrorBody = event.error {
         return _error_failure(nested);
     };
-    _error_failure(OaErrorBody { code: event.code, message: event.message, type: null })
+    _error_failure(OaErrorBody {
+        code: event.code,
+        message: event.message,
+        type: null,
+    })
 }
 
 /// (internal) One decoded SSE event -> provider-agnostic stream events.
@@ -1150,7 +1338,8 @@ function _stream_events(
             // terminal event's response object.
             if let delta: string = event.delta {
                 let key = _event_key(event);
-                let _ = state.call_arguments.set(key, (state.call_arguments.get(key) ?? "") + delta);
+                let _ =
+                    state.call_arguments.set(key, (state.call_arguments.get(key) ?? "") + delta);
                 if (delta != "") {
                     out.push(ai.stream.ContentSeen {});
                 }
@@ -1159,9 +1348,8 @@ function _stream_events(
         },
         // Reasoning and refusal text: content with no TextDelta.
         "response.reasoning_summary_text.delta"
-            | "response.reasoning_text.delta"
-            | "response.refusal.delta" =>
-        {
+        | "response.reasoning_text.delta"
+        | "response.refusal.delta" => {
             if ((event.delta ?? "") != "") {
                 out.push(ai.stream.ContentSeen {});
             }
@@ -1177,17 +1365,11 @@ function _stream_events(
         "response.completed" | "response.incomplete" => {
             if let final_response: OaResponse = event.response {
                 let turn = parse(final_response);
-                out.push(
-                    ai.stream.TurnMeta {
-                        stop_reason: turn.stop_reason,
-                        input_tokens: turn.usage?.input_tokens,
-                        output_tokens: turn.usage?.output_tokens,
-                        cached_input_tokens: turn.usage?.cached_input_tokens,
-                        cache_write_input_tokens: turn.usage?.cache_write_input_tokens,
-                        uncached_input_tokens: turn.usage?.uncached_input_tokens,
-                        reasoning_tokens: turn.usage?.reasoning_tokens,
-                    },
-                );
+                out.push(ai.stream.TurnMeta {
+                    stop_reason: turn.stop_reason,
+                    usage: usage(final_response),
+                    resolved_model: final_response.model,
+                });
             };
             out.push(ai.stream.TurnDone {});
             null
@@ -1202,8 +1384,18 @@ function _decode_batch(batch: string, state: OaStreamState) -> ai.stream.Event[]
     let out: ai.stream.Event[] = [];
     for (let raw in ai.stream.decode_sse_batch(batch)) {
         if let data: string = raw.data {
-            let decoded: OaStreamEvent? = baml.json.from_string<OaStreamEvent>(data) catch_all (e) {
-                _ => null,
+            if (data.trim() == "" || data.trim() == "[DONE]") {
+                continue;
+            }
+            let decoded = baml.json.decode<OaStreamEvent>(data) catch_all (e) {
+                let parse => {
+                    throw ai.errors.InvalidResponse {
+                        provider: "openai",
+                        message: parse.to_string(),
+                        raw_body: data,
+                        status_code: null,
+                    };
+                },
             };
             if let event: OaStreamEvent = decoded {
                 for (let e in _stream_events(event, raw.event, state)) {
@@ -1216,53 +1408,34 @@ function _decode_batch(batch: string, state: OaStreamState) -> ai.stream.Event[]
     out
 }
 
-/// (internal) A failure opening the SSE connection. `baml.http.send_sse` reports a non-2xx
-/// status as an Io error whose message carries the status and body, so the
-/// status is recovered and classified exactly like ai.wire.send_as does — a 401
-/// or 429 on the streaming path must NOT be reported as a retry-safe transport
-/// failure.
-function _sse_failure(error: unknown) -> ai.errors.Failure {
-    let text = match (error) {
-        let io: baml.errors.Io => io.message,
-        _ => error.to_string(),
-    };
-    let marker = "SSE request failed with status ";
-    if let at: int = text.index_of(marker) {
-        let rest = text.slice(at + marker.length(), text.length());
-        if let separator: int = rest.index_of(":") {
-            let code = baml.Int.parse(rest.slice(0, separator).trim()) catch_all (e) {
-                _ => 0,
-            };
-            if (code > 0) {
-                return ai.errors.classify_http(
-                    "openai",
-                    code,
-                    rest.slice(separator + 1, rest.length()).trim(),
-                );
-            };
-        };
-    };
-    ai.errors.NetworkFailure {
-        status_code: null,
-        provider: "openai",
-        detail: `transport failed before a response arrived: ${text}`,
-        raw_body: null,
-    }
-}
-
-function _stream_open_failure(error: unknown) -> never {
+/// (internal) The failure for a `baml.http.send_sse` that could not open the
+/// stream: timeouts, cancellation and a rejected argument keep their type, and
+/// only transport errors enter the provider failure taxonomy.
+function _stream_open_failure(
+    error: baml.errors.Io
+        | baml.errors.Timeout
+        | baml.errors.InvalidArgument
+        | baml.panics.Cancelled,
+) -> never {
     match (error) {
         let timeout: baml.errors.Timeout => throw timeout,
         let cancelled: baml.panics.Cancelled => throw cancelled,
-        _ => throw _sse_failure(error),
+        let io: baml.errors.Io => throw ai.wire.sse_failure("openai", io),
+        let invalid: baml.errors.InvalidArgument => throw invalid,
     }
 }
 
 /// The streaming entry point: the same request as `invoke` with `stream: true`,
 /// wrapped in an ai.TurnStream over the SSE connection.
 function invoke_stream(c: root.ResponsesClient, input: ai.ModelTurnInput) -> ai.stream.TurnStream {
+    if (c.structured_output) {
+        throw _reject(
+            c.provider(),
+            "structured outputs do not stream yet; call the function without streaming, or use a client without structured_output",
+        );
+    }
     let limits = ai.LlmTimeoutOptions._resolve(c.timeout);
-    let req = limits._apply(_request(c, input, true, preview = false));
+    let req = limits._apply(_request(c, input, null, true, preview = false));
     let started = baml.time.Instant.now();
     let sse = baml.http.send_sse(req) catch_all (e) {
         _ => _stream_open_failure(e),
@@ -1285,13 +1458,16 @@ function invoke_stream(c: root.ResponsesClient, input: ai.ModelTurnInput) -> ai.
         timeout_options = limits,
         dispatched = started,
     );
-    let call = ai.events.LLMCall {
-        client_name: c.id(),
-        provider: "openai",
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: null,
-            ttft_ms: null,
+            start_time: started,
+            duration: null,
+            ttft: null,
         },
         http_request: if (c.capture_wire) {
             baml.http.Request {
@@ -1303,17 +1479,15 @@ function invoke_stream(c: root.ResponsesClient, input: ai.ModelTurnInput) -> ai.
         } else {
             null
         },
-        http_response: ai.events.HttpResponse { status: sse.status_code, headers: sse.headers, body: null },
-        usage: null,
-        selected: true,
-        sse_responses: if (c.capture_wire) {
-            []
-        } else {
-            null
+        http_response: ai.events.HttpResponse {
+            status: sse.status_code,
+            headers: sse.headers,
+            body: null,
         },
+        sse_responses: if (c.capture_wire) { [] } else { null },
     };
-    stream._calls = [call];
     stream._wire_call = call;
+    stream._requested_model = c.model;
     stream._call_started = started;
     stream._ttft_from = baml.time.Instant.now();
     stream._capture_sse = c.capture_wire;

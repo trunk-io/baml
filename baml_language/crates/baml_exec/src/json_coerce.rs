@@ -1,13 +1,13 @@
-// JSON source loading for `--json-args`.
+// JSON source loading for `--json-args` and `--context`.
 //
 // Coercion-to-typed-value used to live here, but it now goes through
-// `baml.json.deserialize<T>` (see `dispatch::build_args_from_signature`)
+// `baml.json.decode<T>` (see `dispatch::build_args_from_signature`)
 // so user `from_json` overrides on classes are honored. Only the I/O
 // part — reading the JSON string from inline/@file/stdin — remains here.
 
 use anyhow::{Context, Result};
 
-/// Load JSON from the `--json-args` source: inline string, `@file`, or `-` for stdin.
+/// Load JSON from an inline string, `@file`, or `-` for stdin.
 pub fn load_json_source(source: &str) -> Result<serde_json::Value> {
     if source == "-" {
         let input =
@@ -18,7 +18,7 @@ pub fn load_json_source(source: &str) -> Result<serde_json::Value> {
             .with_context(|| format!("failed to read file: {path}"))?;
         serde_json::from_str(&content).with_context(|| format!("invalid JSON in file: {path}"))
     } else {
-        serde_json::from_str(source).context("invalid inline JSON for `--json-args`")
+        serde_json::from_str(source).context("invalid inline JSON")
     }
 }
 

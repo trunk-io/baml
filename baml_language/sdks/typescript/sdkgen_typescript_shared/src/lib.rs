@@ -176,7 +176,17 @@ pub fn to_source_code_with_metadata(
         let body = bodies.get(&leaf_path).unwrap_or(&empty_body);
         let is_root = dir.is_empty();
 
-        let mut content = render_index_ts(body, &kids, is_root, config.runtime_package);
+        let mut content = render_index_ts(body, &kids, is_root, config.runtime_package, pool);
+        if dir == &["vendor", "trace"] {
+            let _ = write!(
+                content,
+                "\nimport {{ _currentCancelToken }} from \"{}\";\nimport type {{ CancelToken }} from \"../../baml/spawn/index.js\";\nexport const current_cancel_token = _currentCancelToken as () => CancelToken | null;\n",
+                config.runtime_package
+            );
+        }
+        if dir == &["vendor", "trace"] && config.runtime_package == "@boundaryml/baml-bridge" {
+            content.push_str("\nimport { _instrument } from \"@boundaryml/baml-bridge\";\nexport { TraceUsageError, registerCapture, captureFor } from \"@boundaryml/baml-bridge\";\nexport const instrument: {\n  <F extends (...args: any[]) => any>(body: F): F;\n  <F extends (...args: any[]) => any>(options: Options | null | undefined, body: F, display?: { readonly name?: string }): F;\n} = _instrument;\n");
+        }
         content.push_str(&render_interface_tokens(
             interface_tokens
                 .iter()
@@ -186,6 +196,19 @@ pub fn to_source_code_with_metadata(
         out.insert(init_ts_path(dir), content);
     }
 
+    out.insert(
+        PathBuf::from("_invocation.ts"),
+        include_str!("invocation_facade.ts").replace("__RUNTIME__", config.runtime_package),
+    );
+    out.insert(
+        PathBuf::from("experimental.ts"),
+        include_str!("experimental_facade.ts").replace("__RUNTIME__", config.runtime_package),
+    );
+    let root = out
+        .get_mut(&PathBuf::from("index.ts"))
+        .expect("root module");
+    root.push_str("\nexport * as experimental from \"./experimental.js\";\nexport type { BamlOptions } from \"./_invocation.js\";\nexport * as trace from \"./vendor/trace/index.js\";\n");
+
     // Root-only data modules.
     out.insert(
         PathBuf::from("_inlinedbaml.ts"),
@@ -193,7 +216,12 @@ pub fn to_source_code_with_metadata(
     );
     out.insert(
         PathBuf::from("_typemap.ts"),
-        render_typemap_module(&bodies, "baml_sdk", config.runtime_package),
+        render_typemap_module(
+            &bodies,
+            "baml_sdk",
+            config.runtime_package,
+            &baml_sdkgen_types::ProgramDescriptor::describe(pool).encode_embedded(),
+        ),
     );
 
     // Prepend the do-not-edit banner to every `.ts` file.
@@ -252,7 +280,8 @@ mod tests {
 
     use baml_base::Name as BaseName;
     use baml_sdkgen_types::{
-        Class, Enum, EnumVariant, Function, FunctionArgument, Name, Origin, Symbol, SymbolPool, Ty,
+        Class, ClassProperty, Enum, EnumVariant, Function, FunctionArgument, Name, Origin, Symbol,
+        SymbolPool, Ty, TypeAlias,
     };
 
     use super::*;
@@ -276,6 +305,7 @@ mod tests {
 
     fn class_sym(n: &Name, span: u32) -> Symbol {
         Symbol::Class(Class {
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
             name: n.clone(),
             generic_params: Vec::new(),
             docstring: None,
@@ -283,6 +313,7 @@ mod tests {
             static_methods: Vec::new(),
             instance_methods: Vec::new(),
             origin: origin(span),
+            json_omit_nulls: false,
         })
     }
 
@@ -294,6 +325,7 @@ mod tests {
                 name: BaseName::new("POSITIVE"),
                 docstring: None,
                 value: "POSITIVE".to_string(),
+                json_rename: None,
             }],
             origin: origin(span),
         })
@@ -327,6 +359,109 @@ mod tests {
         )
     }
 
+    fn named_fn(n: &str, span: u32) -> Function {
+        let Symbol::Function(mut f) = func_sym(span) else {
+            unreachable!("func_sym builds a function");
+        };
+        f.name = BaseName::new(n);
+        f
+    }
+
+    #[test]
+    fn sibling_sync_twins_never_displace_authored_names() {
+        // Authored `foo` and `foo_sync`: both keep their names, and `foo`'s
+        // blocking twin takes the next free spelling instead of a second
+        // `export const foo_sync`.
+        let mut pool = SymbolPool::new();
+        pool.insert(
+            name("user", &["lorem"], "foo"),
+            Symbol::Function(named_fn("foo", 0)),
+        );
+        pool.insert(
+            name("user", &["lorem"], "foo_sync"),
+            Symbol::Function(named_fn("foo_sync", 1)),
+        );
+        let out = emit_sdk(&pool);
+        let leaf = &out[&PathBuf::from("lorem/index.ts")];
+        for line in [
+            "export const foo = defineFunction(\"user.lorem.foo\", \"async\"",
+            "export const foo_sync_ = defineFunction(\"user.lorem.foo\", \"sync\"",
+            "export const foo_sync = defineFunction(\"user.lorem.foo_sync\", \"async\"",
+            "export const foo_sync_sync = defineFunction(\"user.lorem.foo_sync\", \"sync\"",
+        ] {
+            assert!(leaf.contains(line), "missing `{line}`:\n{leaf}");
+        }
+        assert_eq!(leaf.matches("export const foo_sync =").count(), 1, "{leaf}");
+    }
+
+    #[test]
+    fn method_sync_twins_avoid_sibling_methods_and_properties() {
+        // Instance methods `foo`/`foo_sync`, and method `bar` next to a
+        // `bar_sync` property: instance methods are class fields, so every
+        // member name must be unique.
+        let thing = name("user", &["lorem"], "Thing");
+        let Symbol::Class(mut class) = class_sym(&thing, 0) else {
+            unreachable!("class_sym builds a class");
+        };
+        class.properties.push(baml_sdkgen_types::ClassProperty {
+            name: BaseName::new("bar_sync"),
+            docstring: None,
+            ty: Ty::Int,
+            json_fallback: false,
+            json_flatten: false,
+            json_rename: None,
+        });
+        class.instance_methods = vec![
+            named_fn("foo", 1),
+            named_fn("foo_sync", 2),
+            named_fn("bar", 3),
+        ];
+        let mut pool = SymbolPool::new();
+        pool.insert(thing, Symbol::Class(class));
+        let out = emit_sdk(&pool);
+        let leaf = &out[&PathBuf::from("lorem/index.ts")];
+        for line in [
+            "foo_sync_ = defineInstanceFunction(\"user.lorem.Thing.foo\", \"sync\"",
+            "foo_sync = defineInstanceFunction(\"user.lorem.Thing.foo_sync\", \"async\"",
+            "foo_sync_sync = defineInstanceFunction(\"user.lorem.Thing.foo_sync\", \"sync\"",
+            "bar_sync_ = defineInstanceFunction(\"user.lorem.Thing.bar\", \"sync\"",
+        ] {
+            assert!(leaf.contains(line), "missing `{line}`:\n{leaf}");
+        }
+        assert!(
+            !leaf.contains("bar_sync = defineInstanceFunction"),
+            "{leaf}"
+        );
+    }
+
+    #[test]
+    fn namespace_alias_never_shadows_an_authored_function() {
+        // `id` composes its `id` child namespace through a local alias; an
+        // authored `__ns_id` function keeps its name and the alias moves.
+        let mut pool = SymbolPool::new();
+        pool.insert(
+            name("factory", &[], "id"),
+            Symbol::Function(named_fn("id", 0)),
+        );
+        pool.insert(
+            name("factory", &[], "__ns_id"),
+            Symbol::Function(named_fn("__ns_id", 1)),
+        );
+        let value = name("factory", &["id"], "Value");
+        pool.insert(value.clone(), class_sym(&value, 2));
+        let out = emit_sdk(&pool);
+        let leaf = &out[&PathBuf::from("vendor/factory/index.ts")];
+        assert!(
+            leaf.contains("import * as __ns_id_ from \"./id/index.js\";"),
+            "{leaf}"
+        );
+        assert!(leaf.contains(", __ns_id_);"), "{leaf}");
+        assert!(
+            leaf.contains("export const __ns_id = defineFunction("),
+            "{leaf}"
+        );
+    }
+
     #[test]
     fn empty_pool_emits_structural_files() {
         let out = emit_sdk(&SymbolPool::new());
@@ -348,6 +483,19 @@ mod tests {
             )
         );
         assert!(root.contains("setTypeMap(_TYPE_MAP);"));
+        // The typemap carries the program descriptor the bridge encodes
+        // arguments against, embedded the same way as the bytecode.
+        let typemap = &out[&PathBuf::from("_typemap.ts")];
+        let embedded = typemap
+            .lines()
+            .find_map(|line| line.strip_prefix("const _DESCRIPTOR = \""))
+            .and_then(|rest| rest.strip_suffix("\";"))
+            .expect("typemap embeds the descriptor on one line");
+        assert_eq!(
+            baml_sdkgen_types::ProgramDescriptor::decode_embedded(embedded.as_bytes()).unwrap(),
+            baml_sdkgen_types::ProgramDescriptor::describe(&SymbolPool::new())
+        );
+        assert!(typemap.contains("  descriptor: _DESCRIPTOR,\n});"));
         assert!(root.contains("export * as baml from \"./baml/index.js\";"));
         assert!(!root.contains("export const b"));
         assert!(!root.contains("BAML_PLACEHOLDER"));
@@ -362,6 +510,105 @@ mod tests {
         let leaf = &out[&PathBuf::from("lorem/index.ts")];
         assert!(leaf.contains("export class Resume {"));
         assert!(!out.contains_key(&PathBuf::from("lorem/index.d.ts")));
+    }
+
+    /// A host's own value renders as the host's handle, `_BamlHandle`, and has
+    /// no definition of its own.
+    #[test]
+    fn host_value_class_renders_as_the_host_handle() {
+        let host_value = name("baml", &["host"], "Value");
+        let holder = name("baml", &["errors"], "HostCallable");
+        let pool_with = |handle: Ty| {
+            let Symbol::Class(mut holder_class) = class_sym(&holder, 10) else {
+                unreachable!()
+            };
+            holder_class.properties = vec![ClassProperty {
+                name: BaseName::new("_handle"),
+                docstring: None,
+                ty: handle,
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
+            }];
+            let mut pool = SymbolPool::new();
+            pool.insert(holder.clone(), Symbol::Class(holder_class));
+            pool
+        };
+        let mut pool = pool_with(Ty::Class(host_value.clone(), Box::new([])));
+        let Symbol::Class(mut host_value_class) = class_sym(&host_value, 0) else {
+            unreachable!()
+        };
+        host_value_class.crossing = baml_sdkgen_types::ClassCrossing::HostValue;
+        pool.insert(host_value, Symbol::Class(host_value_class));
+        let host_value = emit_sdk(&pool);
+
+        let errors = PathBuf::from("baml/errors/index.ts");
+        assert!(
+            host_value[&errors].contains("_handle!: _BamlHandle;"),
+            "{}",
+            host_value[&errors]
+        );
+        let host = &host_value[&PathBuf::from("baml/host/index.ts")];
+        assert!(!host.contains("class Value"), "{host}");
+        assert!(!host_value[&PathBuf::from("_typemap.ts")].contains("baml.host.Value"));
+    }
+
+    #[test]
+    fn nullable_fields_are_optional_keys() {
+        let nullable_string = Ty::Union(Box::new([Ty::String, Ty::Null]));
+        let alias = name("user", &["lorem"], "NullableText");
+        let class = name("user", &["lorem"], "Payload");
+        let mut pool = SymbolPool::new();
+        pool.insert(
+            alias.clone(),
+            Symbol::TypeAlias(TypeAlias {
+                name: alias.clone(),
+                resolves_to: nullable_string.clone(),
+                recursive: false,
+                origin: origin(0),
+            }),
+        );
+        let Symbol::Class(mut payload) = class_sym(&class, 10) else {
+            unreachable!()
+        };
+        payload.properties = [
+            ("required", Ty::String),
+            ("nullable", nullable_string.clone()),
+            (
+                "nullable_union",
+                Ty::Union(Box::new([Ty::Int, Ty::String, Ty::Null])),
+            ),
+            ("nullable_alias", Ty::TypeAlias(alias)),
+            ("nullable_items", Ty::List(Box::new(nullable_string))),
+        ]
+        .into_iter()
+        .map(|(field, ty)| ClassProperty {
+            name: BaseName::new(field),
+            docstring: None,
+            ty,
+            json_fallback: false,
+            json_flatten: false,
+            json_rename: None,
+        })
+        .collect();
+        pool.insert(class, Symbol::Class(payload));
+
+        let out = emit_sdk(&pool);
+        let leaf = &out[&PathBuf::from("lorem/index.ts")];
+        let expected = "export class Payload {\n\
+                        \x20 required!: string;\n\
+                        \x20 nullable?: string | null;\n\
+                        \x20 nullable_union?: number | string | null;\n\
+                        \x20 nullable_alias?: NullableText;\n\
+                        \x20 nullable_items!: (string | null)[];\n\
+                        \x20 constructor(init: {\n\
+                        \x20   required: string;\n\
+                        \x20   nullable?: string | null;\n\
+                        \x20   nullable_union?: number | string | null;\n\
+                        \x20   nullable_alias?: NullableText;\n\
+                        \x20   nullable_items: (string | null)[];\n\
+                        \x20 }) {\n";
+        assert!(leaf.contains(expected), "leaf missing class body:\n{leaf}");
     }
 
     #[test]
@@ -383,10 +630,10 @@ mod tests {
         let out = emit_sdk(&pool);
         let leaf = &out[&PathBuf::from("lorem/index.ts")];
         assert!(leaf.contains(
-            "export const extract_resume = defineFunction(\"user.lorem.extract_resume\", \"sync\", [\"x\"])"
+            "export const extract_resume = defineFunction(\"user.lorem.extract_resume\", \"async\", [\"x\"])"
         ));
         assert!(leaf.contains(
-            "export const extract_resume_async = defineFunction(\"user.lorem.extract_resume\", \"async\", [\"x\"])"
+            "export const extract_resume_sync = defineFunction(\"user.lorem.extract_resume\", \"sync\", [\"x\"])"
         ));
     }
 

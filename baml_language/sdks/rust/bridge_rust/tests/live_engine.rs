@@ -21,6 +21,11 @@ function no_op() -> void {}
 function opt_probe(a: int, o: int? = 5) -> int?[] { [a, o] }
 function gid<T>(x: T) -> T { x }
 function gname<T>() -> string { reflect.Type.of<T>().to_string() }
+function rt_wide_literals(
+  x: (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+) -> (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12) { x }
+function make_unknown_pair() -> (int, unknown) { (1, "a") }
+function rt_unknown_pair(x: (int, unknown)) -> (int, unknown) { x }
 "#;
 
 /// Initialize the process-global runtime once for every test in this
@@ -41,22 +46,11 @@ fn ensure_runtime() {
 /// Call a unary echo function synchronously and decode as the same type.
 fn round_trip<T: BamlValue>(fqn: &str, value: &T) -> T {
     ensure_runtime();
-    runtime::invoke_sync::<T, Infallible>(
-        fqn,
-        encode::kwargs(vec![("x", Some(value.to_baml()))]),
-        vec![],
-    )
+    runtime::invoke_sync::<T, Infallible>(fqn, |args| {
+        args.value("x", value, &ty_of::<T>())?;
+        Ok(vec![])
+    })
     .unwrap_or_else(|e| panic!("{fqn} failed: {e}"))
-}
-
-trait ToBamlForTest {
-    fn to_baml(&self) -> baml_bridge::wire::InboundValue;
-}
-
-impl<T: BamlValue> ToBamlForTest for T {
-    fn to_baml(&self) -> baml_bridge::wire::InboundValue {
-        baml_bridge::baml_value::internal::__BamlValuePrivate::to_baml(self)
-    }
 }
 
 /// The wire `BamlTy` a generated SDK would send for a `TypeVar` bound to
@@ -113,19 +107,18 @@ fn round_trips_list() {
 #[test]
 fn void_returns_unit() {
     ensure_runtime();
-    runtime::invoke_sync::<(), Infallible>("user.no_op", encode::kwargs(vec![]), vec![])
-        .expect("no_op succeeds");
+    runtime::invoke_sync::<(), Infallible>("user.no_op", |_| Ok(vec![])).expect("no_op succeeds");
 }
 
 #[test]
 fn unset_takes_default_and_null_stays_null() {
     ensure_runtime();
     let call = |o: OptionalArg<Option<i64>>| {
-        runtime::invoke_sync::<Vec<Option<i64>>, Infallible>(
-            "user.opt_probe",
-            encode::kwargs(vec![("a", Some(1i64.to_baml())), ("o", o.to_baml_opt())]),
-            vec![],
-        )
+        runtime::invoke_sync::<Vec<Option<i64>>, Infallible>("user.opt_probe", |args| {
+            args.value("a", &1i64, &ty_of::<i64>())?;
+            args.optional("o", &o, &ty_of::<Option<i64>>())?;
+            Ok(vec![])
+        })
         .expect("opt_probe succeeds")
     };
     assert_eq!(call(OptionalArg::Unset), [Some(1), Some(5)]);
@@ -138,7 +131,7 @@ fn unknown_function_is_a_panic() {
     // The engine reports a missing entry point on the panic arm (the same
     // envelope python surfaces as `BamlPanic`), not as a thrown error.
     ensure_runtime();
-    let result = runtime::invoke_sync::<i64, Infallible>("user.does_not_exist", vec![], vec![]);
+    let result = runtime::invoke_sync::<i64, Infallible>("user.does_not_exist", |_| Ok(vec![]));
     match result {
         Err(Error::Panic { message, .. }) => {
             assert!(
@@ -153,11 +146,10 @@ fn unknown_function_is_a_panic() {
 #[tokio::test]
 async fn async_invoke_round_trips() {
     ensure_runtime();
-    let result: i64 = runtime::invoke::<i64, Infallible>(
-        "user.rt_int",
-        encode::kwargs(vec![("x", Some(42i64.to_baml()))]),
-        vec![],
-    )
+    let result: i64 = runtime::invoke::<i64, Infallible>("user.rt_int", |args| {
+        args.value("x", &42i64, &ty_of::<i64>())?;
+        Ok(vec![])
+    })
     .await
     .expect("async rt_int succeeds");
     assert_eq!(result, 42);
@@ -166,11 +158,10 @@ async fn async_invoke_round_trips() {
 #[tokio::test]
 async fn sync_invoke_inside_async_runtime_is_refused() {
     ensure_runtime();
-    let result = runtime::invoke_sync::<i64, Infallible>(
-        "user.rt_int",
-        encode::kwargs(vec![("x", Some(1i64.to_baml()))]),
-        vec![],
-    );
+    let result = runtime::invoke_sync::<i64, Infallible>("user.rt_int", |args| {
+        args.value("x", &1i64, &ty_of::<i64>())?;
+        Ok(vec![])
+    });
     assert!(matches!(result, Err(Error::CalledSyncFromAsync)));
 }
 
@@ -178,30 +169,27 @@ async fn sync_invoke_inside_async_runtime_is_refused() {
 fn generic_identity_round_trips_with_explicit_type_args() {
     ensure_runtime();
     // gid<T>(x: T) -> T, bound explicitly (as generated code always does).
-    let seven = runtime::invoke_sync::<i64, Infallible>(
-        "user.gid",
-        encode::kwargs(vec![("x", Some(7i64.to_baml()))]),
-        encode::type_args(vec![("T", ty_of::<i64>())]),
-    )
+    let seven = runtime::invoke_sync::<i64, Infallible>("user.gid", |args| {
+        args.value("x", &7i64, &ty_of::<i64>())?;
+        Ok(encode::type_args(vec![("T", ty_of::<i64>())]))
+    })
     .expect("gid<int> succeeds");
     assert_eq!(seven, 7);
 
-    let hi = runtime::invoke_sync::<String, Infallible>(
-        "user.gid",
-        encode::kwargs(vec![("x", Some("hi".to_string().to_baml()))]),
-        encode::type_args(vec![("T", ty_of::<String>())]),
-    )
+    let hi = runtime::invoke_sync::<String, Infallible>("user.gid", |args| {
+        args.value("x", &"hi".to_string(), &ty_of::<String>())?;
+        Ok(encode::type_args(vec![("T", ty_of::<String>())]))
+    })
     .expect("gid<string> succeeds");
     assert_eq!(hi, "hi");
 
     // A container type argument exercises the nested `BamlTy` construction
     // (`list<int>`) on the wire, round-tripping the whole value back.
     let xs = vec![1i64, 2, 3];
-    let out = runtime::invoke_sync::<Vec<i64>, Infallible>(
-        "user.gid",
-        encode::kwargs(vec![("x", Some(xs.to_baml()))]),
-        encode::type_args(vec![("T", ty_of::<Vec<i64>>())]),
-    )
+    let out = runtime::invoke_sync::<Vec<i64>, Infallible>("user.gid", |args| {
+        args.value("x", &xs, &ty_of::<Vec<i64>>())?;
+        Ok(encode::type_args(vec![("T", ty_of::<Vec<i64>>())]))
+    })
     .expect("gid<int[]> succeeds");
     assert_eq!(out, xs);
 }
@@ -213,19 +201,99 @@ fn return_only_type_param_is_bound_from_type_args() {
     // from the explicit type_args — proving they are honored, not merely
     // recovered from argument inference. `reflect.Type.of<T>()` reflects the
     // bound type's name back as a string.
-    let int_name = runtime::invoke_sync::<String, Infallible>(
-        "user.gname",
-        encode::kwargs(vec![]),
-        encode::type_args(vec![("T", ty_of::<i64>())]),
-    )
+    let int_name = runtime::invoke_sync::<String, Infallible>("user.gname", |_| {
+        Ok(encode::type_args(vec![("T", ty_of::<i64>())]))
+    })
     .expect("gname<int> succeeds");
     assert_eq!(int_name, "int");
 
-    let string_name = runtime::invoke_sync::<String, Infallible>(
-        "user.gname",
-        encode::kwargs(vec![]),
-        encode::type_args(vec![("T", ty_of::<String>())]),
-    )
+    let string_name = runtime::invoke_sync::<String, Infallible>("user.gname", |_| {
+        Ok(encode::type_args(vec![("T", ty_of::<String>())]))
+    })
     .expect("gname<string> succeeds");
     assert_eq!(string_name, "string");
+}
+
+fn wide_literals_ty() -> baml_bridge::wire::BamlTy {
+    use baml_bridge::{baml_value::internal, wire};
+    internal::tuple_ty(
+        (0..13)
+            .map(|value| internal::literal_ty(wire::baml_ty_literal::Literal::IntValue(value)))
+            .collect(),
+    )
+}
+
+type WideLiterals = (
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+fn counting() -> WideLiterals {
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+}
+
+fn call_wide_literals<T: baml_bridge::BamlValue>(x: &T) -> Result<WideLiterals, Error<Infallible>> {
+    ensure_runtime();
+    runtime::invoke_sync::<WideLiterals, Infallible>("user.rt_wide_literals", |args| {
+        args.value("x", x, &wide_literals_ty())?;
+        Ok(vec![])
+    })
+}
+
+#[test]
+fn a_wide_native_tuple_states_its_declared_literal_slots() {
+    let back = call_wide_literals(&counting()).expect("the tuple round-trips");
+    assert_eq!((back.0, back.6, back.12), (0, 6, 12));
+}
+
+#[test]
+fn a_wide_native_tuple_is_checked_slot_by_slot_and_by_arity() {
+    let mut wrong_slot = counting();
+    wrong_slot.12 = 0;
+    assert!(call_wide_literals(&wrong_slot).is_err());
+    let short = (
+        0i64, 1i64, 2i64, 3i64, 4i64, 5i64, 6i64, 7i64, 8i64, 9i64, 10i64, 11i64,
+    );
+    assert!(call_wide_literals(&short).is_err());
+}
+
+#[test]
+fn a_tuple_with_an_unknown_slot_crosses_as_a_dynamic_value() {
+    ensure_runtime();
+    let pair = runtime::invoke_sync::<baml_bridge::dynamic::Value, Infallible>(
+        "user.make_unknown_pair",
+        |_| Ok(vec![]),
+    )
+    .expect("make_unknown_pair succeeds");
+    let declared = {
+        use baml_bridge::{baml_value::internal, wire};
+        internal::tuple_ty(vec![
+            internal::primitive_ty(wire::BamlTyPrimitiveKind::BamlTyPrimitiveInt),
+            internal::leaf_ty(wire::baml_ty::Ty::Unknown(wire::BamlTyUnknown {})),
+        ])
+    };
+    let back = runtime::invoke_sync::<baml_bridge::dynamic::Value, Infallible>(
+        "user.rt_unknown_pair",
+        |args| {
+            args.value("x", &pair, &declared)?;
+            Ok(vec![])
+        },
+    )
+    .expect("rt_unknown_pair succeeds");
+    assert_eq!(
+        back.decode::<(i64, String)>().unwrap(),
+        (1, "a".to_string())
+    );
+    assert!(back.decode::<Vec<baml_bridge::dynamic::Value>>().is_err());
 }

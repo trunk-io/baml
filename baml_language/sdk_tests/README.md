@@ -48,7 +48,7 @@ cargo nextest run -p sdk_test_typescript function_calls::vitest_node
 # rust: run tests matching a name filter (set CARGO_TARGET_DIR to reuse the
 # shared build cache the nextest-driven runs populate).
 cargo nextest run -p sdk_test_rust function_calls::cargo_test
-(cd sdk_tests/crates/rust/function_calls/generated && CARGO_TARGET_DIR=../../../../../target/sdk-rust-target cargo test optional_args)
+(cd sdk_tests/crates/rust/function_calls/generated && CARGO_TARGET_DIR=../../../../../target/sdk-rust-target cargo test --all-features optional_args)
 ```
 
 ### Rust port gating
@@ -60,6 +60,16 @@ Rust tests are compiled only when the capability they exercise has landed:
 and lists the rest as `// LATER(<reason>)` comments. The single source of
 truth is the `TEST_MODS` table in `sdk_tests/codegen/src/rust.rs` —
 enabling a port is a one-line flip there.
+
+## Callable execution contracts
+
+The `callback_dispatch`, `callable_lifecycle`, and `callable_reentry` suites
+separate shared bridge behavior from host-language behavior. Shared cases use
+the same canonical names and assertions in each SDK port. Language-specific
+files and cases use a `_<lang>_only` suffix, such as `_python_only` or
+`_typescript_only`, and retain an explicit parity-lint waiver for other languages.
+Shared ports currently cover Python and TypeScript; other SDK ports remain
+coverage gaps.
 
 ## SDK implementation
 

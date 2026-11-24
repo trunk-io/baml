@@ -3,9 +3,10 @@
 //! Each test creates a minimal DB, adds a `.baml` file, lowers all functions
 //! to MIR, and snapshots the pretty-printed output.
 
+mod escape;
+
 use std::fmt::Write;
 
-use baml_base::Name;
 use baml_compiler2_hir::item_data::{file_functions, function_data, function_source_map};
 use baml_compiler2_hir_ty::{callable::ExternalLinkability, package_interface::export_interface};
 use baml_compiler2_mir::{
@@ -21,6 +22,25 @@ fn make_db() -> ProjectDatabase {
     let mut db = ProjectDatabase::new();
     db.workspace(std::path::Path::new("."));
     db
+}
+
+/// The rendered MIR of the user function `name`, out of [`render_mir`]'s output.
+fn function_mir<'a>(output: &'a str, name: &str) -> &'a str {
+    output
+        .split(&format!("fn user.{name}("))
+        .nth(1)
+        .and_then(|tail| tail.split("\nfn ").next())
+        .unwrap_or_else(|| panic!("no MIR for `user.{name}`:\n{output}"))
+}
+
+/// Whether a line of MIR is a structural type test against a list or map type:
+/// an `is_type` (which renders the type, `int[]`) or a `narrow_bind` (which
+/// renders the type test, `List(Int)`).
+fn is_structural_container_test(line: &str) -> bool {
+    (line.contains("is_type(") || line.contains("narrow_bind"))
+        && ["[]", "map<", "List(", "Map {"]
+            .iter()
+            .any(|spelling| line.contains(spelling))
 }
 
 /// Lower all functions in a file to MIR and pretty-print them.
@@ -42,6 +62,328 @@ fn render_mir(db: &ProjectDatabase, file: baml_base::SourceFile) -> String {
 }
 
 #[test]
+fn map_operations_lower_to_yielding_calls() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+function maps(value: int, optional: map<string, int>?) -> int {
+  let values = {"first": value, "second": value + 1};
+  values["first"] = value + 2;
+  values["second"] += values["first"];
+  optional?.["first"] = value;
+  optional?.["second"] += value;
+  values["second"]
+}
+function nested(values: map<string, map<string, int>>) -> int {
+  values["outer"]["inner"] += 1;
+  values["outer"]["inner"]
+}
+function generic<T>(value: T) -> map<string, T> {
+  {"value": value}
+}
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    assert!(output.contains("Map.index"), "{output}");
+    assert!(output.contains("Map.set"), "{output}");
+    for &loc in file_functions(&db, file) {
+        let mir = lower_function(&db, loc, OptLevel::Two).as_ref().unwrap();
+        let MirFunctionKind::Bytecode(body) = &mir.kind else {
+            panic!("test functions must have bytecode bodies")
+        };
+        for statement in body.blocks.iter().flat_map(|block| &block.statements) {
+            if let StatementKind::Assign {
+                value: baml_compiler2_mir::Rvalue::Map(_, _, entries),
+                ..
+            } = &statement.kind
+            {
+                assert!(entries.is_empty(), "map entries must use yielding calls");
+            }
+        }
+    }
+    let program = baml_db::CheckedWorld::collect(&db, db.workspace_root().unwrap())
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("compile yielding map operations");
+    for object in &program.objects {
+        let bex_vm_types::Object::Function(function) = object else {
+            continue;
+        };
+        if !["maps", "nested", "generic"].iter().any(|name| {
+            function
+                .declared_name()
+                .is_some_and(|declared| declared == *name)
+        }) {
+            continue;
+        }
+        for instruction in &function.bytecode.instructions {
+            assert!(
+                !matches!(
+                    instruction,
+                    bex_vm_types::Instruction::LoadMapElement
+                        | bex_vm_types::Instruction::StoreMapElement
+                        | bex_vm_types::Instruction::AllocMap(1..)
+                ),
+                "legacy map instruction in {}: {instruction:?}",
+                function.name(),
+            );
+        }
+    }
+}
+
+#[test]
+fn primitive_template_holes_skip_the_generic_renderer() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+class Point { x int }
+function holes(a: string, k: int, f: float, b: bool, tag: "x" | "y") -> string {
+  `${a}/${k}/${f}/${b}/${tag}`
+}
+function explicit(k: int, a: string) -> string {
+  string.from(k) + string.from(a)
+}
+function generic<T>(value: T) -> string { `${value}` }
+function structural(p: Point) -> string { `${p}` }
+function mixed(v: int | string) -> string { `${v}` }
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    for name in ["holes", "explicit"] {
+        let mir = function_mir(&output, name);
+        assert!(!mir.contains("String.from"), "{mir}");
+    }
+    assert_eq!(
+        function_mir(&output, "holes")
+            .matches("_to_string_primitive")
+            .count(),
+        3,
+        "{output}"
+    );
+    assert_eq!(
+        function_mir(&output, "explicit")
+            .matches("_to_string_primitive")
+            .count(),
+        1,
+        "{output}"
+    );
+    for name in ["generic", "structural", "mixed"] {
+        let mir = function_mir(&output, name);
+        assert!(mir.contains("String.from"), "{mir}");
+        assert!(!mir.contains("_to_string_primitive"), "{mir}");
+    }
+}
+
+#[test]
+fn primitive_to_string_calls_skip_the_generic_renderer() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+class Point { x int }
+class Holder { k int }
+function methods(k: int, f: float, b: bool, a: string, h: Holder) -> string {
+  k.to_string() + f.to_string() + b.to_string() + a.to_string() + h.k.to_string()
+}
+function literal() -> string { (5).to_string() }
+function generic<T>(value: T) -> string { value.to_string() }
+function structural(p: Point) -> string { p.to_string() }
+function mixed(v: int | string) -> string { v.to_string() }
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    for name in ["methods", "literal"] {
+        let mir = function_mir(&output, name);
+        assert!(!mir.contains("_to_string_default"), "{mir}");
+        assert!(!mir.contains("as baml.ToString"), "{mir}");
+    }
+    assert_eq!(
+        function_mir(&output, "methods")
+            .matches("_to_string_primitive")
+            .count(),
+        4,
+        "{output}"
+    );
+    for name in ["generic", "structural", "mixed"] {
+        let mir = function_mir(&output, name);
+        assert!(!mir.contains("_to_string_primitive"), "{mir}");
+        assert!(mir.contains("to_string as baml.ToString"), "{mir}");
+    }
+}
+
+#[test]
+fn string_plus_chains_join_in_one_step() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+class Point { x int }
+function template(a: string, b: string, k: int) -> string {
+  `/v1/items/${a}/tags/${b}?n=${k}`
+}
+function plus(a: string, b: string, tag: "x" | "y") -> string { a + "/" + b + tag }
+function pair(a: string, b: string) -> string { a + b }
+function grouped(a: string, b: string, c: string, d: string) -> string { (a + b) + (c + d) }
+function folded(a: string) -> string { "x" + "y" + a }
+function structural(p: Point) -> string { `<${p}>` }
+function ints(a: int, b: int, c: int) -> int { a + b + c }
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    let joins = |name: &str| function_mir(&output, name).matches("concat(").count();
+    for (name, count) in [
+        ("template", 1),
+        ("plus", 1),
+        ("grouped", 1),
+        ("structural", 1),
+        ("pair", 0),
+        ("folded", 0),
+        ("ints", 0),
+    ] {
+        assert_eq!(
+            joins(name),
+            count,
+            "{name}:\n{}",
+            function_mir(&output, name)
+        );
+    }
+    // Every `+` of the chain is gone; the right operand of `grouped` is not
+    // on the chain and stays a `+`.
+    for name in ["template", "plus", "structural"] {
+        assert!(!function_mir(&output, name).contains(" + "), "{output}");
+    }
+    assert_eq!(
+        function_mir(&output, "grouped").matches(" + ").count(),
+        1,
+        "{output}"
+    );
+    // `"x" + "y"` folds to one constant, so `folded` joins two parts.
+    assert!(
+        function_mir(&output, "folded").contains("\"xy\" + "),
+        "{output}"
+    );
+}
+
+#[test]
+fn structural_defaults_call_native_helpers_directly() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+function roundtrip(value: int) -> bool {
+  let decoded = int.from_json(value.to_json());
+  value.to_string();
+  value == decoded
+}
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    // An `int` renders through the primitive formatter rather than the
+    // structural renderer (no package can override how it renders).
+    for native in [
+        "_to_json_default",
+        "_from_json_structural_default",
+        "_to_string_primitive",
+    ] {
+        assert!(output.contains(native), "missing {native}:\n{output}");
+    }
+    assert!(!output.contains("virtual_call"), "{output}");
+    assert!(!output.contains("make_virtual_function"), "{output}");
+    assert!(!output.contains("equals_equals"), "{output}");
+    let program = baml_db::CheckedWorld::collect(&db, db.workspace_root().unwrap())
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("compile direct calls");
+    let function = program
+        .objects
+        .iter()
+        .find_map(|object| match object {
+            bex_vm_types::Object::Function(function)
+                if function
+                    .declared_name()
+                    .is_some_and(|declared| declared == "roundtrip") =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .expect("roundtrip compiled");
+    assert!(
+        function.bytecode.call_layouts.is_empty(),
+        "known native calls need no argument adaptation metadata"
+    );
+}
+
+#[test]
+fn structural_defaults_keep_unresolved_receivers_virtual() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+class Box<T> {
+  value T
+}
+function generic<T>(value: T) -> string {
+  value.to_string()
+}
+function generic_class<T>(value: Box<T>) -> string {
+  value.to_string()
+}
+function erased(value: unknown) -> string {
+  value.to_string()
+}
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    assert_eq!(output.matches("virtual_call").count(), 3, "{output}");
+    assert!(!output.contains("_to_string_default"), "{output}");
+}
+
+#[test]
+fn structural_defaults_keep_nominal_receivers_virtual() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+class Record { value int }
+enum Choice { A B }
+function roundtrip(value: Record) -> bool {
+  let decoded = Record.from_json(value.to_json());
+  value.to_string();
+  value.hash(baml.hash.DefaultHasher.new());
+  value == decoded
+}
+function enum_value(value: Choice) -> string { value.to_string() }
+function enum_variant(value: Choice.A) -> string { value.to_string() }
+function list(value: Record[]) -> string { value.to_string() }
+function map_value(value: map<string, Record>) -> string { value.to_string() }
+function map_key(value: map<Record, int>) -> string { value.to_string() }
+"#,
+    );
+    assert_no_diagnostic_errors(&db);
+    let output = render_mir(&db, file);
+    assert!(output.contains("virtual_call"), "{output}");
+    assert!(output.contains("make_virtual_function"), "{output}");
+    for native in [
+        "_to_json_default",
+        "_from_json_structural_default",
+        "_to_string_default",
+        "_hash_structural_default",
+        "_equals_structural_default",
+    ] {
+        assert!(!output.contains(native), "unexpected {native}:\n{output}");
+    }
+}
+
+#[test]
 fn mounted_await_any_kind_is_trusted_only_for_precompiled_packages() {
     let mut dependency = make_db();
     dependency.dependency("dependency");
@@ -54,12 +396,7 @@ function untrusted_await_any<T, E>(futures: baml.future.Future<T, E>[]) -> int t
 "#,
     );
     assert_no_diagnostic_errors(&dependency);
-    let mut interface = export_interface(
-        &dependency,
-        baml_compiler2_hir::package::spelling(&dependency)
-            .root(&Name::new("dependency"))
-            .unwrap(),
-    );
+    let mut interface = export_interface(&dependency, dependency.dependency_named("dependency"));
     let exported = interface
         .rows
         .functions
@@ -129,12 +466,7 @@ function forged_type_of<T>() -> reflect.Type {
 "#,
     );
     assert_no_diagnostic_errors(&dependency);
-    let mut interface = export_interface(
-        &dependency,
-        baml_compiler2_hir::package::spelling(&dependency)
-            .root(&Name::new("dependency"))
-            .unwrap(),
-    );
+    let mut interface = export_interface(&dependency, dependency.dependency_named("dependency"));
     // Model a hostile/corrupt mounted blob that widens its own linkability.
     // (A row that also claimed a lang address — `log.info`, `reflect.Type.of`
     // — cannot mount at all: import refuses a target other than the row's
@@ -238,7 +570,9 @@ function f(result: Ok | Warn | Err) -> string {
     );
     assert_no_diagnostic_errors(&db);
     let output = render_mir(&db, file);
-    assert!(output.contains(".value#0 as HasValue"), "{output}");
+    // Canonical rendering spells every package, the unnamed root under its
+    // stand-in label.
+    assert!(output.contains(".value#0 as user.HasValue"), "{output}");
 }
 
 macro_rules! mir_snapshot {
@@ -397,7 +731,7 @@ fn optional_dropping_function_value() {
         }
 
         function main() -> int {
-          let f: (x: int, b?: int) -> int = combine;
+          let f: (x: int, b?: int) -> int throws never = combine;
           f(1, b = 5)
         }
         "#,
@@ -422,19 +756,76 @@ fn generic_class_destructure_field_projection_uses_instantiated_type() {
         "#,
     );
     let output = render_mir(&db, file);
-    // Scope the check to `user.f`'s body — auto-derived `to_json` /
-    // `from_json` methods on `Box<T>` legitimately have `void` locals
-    // because T isn't instantiated in the auto-derive body.
-    let f_body = output
-        .split("fn user.f(")
-        .nth(1)
-        .and_then(|tail| tail.split("\nfn ").next())
-        .unwrap_or(&output);
+    // The destructured field's local carries the field type at the
+    // instantiation the pattern names, `int`, not the declaration's `T`.
+    let f_body = function_mir(&output, "f");
     assert!(
-        !f_body
+        f_body
             .lines()
-            .any(|line| line.trim_start().starts_with("let _") && line.contains(": void")),
-        "generic class destructure lowered a projected field through a void local:\n{output}"
+            .any(|line| line.trim_start().starts_with("let _") && line.contains(": int // value")),
+        "generic class destructure did not type the projected field's local `int`:\n{output}"
+    );
+}
+
+/// `json[]` and `map<string, json>` are a `json` scrutinee's only list and map
+/// members, so arms of exactly those types test only the runtime tag, also
+/// when they bind the value (a narrowing arm tests a snapshot of the
+/// scrutinee).
+#[test]
+fn json_container_arms_test_only_the_runtime_tag() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+        function size(value: json) -> int {
+            match (value) {
+                let object: map<string, json> => object.length(),
+                let items: json[] => items.length(),
+                _ => 0,
+            }
+        }
+        "#,
+    );
+    let output = render_mir(&db, file);
+    let body = function_mir(&output, "size");
+    assert!(
+        body.contains(", MAP);") && body.contains(", LIST);"),
+        "the json container arms do not test the runtime tag:\n{body}"
+    );
+    assert!(
+        !body.lines().any(is_structural_container_test),
+        "a json container arm kept its structural test:\n{body}"
+    );
+}
+
+/// An element-specific arm stays element-precise on a `json` scrutinee: its
+/// list member is `json[]`, so the `LIST` tag alone cannot prove `int[]`.
+#[test]
+fn element_specific_list_arms_stay_structural() {
+    let mut db = make_db();
+    // An `unknown` scrutinee may hold a list of any element type, so only an
+    // element-precise test tells an `int[]` from a `string[]`.
+    let file = db.file(
+        "test.baml",
+        r#"
+        function ints(value: unknown) -> int {
+            match (value) {
+                let xs: int[] => xs.length(),
+                _ => 0,
+            }
+        }
+        "#,
+    );
+    let output = render_mir(&db, file);
+    let body = function_mir(&output, "ints");
+    assert!(
+        body.lines().any(|line| is_structural_container_test(line)
+            && (line.contains("int[]") || line.contains("List(Int)"))),
+        "the `int[]` arm lost its structural test:\n{body}"
+    );
+    assert!(
+        !body.contains(", LIST);"),
+        "the `int[]` arm tests only the LIST tag:\n{body}"
     );
 }
 
@@ -543,7 +934,7 @@ fn runtime_type_plan_operations_are_explicit() {
 function accept<T>(value: T) -> T { value }
 
 function f(t: reflect.Type, value: unknown) -> bool {
-    type T = unreflect(t)
+    let type T = t;
     match (value) {
         let x: T => accept<T>(x) is T,
         _ => false,
@@ -558,35 +949,39 @@ function f(t: reflect.Type, value: unknown) -> bool {
     );
 }
 
-/// A static right-hand side loads its template into the binding's slot; every
+/// A `let type` binding stores its operand in the binding's slot, and every
 /// later mention of the name reads that slot, including nested under a
-/// constructor (`Bound?`, `Bound[]`).
+/// constructor (`Bound?`). Each `extends` bound is then checked against the
+/// type now in the slot, in written order, by `satisfies_bound`: the bound
+/// travels as an interface constraint (only the associated types it pins),
+/// never as a type. A miss of any bound branches into the `else` block, which
+/// a bounded binding must have.
 #[test]
-fn static_type_binding_loads_its_template_into_the_slot() {
+fn bounded_type_binding_checks_its_bounds_after_binding_the_slot() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
         r#"
-class Wrapper<T> { value T }
+interface Named { name string }
+interface Tagged { tag string }
 
 function erase<T>() -> string { "ok" }
 
-function f(value: unknown) -> bool {
-    type Bound = Wrapper<string>
-    let annotated: Bound? = null
+function checked(t: reflect.Type) -> bool {
+    let type Bound extends Named & Tagged = t else { return false };
+    let annotated: Bound? = null;
+    erase<Bound>() == "ok" && annotated == null
+}
+
+function guarded(t: reflect.Type) -> bool {
+    let type Bound extends Named = t else { return false };
     erase<Bound>() == "ok"
-        && annotated == null
-        && value is Bound
-        && match value {
-            Bound => true,
-            _ => false,
-        }
 }
 "#,
     );
     baml_db::testing::assert_no_diagnostic_errors(&db);
     mir_snapshot!(
-        "static_type_binding_loads_its_template_into_the_slot",
+        "bounded_type_binding_checks_its_bounds_after_binding_the_slot",
         render_mir(&db, file)
     );
 }
@@ -605,9 +1000,7 @@ fn mounted_loc_free_runtime_call_target_is_explicit() {
     baml_db::testing::assert_no_diagnostic_errors(&library);
     let interface = baml_compiler2_hir_ty::package_interface::export_interface(
         &library,
-        baml_compiler2_hir::package::spelling(&library)
-            .root(&Name::new("app"))
-            .unwrap(),
+        library.dependency_named("app"),
     );
     let blob = baml_artifact::encode(baml_artifact::ArtifactKind::PackageInterface, &interface)
         .expect("serialize mounted interface");
@@ -618,7 +1011,7 @@ fn mounted_loc_free_runtime_call_target_is_explicit() {
         "test.baml",
         r#"
 function f(t: reflect.Type, value: unknown) -> unknown {
-    type T = unreflect(t)
+    let type T = t;
     match (value) {
         let x: T => app.accept<T>(x),
         _ => null,

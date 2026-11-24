@@ -89,6 +89,14 @@ pub struct Class {
     pub generic_params: Vec<baml_base::Name>,
     pub docstring: Option<String>,
     pub properties: Vec<ClassProperty>,
+    /// How an instance crosses the host boundary: a host builds and reads a
+    /// `Fields` class as plain data; any other is the engine's own, held by
+    /// reference (a capability) or carried as its own wire value (media, a
+    /// prompt), and never built by a host.
+    pub crossing: baml_type::ClassCrossing,
+    /// `@@json.omit_nulls`: optional fields holding `null` are not written. A
+    /// `json` field keeps its `null`.
+    pub json_omit_nulls: bool,
     /// Static methods on this class. Source-declaration order is
     /// preserved by the pool builder; the emitter sorts at fan-out
     /// time. Static vs. instance is encoded structurally — kind is
@@ -106,6 +114,13 @@ pub struct ClassProperty {
     pub name: baml_base::Name,
     pub docstring: Option<String>,
     pub ty: super::Ty,
+    /// `@json.rename`: the field's JSON key.
+    pub json_rename: Option<String>,
+    /// `@json.flatten`: the field holds every key no other field took.
+    pub json_flatten: bool,
+    /// `@json.fallback`: the field holds the whole object, and its class is
+    /// the union member no other member's literals match.
+    pub json_fallback: bool,
 }
 
 #[derive(Clone)]
@@ -121,6 +136,8 @@ pub struct EnumVariant {
     pub name: baml_base::Name,
     pub docstring: Option<String>,
     pub value: String,
+    /// `@json.rename`: the variant's JSON string.
+    pub json_rename: Option<String>,
 }
 
 #[derive(Clone)]
@@ -235,14 +252,12 @@ impl WalkAllUnions for Ty {
             | Ty::String
             | Ty::Bool
             | Ty::Null
-            | Ty::Void
             | Ty::Uint8Array
             | Ty::Media(..)
             | Ty::Enum(..)
             | Ty::EnumVariant(..)
             | Ty::TypeAlias(..)
             | Ty::TypeVar(..)
-            | Ty::RustType
             | Ty::Type
             | Ty::Resource
             | Ty::PromptAst
@@ -285,7 +300,7 @@ impl WalkAllUnions for Ty {
             }
             // Codegen types are canonical at the compiler boundary, but keep
             // this public symbol traversal total for manually assembled pools.
-            Ty::Union(members) => {
+            Ty::Union(members) | Ty::Tuple(members) => {
                 for member in members {
                     unions.extend(member.walk_all_unions());
                 }
@@ -320,7 +335,7 @@ fn validate_map_keys_ty(
                 .try_for_each(|(_, ty)| validate_map_keys_ty(ty, pool, resolving_aliases))
         }
         Ty::List(inner) => validate_map_keys_ty(inner, pool, resolving_aliases),
-        Ty::Union(members) => members
+        Ty::Union(members) | Ty::Tuple(members) => members
             .iter()
             .try_for_each(|member| validate_map_keys_ty(member, pool, resolving_aliases)),
         Ty::Function {
@@ -395,6 +410,7 @@ mod tests {
 
     fn map_with_key(key: Ty) -> Symbol {
         Symbol::Class(Class {
+            crossing: crate::ClassCrossing::Fields,
             name: name("Holder"),
             generic_params: Vec::new(),
             docstring: None,
@@ -405,10 +421,14 @@ mod tests {
                     key: Box::new(key),
                     value: Box::new(Ty::Int),
                 },
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
             }],
             static_methods: Vec::new(),
             instance_methods: Vec::new(),
             origin: origin(),
+            json_omit_nulls: false,
         })
     }
 

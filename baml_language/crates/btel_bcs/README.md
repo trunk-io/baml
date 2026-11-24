@@ -1,5 +1,7 @@
 # Btel cloud delivery
 
+Cloud contracts and single-attempt HTTP calls live in `bcs_api`. This crate owns recording assembly, bounded delivery, retries, heartbeat scheduling and flush.
+
 This crate implements the runtime side of a proposed BCS direct-upload contract.
 It does not imply that the BCS server already supports this protocol.
 
@@ -11,8 +13,23 @@ A function requesting auto (`null` / no explicit policy) inherits
 - `low`: auto functions are unobserved.
 - `medium` (default): ordinary auto functions produce timing aggregates; auto LLM
   functions produce spans with their default input/output/error captures.
-- `high`: supported auto functions produce spans, without extra value capture.
+- `high`: supported auto functions produce spans, without extra input or output
+  capture.
 - `off`: global kill switch; no telemetry resources are created.
+
+At every level, the innermost span a thrown error or a panic escapes records
+that error, whether or not its function captures anything else, unless the
+call declined it with `error = false` (as `trace.empty_span` does); then the
+next span out records it. The spans the error unwinds through after that
+record only that they failed, unless they request error capture: the error's
+context holds the whole stack trace, so recording it at every frame of a deep
+unwind would cost the square of its depth. An LLM function's default policy
+requests its error, which `error = false` does not decline. A cancelled span
+records only that it was cancelled. An artifact that sets `http_bodies = false`
+records no error value on any span, requested or not, since an error can quote
+a response body; the setting overrides the program's trace options and
+function policies.
+Timing-only and unobserved functions record no values.
 
 Explicit function policies take precedence over every automatic level. In
 particular, `high` does not promote an explicitly configured timing-only function.
@@ -22,20 +39,19 @@ from the engine level: the former engine-level spelling `auto` is replaced by
 
 ## Transport
 
-`baml run`, `baml test`, packed binaries, and native SDK runtimes select cloud
-recording when both `BOUNDARY_URL` and `BOUNDARY_API_KEY` are non-empty and the
-URL parses. `BOUNDARY_URL` is the publisher's HTTPS base URL, including any path
-prefix; `BOUNDARY_API_KEY` is its bearer credential. Packed binaries read these
-variables when they run. The language server and WASM playground do not use this
-configuration.
+`baml run`, `baml test`, and native SDK runtimes select cloud recording from
+`BOUNDARY_API_KEY` or a saved `baml cloud auth login` session. `BOUNDARY_API_URL`
+overrides `[boundary].api_url` and defaults to `https://api.prod.bcs.boundaryml.com`.
+User sessions write to the user's personal environment; API keys enforce their
+provisioned ingestion scope. `BOUNDARY_PROJECT` overrides `[boundary].project`.
 
-With missing or empty variables, or an unparsable URL, hosts keep their existing
-behavior: the CLI records under the project, packed binaries under the user's
-home, and SDKs do not persist recordings. A parsed but rejected delivery config
-disables recording without failing execution. `BAML_TELEMETRY=off` disables all
-recording regardless of the Boundary variables. Cloud recordings omit process
-arguments. Environment reads live in `bex_engine::TelemetryRecording`, not this
-transport crate.
+Without cloud credentials, hosts use their local recording defaults. Explicit
+`BOUNDARY_API_KEY=local` selects local recording and bypasses Boundary endpoint
+validation. Otherwise an invalid Boundary URL cancels execution with an actionable
+configuration diagnostic. Initial authorization rejection also cancels execution;
+later revocation disables cloud recording and lets execution continue.
+`BAML_TELEMETRY=off` disables recording. Cloud recordings omit process arguments.
+Environment reads live in `bex_engine::TelemetryRecording`, not this transport crate.
 
 Construct `DeliveryConfig::new(endpoint.parse()?)` with an explicit BCS endpoint.
 The config retains a parsed `reqwest::Url`; startup still enforces HTTPS and
@@ -52,13 +68,15 @@ lowercase hexadecimal. Snapshot IDs are the existing 16-byte XXH3-128 identities
 not the SHA-256 of their encoded blobs. `recording.sha256` covers the exact sealed
 recording bytes.
 
-The `Idempotency-Key` is `{recording_id}:{recording_file_sequence}`. The server
+The `Idempotency-Key` is `{recording_id}:{recording_file_sequence}`
+(`btel_core::upload::idempotency_key`). The server
 must bind it to the original request contents and return the same immutable plan
 on retry; conflicting immutable contents must fail. Process liveness fields are
 fresh on each attempt and excluded from that idempotency comparison. There is
 no URL-renewal operation.
 
-`wire.rs` is the JSON schema's source of truth. Proposed and returned targets use
+`btel_core::upload`, in the `btel-core` crate BCS publishes, is the JSON schema's source of
+truth, with the contract's limits (`btel_core::upload::limits`). Proposed and returned targets use
 `kind`: `recording`, `cas_batch`, or `cas_object`, with ordered
 `candidate_indices`. Each response disposition uses a nested `disposition` with
 `kind`: `inline_with_recording`, `member_of_batch`, `separate_object`, or
@@ -71,17 +89,29 @@ target even if every snapshot is already available. Availability means validated
 content within the authorized organization, not merely an existing S3 object.
 
 Each surviving target is an ordinary HTTP PUT containing a
-`btel.cloud.v1.CloudUploadEnvelope` from `proto/cloud.proto`, format version 1.
-It embeds the exact recording bytes and the canonical CAS v2 blobs. The blob
-SHA-256 is an integrity check separate from the snapshot identity.
+`btel.upload.v1.UploadEnvelope` (`btel_core::upload::envelope`, the schema
+`proto/upload/v1.proto` of `btel-core`), format version 1, whose framing `btel-core` writes.
+It embeds the exact recording bytes and the canonical CAS v3 blobs. The blob
+SHA-256 is an integrity check separate from the snapshot identity. The body is
+sent with a fixed `Content-Length`, never chunk-encoded.
 
-Snapshot/hash format v2 uses the attribute-free type representation introduced
-by BEP-075. BCS must decode version 2; old v1 CAS objects remain a separate
-namespace and are not reused as v2 content. The upload envelope remains v1.
+Snapshot/hash format v3 keeps BEP-075's attribute-free type representation and
+numbers each blob's objects in first-reference order, so a blob has exactly one
+encoding. A v3 blob may name child blobs by ID, and a capture may be several
+blobs. Each candidate is one blob: a capture's blobs are offered children
+first, and a capture with more new blobs than one plan takes is spread over
+several plans, in files that may carry no events. A `snapshot_id` names a
+blob. BCS must decode version 3; older CAS objects remain separate namespaces
+and are not reused as v3 content. The upload envelope remains v1.
 
 Only prepare and heartbeat requests receive the BCS bearer credential. Upload
 requests use the returned URL and required headers; redirects are not followed.
 URLs and headers are capabilities and must not be logged.
+
+Every request goes through the proxy that `HTTPS_PROXY`, `HTTP_PROXY` or
+`ALL_PROXY` names, unless `NO_PROXY` lists its host, like BAML's other HTTP
+clients. HTTPS requests tunnel through the proxy with `CONNECT`, so a proxy
+that does not intercept TLS sees only the host.
 
 The supported S3 signing policy uses an unsigned payload, optionally with the
 constant required header `x-amz-content-sha256: UNSIGNED-PAYLOAD`. Exact payload
@@ -90,14 +120,36 @@ modes are rejected rather than guessed; BCS must agree to this policy. Envelope
 and blob integrity still require server-side validation.
 
 PUT success is the delivery acknowledgement, not proof of server ingestion or
-query availability. Retries reuse the same body and URL. BCS must issue URLs
-whose lifetimes cover the bounded retry window. Expiration drops that payload;
-it does not stop later delivery.
+query availability. Retries reuse the same body and URL. Expiration drops that
+payload; it does not stop later delivery.
+
+A PUT is given `request_timeout` (10 s) plus its body's length at
+`min_upload_bytes_per_second` (1 MiB/s): a large body is not lost for taking
+long, only for uploading slower than that. A body's retry window is every
+attempt at that timeout and the delays between them: 40.6 s for a small body,
+about 73 s for 8 MiB, about 69 minutes for 1 GiB. Recordings upload
+`max_recording_uploads` (8) at a time and CAS bodies `max_cas_uploads` (2) at
+a time, each when a slot is free, so BCS must issue each URL a lifetime that
+covers the windows of every body of its kind admitted before it, counted as if
+they went one by one, which refuses a URL sooner than the lanes strictly
+require. A URL that does not is refused before anything is sent to it.
+Prepares run together, as many as `max_pending_plans` (16) admits. Every
+staged file carries the metadata retained when it was sealed, so a stored file
+acknowledges every segment through its sequence, whatever order the uploads
+end in and whatever becomes of the files before it. The prepare request does
+not carry blob lengths, only `size_class: LARGE` for a blob uploaded on its
+own.
 
 ## Scope
 
 There is no durable spool, recovery after process exit, or URL renewal.
-Orderly shutdown drains admitted delivery work.
+Orderly shutdown drains admitted delivery work for at most `shutdown_timeout`
+(5 s), retries included, counted from when the engine starts closing telemetry
+after its last call. What is left then is dropped: an endpoint that never
+answers, or a network that drops packets, costs a process at most that much at
+exit instead of the retry windows above. A recording whose first connection
+has not succeeded by then gets the initial-failure policy (by default, the
+one-time warning).
 Cloud contract tests use local HTTP servers and require neither BCS nor AWS;
 they do not establish interoperability with a deployed server.
 
@@ -110,7 +162,9 @@ discards only that physical target. Other targets and later windows continue.
 Temporary admission saturation still applies bounded backpressure.
 
 There is no circuit breaker, cooldown, probe loop, or durable retry spool.
-Only fatal worker failures or explicit cancellation disable cloud recording.
+Only fatal worker failures, explicit cancellation, or the shutdown timeout
+disable cloud recording. What is dropped then is reported by that error, not
+counted as a loss.
 `BexEngine::telemetry_delivery_loss_count` counts discarded groups/targets, not
 events or retry attempts. `telemetry_result` retains an error after loss even
 when later uploads succeed. Delivered recording sequences may have gaps.
@@ -134,44 +188,83 @@ implementation details, not a shared delivery interface required by `Publisher`.
 configures cloud-specific batching and placement; `RecordingConfig` is shared
 with local recording, and `DeliveryConfig` controls cloud transport.
 
-The publisher accumulates recording events and structured snapshots across
-processor batches. A window seals at a record boundary when it reaches the
-recording-byte target, 16 distinct snapshots, or 4 MiB of retained snapshot
-storage. A single snapshot may exceed a soft byte target. The non-sliding timer
-starts at the first event, using `RecordingConfig::flush_interval_duration`;
-idle expiry and explicit shutdown also seal pending data.
+The publisher accumulates recording events and queues the blobs of captured
+values across processor batches; a blob offered recently is not queued again,
+and a capture with nothing new to offer is released at once. A window seals at
+a record boundary when it reaches the recording-byte target, a plan's worth of queued blobs (32),
+or 4 MiB of retained capture storage. A single capture may exceed a soft
+target. Each sealed file takes the head of the queue: at most one plan's worth
+of blobs, cut short where the bytes their upload bodies buffer pass a quarter
+of delivery's CAS reservation, and always at least one blob. While a plan's worth or more still waits,
+or more than one file takes, further files are sealed to carry them, and at
+the end the last file takes what remains. The non-sliding timer starts at the
+first event, using `RecordingConfig::flush_interval_duration`, and starts
+again when a sealed file leaves blobs queued. When it expires, or on an
+explicit flush, the open file is sealed and further files carry every blob
+still queued, so the tail of a large capture waits no longer than an event
+does. A capture queued before the first event (the project's sources) waits
+for that event's file. Explicit shutdown also seals pending data.
+
+Nothing is refused for its size. A blob is uploaded however large it is: the
+only size a capture is cut for is `btel_settings::snapshot::MAX_LEAF_BYTES`,
+when it is made. An upload body is written field by field, so a blob is
+buffered once, beside its capture. A blob that is one string of 2 KiB or more
+is not buffered at all: its content is sent from the memory that already holds
+it, and that string is let go when its upload ends. The window cut and the
+CAS reservation count only what is buffered.
 
 Sealed windows are staged until processor input chunks have been recycled.
-The open window and staged windows together retain at most 32 snapshot owners
-and 8 MiB of snapshot storage by default. Staged recording files are separately
-bounded by delivery's plan/recording-byte limits. Construction validates that
-publisher and delivery owner limits leave headroom in the minimum VM pool.
-No network I/O runs on the processor. Admission waits occur only after recycling.
+The queue and staged windows together retain at most 128 captures and 8 MiB
+of capture storage by default. A blob that is one string holds its own content:
+it is let go as soon as the server reports it stored, or else when its upload
+ends (a short one, once it has been copied into its body), whatever becomes of
+the rest of its capture. The rest of a capture is
+held until the last blob written from it leaves, and a capture that is one
+string is not held at all.
+Before a capture that does not fit, the publisher sends what it holds,
+waiting on delivery's admission, and a capture larger than the whole byte
+budget is then held alone.
+Staged recording files are separately bounded by delivery's plan/recording-byte
+limits. A capture stops counting against the VM's capture budget when the
+processor takes its chunk, so what the publisher and delivery hold is bounded
+only by their own limits and never keeps the VM from capturing. No network I/O
+runs on the processor. Admission waits occur only after recycling.
 
-Delivery separately limits pending owners, plans, recording bytes, and CAS bytes.
-It releases owner-slot reservations after serialization releases the snapshots,
-not after their PUTs finish. Immutable upload bodies remain byte-budgeted until
-delivery completes. Delivery admission waits for temporary plan, byte, or
-owner-slot saturation. Failure, closure, and released capacity wake waiting
-submitters. An individual group that can never fit fails before waiting.
+Delivery separately limits pending captures, plans, recording bytes, and CAS
+bytes; a capture spanning plans counts once per plan. A plan is pending until
+its recording is uploaded. Its captures, and the storage they hold, are given
+back sooner, once its upload bodies are built. Each CAS body is uploaded
+on its own, whatever becomes of the plan it came with, and holds its part of
+the CAS reservation (what it buffers, and the strings it sends from where they
+are held) until its upload ends. So one long upload keeps neither later plans
+nor other bodies waiting.
+
+Delivery admission waits for temporary plan, byte, or owner-slot saturation.
+Failure, closure, and released capacity wake waiting submitters. A group whose
+recording can never fit fails before waiting. One whose captures and CAS
+bodies total more than the whole CAS reservation is never refused: it is
+admitted beside the reservation, one such group at a time, so the most held is
+the reservation and one group. Groups that fit are admitted meanwhile; only
+another oversize group waits.
 Callers must recycle input chunks before entering admission.
 
 Cloud processing moves one chunk into reusable owned storage and recycles its
 source allocation before incremental processing and handoff. Span and timing
 storage each reserve the transport's chunk capacity; only one contains live
-records at a time. Captures are moved, not cloned, and retain their existing
-VM snapshot-pool owners until processed or dropped. Local/no-sink processing
-keeps its original borrowed path without these allocations.
+records at a time. Captures are moved, not cloned, and keep their pooled
+storage until processed or dropped, uncharged from the VM's capture budget.
+Local/no-sink processing keeps its original borrowed path without these
+allocations.
 
 This permits large chunks to make progress through bounded publisher windows
 and delivery backpressure. Snapshot accounting is cached between preflight and
 retention rather than scanning each new snapshot twice. Dropped payloads remain
 observable without stopping later telemetry.
 
-Snapshot IDs use bounded recent deduplication. Loss makes affected content
+Blob IDs use bounded recent deduplication. Loss makes affected content
 eligible to be offered again; reaching the history limit evicts old entries.
-Placement thresholds use retained-memory estimates,
-not exact encoded lengths; output encoding has independent hard limits.
+Placement thresholds use each blob's exact encoded length. A recording body
+has a hard limit; a CAS body is as long as its blobs.
 
 Unacknowledged recording metadata is replayed in later files, without replaying
 spans or aggregates. Its journal is bounded; prolonged outages can evict old
@@ -182,10 +275,9 @@ of complete history after arbitrary outages.
 
 Snapshot accounting conservatively charges arena capacities and shared backing.
 It excludes the preexisting shared pool and allocator metadata. Bigint values
-and bigint type literals currently have no safe retained-capacity bound through
-`num-bigint`'s public API. Unsupported payloads are discarded instead of
-silently violating the budget. This does not change local recording or BAML
-execution.
+and bigint type literals are charged their limbs: `num-bigint`'s public API
+does not show spare capacity, so for them the figure is a close estimate, not
+a bound. This does not change local recording or BAML execution.
 
 ## Optional liveness
 

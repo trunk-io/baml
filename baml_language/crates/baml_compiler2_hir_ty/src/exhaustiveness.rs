@@ -28,7 +28,7 @@
 use std::fmt;
 
 use baml_base::Literal;
-use baml_type::{DeclName, PrimitiveType, Ty, contains_error_recovery};
+use baml_type::{DeclName, PrimitiveType, Ty, contains_error};
 use rustc_hash::FxHashSet;
 
 use crate::render::{Spell, Viewpoint};
@@ -38,18 +38,22 @@ use crate::render::{Spell, Viewpoint};
 /// The "head" of a pattern. Determines arity (number of sub-pattern slots) and
 /// the coverage relation against other ctors at the same column type.
 ///
-/// Scalars (singletons) collapse into [`Ctor::Single`] carrying their type —
+/// A type test ([`Ctor::Type`]) matches every value of the type it carries.
 /// BAML's "literals are types" property means individual literal values, enum
-/// variants, `null`, and bool literals are all just types, so a single variant
-/// can absorb them. Structural ctors ([`Ctor::Slice`], [`Ctor::Class`]) carry
-/// only the information that distinguishes them from other ctors at the same
-/// type; sub-pattern positions are computed by the [`PatCtx`].
+/// variants, `null`, and bool literals are just singleton types, so one
+/// variant holds both a literal and a wider test like `int` (as rustc models
+/// a literal as a degenerate range). Structural ctors ([`Ctor::Slice`],
+/// [`Ctor::Class`]) carry only the information that distinguishes them from
+/// other ctors at the same type; sub-pattern positions are computed by the
+/// [`PatCtx`].
 #[derive(Debug, Clone)]
 pub enum Ctor {
-    /// Any singleton type. Identity is determined by [`ty_ctor_identity`],
-    /// which strips `Freshness` and canonicalizes float literals.
-    /// Absorbs Bool, Null, Int, Float, Str literals, and flat enum variants.
-    Single(Ty),
+    /// Every value of the carried type. Identity is determined by
+    /// [`ty_ctor_identity`], which strips `Freshness` and canonicalizes float
+    /// literals. Singleton types (Bool, Null, Int, Float, Str literals, flat
+    /// enum variants) are the one-value case; a wider type (`int`, a rigid
+    /// type variable) appears where the column's alphabet cannot be listed.
+    Type(Ty),
     /// Array shape. Sub-patterns' types come from the array's element type.
     Slice(SliceShape),
     /// Class destructure. Sub-patterns' types come from the class's fields,
@@ -58,6 +62,7 @@ pub enum Ctor {
     /// Interface destructure. Sub-patterns' types come from the interface's
     /// field view, with generic substitution applied.
     Interface(Ty),
+    Tuple(usize),
 
     /// "Which member of a union" tag, with arity 1. Sub-pattern's type is
     /// the member type carried by the ctor. Specialising on `UnionMember(M)`
@@ -107,11 +112,12 @@ fn class_args_identity_eq(a: &[Ty], b: &[Ty]) -> bool {
 impl PartialEq for Ctor {
     fn eq(&self, other: &Self) -> bool {
         use Ctor::{
-            Class, Interface, Missing, NonExhaustive, Or, Single, Slice, UnionMember, Wildcard,
+            Class, Interface, Missing, NonExhaustive, Or, Slice, Tuple, Type, UnionMember, Wildcard,
         };
         match (self, other) {
-            (Single(a), Single(b)) => ty_ctor_identity(a) == ty_ctor_identity(b),
+            (Type(a), Type(b)) => ty_ctor_identity(a) == ty_ctor_identity(b),
             (Slice(a), Slice(b)) => a == b,
+            (Tuple(a), Tuple(b)) => a == b,
             (Class(a, aa), Class(b, ba)) => a == b && class_args_identity_eq(aa, ba),
             (Interface(a), Interface(b)) => ty_ctor_identity(a) == ty_ctor_identity(b),
             (UnionMember(a), UnionMember(b)) => ty_ctor_identity(a) == ty_ctor_identity(b),
@@ -128,12 +134,13 @@ impl Eq for Ctor {}
 impl std::hash::Hash for Ctor {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         use Ctor::{
-            Class, Interface, Missing, NonExhaustive, Or, Single, Slice, UnionMember, Wildcard,
+            Class, Interface, Missing, NonExhaustive, Or, Slice, Tuple, Type, UnionMember, Wildcard,
         };
         std::mem::discriminant(self).hash(state);
         match self {
-            Single(ty) => ty_ctor_identity(ty).hash(state),
+            Type(ty) => ty_ctor_identity(ty).hash(state),
             Slice(s) => s.hash(state),
+            Tuple(n) => n.hash(state),
             Class(qtn, args) => {
                 qtn.hash(state);
                 for arg in args {
@@ -173,9 +180,10 @@ impl Ctor {
     /// queried through this method; callers special-case Or.
     pub fn arity(&self, ty: &Ty, cx: &dyn PatCtx) -> usize {
         match self {
-            Ctor::Single(_) | Ctor::Wildcard | Ctor::NonExhaustive | Ctor::Missing | Ctor::Or => 0,
+            Ctor::Type(_) | Ctor::Wildcard | Ctor::NonExhaustive | Ctor::Missing | Ctor::Or => 0,
             Ctor::UnionMember(_) => 1,
             Ctor::Slice(shape) => shape.arity(),
+            Ctor::Tuple(arity) => *arity,
             Ctor::Class(qtn, args) => cx
                 .class_field_types(qtn, &class_ty_for_ctor(qtn, args, ty))
                 .len(),
@@ -184,22 +192,31 @@ impl Ctor {
     }
 
     /// Does `self` cover `other` — i.e. is every value matched by `other` also
-    /// matched by `self`? Equality for most ctors; slice variable-length covers
-    /// fixed slices of compatible length; wildcard covers anything. `Or` is
-    /// not handled here — Or rows are handled by matrix-level expansion
-    /// before any normal cover check runs.
-    pub fn covers(&self, other: &Ctor) -> bool {
+    /// matched by `self`? Equality for most ctors; a type test covers the
+    /// tests of its provable subtypes (`int` covers `1`); slice
+    /// variable-length covers fixed slices of compatible length; wildcard
+    /// covers anything. `Or` is not handled here — Or rows are handled by
+    /// matrix-level expansion before any normal cover check runs.
+    ///
+    /// Inclusion rather than equality is rustc's `is_covered_by` rule for
+    /// grouped constructors (its float ranges are the closest analogue: an
+    /// unlistable type whose column ctors are used as-is and joined by
+    /// inclusion). A branch for `Type(T)` therefore stands for the values of
+    /// `T` outside every narrower test in the column; an inclusion the type
+    /// system cannot prove only leaves a dead arm unreported.
+    pub fn covers(&self, other: &Ctor, cx: &dyn PatCtx) -> bool {
         use Ctor::{
-            Class, Interface, Missing, NonExhaustive, Or, Single, Slice, UnionMember, Wildcard,
+            Class, Interface, Missing, NonExhaustive, Or, Slice, Tuple, Type, UnionMember, Wildcard,
         };
         match (self, other) {
             (Wildcard, _) => true,
             (_, Wildcard) => false,
-            (Single(a), Single(b)) => ty_ctor_identity(a) == ty_ctor_identity(b),
+            (Type(a), Type(b)) => ty_ctor_identity(a) == ty_ctor_identity(b) || cx.is_subtype(b, a),
+            (Tuple(a), Tuple(b)) => a == b,
             // Arg-sensitive, but only where decidable: a ctor pair is
             // non-covering only when the args *provably* differ. An arity
             // mismatch (a bare `Box` pattern missing its required type args)
-            // or an `Unknown`/`Error` recovery arg means the pattern already
+            // or an `Error` recovery arg means the pattern already
             // failed resolution at its own site — such a ctor covers like the
             // old qtn-only identity did, so coverage does not stack a
             // non-exhaustive error on top of the resolution error.
@@ -229,10 +246,12 @@ fn class_args_definitely_distinct(a: &[Ty], b: &[Ty]) -> bool {
             .any(|(x, y)| ty_ctor_identity(x) != ty_ctor_identity(y))
 }
 
-/// Whether any of a `Ctor::Class`'s type args carries an error-recovery
-/// sentinel anywhere in its structure — see the `covers` leniency above.
+/// Whether any of a `Ctor::Class`'s type args carries the error sentinel
+/// anywhere in its structure — see the `covers` leniency above. A written
+/// `unknown` argument is an ordinary argument: generics are invariant, so
+/// `Box<unknown>` and `Box<int>` share no value.
 fn class_args_have_recovery(args: &[Ty]) -> bool {
-    args.iter().any(contains_error_recovery)
+    args.iter().any(contains_error)
 }
 
 fn class_ty_for_ctor(qtn: &DeclName, args: &[Ty], fallback: &Ty) -> Ty {
@@ -267,13 +286,13 @@ fn slice_covers(a: &SliceShape, b: &SliceShape) -> bool {
     }
 }
 
-/// A canonicalized form of `Ty` used as the identity key for [`Ctor::Single`].
+/// A canonicalized form of `Ty` used as the identity key for [`Ctor::Type`].
 /// Normalizes `Ty::Literal` `Freshness`,
 /// and canonicalizes float string forms (`1.0` ≡ `1.00` ≡ `1e0`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CtorIdentity(String);
 
-/// Compute the [`CtorIdentity`] for a type. This is what `Ctor::Single` uses
+/// Compute the [`CtorIdentity`] for a type. This is what `Ctor::Type` uses
 /// for `Eq`/`Hash`. Two types with the same identity are the same ctor.
 pub fn ty_ctor_identity<N: baml_type::Head + CtorHead>(ty: &Ty<N>) -> CtorIdentity {
     let mut s = String::new();
@@ -372,6 +391,16 @@ fn write_ty_identity<N: baml_type::Head + CtorHead>(out: &mut String, ty: &Ty<N>
         Ty::Media(kind) => {
             let _ = write!(out, "P:{kind:?}");
         }
+        Ty::Tuple(elements) => {
+            out.push_str("T:(");
+            for (i, e) in elements.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_ty_identity(out, e);
+            }
+            out.push(')');
+        }
         Ty::Union(members) => {
             out.push_str("U:[");
             for (i, m) in members.iter().enumerate() {
@@ -401,10 +430,8 @@ fn write_ty_identity<N: baml_type::Head + CtorHead>(out: &mut String, ty: &Ty<N>
             let _ = write!(out, "V:{name}");
         }
         Ty::Never => out.push_str("Never"),
-        Ty::Void => out.push_str("Void"),
         Ty::Unknown => out.push_str("BUnk"),
         Ty::Error => out.push_str("Err"),
-        Ty::RustType => out.push_str("Rust"),
         Ty::Type => out.push_str("Type"),
         Ty::Function {
             params,
@@ -488,9 +515,9 @@ impl DPat {
             ty,
         }
     }
-    pub fn single(ty: Ty, scrutinee_ty: Ty) -> Self {
+    pub fn type_test(ty: Ty, scrutinee_ty: Ty) -> Self {
         Self {
-            ctor: Ctor::Single(ty),
+            ctor: Ctor::Type(ty),
             fields: vec![],
             arity: 0,
             ty: scrutinee_ty,
@@ -515,6 +542,14 @@ impl DPat {
     pub fn interface(iface_ty: Ty, fields: Vec<DPat>, ty: Ty) -> Self {
         Self {
             ctor: Ctor::Interface(iface_ty),
+            arity: fields.len(),
+            fields,
+            ty,
+        }
+    }
+    pub fn tuple(fields: Vec<DPat>, ty: Ty) -> Self {
+        Self {
+            ctor: Ctor::Tuple(fields.len()),
             arity: fields.len(),
             fields,
             ty,
@@ -603,7 +638,8 @@ pub fn render_witness_pat(
                 _ => crate::extern_loc::mounted_class_loc(db, qtn)
                     .map(|class| {
                         crate::extern_loc::extern_class_row(db, class)
-                            .fields
+                            .body
+                            .fields()
                             .iter()
                             .map(|(name, ..)| name.clone())
                             .collect()
@@ -640,6 +676,14 @@ pub fn render_witness_pat(
             }
             None => w.render(vp),
         },
+        Ctor::Tuple(_) => {
+            let fields: Vec<String> = w
+                .fields
+                .iter()
+                .map(|fld| render_witness_pat(db, vp, fld))
+                .collect();
+            baml_type::render_tuple(&fields)
+        }
         _ => w.render(vp),
     }
 }
@@ -697,7 +741,7 @@ impl WitnessPat {
                     }
                     _ => write_member_ty_witness(f, vp, member_ty),
                 },
-                Ctor::Single(ty) => write_single_witness(f, vp, ty),
+                Ctor::Type(ty) => write_type_witness(f, vp, ty),
                 Ctor::Class(qtn, args) => {
                     let qtn = class_witness_head(vp, qtn, args);
                     if self.fields.is_empty() {
@@ -725,6 +769,11 @@ impl WitnessPat {
                         write!(f, "{}", fld.render(vp))?;
                     }
                     write!(f, " }}")
+                }
+                Ctor::Tuple(_) => {
+                    let fields: Vec<String> =
+                        self.fields.iter().map(|fld| fld.render(vp)).collect();
+                    write!(f, "{}", baml_type::render_tuple(&fields))
                 }
                 Ctor::Slice(shape) => {
                     write!(f, "[")?;
@@ -769,7 +818,7 @@ impl WitnessPat {
     }
 }
 
-fn write_single_witness(f: &mut String, vp: &Viewpoint<'_>, ty: &Ty) -> fmt::Result {
+fn write_type_witness(f: &mut String, vp: &Viewpoint<'_>, ty: &Ty) -> fmt::Result {
     use std::fmt::Write as _;
 
     match ty {
@@ -807,7 +856,7 @@ fn write_member_ty_witness(f: &mut String, vp: &Viewpoint<'_>, ty: &Ty) -> fmt::
         Ty::Interface(_, _, _) => write!(f, "{}", ty.spell(vp)),
         Ty::Class(qtn, _) | Ty::Enum(qtn) => write!(f, "{}", qtn.spell(vp)),
         Ty::EnumVariant(qtn, variant) => write!(f, "{}.{variant}", qtn.spell(vp)),
-        Ty::Literal(_, _) => write_single_witness(f, vp, ty),
+        Ty::Literal(_, _) => write_type_witness(f, vp, ty),
         _ => write!(f, "_"),
     }
 }
@@ -820,8 +869,8 @@ fn write_member_ty_witness(f: &mut String, vp: &Viewpoint<'_>, ty: &Ty) -> fmt::
 pub trait PatCtx {
     /// Enumerate the ctors that inhabit `ty`. This is the merge point with
     /// "literals are types": for finite-alphabet types we list every singleton
-    /// (`Single(EnumVariant)` per variant, `Single(Bool(true))` and
-    /// `Single(Bool(false))` for `bool`, etc.). For infinite alphabets (raw
+    /// (`Type(EnumVariant)` per variant, `Type(Bool(true))` and
+    /// `Type(Bool(false))` for `bool`, etc.). For infinite alphabets (raw
     /// `int`/`string`/`float`) and opaque types (generics, maps, functions) we
     /// return `[NonExhaustive]`. For `Never`, the empty list (vacuously
     /// exhaustive). Type aliases are expanded.
@@ -867,6 +916,15 @@ pub trait PatCtx {
         vec![elem; shape.arity()]
     }
 
+    /// Whether every value of `sub` is provably a value of `sup`. Decides
+    /// which type tests cover which ([`Ctor::covers`]); it must answer
+    /// `false` for anything undecidable, error-carrying types included.
+    /// Test contexts that do not model subtyping can decline, which leaves
+    /// type tests related by identity alone.
+    fn is_subtype(&self, _sub: &Ty, _sup: &Ty) -> bool {
+        false
+    }
+
     /// The element type of an array/list type. Helper for default
     /// [`PatCtx::slice_field_types`].
     fn list_element_type(&self, ty: &Ty) -> Ty;
@@ -908,6 +966,7 @@ fn is_inhabited_default<C: PatCtx + ?Sized>(
             r
         }
         Ty::Union(members) => members.iter().any(|m| is_inhabited_default(m, cx, seen)),
+        Ty::Tuple(elements) => elements.iter().all(|e| is_inhabited_default(e, cx, seen)),
         // `T[]` always inhabits `[]`, so it is inhabited regardless of T.
         Ty::List(_) => true,
         _ => true,
@@ -1036,7 +1095,7 @@ impl<'p> Matrix<'p> {
                         }
                         _ => None,
                     };
-                    if !head.ctor.covers(ctor) && interface_projection.is_none() {
+                    if !head.ctor.covers(ctor, cx) && interface_projection.is_none() {
                         // Row's pattern doesn't accept any value of shape
                         // `ctor`. Skip — this row can't contribute to this
                         // specialization.
@@ -1322,7 +1381,7 @@ fn compute_exhaustiveness(cx: &dyn PatCtx, matrix: &mut Matrix<'_>, witnesses: &
             // the alphabet's, so the alphabet branches already report every
             // true missing case — while this branch excludes covering rows
             // whose ctor doesn't `covers`-join it (an arg-mismatched class
-            // ctor, a slice row against a rigid `Single` head) and would
+            // ctor, a slice row against a rigid `Type` head) and would
             // report their values as false missing cases.
             debug_assert!(
                 !matches!(ctor, Ctor::Missing | Ctor::Or | Ctor::Wildcard),
@@ -1360,7 +1419,7 @@ struct CtorSplit {
     /// synthetic `Missing` ctor when applying it to a witness.
     missing: Vec<Ctor>,
     /// Present-but-outside-the-alphabet branches: possible-but-not-covering
-    /// rows, i.e. a rigid `Single` or an arg-mismatched `Class(Box,[T])` in a
+    /// rows, i.e. a rigid `Type` or an arg-mismatched `Class(Box,[T])` in a
     /// `Box<int>` column, or a non-slice head in a list column. They are
     /// specialized only so their rows are marked reachable. Their value sets
     /// are subsets of the alphabet's, so the alphabet branches already
@@ -1464,7 +1523,7 @@ fn split_ctors(cx: &dyn PatCtx, col_ty: &Ty, matrix: &Matrix<'_>) -> CtorSplit {
             return CtorSplit::alphabet(present_no_wild, vec![]);
         }
         // Infinite alphabet (raw int/string/float, generics, opaque types).
-        let mut split: Vec<Ctor> = present_no_wild;
+        let mut split: Vec<Ctor> = dedup_equivalent_type_tests(cx, present_no_wild);
         let missing = vec![Ctor::NonExhaustive];
         if has_wildcard {
             // Wildcard rows must be specialized through. NonExhaustive as a
@@ -1491,7 +1550,7 @@ fn split_ctors(cx: &dyn PatCtx, col_ty: &Ty, matrix: &Matrix<'_>) -> CtorSplit {
         // each; missing ctors recurse into an empty sub-matrix and surface
         // as witnesses naturally. Dedup `all` first — `enumerate_ctors`
         // can produce duplicates (e.g. `Optional<Optional<T>>` pushes a
-        // `Single(null)` per Optional layer).
+        // `Type(null)` per Optional layer).
         let all = dedup_ctors(all);
         // Membership by `covers`, not equality: a present ctor with
         // error-recovery args (`Box` with unresolved type args) covers its
@@ -1499,10 +1558,10 @@ fn split_ctors(cx: &dyn PatCtx, col_ty: &Ty, matrix: &Matrix<'_>) -> CtorSplit {
         // resurface the ctor as missing.
         let missing: Vec<Ctor> = all
             .iter()
-            .filter(|c| !present_no_wild.iter().any(|p| p.covers(c)))
+            .filter(|c| !present_no_wild.iter().any(|p| p.covers(c, cx)))
             .cloned()
             .collect();
-        // Possible-but-not-covering rows — a rigid `Single` (`let t: T` in a
+        // Possible-but-not-covering rows — a rigid `Type` (`let t: T` in a
         // `bool` column) or an arg-mismatched `Class` (`Box<T>` in a `Box<int>`
         // column) — are outside the column's alphabet, so they need their own
         // split branch: without one they are never specialized and would be
@@ -1603,11 +1662,11 @@ fn split_slice_ctors(present: &[Ctor], _has_wildcard: bool) -> CtorSplit {
         missing.push(tail);
     }
 
-    // Non-slice heads in a list column — a rigid-carrying `Single` type-pattern
+    // Non-slice heads in a list column — a rigid-carrying `Type` type-pattern
     // row like `let t: T[]` in a `string[]` column — cover no length class, but
     // still need a split branch of their own: without one they are never
     // specialized and would be falsely flagged unreachable. The branch is
-    // reachability-only: a slice row never `covers`-joins a `Single` head's
+    // reachability-only: a slice row never `covers`-joins a `Type` head's
     // branch, so a witness from it (reachable through refutable sibling
     // columns) would fabricate a missing case the slice rows actually cover
     // (see `CtorSplit::reachability_only`).
@@ -1650,7 +1709,7 @@ fn collect_column_ctors(matrix: &Matrix<'_>) -> Vec<Ctor> {
 
 /// Stable de-duplication of a ctor list. Order-preserving: keeps the first
 /// occurrence of each ctor. `enumerate_ctors` for nested types (e.g.
-/// `Optional<Optional<T>>`) can emit the same `Single(null)` multiple times;
+/// `Optional<Optional<T>>`) can emit the same `Type(null)` multiple times;
 /// without dedup, missing-case witnesses get duplicated.
 fn dedup_ctors(ctors: Vec<Ctor>) -> Vec<Ctor> {
     let mut seen: FxHashSet<Ctor> = FxHashSet::default();
@@ -1660,11 +1719,36 @@ fn dedup_ctors(ctors: Vec<Ctor>) -> Vec<Ctor> {
         .collect()
 }
 
+/// Keep one type test per set of mutually covering ones (`int` beside an
+/// alias of `int`). Each would otherwise be its own branch over the same
+/// values and rows, reporting every witness of that branch once per spelling.
+fn dedup_equivalent_type_tests(cx: &dyn PatCtx, ctors: Vec<Ctor>) -> Vec<Ctor> {
+    let mut kept: Vec<Ctor> = Vec::with_capacity(ctors.len());
+    for ctor in ctors {
+        let duplicate = matches!(ctor, Ctor::Type(_))
+            && kept.iter().any(|earlier| {
+                matches!(earlier, Ctor::Type(_))
+                    && earlier.covers(&ctor, cx)
+                    && ctor.covers(earlier, cx)
+            });
+        if !duplicate {
+            kept.push(ctor);
+        }
+    }
+    kept
+}
+
 fn ctor_sub_tys(cx: &dyn PatCtx, ctor: &Ctor, col_ty: &Ty) -> Vec<Ty> {
     match ctor {
         Ctor::Class(qtn, args) => cx.class_field_types(qtn, &class_ty_for_ctor(qtn, args, col_ty)),
         Ctor::Interface(iface_ty) => cx.interface_field_types(iface_ty),
         Ctor::Slice(shape) => cx.slice_field_types(shape, col_ty),
+        Ctor::Tuple(arity) => match col_ty {
+            Ty::Tuple(elements) if elements.len() == *arity => elements.to_vec(),
+            // In an open column this ctor establishes only tuple kind and
+            // arity, never membership in a tuple of `unknown` slots.
+            _ => vec![Ty::Unknown; *arity],
+        },
         // UnionMember projects a column from the union type down to the
         // member type. Specialise recurses with that single sub-column.
         Ctor::UnionMember(member_ty) => vec![member_ty.clone()],
@@ -1702,15 +1786,15 @@ mod tests {
         fn enumerate_ctors(&self, ty: &Ty) -> Vec<Ctor> {
             match ty {
                 Ty::Bool => {
-                    vec![Ctor::Single(bool_lit(true)), Ctor::Single(bool_lit(false))]
+                    vec![Ctor::Type(bool_lit(true)), Ctor::Type(bool_lit(false))]
                 }
                 Ty::Int | Ty::Float | Ty::String => vec![Ctor::NonExhaustive],
-                Ty::Null => vec![Ctor::Single(ty.clone())],
+                Ty::Null => vec![Ctor::Type(ty.clone())],
                 Ty::Union(members) => members
                     .iter()
                     .flat_map(|m| self.enumerate_ctors(m))
                     .collect(),
-                Ty::Literal(_, _) | Ty::EnumVariant(_, _) => vec![Ctor::Single(ty.clone())],
+                Ty::Literal(_, _) | Ty::EnumVariant(_, _) => vec![Ctor::Type(ty.clone())],
                 Ty::Never => vec![],
                 Ty::TypeVar(_) => vec![Ctor::NonExhaustive],
                 _ => vec![Ctor::NonExhaustive],
@@ -1746,10 +1830,37 @@ mod tests {
     }
 
     #[test]
+    fn open_tuple_shapes_compare_slot_patterns_without_consuming_other_values() {
+        let shape = |first| {
+            DPat::tuple(
+                vec![
+                    DPat::type_test(first, Ty::Unknown),
+                    DPat::wildcard(Ty::Unknown),
+                ],
+                Ty::Unknown,
+            )
+        };
+        let arms = vec![
+            shape(bool_lit(true)),
+            shape(bool_lit(true)),
+            shape(bool_lit(false)),
+        ];
+        let report = compute_match_usefulness(&StubCtx, &arms, Ty::Unknown);
+        assert_eq!(report.unreachable_arms, vec![ArmId(1)]);
+        assert!(!report.missing.is_empty(), "non-tuples still need coverage");
+
+        let mut arms = arms;
+        arms.push(DPat::wildcard(Ty::Unknown));
+        let report = compute_match_usefulness(&StubCtx, &arms, Ty::Unknown);
+        assert_eq!(report.unreachable_arms, vec![ArmId(1)]);
+        assert!(report.missing.is_empty());
+    }
+
+    #[test]
     fn bool_exhaustive_with_both_arms() {
         let arms = vec![
-            DPat::single(bool_lit(true), bool_ty()),
-            DPat::single(bool_lit(false), bool_ty()),
+            DPat::type_test(bool_lit(true), bool_ty()),
+            DPat::type_test(bool_lit(false), bool_ty()),
         ];
         let report = compute_match_usefulness(&StubCtx, &arms, bool_ty());
         assert!(
@@ -1762,16 +1873,16 @@ mod tests {
 
     #[test]
     fn bool_non_exhaustive_missing_false() {
-        let arms = vec![DPat::single(bool_lit(true), bool_ty())];
+        let arms = vec![DPat::type_test(bool_lit(true), bool_ty())];
         let report = compute_match_usefulness(&StubCtx, &arms, bool_ty());
         assert_eq!(report.missing.len(), 1);
-        assert!(matches!(report.missing[0].ctor, Ctor::Single(_)));
+        assert!(matches!(report.missing[0].ctor, Ctor::Type(_)));
     }
 
     #[test]
     fn bool_wildcard_makes_exhaustive() {
         let arms = vec![
-            DPat::single(bool_lit(true), bool_ty()),
+            DPat::type_test(bool_lit(true), bool_ty()),
             DPat::wildcard(bool_ty()),
         ];
         let report = compute_match_usefulness(&StubCtx, &arms, bool_ty());
@@ -1780,14 +1891,17 @@ mod tests {
 
     #[test]
     fn int_requires_wildcard() {
-        let arms = vec![DPat::single(int_lit(1), int_ty())];
+        let arms = vec![DPat::type_test(int_lit(1), int_ty())];
         let report = compute_match_usefulness(&StubCtx, &arms, int_ty());
         assert_eq!(report.missing.len(), 1);
     }
 
     #[test]
     fn int_with_wildcard_is_exhaustive() {
-        let arms = vec![DPat::single(int_lit(1), int_ty()), DPat::wildcard(int_ty())];
+        let arms = vec![
+            DPat::type_test(int_lit(1), int_ty()),
+            DPat::wildcard(int_ty()),
+        ];
         let report = compute_match_usefulness(&StubCtx, &arms, int_ty());
         assert!(report.missing.is_empty());
     }
@@ -1796,7 +1910,7 @@ mod tests {
     fn unreachable_after_wildcard() {
         let arms = vec![
             DPat::wildcard(bool_ty()),
-            DPat::single(bool_lit(true), bool_ty()),
+            DPat::type_test(bool_lit(true), bool_ty()),
         ];
         let report = compute_match_usefulness(&StubCtx, &arms, bool_ty());
         assert!(report.missing.is_empty());
@@ -1841,7 +1955,7 @@ mod tests {
         let arm1 = DPat::slice(
             SliceShape::Fixed(2),
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
                 DPat::wildcard(bool_ty()),
             ],
             array_bool.clone(),
@@ -1849,8 +1963,8 @@ mod tests {
         let arm2 = DPat::slice(
             SliceShape::Fixed(2),
             vec![
-                DPat::single(bool_lit(false), bool_ty()),
-                DPat::single(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(false), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
             ],
             array_bool.clone(),
         );
@@ -1861,8 +1975,8 @@ mod tests {
             fn enumerate_ctors(&self, ty: &Ty) -> Vec<Ctor> {
                 match ty {
                     Ty::Bool => vec![
-                        Ctor::Single(Ty::Literal(Literal::Bool(true), Freshness::Regular)),
-                        Ctor::Single(Ty::Literal(Literal::Bool(false), Freshness::Regular)),
+                        Ctor::Type(Ty::Literal(Literal::Bool(true), Freshness::Regular)),
+                        Ctor::Type(Ty::Literal(Literal::Bool(false), Freshness::Regular)),
                     ],
                     Ty::List(_) => {
                         // Enumerate length-0..=N for tests; rely on Variable as catchall.
@@ -1876,7 +1990,7 @@ mod tests {
                         }));
                         out
                     }
-                    Ty::Literal(_, _) => vec![Ctor::Single(ty.clone())],
+                    Ty::Literal(_, _) => vec![Ctor::Type(ty.clone())],
                     _ => vec![Ctor::NonExhaustive],
                 }
             }
@@ -1934,8 +2048,8 @@ mod tests {
             fn enumerate_ctors(&self, ty: &Ty) -> Vec<Ctor> {
                 match ty {
                     Ty::Bool => vec![
-                        Ctor::Single(Ty::Literal(Literal::Bool(true), Freshness::Regular)),
-                        Ctor::Single(Ty::Literal(Literal::Bool(false), Freshness::Regular)),
+                        Ctor::Type(Ty::Literal(Literal::Bool(true), Freshness::Regular)),
+                        Ctor::Type(Ty::Literal(Literal::Bool(false), Freshness::Regular)),
                     ],
                     Ty::List(_) => {
                         // Enumerate the length classes appearing in the
@@ -1949,7 +2063,7 @@ mod tests {
                             }),
                         ]
                     }
-                    Ty::Literal(_, _) => vec![Ctor::Single(ty.clone())],
+                    Ty::Literal(_, _) => vec![Ctor::Type(ty.clone())],
                     _ => vec![Ctor::NonExhaustive],
                 }
             }
@@ -2026,16 +2140,16 @@ mod tests {
             let ty = self.expand_alias(ty);
             match &ty {
                 Ty::Bool => {
-                    vec![Ctor::Single(bool_lit(true)), Ctor::Single(bool_lit(false))]
+                    vec![Ctor::Type(bool_lit(true)), Ctor::Type(bool_lit(false))]
                 }
                 Ty::Int | Ty::Float | Ty::String => vec![Ctor::NonExhaustive],
-                Ty::Null => vec![Ctor::Single(ty.clone())],
+                Ty::Null => vec![Ctor::Type(ty.clone())],
                 Ty::Union(members) => members
                     .iter()
                     .flat_map(|m| self.enumerate_ctors(m))
                     .collect(),
                 Ty::Literal(_, _) | Ty::EnumVariant(_, _) => {
-                    vec![Ctor::Single(ty.clone())]
+                    vec![Ctor::Type(ty.clone())]
                 }
                 Ty::Class(qtn, args) => vec![Ctor::Class(qtn.clone(), args.clone())],
                 // For slices, split_ctors handles enumeration via slice splitting;
@@ -2191,8 +2305,8 @@ mod tests {
         );
 
         let false_false = mk_pair(
-            DPat::single(bool_lit(false), opt_bool.clone()),
-            DPat::single(bool_lit(false), opt_bool.clone()),
+            DPat::type_test(bool_lit(false), opt_bool.clone()),
+            DPat::type_test(bool_lit(false), opt_bool.clone()),
         );
         let report = compute_match_usefulness(&cx, &[false_false], pair_ty.clone());
         let witnesses: Vec<String> = report
@@ -2224,7 +2338,7 @@ mod tests {
 
         let any_false = mk_pair(
             DPat::wildcard(opt_bool.clone()),
-            DPat::single(bool_lit(false), opt_bool.clone()),
+            DPat::type_test(bool_lit(false), opt_bool.clone()),
         );
         let report = compute_match_usefulness(&cx, &[any_false], pair_ty);
         let witnesses: Vec<String> = report
@@ -2280,7 +2394,7 @@ mod tests {
         let mk_pair = |b: bool| {
             DPat::class(
                 pair.clone(),
-                vec![DPat::single(bool_lit(b), bool_ty()), ok_any()],
+                vec![DPat::type_test(bool_lit(b), bool_ty()), ok_any()],
                 pair_ty.clone(),
             )
         };
@@ -2376,10 +2490,10 @@ mod tests {
             DPat::class(
                 q.clone(),
                 vec![
-                    DPat::single(bool_lit(a), bool_ty()),
-                    DPat::single(bool_lit(b), bool_ty()),
-                    DPat::single(bool_lit(c), bool_ty()),
-                    DPat::single(bool_lit(d), bool_ty()),
+                    DPat::type_test(bool_lit(a), bool_ty()),
+                    DPat::type_test(bool_lit(b), bool_ty()),
+                    DPat::type_test(bool_lit(c), bool_ty()),
+                    DPat::type_test(bool_lit(d), bool_ty()),
                 ],
                 qty.clone(),
             )
@@ -2432,7 +2546,7 @@ mod tests {
         let arm1 = DPat::class(
             q.clone(),
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
                 DPat::wildcard(bool_ty()),
             ],
             qty.clone(),
@@ -2441,7 +2555,7 @@ mod tests {
         let arm2 = DPat::class(
             q.clone(),
             vec![
-                DPat::single(bool_lit(false), bool_ty()),
+                DPat::type_test(bool_lit(false), bool_ty()),
                 DPat::wildcard(bool_ty()),
             ],
             qty.clone(),
@@ -2473,8 +2587,8 @@ mod tests {
                 suffix: 1,
             },
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
-                DPat::single(bool_lit(false), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(false), bool_ty()),
             ],
             arr.clone(),
         );
@@ -2568,8 +2682,8 @@ mod tests {
         let arm_lit = DPat::slice(
             SliceShape::Fixed(2),
             vec![
-                DPat::single(int_lit(1), int_ty()),
-                DPat::single(int_lit(2), int_ty()),
+                DPat::type_test(int_lit(1), int_ty()),
+                DPat::type_test(int_lit(2), int_ty()),
             ],
             arr.clone(),
         );
@@ -2598,9 +2712,9 @@ mod tests {
             DPat::class(
                 r.clone(),
                 vec![
-                    DPat::single(bool_lit(ok), bool_ty()),
+                    DPat::type_test(bool_lit(ok), bool_ty()),
                     match val {
-                        Some(v) => DPat::single(bool_lit(v), bool_ty()),
+                        Some(v) => DPat::type_test(bool_lit(v), bool_ty()),
                         None => DPat::wildcard(bool_ty()),
                     },
                 ],
@@ -2686,7 +2800,7 @@ mod tests {
         let cont = |tag: bool, items: DPat| {
             DPat::class(
                 c.clone(),
-                vec![DPat::single(bool_lit(tag), bool_ty()), items],
+                vec![DPat::type_test(bool_lit(tag), bool_ty()), items],
                 cty.clone(),
             )
         };
@@ -2739,14 +2853,14 @@ mod tests {
         let inner = opt_of(bool_ty());
         let outer = opt_of(inner.clone());
 
-        let null = DPat::single(null_ty(), outer.clone());
-        let inner_null = DPat::single(null_ty(), outer.clone());
-        let bool_true = DPat::single(bool_lit(true), outer.clone());
-        let bool_false = DPat::single(bool_lit(false), outer.clone());
+        let null = DPat::type_test(null_ty(), outer.clone());
+        let inner_null = DPat::type_test(null_ty(), outer.clone());
+        let bool_true = DPat::type_test(bool_lit(true), outer.clone());
+        let bool_false = DPat::type_test(bool_lit(false), outer.clone());
 
         // The current enumerate_ctors for Optional<Optional<bool>> returns
         // ctors of inner (true, false, null) plus null. The two `null`s
-        // collapse to one because Single(null) has the same identity. So
+        // collapse to one because Type(null) has the same identity. So
         // expected required cases: {true, false, null} — three.
         // (This documents current behavior; if BAML doesn't flatten, this
         // is actually a correctness concern to flag.)
@@ -2784,10 +2898,10 @@ mod tests {
         let cx = TestingCtx::new();
         let scrut = union_of(vec![int_lit(1), int_lit(2), int_lit(3)]);
 
-        let arm0_a = DPat::single(int_lit(1), scrut.clone());
-        let arm0_b = DPat::single(int_lit(2), scrut.clone());
-        let arm1 = DPat::single(int_lit(2), scrut.clone()); // unreachable
-        let arm2 = DPat::single(int_lit(3), scrut.clone());
+        let arm0_a = DPat::type_test(int_lit(1), scrut.clone());
+        let arm0_b = DPat::type_test(int_lit(2), scrut.clone());
+        let arm1 = DPat::type_test(int_lit(2), scrut.clone()); // unreachable
+        let arm2 = DPat::type_test(int_lit(3), scrut.clone());
 
         // To use ArmId for arms_for_user, we need a way to share arm-id
         // across or-pattern rows. compute_match_usefulness assigns one ArmId
@@ -2829,7 +2943,7 @@ mod tests {
         let mk_ok = |v: bool| {
             DPat::class(
                 ok.clone(),
-                vec![DPat::single(bool_lit(v), bool_ty())],
+                vec![DPat::type_test(bool_lit(v), bool_ty())],
                 ok_ty.clone(),
             )
         };
@@ -2902,12 +3016,12 @@ mod tests {
         let arms = vec![
             DPat::class(
                 w_bool.clone(),
-                vec![DPat::single(bool_lit(true), bool_ty())],
+                vec![DPat::type_test(bool_lit(true), bool_ty())],
                 scrut.clone(),
             ),
             DPat::class(
                 w_bool.clone(),
-                vec![DPat::single(bool_lit(false), bool_ty())],
+                vec![DPat::type_test(bool_lit(false), bool_ty())],
                 scrut.clone(),
             ),
         ];
@@ -2936,8 +3050,8 @@ mod tests {
         let arm = DPat::class(
             p.clone(),
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
-                DPat::single(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
             ],
             pty.clone(),
         );
@@ -3040,7 +3154,7 @@ mod tests {
         );
         let one_true = DPat::slice(
             SliceShape::Fixed(1),
-            vec![DPat::single(bool_lit(true), bool_ty())],
+            vec![DPat::type_test(bool_lit(true), bool_ty())],
             arr.clone(),
         );
 
@@ -3264,9 +3378,9 @@ mod tests {
             DPat::slice(
                 SliceShape::Fixed(2),
                 vec![
-                    DPat::single(bool_lit(a), bool_ty()),
+                    DPat::type_test(bool_lit(a), bool_ty()),
                     match b {
-                        Some(v) => DPat::single(bool_lit(v), bool_ty()),
+                        Some(v) => DPat::type_test(bool_lit(v), bool_ty()),
                         None => DPat::wildcard(bool_ty()),
                     },
                 ],
@@ -3324,7 +3438,7 @@ mod tests {
             DPat::class(
                 p.clone(),
                 vec![
-                    DPat::single(bool_lit(a), bool_ty()),
+                    DPat::type_test(bool_lit(a), bool_ty()),
                     DPat::wildcard(bool_ty()),
                 ],
                 pty.clone(),
@@ -3446,7 +3560,7 @@ mod tests {
         let mk_inner = |v: bool| {
             DPat::class(
                 inner.clone(),
-                vec![DPat::single(bool_lit(v), bool_ty())],
+                vec![DPat::type_test(bool_lit(v), bool_ty())],
                 inner_ty.clone(),
             )
         };
@@ -3482,8 +3596,8 @@ mod tests {
         let specific = DPat::class(
             p.clone(),
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
-                DPat::single(bool_lit(false), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(false), bool_ty()),
             ],
             pty.clone(),
         );
@@ -3511,7 +3625,7 @@ mod tests {
             DPat::class(
                 p.clone(),
                 vec![
-                    DPat::single(bool_lit(a), bool_ty()),
+                    DPat::type_test(bool_lit(a), bool_ty()),
                     DPat::wildcard(bool_ty()),
                 ],
                 pty.clone(),
@@ -3545,7 +3659,7 @@ mod tests {
             DPat::class(
                 q.clone(),
                 (0..8)
-                    .map(|i| DPat::single(bool_lit((bits >> i) & 1 != 0), bool_ty()))
+                    .map(|i| DPat::type_test(bool_lit((bits >> i) & 1 != 0), bool_ty()))
                     .collect(),
                 qty.clone(),
             )
@@ -3588,7 +3702,7 @@ mod tests {
         // Scrutinee: Optional<Node>.
         let scrut = opt_n.clone();
 
-        let null_top = DPat::single(null_ty(), scrut.clone());
+        let null_top = DPat::type_test(null_ty(), scrut.clone());
         // Some(node) with any val and any next.
         let some_any = DPat::class(
             n.clone(),
@@ -3656,7 +3770,7 @@ mod tests {
                             d.clone(),
                             vec![DPat::class(
                                 e.clone(),
-                                vec![DPat::single(bool_lit(v), bool_ty())],
+                                vec![DPat::type_test(bool_lit(v), bool_ty())],
                                 e_ty.clone(),
                             )],
                             d_ty.clone(),
@@ -3719,7 +3833,7 @@ mod tests {
         // Specific deep arm: [[[true]]] (length 1 / 1 / 1).
         let inner_true = DPat::slice(
             SliceShape::Fixed(1),
-            vec![DPat::single(bool_lit(true), bool_ty())],
+            vec![DPat::type_test(bool_lit(true), bool_ty())],
             lvl1.clone(),
         );
         let mid = DPat::slice(SliceShape::Fixed(1), vec![inner_true], lvl2.clone());
@@ -3750,7 +3864,7 @@ mod tests {
         // Without the catch-all, MANY missing cases.
         let inner_true2 = DPat::slice(
             SliceShape::Fixed(1),
-            vec![DPat::single(bool_lit(true), bool_ty())],
+            vec![DPat::type_test(bool_lit(true), bool_ty())],
             lvl1.clone(),
         );
         let mid2 = DPat::slice(SliceShape::Fixed(1), vec![inner_true2], lvl2.clone());
@@ -3778,10 +3892,10 @@ mod tests {
                 p.clone(),
                 vec![
                     a.map_or(DPat::wildcard(bool_ty()), |v| {
-                        DPat::single(bool_lit(v), bool_ty())
+                        DPat::type_test(bool_lit(v), bool_ty())
                     }),
                     b.map_or(DPat::wildcard(bool_ty()), |v| {
-                        DPat::single(bool_lit(v), bool_ty())
+                        DPat::type_test(bool_lit(v), bool_ty())
                     }),
                 ],
                 pty.clone(),
@@ -3873,7 +3987,7 @@ mod tests {
         // Single arm at the deepest specific case: O { rows: [M { items: [I{v:true}] }] }
         let inner = DPat::class(
             i.clone(),
-            vec![DPat::single(bool_lit(true), bool_ty())],
+            vec![DPat::type_test(bool_lit(true), bool_ty())],
             i_ty.clone(),
         );
         let inner_arr_one = DPat::slice(SliceShape::Fixed(1), vec![inner], i_arr.clone());
@@ -3940,8 +4054,8 @@ mod tests {
             DPat::class(
                 t.clone(),
                 vec![
-                    DPat::single(bool_lit(a), bool_ty()),
-                    DPat::single(bool_lit(b), bool_ty()),
+                    DPat::type_test(bool_lit(a), bool_ty()),
+                    DPat::type_test(bool_lit(b), bool_ty()),
                     DPat::wildcard(bool_ty()),
                 ],
                 tty.clone(),
@@ -3980,7 +4094,7 @@ mod tests {
             DPat::class(
                 q.clone(),
                 (0..6)
-                    .map(|i| DPat::single(bool_lit((bits >> i) & 1 != 0), bool_ty()))
+                    .map(|i| DPat::type_test(bool_lit((bits >> i) & 1 != 0), bool_ty()))
                     .collect(),
                 qty.clone(),
             )
@@ -4005,8 +4119,8 @@ mod tests {
             DPat::class(
                 p.clone(),
                 vec![
-                    DPat::single(bool_lit(a), bool_ty()),
-                    DPat::single(bool_lit(b), bool_ty()),
+                    DPat::type_test(bool_lit(a), bool_ty()),
+                    DPat::type_test(bool_lit(b), bool_ty()),
                 ],
                 pty.clone(),
             )
@@ -4045,8 +4159,8 @@ mod tests {
             DPat::class(
                 b.clone(),
                 vec![
-                    DPat::single(bool_lit(p), bool_ty()),
-                    DPat::single(bool_lit(q), bool_ty()),
+                    DPat::type_test(bool_lit(p), bool_ty()),
+                    DPat::type_test(bool_lit(q), bool_ty()),
                 ],
                 b_ty.clone(),
             )
@@ -4091,14 +4205,14 @@ mod tests {
                 prefix: 0,
                 suffix: 1,
             },
-            vec![DPat::single(bool_lit(true), bool_ty())],
+            vec![DPat::type_test(bool_lit(true), bool_ty())],
             arr.clone(),
         );
         let true_false = DPat::slice(
             SliceShape::Fixed(2),
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
-                DPat::single(bool_lit(false), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(false), bool_ty()),
             ],
             arr.clone(),
         );
@@ -4124,12 +4238,12 @@ mod tests {
 
         let arm0 = DPat::or(
             vec![
-                DPat::single(int_lit(1), scrut.clone()),
-                DPat::single(int_lit(2), scrut.clone()),
+                DPat::type_test(int_lit(1), scrut.clone()),
+                DPat::type_test(int_lit(2), scrut.clone()),
             ],
             scrut.clone(),
         );
-        let arm1 = DPat::single(int_lit(2), scrut.clone());
+        let arm1 = DPat::type_test(int_lit(2), scrut.clone());
 
         let report = compute_match_usefulness(&cx, &[arm0, arm1], scrut);
         assert_eq!(
@@ -4161,7 +4275,7 @@ mod tests {
             cx.register(qs[i].clone(), vec![field]);
         }
 
-        let mut pat = DPat::single(bool_lit(true), bool_ty());
+        let mut pat = DPat::type_test(bool_lit(true), bool_ty());
         for q in qs.iter().rev() {
             pat = DPat::class(q.clone(), vec![pat], class_ty(q));
         }
@@ -4203,7 +4317,7 @@ mod tests {
     // ── 43. Duplicate ctors deduped in missing witnesses ────────────────
 
     /// `Optional<Optional<bool>>`: enumerate pushes `null` once per Optional
-    /// layer, so `all` ends up with two `Single(null)` entries — semantically
+    /// layer, so `all` ends up with two `Type(null)` entries — semantically
     /// the same case. The missing list and the resulting witnesses must be
     /// deduplicated; otherwise `null` would be reported twice.
     #[test]
@@ -4212,8 +4326,8 @@ mod tests {
         let outer = opt_of(opt_of(bool_ty()));
 
         let arms = vec![
-            DPat::single(bool_lit(true), outer.clone()),
-            DPat::single(bool_lit(false), outer.clone()),
+            DPat::type_test(bool_lit(true), outer.clone()),
+            DPat::type_test(bool_lit(false), outer.clone()),
         ];
 
         let report = compute_match_usefulness(&cx, &arms, outer);
@@ -4302,17 +4416,17 @@ mod tests {
         fn enumerate_ctors(&self, ty: &Ty) -> Vec<Ctor> {
             match ty {
                 Ty::Bool => {
-                    vec![Ctor::Single(bool_lit(true)), Ctor::Single(bool_lit(false))]
+                    vec![Ctor::Type(bool_lit(true)), Ctor::Type(bool_lit(false))]
                 }
                 Ty::Int | Ty::Float | Ty::String => vec![Ctor::NonExhaustive],
-                Ty::Null => vec![Ctor::Single(ty.clone())],
+                Ty::Null => vec![Ctor::Type(ty.clone())],
                 // Key change: each union member becomes a UnionMember ctor.
                 Ty::Union(members) => members
                     .iter()
                     .map(|m| Ctor::UnionMember(m.clone()))
                     .collect(),
                 Ty::Literal(_, _) | Ty::EnumVariant(_, _) => {
-                    vec![Ctor::Single(ty.clone())]
+                    vec![Ctor::Type(ty.clone())]
                 }
                 Ty::Class(qtn, args) => vec![Ctor::Class(qtn.clone(), args.clone())],
                 Ty::List(_) => vec![],
@@ -4539,8 +4653,8 @@ mod tests {
 
         // Both branches → exhaustive.
         let arms = vec![
-            DPat::single(bool_lit(true), alias_ty.clone()),
-            DPat::single(bool_lit(false), alias_ty.clone()),
+            DPat::type_test(bool_lit(true), alias_ty.clone()),
+            DPat::type_test(bool_lit(false), alias_ty.clone()),
         ];
         let report = compute_match_usefulness(&cx, &arms, alias_ty.clone());
         assert!(
@@ -4554,7 +4668,7 @@ mod tests {
         );
 
         // Only `true` → `false` missing.
-        let arms = vec![DPat::single(bool_lit(true), alias_ty.clone())];
+        let arms = vec![DPat::type_test(bool_lit(true), alias_ty.clone())];
         let report = compute_match_usefulness(&cx, &arms, alias_ty);
         assert_eq!(report.missing.len(), 1);
         assert!(
@@ -4579,9 +4693,9 @@ mod tests {
         let tri_ty = Ty::TypeAlias(tri);
 
         let arms = vec![
-            DPat::single(int_lit(1), tri_ty.clone()),
-            DPat::single(int_lit(2), tri_ty.clone()),
-            DPat::single(int_lit(3), tri_ty.clone()),
+            DPat::type_test(int_lit(1), tri_ty.clone()),
+            DPat::type_test(int_lit(2), tri_ty.clone()),
+            DPat::type_test(int_lit(3), tri_ty.clone()),
         ];
         let report = compute_match_usefulness(&cx, &arms, tri_ty);
         assert!(
@@ -4608,7 +4722,7 @@ mod tests {
         cx.register_alias(alias.clone(), opt_n.clone());
         let alias_ty = Ty::TypeAlias(alias);
 
-        let null_top = DPat::single(null_ty(), alias_ty.clone());
+        let null_top = DPat::type_test(null_ty(), alias_ty.clone());
         let some_any = DPat::class(
             n.clone(),
             vec![DPat::wildcard(bool_ty()), DPat::wildcard(opt_n.clone())],
@@ -4666,7 +4780,10 @@ mod tests {
         let arm = |v: i64| {
             DPat::slice(
                 SliceShape::Fixed(2),
-                vec![DPat::single(int_lit(v), int_ty()), DPat::wildcard(int_ty())],
+                vec![
+                    DPat::type_test(int_lit(v), int_ty()),
+                    DPat::wildcard(int_ty()),
+                ],
                 arr.clone(),
             )
         };
@@ -4692,7 +4809,7 @@ mod tests {
         let arm1 = DPat::class(
             qtn.clone(),
             vec![
-                DPat::single(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
                 DPat::wildcard(bool_ty()),
             ],
             pair_ty.clone(),
@@ -4700,8 +4817,8 @@ mod tests {
         let arm2 = DPat::class(
             qtn.clone(),
             vec![
-                DPat::single(bool_lit(false), bool_ty()),
-                DPat::single(bool_lit(true), bool_ty()),
+                DPat::type_test(bool_lit(false), bool_ty()),
+                DPat::type_test(bool_lit(true), bool_ty()),
             ],
             pair_ty.clone(),
         );
@@ -4711,11 +4828,11 @@ mod tests {
             fn enumerate_ctors(&self, ty: &Ty) -> Vec<Ctor> {
                 match ty {
                     Ty::Bool => vec![
-                        Ctor::Single(Ty::Literal(Literal::Bool(true), Freshness::Regular)),
-                        Ctor::Single(Ty::Literal(Literal::Bool(false), Freshness::Regular)),
+                        Ctor::Type(Ty::Literal(Literal::Bool(true), Freshness::Regular)),
+                        Ctor::Type(Ty::Literal(Literal::Bool(false), Freshness::Regular)),
                     ],
                     Ty::Class(_, args) => vec![Ctor::Class(self.0.clone(), args.clone())],
-                    Ty::Literal(_, _) => vec![Ctor::Single(ty.clone())],
+                    Ty::Literal(_, _) => vec![Ctor::Type(ty.clone())],
                     _ => vec![Ctor::NonExhaustive],
                 }
             }
@@ -4769,7 +4886,7 @@ mod tests {
     fn ty_ctor_identity_is_stable_for_projections_and_typevars() {
         // Two independent constructions of the same projection agree; a
         // different member (or a different var) is a distinct identity. This
-        // stability is what lets a rigid `Single` row round-trip through the
+        // stability is what lets a rigid `Type` row round-trip through the
         // matrix's hash-based ctor sets.
         let a = projection_ty(type_var_ty("Self"), "Iterator", "Item");
         let b = projection_ty(type_var_ty("Self"), "Iterator", "Item");
@@ -4793,7 +4910,7 @@ mod tests {
         // is required) — but it must still get its own split branch so it is
         // specialized and not falsely flagged unreachable.
         let cx = TestingCtx::new();
-        let rigid = DPat::single(type_var_ty("T"), bool_ty());
+        let rigid = DPat::type_test(type_var_ty("T"), bool_ty());
         let report =
             compute_match_usefulness(&cx, &[rigid.clone(), DPat::wildcard(bool_ty())], bool_ty());
         assert!(report.missing.is_empty(), "wildcard completes the match");
@@ -4818,9 +4935,9 @@ mod tests {
         // decide exhaustiveness; the rigid row stays a live possible row.
         let cx = TestingCtx::new();
         let arms = vec![
-            DPat::single(type_var_ty("T"), bool_ty()),
-            DPat::single(bool_lit(true), bool_ty()),
-            DPat::single(bool_lit(false), bool_ty()),
+            DPat::type_test(type_var_ty("T"), bool_ty()),
+            DPat::type_test(bool_lit(true), bool_ty()),
+            DPat::type_test(bool_lit(false), bool_ty()),
         ];
         let report = compute_match_usefulness(&cx, &arms, bool_ty());
         assert!(report.missing.is_empty());
@@ -4838,7 +4955,7 @@ mod tests {
         // own split branch and stays reachable.
         let cx = TestingCtx::new();
         let col = list_of(Ty::String);
-        let rigid = DPat::single(list_of(type_var_ty("T")), col.clone());
+        let rigid = DPat::type_test(list_of(type_var_ty("T")), col.clone());
         let report = compute_match_usefulness(
             &cx,
             &[rigid.clone(), DPat::wildcard(col.clone())],
@@ -4927,7 +5044,7 @@ mod tests {
         let rigid_refutable = DPat::class_inst(
             box_q.clone(),
             Box::new([type_var_ty("T")]),
-            vec![DPat::single(int_lit(1), int_ty())],
+            vec![DPat::type_test(int_lit(1), int_ty())],
             box_int.clone(),
         );
         let concrete_cover = DPat::class_inst(
@@ -4974,8 +5091,8 @@ mod tests {
         // `match (h: Holder) { Holder { xs: let t: T[], n: 1 } =>,
         // Holder { xs: [..], n: _ } => }` with `xs: string[]`: the slice arm
         // covers every length class, so the match is exhaustive. The rigid
-        // `Single` head's branch excludes the slice row (a slice ctor never
-        // covers a `Single`), and the refutable sibling column `n: 1` makes
+        // `Type` head's branch excludes the slice row (a slice ctor never
+        // covers a `Type`), and the refutable sibling column `n: 1` makes
         // that branch non-exhaustive internally — its witness must be dropped.
         let mut cx = TestingCtx::new();
         let holder_q = qtn("Holder");
@@ -4986,8 +5103,8 @@ mod tests {
         let rigid_row = DPat::class(
             holder_q.clone(),
             vec![
-                DPat::single(list_of(type_var_ty("T")), strings.clone()),
-                DPat::single(int_lit(1), int_ty()),
+                DPat::type_test(list_of(type_var_ty("T")), strings.clone()),
+                DPat::type_test(int_lit(1), int_ty()),
             ],
             holder.clone(),
         );

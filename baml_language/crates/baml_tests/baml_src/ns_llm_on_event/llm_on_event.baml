@@ -22,8 +22,11 @@ class Probe {
 
 class ScriptedClient {
     implements ai.Client {
-        function id(self) -> string {
+        function requested_model(self) -> string {
             "scripted"
+        }
+        function provider(self) -> string {
+            "test"
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
@@ -33,12 +36,30 @@ class ScriptedClient {
 
         function invoke(self, input: ai.ModelTurnInput) -> ai.ModelTurn {
             let _ = input;
-            ai.ModelTurn { calls: [],
-                content: [ai.content.Text { text: "{\"message\": \"hi\"}" }],
-                stop_reason: ai.content.StopReason.Complete,
-                usage: ai.events.Usage { input_tokens: 3, output_tokens: 5, cached_input_tokens: null, reasoning_tokens: null },
-            }
+            ai.internal.with_own_call(
+                ai.ModelTurn { calls: [],
+                    child_turns: [],
+                    content: [ai.content.Text { text: "{\"message\": \"hi\"}" }],
+                    stop_reason: ai.content.StopReason.Complete,
+                },
+                scripted_call(),
+                ai.events.Usage { input_tokens: 3, output_tokens: 5, cached_input_tokens: null, reasoning_tokens: null },
+                "scripted-model",
+                null,
+            )
         }
+    }
+}
+
+/// The record of one scripted model call, with no HTTP exchange behind it.
+function scripted_call() -> ai.events.ModelCall {
+    ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey { provider: "scripted", model: "scripted-model" },
+        usage: null,
+        timing: ai.events.Timing { start_time: null, duration: null, ttft: null },
+        http_request: null,
+        http_response: null,
+        sse_responses: null,
     }
 }
 
@@ -50,8 +71,7 @@ function label_of(e: ai.events.Event) -> string {
         let x: ai.events.ToolRequested => "ToolRequested",
         let x: ai.events.ToolCompleted => "ToolCompleted",
         let x: ai.events.ToolFailed => "ToolFailed",
-        let x: ai.events.Usage => "Usage",
-        let x: ai.events.LLMCall => "LLMCall",
+        let x: ai.events.ModelCall => "ModelCall",
         let x: ai.events.FinalProduced => "FinalProduced",
     }
 }
@@ -63,7 +83,7 @@ test "direct call delivers events in journal order" {
     };
     let g = Greet("world", client = ScriptedClient {  }, on_event = cb);
     assert.equal(g.message, "hi");
-    assert.equal(probe.labels, ["RunStarted", "AssistantMessage", "Usage", "FinalProduced"])
+    assert.equal(probe.labels, ["RunStarted", "AssistantMessage", "ModelCall", "FinalProduced"])
 }
 
 test "throwing listener does not alter the direct-call result" {
@@ -83,7 +103,7 @@ test "explicit Agent accepts and swallows a throwing listener" {
     let agent = ai.Agent.new(client = ScriptedClient {  }, on_event = cb);
     let out = agent.run(Greet@spec("world"));
     assert.equal(out.value.message, "hi");
-    assert.equal(probe.labels, ["RunStarted", "AssistantMessage", "Usage", "FinalProduced"])
+    assert.equal(probe.labels, ["RunStarted", "AssistantMessage", "ModelCall", "FinalProduced"])
 }
 
 // ─── content blocks: constructors and the text projection ────────────────────
@@ -169,4 +189,50 @@ test "claude_code_transcript_with_media" {
         claude_code_transcript_with_media(),
         "tool result id=call_text is_error=false: sunny in SF\ntool result id=call_media is_error=false: captured:[image]\nuser: Screenshot after the tool ran:[image]",
     )
+}
+
+// Tool-call ids, names, and tool descriptions are arbitrary text: the Claude
+// Code prompt must serialize them as JSON, not interpolate them into it.
+function claude_code_tricky_echo(args: map<string, unknown>) -> string {
+    "unused"
+}
+
+function claude_code_tool_catalog_json() -> json {
+    let schema: map<string, unknown> = {};
+    let _ = schema.set("type", "object");
+    let tb = ai.tools.Toolbox.new(
+        [ai.tools.raw_tool("echo", "say \"hi\"\nthen \\ stop", schema, claude_code_tricky_echo)],
+    );
+    let protocol = claude_code.internal.tool_protocol(tb);
+    baml.json.parse(protocol.split("(request via outcome.calls only):")[1].trim())
+}
+
+test "claude_code_tool_catalog_escapes_descriptions" {
+    let catalog = claude_code_tool_catalog_json();
+    assert.equal(baml.json.path<string>(catalog, "[0].name"), "echo");
+    assert.equal(baml.json.path<string>(catalog, "[0].description"), "say \"hi\"\nthen \\ stop");
+    assert.equal(baml.json.path<string>(catalog, "[0].parameters.type"), "object");
+}
+
+function claude_code_tool_call_json() -> json {
+    let args: map<string, unknown> = {};
+    let _ = args.set("q", "a \"quoted\" arg");
+    let j = ai.Journal {
+        log: [
+            ai.events.AssistantMessage {
+                content: [ai.content.ToolUse { id: "call\"1", name: "look\nup", args: args }],
+                resolved_model: ai.events.ModelKey { provider: "claude-code", model: "opus" },
+                requested_model: "opus",
+            },
+        ],
+    };
+    let text = claude_code.internal.transcript_text(j);
+    baml.json.parse(text.split("assistant tool_call: ")[1])
+}
+
+test "claude_code_transcript_escapes_tool_calls" {
+    let call = claude_code_tool_call_json();
+    assert.equal(baml.json.path<string>(call, ".id"), "call\"1");
+    assert.equal(baml.json.path<string>(call, ".name"), "look\nup");
+    assert.equal(baml.json.path<string>(call, ".args.q"), "a \"quoted\" arg");
 }

@@ -21,7 +21,7 @@ use std::{
 };
 
 use baml_base::qualified_name::{AI_FUNCTION_SPEC, AI_STREAM_STREAM};
-use baml_sdkgen_types::FunctionArgumentDefault;
+use baml_sdkgen_types::{ClassCrossing, FunctionArgumentDefault, SymbolPool};
 
 use crate::{
     emit::{
@@ -43,14 +43,33 @@ pub(crate) struct LeafBody {
 }
 
 impl LeafBody {
+    /// Every name this leaf declares at module scope.
+    fn local_names(&self) -> BTreeSet<String> {
+        self.symbols
+            .iter()
+            .map(|(sym, _)| match sym {
+                EmittedSymbol::Class(c) => c.name.clone(),
+                EmittedSymbol::Enum(e) => e.name.clone(),
+                EmittedSymbol::TypeAlias(t) => t.name.clone(),
+                EmittedSymbol::Function(f) => f.name.clone(),
+            })
+            .collect()
+    }
+
     fn callable_child_aliases(&self, kids: &BTreeSet<String>) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
         for (sym, _) in &self.symbols {
             let EmittedSymbol::Function(f) = sym else {
                 continue;
             };
-            if f.mode == SyncAsync::Sync && kids.contains(&f.name) {
-                out.insert(f.name.clone(), child_namespace_alias(&f.name));
+            // Either binding can share its name with a child namespace:
+            // the async plain name, or the `_sync` twin (`id_sync` next to
+            // an `id_sync` namespace). Compose whichever one collides.
+            if kids.contains(&f.name) {
+                out.insert(
+                    f.name.clone(),
+                    child_namespace_alias(&f.name, &self.local_names()),
+                );
             }
         }
         out
@@ -195,13 +214,16 @@ struct RenderState {
     uses_define_function: bool,
     uses_define_instance: bool,
     /// Set when any rendered type expression references the runtime opaque
-    /// handle token `_BamlHandle` (`Ty::RustType`).
+    /// handle token `_BamlHandle` (a host's own value).
     uses_baml_handle: bool,
     /// Set when a generic class/call emits `$types`, which accepts both opaque
     /// reflected definitions and statically-known host tokens.
     uses_baml_type: bool,
     /// Set when a BAML `type` appears in a public signature.
     uses_baml_type_handle: bool,
+    /// Set when the leaf declares a class the engine keeps for itself, which
+    /// extends the runtime's `BamlReference`.
+    uses_baml_reference: bool,
 }
 
 impl RenderState {
@@ -396,7 +418,7 @@ fn fn_type_sig(
                 ty.expr
             ));
         }
-        fields.push("$ctx?: BamlCallContext | undefined".to_string());
+        fields.push("$baml?: BamlOptions | null | undefined".to_string());
         if !type_binding_params.is_empty() {
             let bindings = type_binding_params
                 .iter()
@@ -423,9 +445,11 @@ pub(crate) fn render_index_ts(
     kids: &BTreeSet<String>,
     is_root: bool,
     runtime_package: &str,
+    pool: &SymbolPool,
 ) -> String {
     let ctx = TranslateCtx {
         current_leaf: body.leaf.clone(),
+        pool,
     };
     let mut state = RenderState::default();
     let callable_child_aliases = body.callable_child_aliases(kids);
@@ -459,6 +483,12 @@ pub(crate) fn render_index_ts(
         is_root,
         runtime_package,
     );
+    if body_str.contains("_currentTraceContext") {
+        let _ = writeln!(
+            out,
+            "import {{ _currentTraceContext, _currentTraceContextAsync }} from \"{runtime_package}\";"
+        );
+    }
     if !body_str.is_empty() {
         if !out.is_empty() {
             out.push('\n');
@@ -527,21 +557,27 @@ fn leaf_module_specifier(from: &LeafPath, to: &LeafPath) -> String {
 /// segment (including `void`), but a reserved word like `default` is not a
 /// legal `export * as` alias — bind a mangled local and re-export under the
 /// reserved name (legal as an export name).
-fn child_namespace_alias(kid: &str) -> String {
-    format!("__ns_{kid}")
+fn child_namespace_alias(kid: &str, taken: &BTreeSet<String>) -> String {
+    // A local binding, so it must not shadow anything the leaf declares.
+    let mut alias = format!("__ns_{kid}");
+    while taken.contains(&alias) {
+        alias.push('_');
+    }
+    alias
 }
 
 fn write_child_reexports(
     out: &mut String,
     kids: &BTreeSet<String>,
     callable_child_aliases: &BTreeMap<String, String>,
+    taken: &BTreeSet<String>,
 ) {
     for kid in kids {
         let child_path = format!("./{kid}/index.js");
         if let Some(local) = callable_child_aliases.get(kid) {
             let _ = writeln!(out, "import * as {local} from \"{child_path}\";");
         } else if is_js_reserved(kid) {
-            let local = format!("__ns_{kid}");
+            let local = child_namespace_alias(kid, taken);
             let _ = writeln!(out, "import * as {local} from \"{child_path}\";");
             let _ = writeln!(out, "export {{ {local} as {kid} }};");
         } else {
@@ -558,9 +594,6 @@ fn runtime_import_line(state: &RenderState, extra: &[&str], runtime_package: &st
     }
     if state.uses_define_instance {
         names.push("defineInstanceFunction");
-    }
-    if state.uses_define_function || state.uses_define_instance {
-        names.push("type BamlCallContext");
     }
     // Type-only import (inline `type` modifier) for the generic `$types` field
     // token. Sorted alongside the value imports; TS accepts a mixed
@@ -590,10 +623,24 @@ fn write_preamble_ts(
     is_root: bool,
     runtime_package: &str,
 ) {
+    if state.uses_define_function || state.uses_define_instance {
+        let up = "../".repeat(body.leaf.segments.len());
+        let prefix = if up.is_empty() { "./" } else { &up };
+        let _ = writeln!(
+            out,
+            "import type {{ BamlOptions }} from \"{prefix}_invocation.js\";"
+        );
+    }
     if state.uses_baml_handle {
         let _ = writeln!(
             out,
             "import type {{ BamlHandle as _BamlHandle }} from \"{runtime_package}\";"
+        );
+    }
+    if state.uses_baml_reference {
+        let _ = writeln!(
+            out,
+            "import {{ BamlReference as _BamlReference }} from \"{runtime_package}\";"
         );
     }
     if is_root {
@@ -610,12 +657,12 @@ fn write_preamble_ts(
         out.push_str("setTypeMap(_TYPE_MAP);\n");
         if !kids.is_empty() {
             out.push('\n');
-            write_child_reexports(out, kids, callable_child_aliases);
+            write_child_reexports(out, kids, callable_child_aliases, &body.local_names());
         }
     } else {
         out.push_str(&runtime_import_line(state, &[], runtime_package));
         out.push_str(&cross_leaf_imports(state, &body.leaf));
-        write_child_reexports(out, kids, callable_child_aliases);
+        write_child_reexports(out, kids, callable_child_aliases, &body.local_names());
     }
 }
 
@@ -630,13 +677,23 @@ fn render_symbol_ts(
     runtime_package: &str,
 ) {
     match sym {
-        EmittedSymbol::Class(c) => {
-            if let Some(rust_name) = runtime_owned_reexport_name(c) {
-                render_media_reexport_ts(out, &c.name, rust_name, runtime_package);
-            } else {
-                render_class_ts(out, c, ctx, state);
+        EmittedSymbol::Class(c) => match c.crossing {
+            ClassCrossing::Opaque => render_reference_class_ts(out, c, ctx, state),
+            ClassCrossing::HostValue => {
+                unreachable!("`build_emitted` emits no definition for a host value")
             }
-        }
+            ClassCrossing::Fields
+            | ClassCrossing::Stream
+            | ClassCrossing::FunctionSpec
+            | ClassCrossing::Media(_)
+            | ClassCrossing::Prompt => {
+                if let Some(rust_name) = runtime_owned_reexport_name(c) {
+                    render_media_reexport_ts(out, &c.name, rust_name, runtime_package);
+                } else {
+                    render_class_ts(out, c, ctx, state);
+                }
+            }
+        },
         EmittedSymbol::Enum(e) => render_enum(out, e),
         EmittedSymbol::TypeAlias(a) => render_type_alias(out, a, ctx, state),
         EmittedSymbol::Function(f) => render_function_ts(
@@ -693,14 +750,19 @@ fn render_class_ts(
     write_class_doc(out, c);
     let generics = generic_decl(&c.generic_params);
 
-    // Translate each property type once; reuse for field + constructor.
-    let props: Vec<(&str, TranslatedType)> = c
+    // Translate each property type once; reuse for field + constructor. A
+    // nullable field's key is optional (`name?: T | null`): the runtime reads
+    // an omitted nullable field as `null`, so callers may leave it out of the
+    // constructor init or of a plain object passed where the class is expected.
+    // Reading the property is then typed `T | null | undefined`, although a
+    // value decoded from BAML always carries the key.
+    let props: Vec<(&str, bool, TranslatedType)> = c
         .properties
         .iter()
         .map(|p| {
             let t = translate_ty(&p.ty, ctx);
             state.merge(&t);
-            (p.name.as_str(), t)
+            (p.name.as_str(), p.nullable, t)
         })
         .collect();
 
@@ -721,10 +783,12 @@ fn render_class_ts(
     });
 
     let _ = writeln!(out, "export class {}{generics} {{", c.name);
-    for (name, t) in &props {
-        // `!` definite-assignment assertion: fields are populated via the
+    for (name, nullable, t) in &props {
+        // Nullable fields are optional (`?`). The rest use `!`, the
+        // definite-assignment assertion: they are populated via the
         // constructor's `Object.assign`, which tsc's flow analysis can't see.
-        let _ = writeln!(out, "  {name}!: {};", t.expr);
+        let marker = if *nullable { "?" } else { "!" };
+        let _ = writeln!(out, "  {name}{marker}: {};", t.expr);
     }
     if let Some(types_ty) = &types_field {
         state.uses_baml_type = true;
@@ -736,8 +800,9 @@ fn render_class_ts(
         out.push_str("  constructor(init: {}) {\n    Object.assign(this, init);\n  }\n");
     } else {
         out.push_str("  constructor(init: {\n");
-        for (name, t) in &props {
-            let _ = writeln!(out, "    {name}: {};", t.expr);
+        for (name, nullable, t) in &props {
+            let marker = if *nullable { "?" } else { "" };
+            let _ = writeln!(out, "    {name}{marker}: {};", t.expr);
         }
         if let Some(types_ty) = &types_field {
             let _ = writeln!(out, "    $types?: {types_ty};");
@@ -765,6 +830,48 @@ fn render_class_ts(
         render_method_binding_ts(out, m, &c.generic_params, ctx, state);
     }
 
+    out.push_str("}\n");
+}
+
+/// A class the engine keeps for itself (`reflect.Package`, …): an instance
+/// crosses as a reference to the engine's own, which the runtime's decoder
+/// wraps in this class. So it has no public constructor and no fields (its
+/// declared fields are the runtime's internals), only its methods, which send
+/// the reference as the receiver.
+///
+/// A generic one lists its params in `$generic`, as a generic data class does.
+/// The decoder fills the reference's `$types` from the class type the engine
+/// sent with it, so an instance method binds the class's params from its
+/// receiver.
+fn render_reference_class_ts(
+    out: &mut String,
+    c: &TypeScriptClass,
+    ctx: &TranslateCtx,
+    state: &mut RenderState,
+) {
+    state.uses_baml_reference = true;
+    write_doc_with_raises(out, c.docstring.as_deref(), &[]);
+    let generics = generic_decl(&c.generic_params);
+    let _ = writeln!(
+        out,
+        "export class {}{generics} extends _BamlReference {{",
+        c.name
+    );
+    if !c.generic_params.is_empty() {
+        let params = c
+            .generic_params
+            .iter()
+            .map(|p| crate::ts_string(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "  static readonly $generic = [{params}] as const;");
+    }
+    for m in &c.static_methods {
+        render_method_binding_ts(out, m, &c.generic_params, ctx, state);
+    }
+    for m in &c.instance_methods {
+        render_method_binding_ts(out, m, &c.generic_params, ctx, state);
+    }
     out.push_str("}\n");
 }
 
@@ -817,7 +924,7 @@ fn binding_surface<'a>(
         tt
     }));
 
-    let ret = translate_ty(&m.return_ty, ctx);
+    let ret = crate::translate_ty::translate_return_ty(&m.return_ty, ctx);
     state.merge(&ret);
 
     let defaults = vec![None; m.required_args.len()]
@@ -906,7 +1013,7 @@ fn render_function_ts(
             tt
         })
         .collect();
-    let ret = translate_ty(&f.return_ty, ctx);
+    let ret = crate::translate_ty::translate_return_ty(&f.return_ty, ctx);
     state.merge(&ret);
     let names: Vec<&str> = f.param_names.iter().map(String::as_str).collect();
     let is_async = f.mode == SyncAsync::Async;
@@ -932,6 +1039,16 @@ fn render_function_ts(
         f.baml_fqn,
         mode_str(f.mode),
     );
+    if f.baml_fqn == "trace.current_context" {
+        let binding = if is_async {
+            "_currentTraceContextAsync"
+        } else {
+            "_currentTraceContext"
+        };
+        // Dynamic import paths are computed by the surrounding generator;
+        // the runtime facade never imports a generated application package.
+        factory = format!("{binding} as {sig}");
+    }
     if let Some(alias) = child_namespace_alias {
         factory = format!("Object.assign({factory}, {alias})");
     }
@@ -1024,7 +1141,7 @@ fn split_param_names(
 #[cfg(test)]
 mod tests {
     use baml_base::{Literal, Name as BaseName};
-    use baml_sdkgen_types::{DefaultLiteral, FunctionArgumentDefault, Name, Ty};
+    use baml_sdkgen_types::{DefaultLiteral, FunctionArgumentDefault, Name, SymbolPool, Ty};
 
     use super::*;
 
@@ -1057,10 +1174,12 @@ mod tests {
             source,
             generic_params: Vec::new(),
             docstring: None,
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
             properties: props
                 .into_iter()
                 .map(|(pn, ty)| crate::emit::class::TypeScriptClassProperty {
                     name: pn.to_string(),
+                    nullable: baml_sdkgen_types::is_nullable(&ty, &SymbolPool::new()),
                     ty,
                     docstring: None,
                 })
@@ -1140,7 +1259,13 @@ mod tests {
                 vec![("name", Ty::String), ("age", Ty::Int)],
             )],
         );
-        let ts = render_index_ts(&b, &BTreeSet::new(), false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(
+            &b,
+            &BTreeSet::new(),
+            false,
+            TEST_RUNTIME_PACKAGE,
+            &SymbolPool::new(),
+        );
         assert!(ts.contains("export class Resume {"));
         assert!(ts.contains("name!: string;"));
         assert!(ts.contains("age!: number;"));
@@ -1157,7 +1282,13 @@ mod tests {
                 &["HAPPY", "SAD"],
             )],
         );
-        let ts = render_index_ts(&b, &BTreeSet::new(), false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(
+            &b,
+            &BTreeSet::new(),
+            false,
+            TEST_RUNTIME_PACKAGE,
+            &SymbolPool::new(),
+        );
         assert!(ts.contains("export enum Sentiment {"));
         assert!(ts.contains("HAPPY = \"HAPPY\","));
     }
@@ -1170,25 +1301,29 @@ mod tests {
                 func_sym(
                     "extract",
                     "user.lorem.extract",
-                    SyncAsync::Sync,
+                    SyncAsync::Async,
                     vec![("text", Ty::String)],
                     Ty::Int,
                 ),
                 func_sym(
-                    "extract_async",
+                    "extract_sync",
                     "user.lorem.extract",
-                    SyncAsync::Async,
+                    SyncAsync::Sync,
                     vec![("text", Ty::String)],
                     Ty::Int,
                 ),
             ],
         );
-        let ts = render_index_ts(&b, &BTreeSet::new(), false, TEST_RUNTIME_PACKAGE);
-        assert!(ts.contains(
-            "import { defineFunction, type BamlCallContext } from \"@boundaryml/baml-bridge\";"
-        ));
-        assert!(ts.contains("export const extract = defineFunction(\"user.lorem.extract\", \"sync\", [\"text\"]) as (text: string, $opts?: { $ctx?: BamlCallContext | undefined } | undefined) => number;"));
-        assert!(ts.contains("export const extract_async = defineFunction(\"user.lorem.extract\", \"async\", [\"text\"]) as (text: string, $opts?: { $ctx?: BamlCallContext | undefined } | undefined) => Promise<number>;"));
+        let ts = render_index_ts(
+            &b,
+            &BTreeSet::new(),
+            false,
+            TEST_RUNTIME_PACKAGE,
+            &SymbolPool::new(),
+        );
+        assert!(ts.contains("import { defineFunction } from \"@boundaryml/baml-bridge\";"));
+        assert!(ts.contains("export const extract = defineFunction(\"user.lorem.extract\", \"async\", [\"text\"]) as (text: string, $opts?: { $baml?: BamlOptions | null | undefined } | undefined) => Promise<number>;"));
+        assert!(ts.contains("export const extract_sync = defineFunction(\"user.lorem.extract\", \"sync\", [\"text\"]) as (text: string, $opts?: { $baml?: BamlOptions | null | undefined } | undefined) => number;"));
     }
 
     #[test]
@@ -1219,9 +1354,15 @@ mod tests {
                 Ty::Int,
             )],
         );
-        let ts = render_index_ts(&b, &BTreeSet::new(), false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(
+            &b,
+            &BTreeSet::new(),
+            false,
+            TEST_RUNTIME_PACKAGE,
+            &SymbolPool::new(),
+        );
         assert!(ts.contains(
-            "as (arg0: number, $opts?: { default?: number | undefined; \"not-valid\"?: string | undefined; $ctx?: BamlCallContext | undefined } | undefined) => number;"
+            "as (arg0: number, $opts?: { default?: number | undefined; \"not-valid\"?: string | undefined; $baml?: BamlOptions | null | undefined } | undefined) => number;"
         ));
         assert!(!ts.contains("default_?:"));
     }
@@ -1249,12 +1390,18 @@ mod tests {
                 Ty::String,
             )],
         );
-        let ts = render_index_ts(&b, &BTreeSet::new(), false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(
+            &b,
+            &BTreeSet::new(),
+            false,
+            TEST_RUNTIME_PACKAGE,
+            &SymbolPool::new(),
+        );
         assert!(ts.contains(
             "defineFunction(\"user.lorem.extract\", \"sync\", [\"arguments\", \"arguments_\", \"$opts\"], [\"eval\"])"
         ));
         assert!(ts.contains(
-            "as (arguments_: string, arguments__: string, $opts_: string, $opts?: { eval?: string | undefined; $ctx?: BamlCallContext | undefined } | undefined) => string;"
+            "as (arguments_: string, arguments__: string, $opts_: string, $opts?: { eval?: string | undefined; $baml?: BamlOptions | null | undefined } | undefined) => string;"
         ));
     }
 
@@ -1271,7 +1418,13 @@ mod tests {
                 )],
             )],
         );
-        let ts = render_index_ts(&b, &BTreeSet::new(), false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(
+            &b,
+            &BTreeSet::new(),
+            false,
+            TEST_RUNTIME_PACKAGE,
+            &SymbolPool::new(),
+        );
         assert!(ts.contains("import type * as lorem from \"../lorem/index.js\";"));
         assert!(ts.contains("r!: lorem.Resume;"));
     }
@@ -1296,7 +1449,13 @@ mod tests {
         let b = body(&["baml", "media"], symbols);
 
         for runtime_package in ["@boundaryml/baml-bridge", "@boundaryml/baml-bridge-web"] {
-            let ts = render_index_ts(&b, &BTreeSet::new(), false, runtime_package);
+            let ts = render_index_ts(
+                &b,
+                &BTreeSet::new(),
+                false,
+                runtime_package,
+                &SymbolPool::new(),
+            );
             for (fqn, runtime_name) in RUNTIME_OWNED_CLASS_REEXPORTS {
                 let local_name = fqn.rsplit('.').next().unwrap();
                 assert!(ts.contains(&format!(
@@ -1314,7 +1473,7 @@ mod tests {
         let b = body(&["vendor"], vec![]);
         let mut kids = BTreeSet::new();
         kids.insert("aws".to_string());
-        let ts = render_index_ts(&b, &kids, false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(&b, &kids, false, TEST_RUNTIME_PACKAGE, &SymbolPool::new());
         assert!(ts.contains("export * as aws from \"./aws/index.js\";"));
         assert!(!ts.contains("export const"));
     }
@@ -1327,14 +1486,14 @@ mod tests {
                 func_sym(
                     "id",
                     "factory.id",
-                    SyncAsync::Sync,
+                    SyncAsync::Async,
                     vec![],
                     Ty::Class(name("factory", &[], "Resource"), Box::new([])),
                 ),
                 func_sym(
-                    "id_async",
+                    "id_sync",
                     "factory.id",
-                    SyncAsync::Async,
+                    SyncAsync::Sync,
                     vec![],
                     Ty::Class(name("factory", &[], "Resource"), Box::new([])),
                 ),
@@ -1343,17 +1502,57 @@ mod tests {
         );
         let mut kids = BTreeSet::new();
         kids.insert("id".to_string());
-        let ts = render_index_ts(&b, &kids, false, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(&b, &kids, false, TEST_RUNTIME_PACKAGE, &SymbolPool::new());
         assert!(ts.contains("import * as __ns_id from \"./id/index.js\";"));
         assert!(!ts.contains("export * as id from \"./id/index.js\";"));
         assert!(ts.contains(
-            "export const id = Object.assign(defineFunction(\"factory.id\", \"sync\", []) as ($opts?: { $ctx?: BamlCallContext | undefined } | undefined) => Resource, __ns_id);"
+            "export const id = Object.assign(defineFunction(\"factory.id\", \"async\", []) as ($opts?: { $baml?: BamlOptions | null | undefined } | undefined) => Promise<Resource>, __ns_id);"
         ));
         assert!(
             ts.contains(
-                "export const id_async = defineFunction(\"factory.id\", \"async\", []) as ($opts?: { $ctx?: BamlCallContext | undefined } | undefined) => Promise<Resource>;"
+                "export const id_sync = defineFunction(\"factory.id\", \"sync\", []) as ($opts?: { $baml?: BamlOptions | null | undefined } | undefined) => Resource;"
             )
         );
+    }
+
+    #[test]
+    fn callable_child_collision_composes_sync_twin_with_namespace() {
+        // `id`'s blocking twin `id_sync` shares its name with an `id_sync`
+        // child namespace: compose them, exactly as for the plain name.
+        let b = body(
+            &["vendor", "factory"],
+            vec![
+                func_sym(
+                    "id",
+                    "factory.id",
+                    SyncAsync::Async,
+                    vec![],
+                    Ty::Class(name("factory", &[], "Resource"), Box::new([])),
+                ),
+                func_sym(
+                    "id_sync",
+                    "factory.id",
+                    SyncAsync::Sync,
+                    vec![],
+                    Ty::Class(name("factory", &[], "Resource"), Box::new([])),
+                ),
+                class_sym("Resource", name("factory", &[], "Resource"), vec![]),
+            ],
+        );
+        let mut kids = BTreeSet::new();
+        kids.insert("id_sync".to_string());
+        let ts = render_index_ts(&b, &kids, false, TEST_RUNTIME_PACKAGE, &SymbolPool::new());
+        assert!(
+            ts.contains("import * as __ns_id_sync from \"./id_sync/index.js\";"),
+            "{ts}"
+        );
+        assert!(!ts.contains("export * as id_sync from"), "{ts}");
+        assert!(ts.contains(
+            "export const id_sync = Object.assign(defineFunction(\"factory.id\", \"sync\", []) as ($opts?: { $baml?: BamlOptions | null | undefined } | undefined) => Resource, __ns_id_sync);"
+        ), "{ts}");
+        assert!(ts.contains(
+            "export const id = defineFunction(\"factory.id\", \"async\", []) as ($opts?: { $baml?: BamlOptions | null | undefined } | undefined) => Promise<Resource>;"
+        ), "{ts}");
     }
 
     #[test]
@@ -1370,7 +1569,7 @@ mod tests {
         );
         let mut kids = BTreeSet::new();
         kids.insert("lorem".to_string());
-        let ts = render_index_ts(&b, &kids, true, TEST_RUNTIME_PACKAGE);
+        let ts = render_index_ts(&b, &kids, true, TEST_RUNTIME_PACKAGE, &SymbolPool::new());
         assert!(
             ts.contains(
                 "initializeRuntimeFromBlob(_inlinedbaml.BYTECODE, _inlinedbaml.BAML_TOML);"
@@ -1379,6 +1578,6 @@ mod tests {
         assert!(ts.contains("setTypeMap(_TYPE_MAP);"));
         assert!(ts.contains("export * as lorem from \"./lorem/index.js\";"));
         assert!(ts.contains("export const make_foo = defineFunction("));
-        assert!(ts.contains("import { defineFunction, initializeRuntimeFromBlob, setTypeMap, type BamlCallContext } from \"@boundaryml/baml-bridge\";"));
+        assert!(ts.contains("import { defineFunction, initializeRuntimeFromBlob, setTypeMap } from \"@boundaryml/baml-bridge\";"));
     }
 }

@@ -72,6 +72,11 @@ defaults:
     shell: bash
 
 env:
+  # Release validation and documentation generation must not record CI traffic.
+  DO_NOT_TRACK: '1'
+  BAML_TELEMETRY: 'off'
+  BAML_WRAPPER_BCS_TELEMETRY: 'off'
+  BOUNDARY_API_KEY: local
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
@@ -80,7 +85,7 @@ env:
   # WorkOS client id for `baml login` (a public identifier, not a secret).
   # Captured by option_env! in baml_cli at build time; the repo variable is
   # configured in Settings -> Actions -> Variables.
-  BAML_WORKOS_CLIENT_ID: ${{ vars.BAML_WORKOS_CLIENT_ID }}
+  BAML_AUTH_CLIENT_ID: ${{ vars.BAML_WORKOS_CLIENT_ID }}
   AWS_ROLE_ARN: arn:aws:iam::277707123528:role/pkg-boundaryml-com-github-release
   PKG_BUCKET: pkgboundarymlcomstack-pkgboundarymlcomsitebucket4f-ybhvygkqittp
 
@@ -271,7 +276,7 @@ jobs:
           wrapper_version="$(python3 - <<'PY'
           import tomllib
           from pathlib import Path
-          print(tomllib.loads(Path("baml_language/crates/baml/Cargo.toml").read_text())["package"]["version"])
+          print(tomllib.loads(Path("baml_language/wrapper/baml.toml").read_text())["package"]["version"])
           PY
           )"
           latest=""
@@ -398,14 +403,29 @@ jobs:
           name: baml-playground-dist
           path: typescript2/app-vscode-webview/dist
 
-  build-wrapper:
-    name: Build toolchain selector
-    needs: [plan]
-    uses: ./.github/workflows/build2-wrapper.reusable.yaml
-    permissions:
-      contents: read
+  # Every channel packs and tests the canonical BAML wrapper before publishing.
+  build-baml-wrapper:
+    name: Pack published BAML wrapper
+    needs: [plan, build-toolchain]
+    uses: ./.github/workflows/build2-baml-wrapper.reusable.yaml
+    secrets:
+      BAML_WRAPPER_BOUNDARY_API_KEY: ${{ secrets.BAML_WRAPPER_BOUNDARY_API_KEY }}
+      BAML_WRAPPER_BCS_PROJECT: ${{ secrets.BAML_WRAPPER_BCS_PROJECT }}
+      BAML_WRAPPER_BCS_ENVIRONMENT: ${{ secrets.BAML_WRAPPER_BCS_ENVIRONMENT }}
     with:
       source_sha: ${{ needs.plan.outputs.source_sha }}
+      wrapper_version: ${{ needs.plan.outputs.wrapper_version }}
+
+  wrapper-tests:
+    name: Wrapper tests
+    needs: [plan, build-baml-wrapper]
+    uses: ./.github/workflows/wrapper-tests.reusable.yaml
+    secrets:
+      BAML_SCCACHE_R2_ACCESS_KEY_ID: ${{ secrets.BAML_SCCACHE_R2_ACCESS_KEY_ID }}
+      BAML_SCCACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BAML_SCCACHE_R2_SECRET_ACCESS_KEY }}
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      release_candidates: true
       wrapper_version: ${{ needs.plan.outputs.wrapper_version }}
 
   build-python-sdk:
@@ -500,7 +520,7 @@ jobs:
   build-swift-sdk:
     name: Build Swift SDK (XCFramework + mirror)
     needs: [plan]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -583,7 +603,8 @@ jobs:
       - plan
       - build-toolchain
       - build-vsix
-      - build-wrapper
+      - build-baml-wrapper
+      - wrapper-tests
       - build-python-sdk
       - build-nodejs-sdk
       - build-web-sdk
@@ -619,8 +640,8 @@ jobs:
           toolchain="$RUNNER_TEMP/toolchain"
           mkdir -p "$toolchain"
           tar -xzf artifacts/toolchain-x86_64-unknown-linux-gnu/*.tar.gz -C "$toolchain"
-          "$toolchain/bin/baml-cli" run --from tools/release-fingerprints check -- \
-            --artifacts "$PWD/artifacts" --commit "$SOURCE_SHA"
+          args=(--artifacts "$PWD/artifacts" --commit "$SOURCE_SHA")
+          "$toolchain/bin/baml-cli" run --project-dir tools/release-fingerprints check -- "${args[@]}"
 
   publish-pypi:
     name: Publish Python PyPI
@@ -1065,9 +1086,8 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
-          pattern: wrapper-*
+          name: wrapper-baml
           path: dist/wrapper
-          merge-multiple: true
       - name: Verify wrapper artifact set
         env:
           WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
@@ -1091,6 +1111,11 @@ jobs:
           set -euo pipefail
           tag="baml-wrapper-$WRAPPER_VERSION"
           if gh release view "$tag" >/dev/null 2>&1; then
+            existing_commit="$(gh api "repos/$GH_REPO/commits/$tag" --jq .sha)"
+            if [[ "$existing_commit" != "$SOURCE_SHA" ]]; then
+              echo "::error::wrapper tag $tag points to $existing_commit, expected $SOURCE_SHA; bump the wrapper version"
+              exit 1
+            fi
             gh release upload "$tag" dist/wrapper/* --clobber
           else
             gh release create "$tag" dist/wrapper/* \
@@ -1488,9 +1513,7 @@ jobs:
       - publish-swift-sdk
       - publish-crates-io
       - publish-homebrew
-      # AUR publishing is temporarily disabled because upstream maintenance
-      # rejects SSH clones and blocks pkg.boundaryml.com manifest promotion.
-      # - publish-aur
+      - publish-aur
     if: ${{ always() && needs.all-builds.result == 'success' && needs.plan.outputs.dry_run == 'false' && needs.plan.outputs.source_branch == 'canary' }}
     runs-on: ubuntu-latest
     steps:
@@ -1509,7 +1532,7 @@ jobs:
           SWIFTPM: ${{ needs.publish-swift-sdk.result }}
           CRATES_IO: ${{ needs.publish-crates-io.result }}
           HOMEBREW: ${{ needs.publish-homebrew.result }}
-          # AUR: ${{ needs.publish-aur.result }}
+          AUR: ${{ needs.publish-aur.result }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
           WRAPPER_CHANGED: ${{ needs.plan.outputs.wrapper_changed }}
         run: |
@@ -1551,11 +1574,11 @@ jobs:
           if [[ "$WRAPPER_CHANGED" == "true" ]]; then
             require_success wrapper-assets "$WRAPPER"
             require_success Homebrew "$HOMEBREW"
-            # require_success AUR "$AUR"
+            require_success AUR "$AUR"
           else
             require_skipped wrapper-assets "$WRAPPER"
             require_skipped Homebrew "$HOMEBREW"
-            # require_skipped AUR "$AUR"
+            require_skipped AUR "$AUR"
           fi
 
   publish-pkg-boundaryml-com:
@@ -1597,9 +1620,8 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
-          pattern: wrapper-*
+          name: wrapper-baml
           path: dist/wrapper
-          merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
           name: baml-vscode-vsix
@@ -1737,7 +1759,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1915,11 +1937,9 @@ jobs:
           export BAML_HOME="$RUNNER_TEMP/developer-docs-baml"
           scripts/install.sh --version "$VERSION" --no-modify-path
           baml_binary="$BAML_HOME/bin/baml"
-          actual_version="$("$baml_binary" --version | sed -n 's/^baml toolchain \([^ ]*\).*/\1/p')"
-          if [[ "$actual_version" != "$VERSION" ]]; then
-            echo "::error::installed BAML toolchain is $actual_version, expected $VERSION"
-            exit 1
-          fi
+          # Printed for the log. populate-generated-content.ts --expect-version
+          # checks it, before publishing anything.
+          "$baml_binary" --version
           echo "BAML_BINARY=$baml_binary" >> "$GITHUB_ENV"
           echo "BAML_HOME=$BAML_HOME" >> "$GITHUB_ENV"
       - name: Validate canonical documentation snippets
@@ -1939,6 +1959,7 @@ jobs:
             --baml-bin "$BAML_BINARY" \
             --source-commit "$SOURCE_SHA" \
             --released-at "$RELEASED_AT" \
+            --expect-version "$VERSION" \
             --organization boundaryml \
             --database developer-docs \
             --branch main \
@@ -1996,7 +2017,7 @@ jobs:
     name: Publish Homebrew wrapper formula
     needs: [plan, all-builds, publish-wrapper-release]
     if: ${{ needs.plan.outputs.wrapper_changed == 'true' && needs.plan.outputs.dry_run == 'false' && needs.plan.outputs.source_branch == 'canary' }}
-    runs-on: macos-14
+    runs-on: macos-15
     environment: infisical-github-baml-language-release
     steps:
       - uses: actions/checkout@v7
@@ -2005,12 +2026,12 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
-          pattern: wrapper-*
+          name: wrapper-baml
           path: dist/wrapper
-          merge-multiple: true
       - name: Generate Homebrew formula
         env:
           SOURCE_SHA256: ${{ needs.publish-wrapper-release.outputs.source_sha256 }}
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source_sha }}
           WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
         run: |
           set -euo pipefail
@@ -2018,6 +2039,7 @@ jobs:
             --wrapper-dir dist/wrapper \
             --version "$WRAPPER_VERSION" \
             --source-sha256 "$SOURCE_SHA256" \
+            --source-commit "$SOURCE_COMMIT" \
             --out package-manager
       - name: Test Homebrew formula
         run: |
@@ -2025,6 +2047,7 @@ jobs:
           brew tap boundaryml/tap
           tap="$(brew --repo boundaryml/tap)"
           cp package-manager/homebrew/Formula/baml.rb "$tap/Formula/baml.rb"
+          brew trust --formula boundaryml/tap/baml
           brew audit --strict boundaryml/tap/baml
           brew install --build-from-source boundaryml/tap/baml
           brew test boundaryml/tap/baml
@@ -2046,63 +2069,107 @@ jobs:
           git commit -m "Update baml wrapper to ${WRAPPER_VERSION}" || exit 0
           git push origin HEAD
 
-  # AUR publishing is temporarily disabled because aur.archlinux.org reports
-  # maintenance and rejects SSH clones. Restore this job and its gate dependency
-  # when AUR is available again.
-  # publish-aur:
-  #   name: Publish AUR wrapper packages
-  #   needs: [plan, all-builds, publish-wrapper-release]
-  #   if: ${{ needs.plan.outputs.wrapper_changed == 'true' && needs.plan.outputs.dry_run == 'false' && needs.plan.outputs.source_branch == 'canary' }}
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v7
-  #       with:
-  #         ref: ${{ needs.plan.outputs.source_sha }}
-  #         persist-credentials: false
-  #     - uses: actions/download-artifact@v8
-  #       with:
-  #         pattern: wrapper-*
-  #         path: dist/wrapper
-  #         merge-multiple: true
-  #     - name: Configure AUR SSH
-  #       env:
-  #         AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-  #       run: |
-  #         set -euo pipefail
-  #         test -n "$AUR_SSH_PRIVATE_KEY"
-  #         mkdir -p ~/.ssh
-  #         printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-  #         chmod 600 ~/.ssh/aur
-  #         ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
-  #         printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
-  #     - name: Generate AUR package files
-  #       env:
-  #         SOURCE_SHA256: ${{ needs.publish-wrapper-release.outputs.source_sha256 }}
-  #         WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
-  #       run: |
-  #         set -euo pipefail
-  #         scripts/baml-package-manager-artifacts \
-  #           --wrapper-dir dist/wrapper \
-  #           --version "$WRAPPER_VERSION" \
-  #           --source-sha256 "$SOURCE_SHA256" \
-  #           --out package-manager
-  #     - name: Push AUR repos
-  #       env:
-  #         WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
-  #       run: |
-  #         set -euo pipefail
-  #         for pkg in baml baml-bin; do
-  #           git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "aur-${pkg}"
-  #           cp "package-manager/aur/${pkg}/PKGBUILD" "aur-${pkg}/PKGBUILD"
-  #           cp "package-manager/aur/${pkg}/.SRCINFO" "aur-${pkg}/.SRCINFO"
-  #           cd "aur-${pkg}"
-  #           git config user.name "boundaryml-release-bot"
-  #           git config user.email "boundaryml-release-bot@users.noreply.github.com"
-  #           git add PKGBUILD .SRCINFO
-  #           git commit -m "Update baml wrapper to ${WRAPPER_VERSION}" || { cd ..; continue; }
-  #           git push origin HEAD
-  #           cd ..
-  #         done
+  publish-aur:
+    name: Publish AUR wrapper packages
+    needs: [plan, all-builds, publish-wrapper-release]
+    if: ${{ needs.plan.outputs.wrapper_changed == 'true' && needs.plan.outputs.dry_run == 'false' && needs.plan.outputs.source_branch == 'canary' }}
+    runs-on: ubuntu-latest
+    environment: infisical-github-baml-language-release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: wrapper-baml
+          path: dist/wrapper
+      - name: Configure AUR SSH
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$AUR_SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Host key from the fingerprints published on https://aur.archlinux.org/
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' >> ~/.ssh/known_hosts
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
+      - name: Generate AUR package files
+        env:
+          SOURCE_SHA256: ${{ needs.publish-wrapper-release.outputs.source_sha256 }}
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source_sha }}
+          WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
+        run: |
+          set -euo pipefail
+          scripts/baml-package-manager-artifacts \
+            --wrapper-dir dist/wrapper \
+            --version "$WRAPPER_VERSION" \
+            --source-sha256 "$SOURCE_SHA256" \
+            --source-commit "$SOURCE_COMMIT" \
+            --out package-manager
+      - name: Push AUR repos
+        env:
+          WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
+        run: |
+          set -euo pipefail
+          for pkg in baml baml-bin; do
+            git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "aur-${pkg}"
+            cp "package-manager/aur/${pkg}/PKGBUILD" "aur-${pkg}/PKGBUILD"
+            cp "package-manager/aur/${pkg}/.SRCINFO" "aur-${pkg}/.SRCINFO"
+            cd "aur-${pkg}"
+            git config user.name "boundaryml-release-bot"
+            git config user.email "boundaryml-release-bot@users.noreply.github.com"
+            git add PKGBUILD .SRCINFO
+            if git diff --cached --quiet; then
+              cd ..
+              continue
+            fi
+            git commit -m "Update baml wrapper to ${WRAPPER_VERSION}"
+            git push origin HEAD
+            cd ..
+          done
+
+  # Not part of release-prerequisites-complete: winget-pkgs is a moderated
+  # third-party repo, so a failed submission is reported via notify-slack
+  # instead of blocking the release.
+  publish-winget:
+    name: Submit winget manifest update
+    needs: [plan, all-builds, publish-wrapper-release]
+    if: ${{ needs.plan.outputs.wrapper_changed == 'true' && needs.plan.outputs.dry_run == 'false' && needs.plan.outputs.source_branch == 'canary' }}
+    runs-on: ubuntu-latest
+    environment: infisical-github-baml-language-release
+    env:
+      KOMAC_VERSION: 2.16.0
+    steps:
+      - name: Install komac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="komac-${KOMAC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          gh release download "v${KOMAC_VERSION}" --repo russellbanks/Komac \
+            --pattern "$archive" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"
+          grep " \*${archive}\$" SHA256SUMS | sed 's/ \*/  /' | sha256sum --check --strict
+          mkdir -p komac
+          tar -xzf "$archive" -C komac
+          echo "$RUNNER_TEMP/komac" >> "$GITHUB_PATH"
+      - name: Submit BoundaryML.BAML update
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_AUTOMATION_TOKEN }}
+          WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
+        run: |
+          set -euo pipefail
+          test -n "$GITHUB_TOKEN"
+          base="https://github.com/BoundaryML/baml/releases/download/baml-wrapper-${WRAPPER_VERSION}"
+          komac update BoundaryML.BAML \
+            --version "$WRAPPER_VERSION" \
+            --urls \
+              "${base}/baml-wrapper-no-self-update-${WRAPPER_VERSION}-x86_64-pc-windows-msvc.zip" \
+              "${base}/baml-wrapper-no-self-update-${WRAPPER_VERSION}-aarch64-pc-windows-msvc.zip" \
+            --submit
 
   dry-run-artifacts:
     name: Generate dry-run manifests and package files
@@ -2129,9 +2196,8 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
-          pattern: wrapper-*
+          name: wrapper-baml
           path: dist/wrapper
-          merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
           name: baml-vscode-vsix
@@ -2146,6 +2212,7 @@ jobs:
           path: dist/swift
       - name: Generate dry-run files
         env:
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source_sha }}
           WRAPPER_CHANGED: ${{ needs.plan.outputs.wrapper_changed }}
           CRATES_IO_VERSION: ${{ needs.plan.outputs.crates_io_version }}
           NUGET_VERSION: ${{ needs.plan.outputs.nuget_version }}
@@ -2200,11 +2267,13 @@ jobs:
           scripts/baml-package-manager-artifacts \
             --wrapper-dir dist/wrapper \
             --version "$WRAPPER_VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
             --out dry-run/package-manager
       - uses: actions/upload-artifact@v7
         with:
           name: dry-run-release-files
           path: dry-run
+          include-hidden-files: true # AUR metadata is named .SRCINFO.
       - uses: aws-actions/configure-aws-credentials@v6
         if: ${{ needs.plan.outputs.source_branch == 'canary' }}
         with:
@@ -2219,9 +2288,130 @@ jobs:
             --content-type application/json \
             --cache-control "public, max-age=300"
 
+  dry-run-homebrew:
+    name: Verify Homebrew dry-run package
+    needs: [plan, all-builds, dry-run-artifacts]
+    if: ${{ needs.plan.outputs.dry_run == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: wrapper-baml
+          path: dist/wrapper
+      - uses: actions/download-artifact@v8
+        with:
+          name: dry-run-release-files
+          path: dry-run
+      - name: Install, test, and check linkage of the real package
+        run: |
+          python3 scripts/baml-test-homebrew-package \
+            --formula dry-run/package-manager/homebrew/Formula/baml.rb \
+            --wrapper-dir dist/wrapper
+
+  dry-run-aur:
+    name: Verify Arch dry-run package
+    needs: [plan, all-builds, dry-run-artifacts]
+    if: ${{ needs.plan.outputs.dry_run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: archlinux:base-devel
+    steps:
+      - name: Install package verification tools
+        run: pacman --disable-sandbox -Syu --noconfirm git python
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: wrapper-baml
+          path: dist/wrapper
+      - uses: actions/download-artifact@v8
+        with:
+          name: dry-run-release-files
+          path: dry-run
+      - name: Build, install, and verify the real Arch package
+        env:
+          WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
+        run: |
+          python scripts/baml-test-aur-package \
+            --package-dir dry-run/package-manager/aur \
+            --wrapper-dir dist/wrapper \
+            --version "$WRAPPER_VERSION"
+
+  dry-run-developer-docs:
+    name: Generate developer documentation (dry run)
+    # publish-developer-docs runs only after publishing, so without this a dry
+    # run never exercises it; 0.25.1 first failed there. This runs the same
+    # snippet validation and content generation against this run's own wrapper
+    # and toolchain, and writes nothing.
+    needs: [plan, all-builds]
+    if: ${{ needs.plan.outputs.dry_run == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node2
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain-x86_64-unknown-linux-gnu
+          path: dist/toolchain
+      - uses: actions/download-artifact@v8
+        with:
+          name: wrapper-baml
+          path: dist/wrapper
+      - name: Install this run's wrapper and toolchain
+        env:
+          WRAPPER_VERSION: ${{ needs.plan.outputs.wrapper_version }}
+        run: |
+          set -euo pipefail
+          baml_home="$RUNNER_TEMP/developer-docs-baml"
+          toolchain="$RUNNER_TEMP/developer-docs-toolchain"
+          mkdir -p "$baml_home" "$toolchain"
+          tar -xzf "dist/wrapper/baml-wrapper-$WRAPPER_VERSION-x86_64-unknown-linux-gnu.tar.gz" -C "$baml_home"
+          tar -xzf dist/toolchain/*.tar.gz -C "$toolchain"
+          # A path selector runs this exact baml-cli; nothing is downloaded.
+          export BAML_HOME="$baml_home" BAML_TOOLCHAIN="$toolchain/bin/baml-cli"
+          "$baml_home/bin/baml" --version
+          {
+            echo "BAML_BINARY=$baml_home/bin/baml"
+            echo "BAML_HOME=$BAML_HOME"
+            echo "BAML_TOOLCHAIN=$BAML_TOOLCHAIN"
+            echo "BAML_TELEMETRY=off"
+          } >> "$GITHUB_ENV"
+      - name: Validate canonical documentation snippets
+        working-directory: typescript2/app-developer-docs
+        run: pnpm exec tsx scripts/validate-snippets.ts
+      - name: Generate the documentation release without publishing
+        working-directory: typescript2/app-developer-docs
+        env:
+          RELEASED_AT: ${{ needs.plan.outputs.released_at }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          pnpm exec tsx scripts/populate-generated-content.ts \
+            --baml-bin "$BAML_BINARY" \
+            --source-commit "$SOURCE_SHA" \
+            --released-at "$RELEASED_AT" \
+            --expect-version "$VERSION" \
+            --organization boundaryml \
+            --database developer-docs \
+            --branch main \
+            --dry-run
+
   dry-run-summary:
     name: Dry-run summary
-    needs: [plan, all-builds, dry-run-artifacts]
+    needs: [plan, all-builds, dry-run-artifacts, dry-run-homebrew, dry-run-aur, dry-run-developer-docs]
     if: ${{ needs.plan.outputs.dry_run == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -2236,7 +2426,7 @@ jobs:
             echo
             echo 'Validation example:'
             echo '```bash'
-            echo "BAML_HOME=\"\$(mktemp -d)\" BAML_MANIFEST_BASE_URL=\"$base\" baml toolchain use ${{ needs.plan.outputs.channel }}"
+            echo "BAML_HOME=\"\$(mktemp -d)\" BAML_MANIFEST_BASE_URL=\"$base\" baml toolchain use --global ${{ needs.plan.outputs.channel }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -2261,7 +2451,6 @@ jobs:
       - build-matrix
       - build-toolchain
       - build-vsix
-      - build-wrapper
       - build-python-sdk
       - build-nodejs-sdk
       - build-java-sdk
@@ -2283,8 +2472,8 @@ jobs:
       - publish-pkg-boundaryml-com
       - smoke-go-release
       - publish-homebrew
-      # AUR is temporarily absent from the release graph during maintenance.
-      # - publish-aur
+      - publish-aur
+      - publish-winget
       - dry-run-artifacts
       - dry-run-summary
       - build-swift-sdk

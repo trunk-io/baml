@@ -7,14 +7,15 @@
 //! announcement's context.
 use std::collections::BTreeMap;
 
-use btel_reader::{
-    cas::{CasOutcome, CasStore},
-    context::{ContextReference, reference},
-    discovery::FileStamp,
-    value::{Nav, Root, Segment, navigate},
+use btel_core::{
+    cas::CasId,
+    reader::{
+        context::{self, ContextReference, reference},
+        discovery::FileStamp,
+        store::{CasStore, CasUnavailable},
+    },
+    recording::v2::{self as proto, span_event::Event},
 };
-use btel_recorder::proto::{self, span_event::Event};
-use btel_snapshot::{DecodedObject, DecodedRoot, DecodedValue, SnapshotId};
 use rusqlite::{Connection, Transaction, params};
 
 use crate::Error;
@@ -117,12 +118,14 @@ fn resolve_with(
     cas: &CasStore,
     options: &super::RefreshOptions,
     facts_changed: bool,
-    mut load: impl FnMut(SnapshotId) -> btel_reader::cas::CasLoad,
+    mut load: impl FnMut(CasId) -> btel_core::reader::store::CasLoad,
 ) -> Result<(), Error> {
     if facts_changed {
         conn.execute(
             "DELETE FROM context_snapshot WHERE NOT EXISTS
-             (SELECT 1 FROM event_context WHERE event_context.cas = context_snapshot.cas)",
+             (SELECT 1 FROM event_context WHERE event_context.cas = context_snapshot.cas)
+             AND NOT EXISTS
+             (SELECT 1 FROM recording WHERE recording.initial_context_cas = context_snapshot.cas)",
             [],
         )?;
     }
@@ -151,7 +154,7 @@ fn resolve_with(
         let mut bytes = 0u64;
         for (id, failed_stamp) in pending {
             after = id.to_vec();
-            let snapshot_id = SnapshotId::from_bytes(id);
+            let snapshot_id = CasId::from_bytes(id);
             let stamp = std::fs::metadata(cas.path(snapshot_id))
                 .ok()
                 .map(|metadata| fingerprint(FileStamp::of(&metadata)));
@@ -160,18 +163,20 @@ fn resolve_with(
             }
             let loaded = load(snapshot_id);
             bytes = bytes.saturating_add(loaded.bytes_read);
-            let (state, identity, failed_stamp) = match loaded.outcome {
-                CasOutcome::Available(snapshot) => {
-                    let identity = identity(&snapshot);
+            let (state, identity, failed_stamp) = match loaded.snapshot {
+                Ok(snapshot) => {
+                    let identity = context::identity(cas, &snapshot);
                     (
                         if identity.is_ok() { 1 } else { 2 },
-                        identity.ok().flatten().map(str::to_owned),
+                        identity.ok().flatten(),
                         None,
                     )
                 }
-                CasOutcome::Corrupt(_) | CasOutcome::TooLarge { .. } => (0, None, stamp),
+                Err(CasUnavailable::Corrupt(_) | CasUnavailable::TooLarge { .. }) => {
+                    (0, None, stamp)
+                }
                 // Missing and transiently unreadable files remain retryable.
-                CasOutcome::Missing | CasOutcome::Unreadable(_) => (0, None, None),
+                Err(CasUnavailable::Missing | CasUnavailable::Unreadable(_)) => (0, None, None),
             };
             hydrated.push((id, state, identity, failed_stamp));
             if bytes >= options.batch_bytes {
@@ -204,50 +209,9 @@ fn fingerprint(stamp: FileStamp) -> Vec<u8> {
     .concat()
 }
 
-fn identity(snapshot: &btel_snapshot::DecodedSnapshot) -> Result<Option<&str>, ()> {
-    let DecodedRoot::Value(DecodedValue::Object(root)) = snapshot.root else {
-        return Err(());
-    };
-    if !matches!(snapshot.object(root), DecodedObject::Map { .. }) {
-        return Err(());
-    }
-    let Nav::Value(DecodedValue::Object(metadata)) = navigate(
-        snapshot,
-        Root::Value,
-        None,
-        &[Segment::Key("metadata".into())],
-    ) else {
-        return Err(());
-    };
-    let DecodedObject::Map { entries, .. } = snapshot.object(*metadata) else {
-        return Err(());
-    };
-    if !entries.iter().all(|(_, value)| {
-        matches!(
-            value,
-            DecodedValue::String(_)
-                | DecodedValue::Int(_)
-                | DecodedValue::Float(_)
-                | DecodedValue::Bool(_)
-        )
-    }) {
-        return Err(());
-    }
-    match navigate(
-        snapshot,
-        Root::Value,
-        None,
-        &[Segment::Key("distinct_id".into())],
-    ) {
-        Nav::Value(DecodedValue::String(value)) => Ok(Some(value.as_ref())),
-        Nav::Value(DecodedValue::Null) => Ok(None),
-        _ => Err(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use btel_reader::cas::CasLimits;
+    use btel_core::reader::store::CasLimits;
     use btel_snapshot::{Limits, SnapshotPool};
     use btel_types::context::{Context, ContextPatch};
 
@@ -255,10 +219,13 @@ mod tests {
 
     #[test]
     fn unchanged_failed_blobs_are_skipped_and_repairs_recover() {
-        let pool = SnapshotPool::new(1, Limits::default());
+        let pool = SnapshotPool::unbounded(Limits::default());
         let snapshot = btel_snapshot::context::capture(&Context::default(), &pool).unwrap();
         let mut valid = Vec::new();
-        snapshot.write_blob(&mut valid).unwrap();
+        snapshot
+            .root_blob()
+            .write(&mut btel_snapshot::BlobScratch::default(), &mut valid)
+            .unwrap();
         for (oversized, remove) in [(false, false), (true, false), (false, true), (true, true)] {
             let directory = tempfile::tempdir().unwrap();
             let cas = CasStore::new(
@@ -268,7 +235,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let path = cas.path(snapshot.id());
+            let path = cas.path(snapshot.root_id());
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let invalid = vec![0; if oversized { valid.len() + 1 } else { 1 }];
             std::fs::write(&path, invalid).unwrap();
@@ -276,7 +243,7 @@ mod tests {
             conn.execute_batch(crate::schema::DDL).unwrap();
             conn.execute(
                 "INSERT INTO context_snapshot (cas) VALUES (?1)",
-                [snapshot.id().as_bytes()],
+                [snapshot.root_id().as_bytes()],
             )
             .unwrap();
             let options = super::super::RefreshOptions::default();
@@ -317,7 +284,7 @@ mod tests {
     fn bounded_groups_do_not_omit_pending_identities() {
         let directory = tempfile::tempdir().unwrap();
         let cas = CasStore::new(directory.path().to_owned(), CasLimits::default());
-        let pool = SnapshotPool::new(1, Limits::default());
+        let pool = SnapshotPool::unbounded(Limits::default());
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::schema::DDL).unwrap();
         for i in 0..5 {
@@ -326,14 +293,18 @@ mod tests {
                 ..Default::default()
             });
             let snapshot = btel_snapshot::context::capture(&context, &pool).unwrap();
-            let path = cas.path(snapshot.id());
+            let path = cas.path(snapshot.root_id());
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             snapshot
-                .write_blob(&mut std::fs::File::create(path).unwrap())
+                .root_blob()
+                .write(
+                    &mut btel_snapshot::BlobScratch::default(),
+                    &mut std::fs::File::create(path).unwrap(),
+                )
                 .unwrap();
             conn.execute(
                 "INSERT INTO context_snapshot (cas) VALUES (?1)",
-                [snapshot.id().as_bytes()],
+                [snapshot.root_id().as_bytes()],
             )
             .unwrap();
         }

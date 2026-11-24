@@ -15,7 +15,22 @@ interface Runner {
 class RunResult<Out> {
     value: Out,
     journal: Journal,
-    usage: root.events.Usage,
+    // The usage of every model call the run made, summed per model.
+    usage: root.events.ModelUsage[],
+}
+
+/// (internal) How far `on_event` has read a journal: the count of entries it was
+/// given. One count for a run, so each event is delivered one time.
+class _Delivered {
+    count: int,
+}
+
+/// (internal) A turn `Agent._attempt_turn` accepted. When parsing its terminal
+/// text is what accepted it, `text_output` holds that parse, so `Agent.run`
+/// does not parse the same text a second time.
+class _AcceptedTurn {
+    turn: ModelTurn,
+    text_output: ParsedOutput?,
 }
 
 /// The default runner. A spec-mode LLM function's direct call runs
@@ -26,6 +41,13 @@ class RunResult<Out> {
 /// The class itself is not generic: none of its configuration involves the
 /// output type. `Out` lives on `run`, where it is inferred from the spec
 /// argument, so no call site needs to name it.
+///
+/// `on_event` gets every event of the run's journal, in journal order, one
+/// time each. A run that ends with an error has delivered everything it
+/// recorded before the error leaves `run`: the reply that did not parse (and
+/// every repair attempt before it), the turn the model cut short, the refusal,
+/// the tool failure. No event stands for the failure itself: a good run ends
+/// with `FinalProduced`, a failed one with the error.
 class Agent {
     max_steps: int,
     // Total model invocations allowed for one schema candidate. The default
@@ -45,7 +67,7 @@ class Agent {
         if (schema_attempts < 1) {
             throw baml.errors.InvalidArgument {
                 message: "Agent schema_attempts must be at least 1",
-            }
+            };
         }
         Agent {
             max_steps: max_steps,
@@ -60,7 +82,7 @@ class Agent {
         if (self.schema_attempts < 1) {
             throw baml.errors.InvalidArgument {
                 message: "Agent schema_attempts must be at least 1",
-            }
+            };
         }
         self.schema_attempts
     }
@@ -77,9 +99,12 @@ class Agent {
             let t: root.tools.Tool => {
                 let outcome: string? = t.call(call.args) catch_all (e) {
                     _ => {
-                        j.append_all(
-                            [root.events.ToolFailed { id: call.id, message: e.to_string() }],
-                        );
+                        j.append_all([
+                            root.events.ToolFailed {
+                                id: call.id,
+                                message: e.to_string(),
+                            },
+                        ]);
                         // the per-tool setting wins; null inherits the run's mode
                         if ((t.on_error ?? self.tool_errors) == root.tools.ErrorMode.Raise) {
                             let classified = match (e) {
@@ -91,7 +116,7 @@ class Agent {
                                 name: call.name,
                                 message: e.to_string(),
                                 cause: classified,
-                            }
+                            };
                         } else {
                             null
                         }
@@ -103,14 +128,12 @@ class Agent {
                 null
             },
             null => {
-                j.append_all(
-                    [
-                        root.events.ToolFailed {
-                            id: call.id,
-                            message: `tool is not in the active toolbox: ${call.name}`,
-                        },
-                    ],
-                );
+                j.append_all([
+                    root.events.ToolFailed {
+                        id: call.id,
+                        message: `tool is not in the active toolbox: ${call.name}`,
+                    },
+                ]);
                 null
             },
         }
@@ -129,7 +152,10 @@ class Agent {
         if (form == "mixed" || form == "mixedlist") {
             return root.internal._media_mixed_parts(turn).length() > 0;
         }
-        root.internal._media_of_kind(turn, shape.split(":").at(1) ?? "").length() > 0
+        root.internal
+            ._media_of_kind(turn, shape.split(":").at(1) ?? "")
+            .length()
+            > 0
     }
 
     /// (internal) Build a media-shaped `Out` from the turn's content blocks. Only called
@@ -160,7 +186,7 @@ class Agent {
                     throw root.errors.ParseFailed {
                         provider: provider,
                         raw_output: `Expected one text or image output for ${t.to_string()}, got ${items.length()} parts. Use (image | string)[] to preserve mixed outputs.`,
-                    }
+                    };
                 }
             },
             "list" => {
@@ -179,7 +205,7 @@ class Agent {
                         } else {
                             `Expected zero or one ${kind} output for ${t.to_string()}, got ${parts.length()}. Use ${kind}[] for multiple outputs.`
                         },
-                    }
+                    };
                 }
                 let only: baml.json.json = null;
                 for (let p in parts) {
@@ -188,17 +214,20 @@ class Agent {
                 only
             },
         };
-        baml.json.from_json<Out>(payload) catch_all (e) {
+        baml.json.to<Out>(payload) catch_all (e) {
             _ => {
                 throw root.errors.ParseFailed {
                     provider: provider,
                     raw_output: `the ${kind} output did not fit ${t.to_string()}: ${e.to_string()}`,
-                }
+                };
             },
         }
     }
 
-    function _parses<Out>(self, turn: ModelTurn, candidate: string) -> bool {
+    /// (internal) Whether the turn answers with an `Out` without parsing its
+    /// text: the provider-decoded output decides, or the turn's media does.
+    /// `null` when only parsing the terminal text can tell.
+    function _fits_without_text<Out>(self, turn: ModelTurn) -> bool? {
         if let parsed: ParsedOutput = turn.parsed_output {
             return match (parsed.value) {
                 let value: Out => true,
@@ -216,12 +245,18 @@ class Agent {
         if (self._has_media_output<Out>(turn)) {
             return true;
         }
-        let _ = baml.sap.parse<Out>(candidate) catch_all (e) {
+        null
+    }
+
+    /// (internal) The terminal text parsed into an `Out`, or `null` when it does
+    /// not parse.
+    function _parse_text<Out>(self, candidate: string) -> ParsedOutput? {
+        let value = baml.sap.parse<Out>(candidate) catch_all (e) {
             _ => {
-                return false;
+                return null;
             },
         };
-        true
+        ParsedOutput { value: value }
     }
 
     /// (internal) One accepted model turn, with the within-turn repair loop: when a
@@ -235,86 +270,99 @@ class Agent {
         c: Client,
         spec: FunctionSpec<Out>,
         j: Journal,
-        total: root.events.Usage,
+        total: root.events.ModelUsage[],
         attempts_left: int,
-    ) -> ModelTurn {
-        let turn = c.invoke(
-            ModelTurnInput {
-                prompt: spec.prompt_template,
-                journal: j,
-                toolbox: spec.tools(),
-                output_type: spec.output_type(),
-            },
-        );
-        if let u: root.events.Usage = turn.usage {
-            total.input_tokens += u.input_tokens;
-            total.output_tokens += u.output_tokens;
-            if let ci: int = u.cached_input_tokens {
-                total.cached_input_tokens = (total.cached_input_tokens ?? 0) + ci;
-            }
-            if let rt: int = u.reasoning_tokens {
-                total.reasoning_tokens = (total.reasoning_tokens ?? 0) + rt;
-            }
-            if let cw: int = u.cache_write_input_tokens {
-                total.cache_write_input_tokens = (total.cache_write_input_tokens ?? 0) + cw;
-            }
-            if let ui: int = u.uncached_input_tokens {
-                total.uncached_input_tokens = (total.uncached_input_tokens ?? 0) + ui;
-            }
-        }
+    ) -> _AcceptedTurn {
+        let turn = c.invoke(ModelTurnInput {
+            prompt: spec.prompt_template,
+            journal: j,
+            toolbox: spec.tools(),
+            output_type: spec.output_type(),
+        });
+        let calls = turn.all_calls();
+        root.events.merge_usage(total, root.events.call_usage(calls));
+        let provider = turn.resolved_model?.provider ?? "unknown";
         // every attempt commits: the journal is the complete record
-        let batch: root.events.Event[] = [root.events.AssistantMessage { content: turn.content, client_id: c.id() }];
-        // wire records ride the journal: failed legs first, selected last
-        for (let call in turn.calls) {
+        let batch: root.events.Event[] = [
+            root.events.AssistantMessage {
+                content: turn.content,
+                resolved_model: turn.resolved_model,
+                requested_model: turn.requested_model,
+            },
+        ];
+        // wire records ride the journal, oldest first
+        for (let call in calls) {
             batch.push(call);
         }
         for (let u in turn.tool_uses()) {
-            batch.push(root.events.ToolRequested { id: u.id, name: u.name, args: u.args });
-        }
-        if let u: root.events.Usage = turn.usage {
-            batch.push(u);
+            batch.push(root.events.ToolRequested {
+                id: u.id,
+                name: u.name,
+                args: u.args,
+            });
         }
         let candidate = turn.terminal_text() ?? "";
-        let accepted = turn.tool_uses().length() > 0
-            || turn.stop_reason == root.content.StopReason.MaxTokens
-            || turn.stop_reason == root.content.StopReason.Refused
-            || self._parses<Out>(turn, candidate);
+        let text_output: ParsedOutput? = null;
+        let accepted = if (
+            turn.tool_uses().length() > 0
+                || turn.stop_reason == root.content.StopReason.MaxTokens
+                || turn.stop_reason == root.content.StopReason.Refused
+        ) {
+            true
+        } else {
+            match (self._fits_without_text<Out>(turn)) {
+                let fits: bool => fits,
+                null => {
+                    text_output = self._parse_text<Out>(candidate);
+                    text_output != null
+                },
+            }
+        };
         if (accepted) {
             j.append_all(batch);
             // terminal wire outcomes are thrown here, with the turn on the record
             match (turn.stop_reason) {
                 root.content.StopReason.MaxTokens => {
                     throw root.errors.FinishReasonError {
-                        provider: c.id(),
+                        provider: provider,
                         finish_reason: turn.stop_reason,
                         raw_output: candidate,
-                    }
+                    };
                 },
                 root.content.StopReason.Refused => {
-                    throw root.errors.Refused { provider: c.id(), reason: "the model declined to answer", raw_body: null }
+                    throw root.errors.Refused {
+                        provider: provider,
+                        reason: "the model declined to answer",
+                        raw_body: null,
+                    };
                 },
                 _ => null,
             };
-            turn
+            _AcceptedTurn {
+                turn: turn,
+                text_output: text_output,
+            }
         } else if (attempts_left > 1) {
-            batch.push(
-                root.events.UserMessage.new(
-                    "The reply did not match the required schema. Answer again with only the corrected value.",
-                ),
-            );
+            batch.push(root.events.UserMessage.new(
+                "The reply did not match the required schema. Answer again with only the corrected value.",
+            ));
             j.append_all(batch);
             self._attempt_turn<Out>(c, spec, j, total, attempts_left - 1)
         } else {
             j.append_all(batch);
-            throw root.errors.ParseFailed { provider: c.id(), raw_output: candidate }
+            throw root.errors.ParseFailed {
+                provider: provider,
+                raw_output: candidate,
+            };
         }
     }
 
-    /// (internal) Emit any events appended since `seen` to on_event; returns the new count.
-    function _emit_from(self, j: Journal, seen: int) -> int {
+    /// (internal) Give `on_event` the events appended since the last delivery, in
+    /// journal order.
+    function _deliver(self, j: Journal, delivered: _Delivered) -> void {
         let entries = j.entries();
         if let cb: (root.events.Event) -> void throws never = self.on_event {
-            let i = seen;
+            let i = delivered.count;
             while (i < entries.length()) {
                 if let e: root.events.Event = entries.at(i) {
                     cb(e);
@@ -322,7 +370,111 @@ class Agent {
                 i = i + 1;
             }
         }
-        entries.length()
+        delivered.count = entries.length();
+    }
+
+    /// (internal) The loop of `run`: turns, tool calls and the final value. It
+    /// delivers events as it goes; an error it throws can leave events on the
+    /// record that it did not deliver, and `run` delivers those.
+    function _run_steps<Out>(
+        self,
+        selected: Client,
+        spec: FunctionSpec<Out>,
+        j: Journal,
+        delivered: _Delivered,
+        schema_attempts: int,
+    ) -> RunResult<Out> {
+        let steps = 0;
+        let total: root.events.ModelUsage[] = [];
+        // the futility breaker: identical repeated failures stop the run
+        let fail_counts: map<string, int> = {};
+        while (steps < self.max_steps) {
+            // Repair re-asks happen inside the step and share this total
+            // schema-attempt budget.
+            let accepted = self._attempt_turn<Out>(selected, spec, j, total, schema_attempts);
+            let turn = accepted.turn;
+            steps = steps + 1;
+            self._deliver(j, delivered);
+            let calls = turn.tool_uses();
+            if (calls.length() > 0) {
+                let before = j.entries().length();
+                // execute concurrently; each call appends its correlated result
+                let futures = calls.map((call) -> {
+                    spawn {
+                        self._run_one_tool(spec.tools(), call, j)
+                    }
+                });
+                let _ = await baml.future.all(futures);
+                self._deliver(j, delivered);
+                // Reporting a failure lets the model adapt; repeating the
+                // IDENTICAL failing call is futile, and each step can be
+                // expensive. Three identical failures end the run.
+                let entries = j.entries();
+                let i = before;
+                while (i < entries.length()) {
+                    if let f: root.events.ToolFailed = entries.at(i) {
+                        let failed_call =
+                            calls.find((one: root.content.ToolUse) -> { one.id == f.id });
+                        if let known: root.content.ToolUse = failed_call {
+                            let key = `${known.name}|${f.message}`;
+                            let n = (fail_counts.get(key) ?? 0) + 1;
+                            let _ = fail_counts.set(key, n);
+                            if (n >= 3) {
+                                throw root.errors.ToolFailedError {
+                                    id: known.id,
+                                    name: known.name,
+                                    message: `the same tool call failed ${n} times; stopping the run: ${f.message}`,
+                                    cause: null,
+                                };
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+            } else {
+                let candidate = turn.terminal_text() ?? "";
+                // `_attempt_turn` accepted this turn for exactly one of three
+                // reasons: the provider decoded the output, the terminal text
+                // parsed (it kept that value), or the turn carries the media
+                // a media-shaped Out is built from. A media Out the turn
+                // produced no media for went through the text parse, which is
+                // how absence is expressed (`_fits_without_text`).
+                let provider = turn.resolved_model?.provider ?? "unknown";
+                let value = if let parsed: ParsedOutput = turn.parsed_output
+                    ?? accepted.text_output
+                {
+                    let typed: Out = parsed.value else {
+                        throw root.errors.ParseFailed {
+                            provider: provider,
+                            raw_output: candidate,
+                        };
+                    };
+                    typed
+                } else {
+                    self._media_value<Out>(turn, provider)
+                };
+                let value_json = baml.json.stringify(value) catch_all (e) {
+                    _ => {
+                        throw baml.errors.UnknownError.with_message<never>(
+                            e,
+                            "final value serialization failed",
+                        );
+                    },
+                };
+                j.append_all([
+                    root.events.FinalProduced {
+                        value_json: value_json,
+                    },
+                ]);
+                self._deliver(j, delivered);
+                return RunResult {
+                    value: value,
+                    journal: j,
+                    usage: total,
+                };
+            }
+        }
+        throw root.errors.StepBudgetExceeded { steps: steps };
     }
 
     implements Runner {
@@ -335,110 +487,62 @@ class Agent {
             | reflect.errors.CompilationError
             | root.errors.Failure;
 
+        //baml:trace_passthrough
         function run<Out>(self, spec: FunctionSpec<Out>) -> RunResult<Out> {
-            let schema_attempts = self._validated_schema_attempts();
             let selected = self.client ?? spec.default_client;
-            let j = Journal.new(spec);
-            let seen = self._emit_from(j, 0);
-            let steps = 0;
-            let total = root.events.Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_input_tokens: null,
-                reasoning_tokens: null,
-                cache_write_input_tokens: null,
-                uncached_input_tokens: null,
-            };
-            // the futility breaker: identical repeated failures stop the run
-            let fail_counts: map<string, int> = {};
-            while (steps < self.max_steps) {
-                // Repair re-asks happen inside the step and share this total
-                // schema-attempt budget.
-                let turn = self._attempt_turn<Out>(selected, spec, j, total, schema_attempts);
-                steps = steps + 1;
-                seen = self._emit_from(j, seen);
-                let calls = turn.tool_uses();
-                if (calls.length() > 0) {
-                    let before = j.entries().length();
-                    // execute concurrently; each call appends its correlated result
-                    let futures = calls.map((call) -> {
-                        spawn { self._run_one_tool(spec.tools(), call, j) }
-                    });
-                    let _ = await baml.future.all(futures) catch_all (e) {
-                        _ => {
-                            // A Raise-mode tool failure: its ToolFailed event is
-                            // already on the record; deliver it before the error
-                            // propagates so listeners never miss journal events.
-                            seen = self._emit_from(j, seen);
-                            throw e
-                        },
-                    };
-                    seen = self._emit_from(j, seen);
-                    // Reporting a failure lets the model adapt; repeating the
-                    // IDENTICAL failing call is futile, and each step can be
-                    // expensive. Three identical failures end the run.
-                    let entries = j.entries();
-                    let i = before;
-                    while (i < entries.length()) {
-                        if let f: root.events.ToolFailed = entries.at(i) {
-                            let failed_call = calls.find((one: root.content.ToolUse) -> {
-                                one.id == f.id
-                            });
-                            if let known: root.content.ToolUse = failed_call {
-                                let key = `${known.name}|${f.message}`;
-                                let n = (fail_counts.get(key) ?? 0) + 1;
-                                let _ = fail_counts.set(key, n);
-                                if (n >= 3) {
-                                    throw root.errors.ToolFailedError {
-                                            id: known.id,
-                                            name: known.name,
-                                            message: `the same tool call failed ${n} times; stopping the run: ${f.message}`,
-                                            cause: null,
-                                        }
-                                }
-                            }
-                        }
-                        i = i + 1;
-                    }
-                } else {
-                    let candidate = turn.terminal_text() ?? "";
-                    // A media-shaped Out comes from the turn's media blocks;
-                    // everything else, including a media Out the turn produced
-                    // no media for, goes through the ordinary text parse. That
-                    // second branch is REACHABLE for a media Out and is how
-                    // absence is expressed: SAP answers `null` for `image?` /
-                    // `image[]?` and `[]` for `image[]`, and only a required
-                    // `image` fails there (`_parses` agrees, by construction).
-                    let value = if let parsed: ParsedOutput = turn.parsed_output {
-                        let typed: Out = parsed.value else {
-                            throw root.errors.ParseFailed { provider: selected.id(), raw_output: candidate }
-                        };
-                        typed
-                    } else if (self._has_media_output<Out>(turn)) {
-                        self._media_value<Out>(turn, selected.id())
-                    } else {
-                        baml.sap.parse<Out>(candidate) catch_all (e) {
-                            _ => {
-                                throw root.errors.ParseFailed { provider: selected.id(), raw_output: candidate }
-                            },
-                        }
-                    };
-                    let value_json = baml.json.to_json(value) catch_all (e) {
-                        _ => {
-                            throw baml.errors.UnknownError.with_message<never>(
-                                    e,
-                                    "final value serialization failed",
-                                )
-                        },
-                    };
-                    j.append_all(
-                        [root.events.FinalProduced { value_json: baml.json.stringify(value_json) }],
-                    );
-                    seen = self._emit_from(j, seen);
-                    return RunResult { value: value, journal: j, usage: total };
-                }
+            let inputs: map<string, unknown> = {};
+            let arguments = spec.arguments();
+            for (let key in arguments.keys()) {
+                inputs[key] = arguments[key];
             }
-            throw root.errors.StepBudgetExceeded { steps: steps }
+            inputs["client"] = selected;
+            inputs["on_event"] = self.on_event;
+            let span = trace._create_span(
+                spec.target(),
+                inputs = inputs,
+                config = trace._passthrough(),
+            ) catch_all (e) {
+                _ => {
+                    throw baml.errors.UnknownError.with_message<never>(
+                        e,
+                        "could not start agent span",
+                    );
+                },
+            };
+            span.run(() -> {
+                let schema_attempts = self._validated_schema_attempts();
+                let j = Journal.new(spec);
+                let delivered = _Delivered { count: 0 };
+                self._deliver(j, delivered);
+                let result = self
+                    ._run_steps<Out>(selected, spec, j, delivered, schema_attempts) catch_all (e) {
+                        _ => {
+                            // A turn is on the record before it is judged, so the turn
+                            // that ends the run with an error is in the journal: the
+                            // reply that did not parse and the repair attempts before
+                            // it, the cut-short turn, the refusal, the failed tool.
+                            // Every error passes here, and the listener gets what the
+                            // journal holds before the error propagates.
+                            self._deliver(j, delivered);
+                            throw e;
+                        },
+                    };
+                span.finish(result.value);
+                result
+            }) catch_all_panics (e, context) {
+                let e: trace.SpanError => {
+                    let error = baml.errors.UnknownError.with_message<never>(
+                        e,
+                        "could not enter agent span",
+                    );
+                    span.fail_with_context(error, context);
+                    throw error;
+                },
+                _ => {
+                    span.fail_with_context(e, context);
+                    throw e;
+                },
+            }
         }
     }
 }

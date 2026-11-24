@@ -193,7 +193,7 @@ fn wildcards_expand_so_values_render() {
         "{}",
         t.sql
     );
-    assert_eq!(t.columns.iter().filter(|c| c.value).count(), 7);
+    assert_eq!(t.columns.iter().filter(|c| c.value).count(), 8);
     let t = ok(
         "SELECT p.*, c.output_value FROM processes p JOIN spans c ON c.process_id = p.process_id",
     );
@@ -383,7 +383,14 @@ fn value_inspection_functions_take_values() {
         t.sql
     );
     assert!(t.sql.contains("__btel_kind(output_value)"), "{}", t.sql);
+    let t = ok("SELECT baml_code(type_args['T']) FROM spans");
+    assert!(
+        t.sql.contains("__btel_code(__btel_nav(type_args, 'T'))"),
+        "{}",
+        t.sql
+    );
     assert!(fails("SELECT baml_kind(span_name) FROM spans").contains("takes a BAML value"));
+    assert!(fails("SELECT baml_code(span_name) FROM spans").contains("takes a BAML value"));
     assert!(
         fails("SELECT baml_value_state(input_args, output_value) FROM spans")
             .contains("one BAML value")
@@ -517,4 +524,42 @@ fn recursive_ctes_walk_span_trees_with_values() {
     );
     // A non-recursive CTE in a WITH RECURSIVE clause translates as usual.
     ok("WITH RECURSIVE x AS (SELECT span_id FROM spans) SELECT * FROM x");
+}
+
+#[test]
+fn dotted_slot_numbers_navigate_as_bracket_indices() {
+    for (dotted, bracketed) in [
+        ("output_value.0", "output_value[0]"),
+        ("output_value.0.1", "output_value[0][1]"),
+        ("output_value.10.2.0", "output_value[10][2][0]"),
+        ("output_value[0].1", "output_value[0][1]"),
+        ("output_value.0['name']", "output_value[0]['name']"),
+        ("output_value['pair'].1", "output_value['pair'][1]"),
+        ("c.input_args.0.1", "c.input_args[0][1]"),
+        ("output_value.7", "output_value[7]"),
+    ] {
+        let from = |path: &str| {
+            ok(&format!(
+                "SELECT {path} AS v FROM spans c WHERE {path} = 1 AND {path} IS NOT NULL"
+            ))
+            .sql
+        };
+        assert_eq!(from(dotted), from(bracketed), "{dotted}");
+    }
+    let t = ok("SELECT output_value.0.1 AS v FROM spans");
+    assert!(
+        t.sql.contains("__btel_nav(output_value, 0, 1)"),
+        "{}",
+        t.sql
+    );
+}
+
+#[test]
+fn numbers_and_strings_are_not_slot_numbers() {
+    let t = ok("SELECT output_value AS v FROM spans WHERE 0.1 < 1 AND span_name <> 'a.0'");
+    assert!(t.sql.contains("0.1"), "{}", t.sql);
+    assert!(t.sql.contains("'a.0'"), "{}", t.sql);
+    assert!(!t.sql.contains("__btel_nav"), "{}", t.sql);
+    assert!(fails("SELECT output_value.01 FROM spans").contains("syntax"));
+    assert!(fails("SELECT output_value.1e0 FROM spans").contains("syntax"));
 }

@@ -27,7 +27,7 @@ impl Recording {
         let id = [tag; 16];
         let dir = project
             .join(".baml/btel/recordings")
-            .join(btel_reader::discovery::hex(&id));
+            .join(btel_core::reader::discovery::hex(&id));
         std::fs::create_dir_all(&dir).unwrap();
         Self { dir, id }
     }
@@ -49,7 +49,7 @@ impl Recording {
     }
 }
 
-/// `btel_settings::encoding::FORMAT_MAJOR`.
+/// `btel_core::recording::FORMAT_MAJOR`.
 const FORMAT_MAJOR: u32 = 2;
 
 fn epoch() -> proto::ClockEpochDefinition {
@@ -143,11 +143,12 @@ fn spans(events: Vec<Event>) -> proto::SpanBatch {
 
 fn announce(inputs: Option<[u8; 16]>) -> Event {
     Event::FunctionAnnouncement(proto::FunctionAnnouncement {
+        manual: false,
         id: CALL,
         parent_id: THREAD,
         call_path_id: PATH,
         entered_at_ticks: 1000,
-        inputs_cas_id: inputs.map(|b| proto::SnapshotId {
+        inputs_cas_id: inputs.map(|b| proto::CasId {
             low: u64::from_le_bytes(b[..8].try_into().unwrap()),
             high: u64::from_le_bytes(b[8..].try_into().unwrap()),
         }),
@@ -210,7 +211,9 @@ fn internal(index: &Index, sql: &str) -> Vec<Vec<Json>> {
                         rusqlite::types::Value::Integer(n) => json!(n),
                         rusqlite::types::Value::Real(f) => json!(f),
                         rusqlite::types::Value::Text(t) => json!(t),
-                        rusqlite::types::Value::Blob(b) => json!(btel_reader::discovery::hex(&b)),
+                        rusqlite::types::Value::Blob(b) => {
+                            json!(btel_core::reader::discovery::hex(&b))
+                        }
                     })
                 })
                 .collect()
@@ -681,7 +684,7 @@ fn crash(project: &Path, fault: &str) {
             "1",
         ])
         .env("RECOVERY_CHILD_PROJECT", project)
-        .env("BAML_QUERY_FAULT", fault)
+        .env("DEV_BAML_QUERY_FAULT", fault)
         .status()
         .unwrap();
     assert!(!status.success(), "the child must crash at {fault}");

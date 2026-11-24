@@ -9,37 +9,47 @@
 //! - [`new`] — compile source files and return `Arc<dyn Bex>`.
 use std::{collections::HashMap, sync::Arc};
 
-pub use baml_builtins2::{MediaContent, MediaValue, PromptAst, PromptAstSimple};
 pub use bex::{Bex, BexRunResult};
 // The engine type itself, and the compiled program it is built from, for
 // hosts that manage engine lifecycles (the LSP server's and the browser's
 // playground runtimes): the blessed seam stays this crate rather than a
 // direct `bex_engine`/`bex_vm_types` dependency.
 pub use bex_engine::BexCallResult;
+#[cfg(not(target_arch = "wasm32"))]
+pub use bex_engine::HostCapture;
 #[cfg(target_arch = "wasm32")]
 pub use bex_engine::configure_workerd_runtime;
 pub use bex_engine::{
     BexEngine, CANCELLED_PANIC_CLASS, EngineError, FunctionCallContext, FunctionCallContextBuilder,
-    InboundUnionAmbiguityPolicy, UnhandledSpawnError, UnhandledSpawnErrorHandler,
+    InheritedInvocationState, InvocationCapture, UnhandledSpawnError, UnhandledSpawnErrorHandler,
     is_cancelled_engine_error,
     logger::{TraceLogDrainReport, TraceLogMetadata, TraceLogger},
-    register_inbound_union_ambiguity_policy,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use bex_engine::{
+    CallbackHostInvocation, HostCallSite, HostDefinition, HostInvocation, capture_callback_inputs,
 };
 pub use bex_external_types::{
-    BexExternalAdt, BexExternalValue, DynWitnessDef, Handle, HostReleaseFn, HostReturnTypeError,
-    HostValueArc, HostValueKind, MediaKind, PortableClassDef, PortableClassFieldDef,
-    PortableEnumDef, PortableEnumVariantDef, PortableMetadata, PortableTypeDef, RuntimeTy,
-    TaggedHeapHandleKind, TypeDefRef, WeakHeapRef, host_release_dispatch, js_number_to_i64,
-    runtime_ty_structurally_equal, selected_arm_equal, try_convert_rust_data, validate_host_return,
+    AnnotationTy, BexExternalAdt, BexExternalValue, Bounded, CancelTokenCapability,
+    ConcreteMediaKind, Handle, HostCallCompletion, HostException, HostKey, HostOutcome,
+    HostReleaseFn, HostValueArc, HostValueKind, MediaKind, RuntimeTy, TaggedHeapHandleKind,
+    TraceControl, WeakHeapRef, WireFunctionParamTy, WireHead, WireTy, host_release_dispatch,
+    runtime_ty_structurally_equal, selected_arm_equal,
 };
-pub use bex_vm_types::{HeapPtr, Program};
+pub use bex_vm_types::{
+    BexRustData, HeapPtr, MediaContent, MediaValue, Meter, Program, PromptAst, PromptAstSimple,
+    RetainedBytes, RustDataArc, RustPayload, TestRustData,
+    trace::{HostMarker, ReservedSpanData, TraceOptionsData},
+};
 use indexmap::IndexMap;
 pub use sys_ops::SysOps;
 pub use sys_types::{CallId, CancellationToken};
 use thiserror::Error;
 
 mod bex;
+pub mod build;
 mod fs;
+pub mod hotswap_fingerprint;
 mod precompiled_stdlib;
 mod precompiled_stdlib_config;
 mod runtime_compile;
@@ -112,7 +122,8 @@ pub fn is_cancelled_runtime_error(err: &RuntimeError) -> bool {
 /// Compile a BAML project from in-memory sources and initialize a runtime.
 ///
 /// `files` are the project's `.baml` sources keyed by the path the host
-/// spelled (relative to `root_path` or absolute); the embedded stdlib is
+/// spelled (relative to `root_path` or absolute), optionally including the root
+/// `baml.toml` for shared package metadata; the embedded stdlib is
 /// compiled from source alongside them. Compile errors surface as
 /// [`RuntimeError::Compilation`] listing every diagnostic.
 ///
@@ -142,12 +153,43 @@ pub fn new(
 pub struct PreparedRuntime {
     program: Program,
     sys_ops: SysOps,
+    artifact_telemetry: Option<btel_settings::artifact::ArtifactTelemetry>,
 }
 
 impl PreparedRuntime {
+    #[must_use]
+    pub fn with_artifact_telemetry(
+        mut self,
+        policy: btel_settings::artifact::ArtifactTelemetry,
+    ) -> Self {
+        self.artifact_telemetry = Some(policy);
+        self
+    }
+
     pub fn build(self) -> Result<Arc<BexEngine>, RuntimeError> {
+        if let Some(policy) = self.artifact_telemetry {
+            #[cfg(not(target_arch = "wasm32"))]
+            let recording = bex_engine::TelemetryRecording::from_artifact(&policy)?
+                .with_host("bridge")
+                .preferring_cwd_project();
+            let config = bex_engine::EngineConfig {
+                runtime_compiler: Some(runtime_compiler()),
+                artifact_telemetry: Some(policy),
+                #[cfg(not(target_arch = "wasm32"))]
+                recording: Some(recording),
+                ..Default::default()
+            };
+            return Ok(Arc::new(BexEngine::new_with_config(
+                self.program,
+                Arc::new(self.sys_ops),
+                Vec::new(),
+                config,
+            )?));
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(recording) = bex_engine::TelemetryRecording::from_boundary_env() {
+        if let Some(recording) = bex_engine::TelemetryRecording::from_boundary_env()
+            .map(bex_engine::TelemetryRecording::preferring_cwd_project)
+        {
             let engine = BexEngine::new_with_telemetry_recording(
                 self.program,
                 Arc::new(self.sys_ops),
@@ -175,6 +217,32 @@ pub fn prepare(
     sys_ops: SysOps,
     files: std::collections::HashMap<crate::fs::FsPath, String>,
 ) -> Result<PreparedRuntime, RuntimeError> {
+    let manifest_path =
+        root_path
+            .join("baml.toml")
+            .map_err(|error| RuntimeError::InvalidArgument {
+                name: format!("root path: {error}"),
+            })?;
+    let is_manifest = |path: &crate::fs::FsPath| {
+        let relative = path.as_path().strip_prefix(".").unwrap_or(path.as_path());
+        relative == std::path::Path::new("baml.toml")
+            || path.as_path() == std::path::Path::new(manifest_path.as_str())
+    };
+    let mut manifests = files.iter().filter(|(path, _)| is_manifest(path));
+    let manifest = manifests.next();
+    if manifests.next().is_some() {
+        return Err(RuntimeError::InvalidArgument {
+            name: "baml.toml supplied with both relative and absolute paths".to_owned(),
+        });
+    }
+    let claim = manifest
+        .map(|(_, text)| baml_db::manifest::parse(text))
+        .transpose()
+        .map_err(|error| RuntimeError::InvalidArgument {
+            name: format!("baml.toml: {error}"),
+        })?
+        .map(|manifest| baml_db::manifest::claimed_identity(&manifest))
+        .unwrap_or_default();
     let mut db = baml_db::ProjectDatabase::new();
     db.ensure_stdlib_sources();
     let root = db
@@ -183,18 +251,17 @@ pub fn prepare(
             baml_base::SourceRootKind::Workspace,
         ))
         .unwrap_or_else(|e| unreachable!("fresh database accepts one workspace root: {e}"));
+    db.set_claimed_identity(root, claim);
     db.add_or_update_files_in(
         root,
         files
             .iter()
+            .filter(|(path, _)| !is_manifest(path))
             .map(|(path, text)| (path.as_path(), text.as_str())),
     );
 
-    let diagnostics = baml_db::collect_diagnostics(&db);
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == baml_compiler_diagnostics::Severity::Error)
-    {
+    let diagnostics = baml_db::ProjectDiagnostics::collect(&db);
+    let world = baml_db::CheckedWorld::check(&diagnostics, root).map_err(|refused| {
         let source_files = baml_compiler2_hir::compiler2_all_files(&db);
         let sources = source_files
             .iter()
@@ -204,21 +271,26 @@ pub fn prepare(
             .iter()
             .map(|file| (file.file_id(&db), file.path(&db)))
             .collect();
-        let message = baml_compiler_diagnostics::render::render_diagnostics(
-            &diagnostics,
-            &sources,
-            &file_paths,
-            &baml_compiler_diagnostics::render::RenderConfig::agent(),
-        );
-        return Err(RuntimeError::Compilation { message });
-    }
-    let program = db
-        .get_bytecode_unchecked(root)
+        RuntimeError::Compilation {
+            message: baml_compiler_diagnostics::render::render_diagnostics(
+                refused.errors(),
+                &sources,
+                &file_paths,
+                &baml_compiler_diagnostics::render::RenderConfig::agent(),
+            ),
+        }
+    })?;
+    let program = world
+        .compile(baml_compiler2_emit::OptLevel::Two)
         .map_err(|e| RuntimeError::Compilation {
             message: e.to_string(),
         })?;
 
-    Ok(PreparedRuntime { program, sys_ops })
+    Ok(PreparedRuntime {
+        program,
+        sys_ops,
+        artifact_telemetry: None,
+    })
 }
 
 /// Initialize a runtime from a versioned BAML program artifact rather than
@@ -233,6 +305,7 @@ pub fn new_from_bytecode(bytecode: &[u8], sys_ops: SysOps) -> Result<Arc<dyn Bex
 }
 
 /// Validate and decode a program artifact without executing package initializers.
+/// Runtime telemetry settings apply unless the caller attaches an artifact policy.
 pub fn prepare_from_bytecode(
     bytecode: &[u8],
     sys_ops: SysOps,
@@ -243,7 +316,11 @@ pub fn prepare_from_bytecode(
                 message: format!("Failed to deserialize BAML bytecode: {e}"),
             }
         })?;
-    Ok(PreparedRuntime { program, sys_ops })
+    Ok(PreparedRuntime {
+        program,
+        sys_ops,
+        artifact_telemetry: None,
+    })
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -251,6 +328,133 @@ mod bytecode_artifact_tests {
     use sys_native::SysOpsExt as _;
 
     use super::*;
+
+    #[test]
+    fn source_runtime_reads_the_shared_root_manifest() {
+        let root = vfs::VfsPath::new(vfs::MemoryFS::new())
+            .join("project")
+            .unwrap();
+        for path in ["baml.toml", "./baml.toml", "/project/baml.toml"] {
+            let mut files = HashMap::from([
+                (
+                    FsPath::from_str("main.baml".to_owned()),
+                    "function main() -> int { 7 }".to_owned(),
+                ),
+                (
+                    FsPath::from_str(path.to_owned()),
+                    "[package]\nname = 'app'\nversion = '  1.2.3-beta.4+build.5  '".to_owned(),
+                ),
+            ]);
+            let prepared = prepare(root.clone(), sys_ops::SysOps::native(), files.clone()).unwrap();
+            assert_eq!(
+                prepared.program.packages[prepared.program.root as usize]
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .claimed
+                    .version
+                    .as_deref(),
+                Some("1.2.3-beta.4+build.5")
+            );
+            files
+                .get_mut(&FsPath::from_str(path.to_owned()))
+                .unwrap()
+                .push_str("invalid");
+            assert!(matches!(
+                prepare(root.clone(), sys_ops::SysOps::native(), files),
+                Err(RuntimeError::InvalidArgument { .. })
+            ));
+        }
+        for path in ["./baml.toml", "/project/baml.toml"] {
+            let files = HashMap::from([
+                (FsPath::from_str("baml.toml".to_owned()), String::new()),
+                (FsPath::from_str(path.to_owned()), String::new()),
+            ]);
+            assert!(matches!(
+                prepare(root.clone(), sys_ops::SysOps::native(), files),
+                Err(RuntimeError::InvalidArgument { .. })
+            ));
+        }
+        let prepared = prepare(
+            vfs::VfsPath::new(vfs::MemoryFS::new()),
+            sys_ops::SysOps::native(),
+            HashMap::from([
+                (
+                    FsPath::from_str("/main.baml".to_owned()),
+                    "function main() -> int { 7 }".to_owned(),
+                ),
+                (
+                    FsPath::from_str("/baml.toml".to_owned()),
+                    "[package]\nversion = '4.5.6'".to_owned(),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.program.packages[prepared.program.root as usize]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .claimed
+                .version
+                .as_deref(),
+            Some("4.5.6")
+        );
+    }
+
+    #[test]
+    fn bytecode_without_artifact_policy_uses_source_runtime_defaults() {
+        const CHILD: &str = "BAML_BYTECODE_POLICY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "bytecode_artifact_tests::bytecode_without_artifact_policy_uses_source_runtime_defaults", "--nocapture"])
+                .current_dir(home.path())
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .env("BAML_HOME", home.path())
+                .env("BAML_TELEMETRY", "off")
+                .env("BOUNDARY_API_KEY", "local")
+                .env("BOUNDARY_API_URL", "not a URL")
+                .env_remove("BOUNDARY_PROJECT")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let source = prepare(
+            vfs::VfsPath::new(vfs::MemoryFS::new()),
+            sys_ops::SysOps::native(),
+            HashMap::from([(
+                FsPath::from_str("/p/a.baml".to_string()),
+                "function main() -> int { 7 }".to_string(),
+            )]),
+        )
+        .unwrap();
+        let bytecode =
+            baml_artifact::encode(baml_artifact::ArtifactKind::Program, &source.program).unwrap();
+        // Both paths honor the caller's explicit telemetry-off setting.
+        for engine in [
+            source.build().unwrap(),
+            prepare_from_bytecode(&bytecode, sys_ops::SysOps::native())
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            assert_eq!(engine.telemetry_recording_id(), None);
+        }
+        // Legacy unbound policies also honor the standard off-only veto.
+        let artifact = prepare_from_bytecode(&bytecode, sys_ops::SysOps::native())
+            .unwrap()
+            .with_artifact_telemetry(btel_settings::artifact::ArtifactTelemetry::default())
+            .build()
+            .unwrap();
+        assert_eq!(artifact.telemetry_recording_id(), None);
+    }
 
     #[test]
     fn preparation_defers_package_execution_but_eager_constructors_do_not() {

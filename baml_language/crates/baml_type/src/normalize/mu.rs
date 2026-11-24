@@ -97,8 +97,9 @@ pub(super) fn canonicalize_mu<H: Head, C: TypeContext<H>>(
     term: NormalTy<H>,
     ctx: &C,
 ) -> NormalTy<H> {
+    let specials = Specials::new();
     let out = Builder::default()
-        .build(&term)
+        .build(&term, &specials)
         .epsilon_close()
         .minimize_and_absorb(ctx)
         .read_back();
@@ -113,8 +114,9 @@ pub(super) fn canonicalize_mu_with_render<H: Head, C: TypeContext<H>>(
     term: NormalTy<H>,
     ctx: &C,
 ) -> (NormalTy<H>, Ty<H>) {
+    let specials = Specials::new();
     let minimal = Builder::default()
-        .build(&term)
+        .build(&term, &specials)
         .epsilon_close()
         .minimize_and_absorb(ctx);
     if let (Some(t), Some(r)) = (minimal.read_back(), minimal.render_root()) {
@@ -196,6 +198,7 @@ enum Node {
     Map(StateId, StateId),
     Future(StateId, StateId),
     Union(Vec<StateId>),
+    Tuple(Vec<StateId>),
     Function {
         params: Vec<(Option<StrId>, FunctionParamMode, StateId)>,
         ret: StateId,
@@ -216,33 +219,31 @@ struct State {
     names: BTreeSet<NameId>,
 }
 
-/// The special leaves, pre-interned by [`Automaton::new`] so the hot
+/// The special leaves, interned first by [`Automaton::new`] so the hot
 /// special-case probes are id compares.
 ///
-/// Functions wrapping an inline `const` block, not `const` items: a `const` item
-/// cannot name an enclosing generic parameter, and `&SOME_CONST` of a generic
-/// type will not promote to `'static` either — rustc cannot prove
-/// `NormalTy` is drop-free for an arbitrary `H`. An inline `const` block
-/// *does* inherit the generics and *does* promote, which is what lets these stay
-/// `'static` and keeps [`Interner`] borrowing rather than cloning.
-fn never<H: Head>() -> &'static NormalTy<H> {
-    &const { NormalTy::Never }
+/// Owned by the entry point that runs the automaton and borrowed for the
+/// automaton's whole life, exactly like the term being canonicalized: the
+/// [`Interner`] borrows rather than clones, and nothing here asks a head to be
+/// `'static` (the runtime's head is branded by the heap epoch it was read in).
+struct Specials<H: Head> {
+    never: NormalTy<H>,
+    unknown_top: NormalTy<H>,
+    bool_leaf: NormalTy<H>,
+    lit_true: NormalTy<H>,
+    lit_false: NormalTy<H>,
 }
 
-fn unknown_top<H: Head>() -> &'static NormalTy<H> {
-    &const { NormalTy::Unknown }
-}
-
-fn bool_leaf<H: Head>() -> &'static NormalTy<H> {
-    &const { NormalTy::Bool }
-}
-
-fn lit_true<H: Head>() -> &'static NormalTy<H> {
-    &const { NormalTy::Literal(crate::Literal::Bool(true)) }
-}
-
-fn lit_false<H: Head>() -> &'static NormalTy<H> {
-    &const { NormalTy::Literal(crate::Literal::Bool(false)) }
+impl<H: Head> Specials<H> {
+    fn new() -> Self {
+        Self {
+            never: NormalTy::Never,
+            unknown_top: NormalTy::Unknown,
+            bool_leaf: NormalTy::Bool,
+            lit_true: NormalTy::Literal(crate::Literal::Bool(true)),
+            lit_false: NormalTy::Literal(crate::Literal::Bool(false)),
+        }
+    }
 }
 
 struct Automaton<'a, H: Head> {
@@ -262,13 +263,13 @@ struct Automaton<'a, H: Head> {
 }
 
 impl<'a, H: Head> Automaton<'a, H> {
-    fn new() -> Self {
+    fn new(specials: &'a Specials<H>) -> Self {
         let mut leaves = Interner::default();
-        let never = LeafId(leaves.intern(never()));
-        let unknown_top = LeafId(leaves.intern(unknown_top()));
-        let bool_leaf = LeafId(leaves.intern(bool_leaf()));
-        let lit_true = LeafId(leaves.intern(lit_true()));
-        let lit_false = LeafId(leaves.intern(lit_false()));
+        let never = LeafId(leaves.intern(&specials.never));
+        let unknown_top = LeafId(leaves.intern(&specials.unknown_top));
+        let bool_leaf = LeafId(leaves.intern(&specials.bool_leaf));
+        let lit_true = LeafId(leaves.intern(&specials.lit_true));
+        let lit_false = LeafId(leaves.intern(&specials.lit_false));
         Self {
             states: Vec::new(),
             redirect: Vec::new(),
@@ -361,7 +362,7 @@ fn children(node: &Node) -> Vec<StateId> {
             .collect(),
         Node::List(inner) => vec![*inner],
         Node::Map(k, v) | Node::Future(k, v) => vec![*k, *v],
-        Node::Union(members) => members.clone(),
+        Node::Union(members) | Node::Tuple(members) => members.clone(),
         Node::Function {
             params,
             ret,
@@ -389,8 +390,12 @@ struct Builder {
 }
 
 impl Builder {
-    fn build<'a, H: Head>(mut self, term: &'a NormalTy<H>) -> Built<'a, H> {
-        let mut auto = Automaton::new();
+    fn build<'a, H: Head>(
+        mut self,
+        term: &'a NormalTy<H>,
+        specials: &'a Specials<H>,
+    ) -> Built<'a, H> {
+        let mut auto = Automaton::new(specials);
         let root = self.intern_term(&mut auto, term);
         debug_assert!(self.binders.is_empty());
         Built { auto, root }
@@ -472,6 +477,10 @@ impl Builder {
                 let members = members.iter().map(|m| self.intern_term(auto, m)).collect();
                 auto.alloc(Node::Union(members))
             }
+            NormalTy::Tuple(elements) => {
+                let elements = elements.iter().map(|e| self.intern_term(auto, e)).collect();
+                auto.alloc(Node::Tuple(elements))
+            }
             NormalTy::Function {
                 params,
                 ret,
@@ -509,7 +518,23 @@ impl Builder {
                     member,
                 })
             }
-            leaf => {
+            leaf @ (NormalTy::Int
+            | NormalTy::Bigint
+            | NormalTy::Float
+            | NormalTy::String
+            | NormalTy::Bool
+            | NormalTy::Null
+            | NormalTy::Uint8Array
+            | NormalTy::Media(_)
+            | NormalTy::Type
+            | NormalTy::Resource
+            | NormalTy::PromptAst
+            | NormalTy::Literal(_)
+            | NormalTy::TypeVar(_)
+            | NormalTy::OpaqueAlias(_)
+            | NormalTy::Never
+            | NormalTy::Unknown
+            | NormalTy::Error) => {
                 let id = LeafId(auto.leaves.intern(leaf));
                 auto.alloc(Node::Leaf(id))
             }
@@ -816,6 +841,7 @@ enum LocalKey {
     Map,
     Future,
     Union,
+    Tuple(usize),
     Function(Vec<(Option<StrId>, FunctionParamMode)>),
     Projection(StrId),
 }
@@ -833,6 +859,7 @@ fn local_key<H: Head>(auto: &Automaton<'_, H>, s: StateId) -> LocalKey {
         Node::Map(..) => LocalKey::Map,
         Node::Future(..) => LocalKey::Future,
         Node::Union(_) => LocalKey::Union,
+        Node::Tuple(elements) => LocalKey::Tuple(elements.len()),
         Node::Function { params, .. } => LocalKey::Function(
             params
                 .iter()
@@ -1054,6 +1081,7 @@ enum RbShape {
     Map(Box<Rb>, Box<Rb>),
     Future(Box<Rb>, Box<Rb>),
     Union(Vec<Rb>),
+    Tuple(Vec<Rb>),
     Function {
         params: Vec<(Option<StrId>, FunctionParamMode, Rb)>,
         ret: Box<Rb>,
@@ -1189,6 +1217,13 @@ fn expand<H: Head>(
                 .map(|m| child(auto, m, path, &mut refs))
                 .collect(),
         ),
+        Node::Tuple(elements) => RbShape::Tuple(
+            elements
+                .clone()
+                .into_iter()
+                .map(|e| child(auto, e, path, &mut refs))
+                .collect(),
+        ),
         Node::Function {
             params,
             ret,
@@ -1313,6 +1348,12 @@ fn convert<H: Head>(
                 RbShape::Future(v, e) => NormalTy::Future(
                     Box::new(convert(auto, v, binders, displays, rec)),
                     Box::new(convert(auto, e, binders, displays, rec)),
+                ),
+                RbShape::Tuple(elements) => NormalTy::Tuple(
+                    elements
+                        .iter()
+                        .map(|e| convert(auto, e, binders, displays, rec))
+                        .collect(),
                 ),
                 RbShape::Union(members) => {
                     let mut converted: Vec<(NormalTy<H>, StateId)> = members
@@ -1666,6 +1707,14 @@ impl<'x, 'a, H: Head> Renderer<'x, 'a, H> {
                     Box::new(self.render(v, path)?),
                     Box::new(self.render(e, path)?),
                 )
+            }
+            Node::Tuple(elements) => {
+                let elements = elements.clone();
+                let mut out = Vec::with_capacity(elements.len());
+                for e in elements {
+                    out.push(self.render(e, path)?);
+                }
+                Ty::Tuple(out.into())
             }
             Node::Union(_) => {
                 // Cyclic unnamed unions fold their covered members to alias

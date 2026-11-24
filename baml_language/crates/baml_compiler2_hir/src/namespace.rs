@@ -18,8 +18,60 @@ use crate::contributions::{Contribution, Definition};
 /// Interned namespace identity — the package (its root) + path within it.
 #[salsa::interned]
 pub struct NamespaceId<'db> {
+    #[returns(clone)]
     pub package: SourceRoot,
+    #[returns(clone)]
     pub path: Vec<Name>,
+}
+
+/// The name of every item the files of `namespace_id` declare, read off
+/// their ASTs — a layer below the semantic index, so the index builder may
+/// ask while it runs. Sorted, for [`namespace_declares`].
+#[salsa::tracked(returns(ref))]
+pub fn namespace_item_names<'db>(
+    db: &'db dyn crate::Db,
+    namespace_id: NamespaceId<'db>,
+) -> Vec<Name> {
+    let package = namespace_id.package(db);
+    let ns_path = namespace_id.path(db);
+    let mut names: Vec<Name> = package
+        .files(db)
+        .iter()
+        .copied()
+        .filter(|file| crate::file_package::file_package(db, *file).namespace_path == ns_path)
+        .flat_map(|file| crate::file_ast(db, file).items.iter().filter_map(item_name))
+        .collect();
+    names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    names.dedup();
+    names
+}
+
+/// The name an item declares, if it declares one (an `implements` block
+/// declares none).
+fn item_name(item: &baml_compiler2_ast::Item) -> Option<Name> {
+    use baml_compiler2_ast::Item;
+    match item {
+        Item::Function(f) => Some(f.name.clone()),
+        Item::Class(c) => Some(c.name.clone()),
+        Item::Enum(e) => Some(e.name.clone()),
+        Item::TypeAlias(ta) => Some(ta.name.clone()),
+        Item::Let(l) => Some(l.name.clone()),
+        Item::Interface(i) => Some(i.name.clone()),
+        Item::ImplementsFor(_) => None,
+    }
+}
+
+/// Whether the namespace `namespace` of `package` declares an item named
+/// `name`, in either the type or the value namespace.
+pub fn namespace_declares(
+    db: &dyn crate::Db,
+    package: SourceRoot,
+    namespace: &[Name],
+    name: &Name,
+) -> bool {
+    namespace_item_names(db, NamespaceId::new(db, package, namespace.to_vec()))
+        .binary_search_by(|candidate| candidate.as_str().cmp(name.as_str()))
+        .is_ok()
 }
 
 /// One entry in a namespace conflict — the definition + its name span.
@@ -124,34 +176,12 @@ impl<'db> NamespaceItems<'db> {
     }
 }
 
-// ── salsa::Update impl ────────────────────────────────────────────────────────
+// ── Salsa retention safety ────────────────────────────────────────────────
 
-/// # Safety
-///
-/// `NamespaceItems<'db>` contains `Definition<'db>` (Salsa interned types
-/// with a database-tied lifetime). This impl allows it to be stored and
-/// returned by `#[salsa::tracked(returns(ref))]` queries.
-///
-/// `maybe_update` uses `PartialEq` to determine whether the value changed,
-/// providing proper Salsa early-cutoff for downstream queries.
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[allow(unsafe_code)]
-unsafe impl salsa::Update for NamespaceItems<'_> {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        // SAFETY: `old_pointer` is valid, aligned, and Salsa-owned.
-        #[allow(unsafe_code)]
-        let old = unsafe { &*old_pointer };
-        if old == &new_value {
-            false
-        } else {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            true
-        }
-    }
-}
+unsafe impl salsa::SalsaValue for NamespaceItems<'_> {}
 
 /// Merges `file_symbol_contributions` for all files within a namespace.
 ///

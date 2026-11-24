@@ -11,7 +11,7 @@ use std::ffi::{c_char, c_void};
 
 use crate::{
     SdkError,
-    loader::{self, LoaderError, log},
+    loader::{self, LoaderError},
 };
 
 /// The engine's result-delivery callback. `content` is borrowed only for
@@ -25,9 +25,11 @@ pub(crate) type CallbackFn = extern "C" fn(call_id: u32, content: *const c_char,
 pub(crate) type HostDispatchFn =
     extern "C" fn(host_value_key: u64, call_id: u32, args: *const u8, length: usize);
 
-/// The engine's host-value release callback: the engine dropped its last
-/// reference to a host-owned value.
-pub(crate) type HostReleaseFn = extern "C" fn(host_value_key: u64);
+/// The engine's host-value release callback: the engine gives back `count`
+/// of the references it holds to the host value `host_value_key`.
+pub(crate) type HostReleaseFn = extern "C" fn(host_value_key: u64, count: u64);
+pub(crate) type HostDispatchV2 = extern "C" fn(*const u8, usize);
+pub(crate) type HostCancelFn = extern "C" fn(u32);
 
 /// Owned byte buffer returned by the engine. Must be released exactly once
 /// with [`Api::free_buffer`]. Layout-identical to `bridge_cffi::Buffer`.
@@ -50,17 +52,29 @@ pub(crate) struct Api {
         unsafe extern "C" fn(*const u8, usize, *const c_char) -> Buffer,
     pub(crate) register_callback: unsafe extern "C" fn(CallbackFn),
     pub(crate) new_function_call: unsafe extern "C" fn() -> u64,
+    pub(crate) cancel_function_call: unsafe extern "C" fn(u64) -> i32,
     pub(crate) call_function: unsafe extern "C" fn(*const u8, usize, u32),
     pub(crate) handle_clone: unsafe extern "C" fn(u64, *mut u64) -> u32,
     pub(crate) handle_release: unsafe extern "C" fn(u64) -> u32,
     pub(crate) free_buffer: unsafe extern "C" fn(Buffer),
-    pub(crate) register_host_dispatch_callback: unsafe extern "C" fn(HostDispatchFn),
+    /// Finalize the host's BAML lifetime: waits for in-flight calls and
+    /// spawned work, finishes telemetry delivery and releases the
+    /// process-wide runtime. Blocks the calling thread (the engine runs the
+    /// work on a fresh thread). Returns a status buffer like
+    /// `initialize_runtime_from_blob`.
+    pub(crate) shutdown_runtime: unsafe extern "C" fn() -> Buffer,
+    pub(crate) register_host_dispatch_v2: unsafe extern "C" fn(HostDispatchV2),
+    pub(crate) register_host_cancel_callback: unsafe extern "C" fn(HostCancelFn),
+    pub(crate) trace_selection: unsafe extern "C" fn(u64, u64, *mut Buffer, *mut u64) -> u32,
+    pub(crate) invocation_context: unsafe extern "C" fn(u64, *mut Buffer) -> u32,
+    pub(crate) invocation_clock_ns: unsafe extern "C" fn(u64, *mut u64) -> u32,
+    pub(crate) release_function_call: unsafe extern "C" fn(u64) -> i32,
     pub(crate) register_host_release_callback: unsafe extern "C" fn(HostReleaseFn),
-    /// Complete one outstanding BAML→host call. `is_error` is 0 or 1;
-    /// `content` is a protobuf `InboundValue`, borrowed only for the call.
-    /// An empty (`length == 0`) error payload is the bridge-failure signal:
-    /// the engine surfaces it as an SDK panic instead of a catchable throw.
-    pub(crate) complete_host_call: unsafe extern "C" fn(u32, i32, *const c_char, usize),
+    /// Complete one outstanding BAML→host call. `content` is a protobuf
+    /// `HostCallCompletion`, borrowed only for the call: the callable's result
+    /// or thrown value encoded against its declared types, an exception of the
+    /// host's own, a broken contract, or a bridge failure.
+    pub(crate) complete_host_call: unsafe extern "C" fn(u32, *const c_char, usize),
 }
 
 impl Api {
@@ -76,7 +90,7 @@ impl Api {
     }
 
     /// Copy an engine-owned buffer's bytes out and free it exactly once.
-    fn copy_and_free(&self, buffer: Buffer) -> Vec<u8> {
+    pub(crate) fn copy_and_free(&self, buffer: Buffer) -> Vec<u8> {
         // SAFETY: the engine hands over an owned buffer of `len` bytes that
         // we must free exactly once; the bytes are copied before the free.
         #[expect(unsafe_code)]
@@ -103,10 +117,23 @@ pub(crate) fn engine_loaded() -> bool {
     LOADED.get().is_some()
 }
 
-/// The process-wide API table, loading the engine on first use.
+/// The process-wide API table if the engine is already loaded; never loads
+/// it.
+pub(crate) fn loaded_api() -> Option<&'static Api> {
+    LOADED.get().and_then(|loaded| loaded.as_ref().ok())
+}
+
+/// The process-wide API table, loading the engine on first use (which also
+/// registers the runtime's shutdown for process exit).
 pub(crate) fn api() -> Result<&'static Api, SdkError> {
     LOADED
-        .get_or_init(load)
+        .get_or_init(|| {
+            let loaded = load();
+            if loaded.is_ok() {
+                crate::runtime::shutdown_at_exit();
+            }
+            loaded
+        })
         .as_ref()
         .map_err(|e| SdkError::new(e.to_string()))
 }
@@ -121,9 +148,9 @@ fn load() -> Result<Api, LoaderError> {
             tokio::runtime::RuntimeFlavor::MultiThread
         )
     {
-        return tokio::task::block_in_place(|| load_inner(&loader::LoaderEnv::from_process()));
+        return tokio::task::block_in_place(|| load_inner(&loader::LoaderEnv::from_process()?));
     }
-    load_inner(&loader::LoaderEnv::from_process())
+    load_inner(&loader::LoaderEnv::from_process()?)
 }
 
 /// The `bridge_cffi` versioned `BamlApiV1` table returned by
@@ -149,7 +176,7 @@ struct BamlApiV1 {
     cancel_function_call: Option<unsafe extern "C" fn(u64) -> i32>,
     register_host_dispatch_callback: Option<unsafe extern "C" fn(HostDispatchFn)>,
     register_host_release_callback: Option<unsafe extern "C" fn(HostReleaseFn)>,
-    complete_host_call: Option<unsafe extern "C" fn(u32, i32, *const c_char, usize)>,
+    complete_host_call: Option<unsafe extern "C" fn(u32, *const c_char, usize)>,
     handle_clone: Option<unsafe extern "C" fn(u64, *mut u64) -> u32>,
     handle_release: Option<unsafe extern "C" fn(u64) -> u32>,
     media_from_url:
@@ -168,6 +195,24 @@ struct BamlApiV1 {
     shutdown_runtime: Option<unsafe extern "C" fn() -> Buffer>,
     initialize_runtime_from_blob_with_metadata:
         Option<unsafe extern "C" fn(*const u8, usize, *const c_char) -> Buffer>,
+    invocation_protocol_version: Option<unsafe extern "C" fn() -> u32>,
+    invocation_clock_ns: Option<unsafe extern "C" fn(u64, *mut u64) -> u32>,
+    release_function_call: Option<unsafe extern "C" fn(u64) -> i32>,
+    register_host_dispatch_v2: Option<unsafe extern "C" fn(HostDispatchV2)>,
+    register_host_cancel_callback: Option<unsafe extern "C" fn(HostCancelFn)>,
+    trace_selection: Option<unsafe extern "C" fn(u64, u64, *mut Buffer, *mut u64) -> u32>,
+    invocation_context: Option<unsafe extern "C" fn(u64, *mut Buffer) -> u32>,
+    media_name: Option<unsafe extern "C" fn(u64, i32, *mut Buffer) -> u32>,
+    media_from_file_content: Option<
+        unsafe extern "C" fn(
+            i32,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *mut u64,
+            *mut i32,
+        ) -> u32,
+    >,
 }
 
 #[repr(C)]
@@ -184,7 +229,7 @@ struct BamlBridgeInfoV1 {
 
 fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
     let path = loader::resolve_library_path(env)?;
-    log::debug(&format!("Loading BAML library from {}", path.display()));
+    log::debug!("Loading BAML library from {}", path.display());
 
     // SAFETY: loading a shared library runs its initializers; the
     // resolved file is the engine artifact this loader exists to load.
@@ -229,10 +274,10 @@ fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
     // contract returns a process-lifetime table.
     #[expect(unsafe_code)]
     let table = unsafe { &*table_ptr };
-    if table.abi_version != 2 || table.struct_size < std::mem::size_of::<BamlApiV1>() {
+    if table.abi_version != 6 || table.struct_size < std::mem::size_of::<BamlApiV1>() {
         return Err(LoaderError::LoadLibrary(format!(
             "{} exposes an incompatible BAML C API (abi_version {}, {} bytes; \
-             baml_bridge needs ABI revision 2 with at least {} bytes)",
+             baml_bridge needs ABI revision 6 with at least {} bytes)",
             path.display(),
             table.abi_version,
             table.struct_size,
@@ -255,8 +300,9 @@ fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
     let register_callback = required_slot(table.register_callback, "register_callback", &path)?;
     let call_function = required_slot(table.call_function, "call_function", &path)?;
     let new_function_call = required_slot(table.new_function_call, "new_function_call", &path)?;
-    required_slot(table.cancel_function_call, "cancel_function_call", &path)?;
-    let register_host_dispatch_callback = required_slot(
+    let cancel_function_call =
+        required_slot(table.cancel_function_call, "cancel_function_call", &path)?;
+    required_slot(
         table.register_host_dispatch_callback,
         "register_host_dispatch_callback",
         &path,
@@ -276,13 +322,42 @@ fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
     required_slot(table.media_file, "media_file", &path)?;
     required_slot(table.media_base64, "media_base64", &path)?;
     required_slot(table.media_mime_type, "media_mime_type", &path)?;
+    required_slot(table.media_name, "media_name", &path)?;
+    required_slot(
+        table.media_from_file_content,
+        "media_from_file_content",
+        &path,
+    )?;
     let register_bridge = required_slot(table.register_bridge, "register_bridge", &path)?;
     required_slot(
         table.register_unhandled_spawn_error_callback,
         "register_unhandled_spawn_error_callback",
         &path,
     )?;
-    required_slot(table.shutdown_runtime, "shutdown_runtime", &path)?;
+    let shutdown_runtime = required_slot(table.shutdown_runtime, "shutdown_runtime", &path)?;
+
+    required_slot(
+        table.invocation_protocol_version,
+        "invocation_protocol_version",
+        &path,
+    )?;
+    let invocation_clock_ns =
+        required_slot(table.invocation_clock_ns, "invocation_clock_ns", &path)?;
+    let release_function_call =
+        required_slot(table.release_function_call, "release_function_call", &path)?;
+    let register_host_dispatch_v2 = required_slot(
+        table.register_host_dispatch_v2,
+        "register_host_dispatch_v2",
+        &path,
+    )?;
+    let register_host_cancel_callback = required_slot(
+        table.register_host_cancel_callback,
+        "register_host_cancel_callback",
+        &path,
+    )?;
+
+    let trace_selection = required_slot(table.trace_selection, "trace_selection", &path)?;
+    let invocation_context = required_slot(table.invocation_context, "invocation_context", &path)?;
 
     let api = Api {
         // Not part of BamlApiV1 (a legacy direct export); resolved directly.
@@ -291,11 +366,18 @@ fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
         initialize_runtime_from_blob_with_metadata,
         register_callback,
         new_function_call,
+        cancel_function_call,
         call_function,
         handle_clone,
         handle_release,
         free_buffer,
-        register_host_dispatch_callback,
+        shutdown_runtime,
+        register_host_dispatch_v2,
+        register_host_cancel_callback,
+        trace_selection,
+        invocation_context,
+        invocation_clock_ns,
+        release_function_call,
         register_host_release_callback,
         complete_host_call,
     };
@@ -306,7 +388,11 @@ fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
     let version_buffer = unsafe { version() };
     let loaded_version = String::from_utf8_lossy(&api.copy_and_free(version_buffer)).into_owned();
     let expected = crate::get_version();
-    if loaded_version != expected {
+    // DEV_BAML_BRIDGE_SKIP_VERSION_CHECK skips only the toolchain-version
+    // match (this check; the library skips its own inside `register_bridge`
+    // by reading the same variable). The ABI table check above is never
+    // skipped.
+    if !env.skip_version_check && loaded_version != expected {
         // Dropping `library` here unloads it (Go parity).
         return Err(LoaderError::VersionMismatch(format!(
             "baml_bridge expects {expected}, but loaded library {} reports {loaded_version}",
@@ -332,8 +418,7 @@ fn load_inner(env: &loader::LoaderEnv) -> Result<Api, LoaderError> {
     api.take_status(registration)
         .map_err(LoaderError::VersionMismatch)?;
 
-    log::info(&format!("BAML (v{loaded_version}) loaded"));
-    log::debug(&format!("Library path: {}", path.display()));
+    log::debug!("Loaded BAML v{loaded_version} from {}", path.display());
 
     // The Api table's fn pointers point into the mapped library; keep it
     // mapped for the process lifetime.
@@ -384,11 +469,10 @@ mod tests {
         let env = LoaderEnv {
             explicit_path: Some(path.clone()),
             env_path: None,
-            cache_dir_override: None,
-            user_cache_dir: None,
+            baml_home: std::env::temp_dir(),
             disable_download: true,
-            download_base: None,
-            system_paths: Vec::new(),
+            skip_version_check: false,
+            manifest_base_url: String::new(),
             version: crate::get_version().to_string(),
         };
         let Err(err) = load_inner(&env) else {

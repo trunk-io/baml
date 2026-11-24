@@ -12,7 +12,7 @@ type IncludeRule = tm.IncludeRule<BamlScope>;
 // replaces the reference with `{ include: "#<key>" }`.
 
 // An identifier as the BAML lexer defines its `Word` token
-// (baml_compiler_lexer/src/tokens.rs):
+// (baml_syntax/src/token.rs):
 //
 //   $-prefixed: \$[a-zA-Z_][a-zA-Z0-9_]*
 //   normal:     [a-zA-Z_][a-zA-Z0-9_-]*(\$[a-zA-Z_][a-zA-Z0-9_-]*)*
@@ -28,11 +28,10 @@ const DOTTED_IDENT = String.raw`${IDENT}(?:${ACCESSOR}${IDENT})*`;
 const TYPE_ARGS_BEFORE_BLOCK = String.raw`(?:<[^{}=;\r\n]*>\s*)?`;
 const BINDING_INTRO = String.raw`(?:let|const)`;
 
-// Capturing path regexes shared by the type/value reference rules. DOTTED_REF
+// Capturing path regex shared by the type/value reference rules. DOTTED_REF
 // has 4 groups (optional leading segment, its dot, the middle prefix, the final
-// name); DOTTED_PATH has 2 (head, dotted tail).
+// name).
 const DOTTED_REF = String.raw`\b(?:(${IDENT})\s*(\.)\s*)?((?:${IDENT}${ACCESSOR})*)(${IDENT})\b`;
-const DOTTED_PATH = String.raw`\b(${IDENT})((?:${ACCESSOR}${IDENT})*)\b`;
 
 // --- Builtins --------------------------------------------------------------
 //
@@ -190,7 +189,7 @@ const ITEM_END_TAIL = String.raw`\s*\}|\s+${IDENT}\b|\r?\n\s*(?:${IDENT}\b|@@|\}
 
 // --- Literals --------------------------------------------------------------
 //
-// Derived from the BAML lexer (baml_compiler_lexer/src/tokens.rs). Every literal
+// Derived from the BAML lexer (baml_syntax/src/token.rs). Every literal
 // is also a valid type expression in BAML (literal types: `1 | 2`, `"a" | "b"`,
 // `true`), so the `literal` group below is wired into `typeExpression` as well.
 
@@ -245,67 +244,21 @@ const numericLiteral: Rule = {
   patterns: [bigintLiteral, floatLiteral, integerLiteral],
 };
 
+// Escape sequences, matching `baml_base::escape`. Every literal kind (quoted,
+// backtick, byte) shares one escape set so JSON string bodies paste as-is:
+// `\n \t \r \b \f \0`, `\\ \" \' \/`, `` \` `` and `\$`. Strings add ASCII
+// `\xHH` and `\uHHHH` / `\u{H...}`; byte strings take any `\xHH` and reject
+// `\u`. Anything else is a compile error, so it is scoped invalid.
 const standardControlEscape: Rule = {
   key: 'string-escape-control',
   scope: 'constant.character.escape.control.baml',
-  match: String.raw`\\[ntr0bvf]`,
+  match: String.raw`\\[ntr0bf]`,
 };
 
 const quotedDelimiterEscape: Rule = {
   key: 'string-escape-quoted-delimiter',
   scope: 'constant.character.escape.delimiter.baml',
-  match: String.raw`\\["\\]`,
-};
-
-const unknownStringEscape: Rule = {
-  key: 'string-escape-unknown',
-  scope: 'constant.character.escape.unknown.baml',
-  match: String.raw`\\.`,
-};
-
-// Quoted strings decode the standard control escapes plus `\\` and `\"`.
-// Unknown escapes are preserved by the lowerer, so scope them distinctly rather
-// than marking them invalid.
-const stringEscape: Rule = {
-  key: 'string-escape',
-  patterns: [standardControlEscape, quotedDelimiterEscape, unknownStringEscape],
-};
-
-const byteStringControlEscape: Rule = {
-  key: 'byte-string-escape-control',
-  scope: 'constant.character.escape.control.baml',
-  match: String.raw`\\[ntr0]`,
-};
-
-const byteStringHexEscape: Rule = {
-  key: 'byte-string-escape-hex',
-  scope: 'constant.character.escape.hex.baml',
-  match: String.raw`\\x[0-9A-Fa-f]{2}`,
-};
-
-const byteStringInvalidHexEscape: Rule = {
-  key: 'byte-string-escape-invalid-hex',
-  scope: 'invalid.illegal.escape.hex.baml',
-  match: String.raw`\\x(?:[0-9A-Fa-f]{0,1}(?=["\\]|$)|[0-9A-Fa-f]?[^0-9A-Fa-f"\\])`,
-};
-
-const byteStringInvalidEscape: Rule = {
-  key: 'byte-string-escape-invalid',
-  scope: 'invalid.illegal.escape.baml',
-  match: String.raw`\\.`,
-};
-
-// Byte strings decode `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, and `\xHH`.
-// Everything else is a lowering error.
-const byteStringEscape: Rule = {
-  key: 'byte-string-escape',
-  patterns: [
-    byteStringHexEscape,
-    byteStringControlEscape,
-    quotedDelimiterEscape,
-    byteStringInvalidHexEscape,
-    byteStringInvalidEscape,
-  ],
+  match: String.raw`\\["\\'/]`,
 };
 
 const backtickDelimiterEscape: Rule = {
@@ -315,15 +268,69 @@ const backtickDelimiterEscape: Rule = {
   match: String.raw`\\[` + '`' + String.raw`$]`,
 };
 
-// Backtick strings share normal string escapes and add \` plus \$ for literal
-// backticks and literal interpolation starts.
-const backtickStringEscape: Rule = {
-  key: 'backtick-string-escape',
+// `\x00`-`\x7F`: strings only allow ASCII code points.
+const stringHexEscape: Rule = {
+  key: 'string-escape-hex',
+  scope: 'constant.character.escape.hex.baml',
+  match: String.raw`\\x[0-7][0-9A-Fa-f]`,
+};
+
+// `\uHHHH` or `\u{H...}` with `_` allowed only between hex digits.
+const stringUnicodeEscape: Rule = {
+  key: 'string-escape-unicode',
+  scope: 'constant.character.escape.unicode.baml',
+  match: String.raw`\\u(?:[0-9A-Fa-f]{4}|\{[0-9A-Fa-f](?:_?[0-9A-Fa-f])*\})`,
+};
+
+// Unknown escapes (`\d`, `\v`, `\U...`, octal, `\x80`, ...) and a backslash at
+// the end of a line (BAML has no line continuations) are compile errors.
+const invalidStringEscape: Rule = {
+  key: 'string-escape-invalid',
+  scope: 'invalid.illegal.escape.baml',
+  match: String.raw`\\(?:x[0-9A-Fa-f]{0,2}|u(?:\{[^}"\\]*\}?|[0-9A-Fa-f]{0,3})|.|$)`,
+};
+
+const stringEscape: Rule = {
+  key: 'string-escape',
   patterns: [
     standardControlEscape,
     quotedDelimiterEscape,
     backtickDelimiterEscape,
-    unknownStringEscape,
+    stringHexEscape,
+    stringUnicodeEscape,
+    invalidStringEscape,
+  ],
+};
+
+const byteStringHexEscape: Rule = {
+  key: 'byte-string-escape-hex',
+  scope: 'constant.character.escape.hex.baml',
+  match: String.raw`\\x[0-9A-Fa-f]{2}`,
+};
+
+// A code point isn't a byte: `\u` escapes are errors in byte strings.
+const byteStringInvalidEscape: Rule = {
+  key: 'byte-string-escape-invalid',
+  scope: 'invalid.illegal.escape.baml',
+  match: String.raw`\\(?:x[0-9A-Fa-f]?|u(?:\{[^}"\\]*\}?|[0-9A-Fa-f]{0,4})|.|$)`,
+};
+
+// Non-ASCII text is an error in byte strings; spell the bytes with `\xHH`.
+const byteStringNonAscii: Rule = {
+  key: 'byte-string-non-ascii',
+  scope: 'invalid.illegal.character.baml',
+  match: String.raw`[^\x00-\x7F]+`,
+};
+
+const byteStringEscape: Rule = {
+  key: 'byte-string-escape',
+  patterns: [
+    byteStringHexEscape,
+    standardControlEscape,
+    quotedDelimiterEscape,
+    backtickDelimiterEscape,
+    byteStringInvalidEscape,
+    byteStringNonAscii,
   ],
 };
 
@@ -356,6 +363,22 @@ const byteStringLiteral: Rule = {
   end: String.raw`"`,
   endCaptures: caps0('punctuation.definition.string.end.baml'),
   patterns: [byteStringEscape],
+};
+
+// Raw string literal: `r"..."`. The body is verbatim, but a backslash still
+// keeps the next character (including `"`) from closing the literal, as in
+// Python. Like byte strings, the prefix must touch the quote.
+const rawQuotedStringLiteral: Rule = {
+  key: 'raw-quoted-string-literal',
+  scope: 'string.quoted.raw.double.baml',
+  begin: String.raw`\b(r)(")`,
+  beginCaptures: {
+    '1': { scope: 'storage.type.string.baml' },
+    '2': { scope: 'punctuation.definition.string.begin.baml' },
+  },
+  end: String.raw`"`,
+  endCaptures: caps0('punctuation.definition.string.end.baml'),
+  patterns: [{ key: 'raw-quoted-string-escaped-char', match: String.raw`\\.` }],
 };
 
 // Raw and backtick strings use a balanced run of delimiters (`##"..."##`,
@@ -402,7 +425,7 @@ function backtickStringRules(max: number): Rule[] {
     endCaptures: {
       '1': { scope: 'punctuation.definition.string.end.baml' },
     },
-    patterns: [backtickInterpolation, backtickStringEscape],
+    patterns: [backtickInterpolation, stringEscape],
   }));
 }
 
@@ -411,7 +434,8 @@ const backtickStringLiteral: Rule = {
   patterns: backtickStringRules(MAX_DELIMITER),
 };
 
-// Type literals are also valid value literals; byte strings are value-only.
+// Type literals are also valid value literals; byte and raw strings are
+// value-only.
 const typeLiteral: Rule = {
   key: 'type-literal',
   patterns: [
@@ -426,11 +450,17 @@ const typeLiteral: Rule = {
 
 const literal: Rule = {
   key: 'literal',
-  patterns: [byteStringLiteral, typeLiteral],
+  patterns: [byteStringLiteral, rawQuotedStringLiteral, typeLiteral],
 };
 
 const expression: IncludeRule = {
   key: 'expression',
+  patterns: [],
+};
+
+// `expression` minus `=>` lambdas, for match guards; filled in with it.
+const guardExpression: IncludeRule = {
+  key: 'guard-expression',
   patterns: [],
 };
 
@@ -568,48 +598,21 @@ const arrayExpression: Rule = {
   patterns: [comments, expression, comma],
 };
 
+// Bare braces may contain a map or a block. Tokenize their contents normally;
+// classifying the whole expression belongs to the parser, not a regex lookahead.
+const bracedExpression: Rule = braceBlock(
+  'braced-expression',
+  'meta.expression.braced.baml',
+  [blockContents, colonSeparator, comma],
+);
+
 const mapExpression: Rule = {
   key: 'map-expression',
   scope: 'meta.expression.map.baml',
-  begin: String.raw`\{(?=\s*(?:\}|["#]|${DOTTED_IDENT}\s*:))`,
-  beginCaptures: caps0('punctuation.definition.map.begin.baml'),
-  end: String.raw`\}`,
-  endCaptures: caps0('punctuation.definition.map.end.baml'),
-  patterns: [
-    comments,
-    {
-      key: 'map-entry',
-      scope: 'meta.map.entry.baml',
-      begin: String.raw`\s*(?=(?:"|#|${DOTTED_IDENT}\s*:))`,
-      end: String.raw`(?=,|\})`,
-      patterns: [
-        comments,
-        {
-          key: 'map-entry-key',
-          scope: tm.meta,
-          match: DOTTED_PATH + String.raw`(?=\s*:)`,
-          captures: {
-            '1': { scope: 'variable.other.property.baml' },
-            '2': {
-              patterns: [
-                accessorDot,
-                {
-                  key: 'map-entry-key-segment',
-                  scope: 'variable.other.property.baml',
-                  match: String.raw`\b${IDENT}\b`,
-                },
-              ],
-            },
-          },
-        },
-        stringLiteral,
-        rawStringLiteral,
-        colonSeparator,
-        expression,
-      ],
-    },
-    comma,
-  ],
+  begin: String.raw`\bmap\b(?=\s*\{)`,
+  beginCaptures: caps0('support.type.primitive.baml'),
+  end: String.raw`(?<=\})`,
+  patterns: [comments, bracedExpression],
 };
 
 function typeArgumentsRule(key: string, endLookahead: string): Rule {
@@ -726,7 +729,7 @@ const callArguments: Rule = {
 
 // The lookahead every call begin uses to require `(` (optionally after a
 // type-argument list) without consuming it.
-const CALL_ARGS_LOOKAHEAD = String.raw`(?=\s*(?:<[^(){};]*>\s*)?\()`;
+const CALL_ARGS_LOOKAHEAD = String.raw`(?=\s*(?:<(?:[^(){};]|\([^(){};]*\))*>\s*)?\()`;
 
 // `obj.method(...)` and `obj?.method(...)` differ only by the accessor.
 function memberCall(
@@ -842,10 +845,23 @@ const fieldAccessExpression: Rule = memberAccess(
   String.raw`([.$])`,
 );
 
+// `t.0`, `t?.1`. The lexer reads `t.0.1` as `.` + float `0.1`; each slot is
+// matched separately, so both digits are slots. `(?<!\.)` keeps a range
+// `1..2` from reading `.2` as a slot.
+const tupleFieldAccessExpression: Rule = {
+  key: 'tuple-field-access-expression',
+  scope: 'meta.field-access.tuple.baml',
+  match: String.raw`(?<!\.)(\?\.|\.)\s*([0-9]+)\b`,
+  captures: {
+    '1': { scope: 'punctuation.accessor.baml' },
+    '2': { scope: 'variable.other.property.baml' },
+  },
+};
+
 const dottedExpression: Rule = {
   key: 'dotted-expression',
   scope: tm.meta,
-  // Like DOTTED_PATH, but a path segment never absorbs an `.as<` projection, so
+  // A path segment never absorbs an `.as<` projection, so
   // `self.as<T>` leaves `.as<T>` for upcastExpression instead of reading `as`
   // as a member and `<`/`>` as comparisons.
   match: String.raw`\b(${IDENT})((?:${ACCESSOR}(?!as\b\s*<)${IDENT})*)\b`,
@@ -865,7 +881,7 @@ const upcastExpression: Rule = {
   begin: String.raw`(\.)\s*(as)\b(?=\s*<)`,
   beginCaptures: {
     '1': { scope: 'punctuation.accessor.baml' },
-    '2': { scope: 'keyword.operator.as.baml' },
+    '2': { scope: 'keyword.operator.expression.as.baml' },
   },
   end: String.raw`(?<=>)`,
   patterns: [comments, typeArgumentsRule('upcast-type-arguments', '')],
@@ -876,7 +892,7 @@ const spawnExpression: Rule = {
   scope: 'meta.expression.spawn.baml',
   begin: String.raw`\b(spawn)\b`,
   beginCaptures: {
-    '1': { scope: 'keyword.operator.spawn.baml' },
+    '1': { scope: 'keyword.operator.expression.spawn.baml' },
   },
   end: EXPRESSION_BODY_END,
   patterns: [
@@ -900,7 +916,7 @@ const spawnExpression: Rule = {
           scope: 'meta.spawn.modifiers.baml',
           begin: String.raw`\b(with)\b`,
           beginCaptures: {
-            '1': { scope: 'keyword.operator.with.baml' },
+            '1': { scope: 'keyword.operator.expression.with.baml' },
           },
           end: String.raw`(?=\{)`,
           patterns: [comments, conditionExpression, comma],
@@ -913,7 +929,7 @@ const spawnExpression: Rule = {
 
 const awaitExpression: Rule = {
   key: 'await-expression',
-  scope: 'keyword.operator.await.baml',
+  scope: 'keyword.operator.expression.await.baml',
   match: String.raw`\bawait\b`,
 };
 
@@ -1052,13 +1068,13 @@ const typeArrowOperator: Rule = {
 
 const typeThrowsOperator: Rule = {
   key: 'type-throws-operator',
-  scope: 'keyword.operator.throws.baml',
+  scope: 'keyword.operator.expression.throws.baml',
   match: String.raw`\bthrows\b`,
 };
 
 const typeAsOperator: Rule = {
   key: 'type-as-operator',
-  scope: 'keyword.operator.as.baml',
+  scope: 'keyword.operator.expression.as.baml',
   match: String.raw`\bas\b`,
 };
 
@@ -1074,6 +1090,18 @@ const associatedTypeProjection: Rule = {
     '3': { scope: 'entity.name.type.associated.baml' },
   },
   patterns: [comments, typeAsOperator, typeExpression],
+};
+
+// `(int, (string, bool))`, `(int,)`, `(A | B)`, `(int) -> int`: a group nests,
+// so a suffix after the inner `)` stays inside the enclosing type.
+const typeGroup: Rule = {
+  key: 'type-group',
+  scope: 'meta.group.type.baml',
+  begin: String.raw`\(`,
+  beginCaptures: caps0('punctuation.definition.type.begin.baml'),
+  end: String.raw`\)`,
+  endCaptures: caps0('punctuation.definition.type.end.baml'),
+  patterns: [comments, typeExpression],
 };
 
 // Brackets, angles, and commas are pure punctuation.
@@ -1182,6 +1210,7 @@ typeExpression.patterns = [
   assignmentOperator,
   optionalOperator,
   unionOperator,
+  typeGroup,
   typePunctuation,
   colonSeparator,
 ];
@@ -1294,12 +1323,29 @@ const arrayDestructurePattern: Rule = {
   ],
 };
 
+// `(let a, let b)`, `const (const a, _)`, `(0, let s)`, `(A | B)`. A group
+// followed by `->`, `[` or `?` is a type (`(int) -> int`, `(A | B)[]`), as in
+// the parser's pattern lookahead, and so is a projection `(T as I).Assoc`.
+const tupleDestructurePattern: Rule = {
+  key: 'tuple-destructure-pattern',
+  scope: 'meta.pattern.destructure.tuple.baml',
+  begin: String.raw`(?:\b(${BINDING_INTRO})\b\s*)?(\()(?![^)"'\x60\r\n]*\bas\b[^)\r\n]*\)\s*\.)(?!(?:[^()]|\([^()]*\))*\)\s*(?:->|[\[?]))`,
+  beginCaptures: {
+    '1': { scope: 'keyword.declaration.binding.baml' },
+    '2': { scope: 'punctuation.definition.group.begin.baml' },
+  },
+  end: String.raw`\)`,
+  endCaptures: caps0('punctuation.definition.group.end.baml'),
+  patterns: [comments, pattern, comma],
+};
+
 pattern.patterns = [
   comments,
   wildcardBindingPattern,
   typedBindingPattern,
   classDestructurePattern,
   arrayDestructurePattern,
+  tupleDestructurePattern,
   bareBindingPattern,
   wildcardPattern,
   typeExpression,
@@ -1312,7 +1358,7 @@ function isPatternRule(key: string, inner: Rule, extra = ''): Rule {
     key,
     scope: 'meta.expression.is.baml',
     begin: String.raw`\b(is)\b`,
-    beginCaptures: { '1': { scope: 'keyword.operator.is.baml' } },
+    beginCaptures: { '1': { scope: 'keyword.operator.expression.is.baml' } },
     end: String.raw`(?=\s*(?:&&|\|\||=>|[,);\]}${extra}]|$))`,
     patterns: [comments, inner],
   };
@@ -1421,7 +1467,19 @@ const matchScrutineeGroup: Rule = {
   beginCaptures: caps0('punctuation.definition.group.begin.baml'),
   end: String.raw`\)`,
   endCaptures: caps0('punctuation.definition.group.end.baml'),
-  patterns: [comments, expression, typeExpression],
+  patterns: [
+    comments,
+    {
+      key: 'match-scrutinee-ascription',
+      scope: 'meta.type.annotation.baml',
+      begin: String.raw`:`,
+      beginCaptures: caps0('punctuation.separator.colon.baml'),
+      end: String.raw`(?=\))`,
+      patterns: [comments, typeExpression],
+    },
+    expression,
+    typeExpression,
+  ],
 };
 
 const matchScrutinee: Rule = {
@@ -1437,6 +1495,7 @@ const matchScrutinee: Rule = {
     awaitExpression,
     throwExpression,
     catchExpression,
+    tupleFieldAccessExpression,
     expressionOperator,
     functionCallExpression,
     dottedExpression,
@@ -1465,7 +1524,7 @@ const matchArm: Rule = {
         '1': { scope: 'keyword.control.conditional.baml' },
       },
       end: String.raw`(?=\s*=>)`,
-      patterns: [comments, expression],
+      patterns: [comments, guardExpression],
     },
     {
       key: 'match-arm-arrow',
@@ -1569,7 +1628,7 @@ const forInPattern: Rule = {
 
 const forInKeyword: Rule = {
   key: 'for-in-keyword',
-  scope: 'keyword.operator.in.baml',
+  scope: 'keyword.operator.expression.in.baml',
   match: String.raw`\bin\b`,
 };
 
@@ -1769,20 +1828,26 @@ backtickInterpolation.patterns = [
 
 // --- Classes ---------------------------------------------------------------
 
+// A field's type arguments nest, so the commas in `map<map<K, V>, W>` stay
+// inside the type instead of ending the field. Tuple types already nest.
+const fieldTypeArguments: Rule = typeArgumentsRule('field-type-arguments', '');
+fieldTypeArguments.patterns = [comments, fieldTypeArguments, typeExpression];
+
 // `<name> <type>` inside a class body. The colon is optional: the parser accepts
 // both `name string` and `name: string` (parse_field eats an optional Colon), so
-// scope it only when present. Inline one-field classes (`class E { code int }`)
-// need the `{` branch in addition to the normal start-of-line branch.
+// scope it only when present. Inline classes (`class E { code int }`) need the
+// `{` branch in addition to the normal start-of-line branch, and fields that
+// share a line (`{ a: int, b: string }`) start after and end before a `,`.
 const field: Rule = {
   key: 'field',
   scope: 'meta.field.baml',
-  begin: String.raw`(?:^\s*|(?<=\{)\s*)(?!@)(${IDENT})\s*(:)?`,
+  begin: String.raw`(?:^\s*|(?<=[{,])\s*)(?!@)(${IDENT})\s*(:)?`,
   beginCaptures: {
     '1': { scope: 'variable.other.property.baml' },
     '2': { scope: 'punctuation.separator.colon.baml' },
   },
-  end: String.raw`(?=\})|$`,
-  patterns: [comments, typeExpression],
+  end: String.raw`(?=[,}])|$`,
+  patterns: [comments, fieldTypeArguments, typeExpression],
 };
 
 const functionParameters: Rule = {
@@ -1840,38 +1905,52 @@ const functionParameters: Rule = {
   ],
 };
 
+const LAMBDA_PARAMS_AHEAD = String.raw`\((?:[^()]|\([^()]*\))*\)\s*`;
+
+const lambdaPatterns: Rule['patterns'] = [
+  comments,
+  functionParameters,
+  {
+    key: 'lambda-arrow',
+    scope: 'keyword.operator.arrow.baml',
+    match: String.raw`->|=>`,
+  },
+  {
+    key: 'lambda-return-type',
+    scope: 'meta.return-type.lambda.baml',
+    begin: String.raw`(?<=->|=>)\s*(?!throws\b)(?=[^\s\{])`,
+    end: String.raw`(?=\s*(?:throws\b|\{))`,
+    patterns: [comments, typeExpression],
+  },
+  {
+    key: 'lambda-throws-clause',
+    scope: 'meta.throws.lambda.baml',
+    begin: String.raw`\b(throws)\b`,
+    beginCaptures: {
+      '1': { scope: 'keyword.operator.expression.throws.baml' },
+    },
+    end: String.raw`(?=\{)`,
+    patterns: [comments, typeExpression],
+  },
+  codeBlock,
+];
+
 const lambdaExpression: Rule = {
   key: 'lambda-expression',
   scope: 'meta.expression.lambda.baml',
-  begin: String.raw`(?=\((?:[^()]|\([^()]*\))*\)\s*(?:->|=>))`,
+  begin: String.raw`(?=${LAMBDA_PARAMS_AHEAD}(?:->|=>))`,
   end: String.raw`(?<=\})`,
-  patterns: [
-    comments,
-    functionParameters,
-    {
-      key: 'lambda-arrow',
-      scope: 'keyword.operator.arrow.baml',
-      match: String.raw`->|=>`,
-    },
-    {
-      key: 'lambda-return-type',
-      scope: 'meta.return-type.lambda.baml',
-      begin: String.raw`(?<=->|=>)\s*(?!throws\b)(?=[^\s\{])`,
-      end: String.raw`(?=\s*(?:throws\b|\{))`,
-      patterns: [comments, typeExpression],
-    },
-    {
-      key: 'lambda-throws-clause',
-      scope: 'meta.throws.lambda.baml',
-      begin: String.raw`\b(throws)\b`,
-      beginCaptures: {
-        '1': { scope: 'keyword.operator.throws.baml' },
-      },
-      end: String.raw`(?=\{)`,
-      patterns: [comments, typeExpression],
-    },
-    codeBlock,
-  ],
+  patterns: lambdaPatterns,
+};
+
+// In a match guard `(cond) =>` is the arm's arrow, so only `->` opens a lambda
+// (the parser's MATCH_GUARD restriction).
+const guardLambdaExpression: Rule = {
+  key: 'guard-lambda-expression',
+  scope: 'meta.expression.lambda.baml',
+  begin: String.raw`(?=${LAMBDA_PARAMS_AHEAD}->)`,
+  end: String.raw`(?<=\})`,
+  patterns: lambdaPatterns,
 };
 
 expression.patterns = [
@@ -1882,9 +1961,9 @@ expression.patterns = [
   ifExpression,
   matchExpression,
   spawnExpression,
-  constructorExpression,
   mapExpression,
-  codeBlock,
+  constructorExpression,
+  bracedExpression,
   awaitExpression,
   throwExpression,
   catchExpression,
@@ -1896,10 +1975,15 @@ expression.patterns = [
   upcastExpression,
   postfixMethodCallExpression,
   fieldAccessExpression,
+  tupleFieldAccessExpression,
   expressionOperator,
   functionCallExpression,
   dottedExpression,
 ];
+
+guardExpression.patterns = expression.patterns.map((rule) =>
+  rule === lambdaExpression ? guardLambdaExpression : rule,
+);
 
 conditionExpression.patterns = expression.patterns
   .filter((rule) => rule !== constructorExpression)
@@ -1945,7 +2029,7 @@ const declarationTypeParameters: Rule = {
         comments,
         {
           key: 'declaration-type-parameter-extends',
-          scope: 'keyword.operator.extends.baml',
+          scope: 'keyword.operator.expression.extends.baml',
           match: String.raw`\bextends\b`,
         },
         {
@@ -2029,6 +2113,45 @@ const letStatement: Rule = {
   ],
 };
 
+// `let type T extends I & J = expr else { ... };` binds a type parameter for
+// the rest of the block. Sits before `letStatement`, which would read `type`
+// as the bound name and `T` as its annotation.
+const letTypeStatement: Rule = {
+  key: 'let-type-statement',
+  scope: 'meta.statement.let-type.baml',
+  begin: String.raw`${STATEMENT_START}(let)\s+(type)\s+(${IDENT})\b`,
+  beginCaptures: {
+    '1': { scope: 'keyword.declaration.binding.baml' },
+    '2': { scope: 'keyword.declaration.type-binding.baml' },
+    '3': { scope: 'entity.name.type.parameter.baml' },
+  },
+  end: STATEMENT_END,
+  patterns: [
+    comments,
+    {
+      key: 'let-type-bounds',
+      scope: 'meta.type-parameter.bounds.baml',
+      begin: String.raw`\b(extends)\b`,
+      beginCaptures: {
+        '1': { scope: 'keyword.operator.expression.extends.baml' },
+      },
+      end: String.raw`(?=\s*=)`,
+      patterns: [
+        comments,
+        {
+          key: 'let-type-bound-intersection',
+          scope: 'keyword.operator.type.baml',
+          match: String.raw`&`,
+        },
+        typeExpression,
+      ],
+    },
+    assignmentOperator,
+    letElseClause,
+    expression,
+  ],
+};
+
 const watchStatement: Rule = keywordStatement(
   'watch-statement',
   'meta.statement.watch.baml',
@@ -2100,6 +2223,24 @@ const clientItem: Rule = {
   },
   end: String.raw`(?<=\})`,
   patterns: [comments, configBlock],
+};
+
+// `client Name = <expr>;` binds a client value (anything implementing
+// `ai.Client`). The legacy `client<llm> Name { ... }` block above still
+// parses, so the compiler can point at the migration. The initializer may
+// start on the next line and the `;` is optional, so the rule stays open
+// until the `;` or the next top-level item.
+const clientValueItem: Rule = {
+  key: 'client-value',
+  scope: 'meta.client.baml',
+  begin: String.raw`^\s*(client)\s+(${IDENT})\s*(=)(?!=)`,
+  beginCaptures: {
+    '1': { scope: 'keyword.declaration.client.baml' },
+    '2': { scope: 'entity.name.client.baml' },
+    '3': { scope: 'keyword.operator.assignment.baml' },
+  },
+  end: String.raw`(?=;|${TOP_LEVEL_ITEM_START}|^\s*${BINDING_INTRO}\b)`,
+  patterns: [comments, expression],
 };
 
 const retryPolicyItem: Rule = {
@@ -2212,7 +2353,7 @@ const testHeader: Rule = {
     comments,
     {
       key: 'test-with-keyword',
-      scope: 'keyword.operator.with.baml',
+      scope: 'keyword.operator.expression.with.baml',
       match: String.raw`\bwith\b`,
     },
     conditionExpression,
@@ -2253,6 +2394,7 @@ blockContents.patterns = [
   testsetItem,
   testItem,
   watchStatement,
+  letTypeStatement,
   letStatement,
   returnStatement,
   breakStatement,
@@ -2331,7 +2473,7 @@ const associatedTypeItem: Rule = {
     comments,
     {
       key: 'associated-type-extends',
-      scope: 'keyword.operator.extends.baml',
+      scope: 'keyword.operator.expression.extends.baml',
       match: String.raw`\bextends\b`,
     },
     assignmentOperator,
@@ -2375,7 +2517,7 @@ const interfaceFieldLink: Rule = {
   begin: String.raw`(?:^\s*|(?<=\{)\s*)(${IDENT})\s+(as)\s+(${IDENT})\b`,
   beginCaptures: {
     '1': { scope: 'variable.other.property.interface.baml' },
-    '2': { scope: 'keyword.operator.as.baml' },
+    '2': { scope: 'keyword.operator.expression.as.baml' },
     '3': { scope: 'variable.other.property.baml' },
   },
   end: MEMBER_SIGNATURE_END,
@@ -2506,6 +2648,7 @@ const classBody: Rule = braceBlock('class-body', 'meta.class.body.baml', [
   functionItem,
   field,
   semicolon,
+  comma,
 ]);
 
 const classItem: Rule = {
@@ -2564,6 +2707,7 @@ export const baml: Grammar = {
   patterns: [
     comments,
     clientItem,
+    clientValueItem,
     retryPolicyItem,
     generatorItem,
     templateStringItem,

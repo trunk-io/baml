@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use bex_project::{BexExternalAdt, MediaKind, MediaValue};
+use bex_project::{ConcreteMediaKind, MediaValue};
 use bridge_ctypes::{
-    CffiHandleTableEntry, HANDLE_TABLE,
+    CffiHandleTableEntry, HANDLE_TABLE, TableKey,
     baml_bridge::cffi::{BamlHandleType, MediaTypeEnum},
 };
 
@@ -30,8 +30,14 @@ pub enum HandleError {
 
 fn insert_entry(entry: CffiHandleTableEntry) -> HandleParts {
     let handle_type = entry.handle_type() as i32;
-    let key = HANDLE_TABLE.insert(entry);
+    let key = HANDLE_TABLE.insert(entry).get();
     HandleParts { key, handle_type }
+}
+
+/// A key as the C ABI carries it, or the one refusal every table operation
+/// gives a key that names nothing.
+fn table_key(key: u64) -> Result<TableKey, HandleError> {
+    TableKey::new(key).ok_or(HandleError::InvalidHandle)
 }
 
 fn validate_input(value: &str, field: &str) -> Result<(), HandleError> {
@@ -53,7 +59,7 @@ fn validate_media_input(source: &str, mime_type: Option<&str>) -> Result<(), Han
 
 fn resolve_media(key: u64, handle_type: i32) -> Result<Arc<MediaValue>, HandleError> {
     let entry = HANDLE_TABLE
-        .resolve(key)
+        .resolve(table_key(key)?)
         .ok_or(HandleError::InvalidHandle)?;
 
     if handle_type != BamlHandleType::HandleUnspecified as i32
@@ -63,7 +69,7 @@ fn resolve_media(key: u64, handle_type: i32) -> Result<Arc<MediaValue>, HandleEr
     }
 
     match &*entry {
-        CffiHandleTableEntry::Adt(BexExternalAdt::Media(media)) => Ok(media.clone()),
+        CffiHandleTableEntry::Adt(bridge_ctypes::TableAdt::Media(media)) => Ok(media.clone()),
         _ => Err(HandleError::UnsupportedHandleType),
     }
 }
@@ -74,13 +80,14 @@ fn resolve_media(key: u64, handle_type: i32) -> Result<Arc<MediaValue>, HandleEr
 /// object; the row's refcount tracks its owners).
 pub fn clone_handle(key: u64) -> Result<u64, HandleError> {
     HANDLE_TABLE
-        .clone_handle(key)
+        .clone_handle(table_key(key)?)
+        .map(TableKey::get)
         .ok_or(HandleError::InvalidHandle)
 }
 
 /// Release one owned ordinary handle-table key.
 pub fn release_handle(key: u64) -> Result<(), HandleError> {
-    if HANDLE_TABLE.release(key) {
+    if HANDLE_TABLE.release(table_key(key)?) {
         Ok(())
     } else {
         Err(HandleError::InvalidHandle)
@@ -102,20 +109,13 @@ pub fn live_handle_count() -> usize {
 /// [`live_handle_count`] cannot show. Test instrumentation only; not part of
 /// the generated SDK surface.
 pub fn handle_refcount(key: u64) -> Option<u64> {
-    HANDLE_TABLE.refcount(key)
+    HANDLE_TABLE.refcount(TableKey::new(key)?)
 }
 
-/// Seed a function-reference handle for focused bridge tests.
-pub fn seed_function_ref_handle(global_index: u64) -> HandleParts {
-    insert_entry(CffiHandleTableEntry::FunctionRef {
-        global_index: global_index as usize,
-    })
-}
-
-/// Seed a generic-media handle for focused bridge tests.
-pub fn seed_generic_media_handle() -> HandleParts {
-    insert_entry(CffiHandleTableEntry::Adt(BexExternalAdt::Media(
-        MediaValue::from_url(MediaKind::Generic, "https://example.com/", None),
+/// Seed an image-media handle for focused bridge tests: an identity-free row.
+pub fn seed_media_handle() -> HandleParts {
+    insert_entry(CffiHandleTableEntry::Adt(bridge_ctypes::TableAdt::Media(
+        MediaValue::from_url(ConcreteMediaKind::Image, "https://example.com/", None),
     )))
 }
 
@@ -149,37 +149,44 @@ pub fn seed_heap_handle(slab_key: u64) -> HandleParts {
 
 /// Construct an owned media handle from a URL descriptor.
 pub fn media_from_url(
-    kind: MediaKind,
+    kind: ConcreteMediaKind,
     url: &str,
     mime_type: Option<&str>,
 ) -> Result<HandleParts, HandleError> {
     validate_media_input(url, mime_type)?;
     Ok(insert_entry(CffiHandleTableEntry::Adt(
-        BexExternalAdt::Media(MediaValue::from_url(kind, url, mime_type)),
+        bridge_ctypes::TableAdt::Media(MediaValue::from_url(kind, url, mime_type)),
     )))
 }
 
-/// Construct an owned media handle from a file-path descriptor.
-pub fn media_from_file(
-    kind: MediaKind,
+/// Construct an owned media handle from base64 content read from `file`.
+pub fn media_from_file_content(
+    kind: ConcreteMediaKind,
     file: &str,
+    base64: &str,
     mime_type: Option<&str>,
 ) -> Result<HandleParts, HandleError> {
     validate_media_input(file, mime_type)?;
+    validate_input(base64, "base64")?;
     Ok(insert_entry(CffiHandleTableEntry::Adt(
-        BexExternalAdt::Media(MediaValue::from_file(kind, file, mime_type)),
+        bridge_ctypes::TableAdt::Media(MediaValue::from_file_content(
+            kind,
+            file,
+            base64.into(),
+            mime_type,
+        )),
     )))
 }
 
 /// Construct an owned media handle from base64 text.
 pub fn media_from_base64(
-    kind: MediaKind,
+    kind: ConcreteMediaKind,
     base64: &str,
     mime_type: Option<&str>,
 ) -> Result<HandleParts, HandleError> {
     validate_media_input(base64, mime_type)?;
     Ok(insert_entry(CffiHandleTableEntry::Adt(
-        BexExternalAdt::Media(MediaValue::from_base64(kind, base64, mime_type)),
+        bridge_ctypes::TableAdt::Media(MediaValue::from_base64(kind, base64.into(), mime_type)),
     )))
 }
 
@@ -187,27 +194,37 @@ pub fn media_url(key: u64, handle_type: i32) -> Result<Option<String>, HandleErr
     Ok(resolve_media(key, handle_type)?.url())
 }
 
+/// A media value holds content, never a path: there is none to return. The
+/// handle is still checked, as for every accessor.
 pub fn media_file(key: u64, handle_type: i32) -> Result<Option<String>, HandleError> {
-    Ok(resolve_media(key, handle_type)?.file())
+    resolve_media(key, handle_type)?;
+    Ok(None)
 }
 
 pub fn media_base64(key: u64, handle_type: i32) -> Result<String, HandleError> {
-    Ok(resolve_media(key, handle_type)?.base64())
+    Ok(resolve_media(key, handle_type)?
+        .base64()
+        .as_str()
+        .to_owned())
 }
 
 pub fn media_mime_type(key: u64, handle_type: i32) -> Result<Option<String>, HandleError> {
     Ok(resolve_media(key, handle_type)?.mime_type())
 }
 
-/// Convert a protocol media discriminant, rejecting unspecified and unknown values.
-pub fn media_kind_from_proto(media_kind: i32) -> Option<MediaKind> {
-    match media_kind {
-        x if x == MediaTypeEnum::Image as i32 => Some(MediaKind::Image),
-        x if x == MediaTypeEnum::Audio as i32 => Some(MediaKind::Audio),
-        x if x == MediaTypeEnum::Pdf as i32 => Some(MediaKind::Pdf),
-        x if x == MediaTypeEnum::Video as i32 => Some(MediaKind::Video),
-        x if x == MediaTypeEnum::Other as i32 => Some(MediaKind::Generic),
-        _ => None,
+pub fn media_name(key: u64, handle_type: i32) -> Result<Option<String>, HandleError> {
+    Ok(resolve_media(key, handle_type)?.name())
+}
+
+/// Convert a protocol media discriminant, rejecting unspecified, reserved and
+/// unknown values: a media value has a kind of its own.
+pub fn media_kind_from_proto(media_kind: i32) -> Option<ConcreteMediaKind> {
+    match MediaTypeEnum::try_from(media_kind).ok()? {
+        MediaTypeEnum::Image => Some(ConcreteMediaKind::Image),
+        MediaTypeEnum::Audio => Some(ConcreteMediaKind::Audio),
+        MediaTypeEnum::Pdf => Some(ConcreteMediaKind::Pdf),
+        MediaTypeEnum::Video => Some(ConcreteMediaKind::Video),
+        MediaTypeEnum::MediaTypeUnspecified => None,
     }
 }
 
@@ -234,8 +251,12 @@ mod tests {
 
     #[test]
     fn resolve_media_rejects_type_mismatch() {
-        let parts = media_from_url(MediaKind::Image, "https://example.com/image.png", None)
-            .expect("media handle should be created");
+        let parts = media_from_url(
+            ConcreteMediaKind::Image,
+            "https://example.com/image.png",
+            None,
+        )
+        .expect("media handle should be created");
 
         assert_eq!(
             resolve_media(parts.key, BamlHandleType::AdtMediaAudio as i32),
@@ -246,13 +267,19 @@ mod tests {
 
     #[test]
     fn resolve_media_rejects_unsupported_handle_type() {
-        let parts = seed_function_ref_handle(7);
+        let parts = insert_entry(CffiHandleTableEntry::Adt(
+            bridge_ctypes::TableAdt::PromptAst(std::sync::Arc::new(
+                bex_project::PromptAst::Simple(std::sync::Arc::new(
+                    bex_project::PromptAstSimple::String("hi".into()),
+                )),
+            )),
+        ));
 
         assert_eq!(
             resolve_media(parts.key, parts.handle_type),
             Err(HandleError::UnsupportedHandleType)
         );
-        release_handle(parts.key).expect("function handle should be released");
+        release_handle(parts.key).expect("the row should be released");
     }
 
     #[test]
@@ -266,17 +293,17 @@ mod tests {
 mod media_kind_tests {
     use super::*;
     #[test]
-    fn protocol_kinds_include_generic_but_reject_unspecified_and_unknown() {
+    fn protocol_kinds_are_concrete_and_reject_unspecified_reserved_and_unknown() {
         for (proto, kind) in [
-            (MediaTypeEnum::Image, MediaKind::Image),
-            (MediaTypeEnum::Audio, MediaKind::Audio),
-            (MediaTypeEnum::Pdf, MediaKind::Pdf),
-            (MediaTypeEnum::Video, MediaKind::Video),
-            (MediaTypeEnum::Other, MediaKind::Generic),
+            (MediaTypeEnum::Image, ConcreteMediaKind::Image),
+            (MediaTypeEnum::Audio, ConcreteMediaKind::Audio),
+            (MediaTypeEnum::Pdf, ConcreteMediaKind::Pdf),
+            (MediaTypeEnum::Video, ConcreteMediaKind::Video),
         ] {
             assert_eq!(media_kind_from_proto(proto as i32), Some(kind));
         }
-        for value in [MediaTypeEnum::MediaTypeUnspecified as i32, -1, i32::MAX] {
+        // 5 is the reserved generic kind.
+        for value in [MediaTypeEnum::MediaTypeUnspecified as i32, 5, -1, i32::MAX] {
             assert_eq!(media_kind_from_proto(value), None);
         }
     }

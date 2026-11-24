@@ -1,6 +1,6 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
-use baml_db::testing::compile_source;
+use baml_test_support::compile_source;
 use baml_type::{CallLayout, Name};
 use bex_vm::{BexVm, BytecodeProgram, VmExecState, convert_program};
 use bex_vm_types::{Instruction, Object, bytecode::OpCode, types::Function};
@@ -10,7 +10,7 @@ fn function<'a>(program: &'a BytecodeProgram, name: &str) -> &'a Function {
         .objects
         .iter()
         .find_map(|object| match object {
-            Object::Function(function) if function.name == name => Some(function.as_ref()),
+            Object::Function(function) if function.name() == name => Some(function.as_ref()),
             _ => None,
         })
         .expect("function exists")
@@ -48,7 +48,7 @@ const SIMPLE: &str =
 #[test]
 fn exact_calls_preserve_operands_and_source_positions() {
     let program = convert_program(compile_source(SIMPLE)).unwrap();
-    let main = function(&program, "user.main");
+    let main = function(&program, "main");
     let original = main.bytecode.lower_to_compact();
     let compact = main.bytecode.compact.as_ref().unwrap();
     let mut restored = compact.code.clone();
@@ -71,6 +71,32 @@ fn exact_calls_preserve_operands_and_source_positions() {
 }
 
 #[test]
+fn passthrough_entries_are_not_specialized_as_ordinary_calls() {
+    let mut program = compile_source(SIMPLE);
+    let index = program.rendered_callables()["user.leaf"].object.raw();
+    let Object::Function(leaf) = &mut (*program.objects)[index] else {
+        unreachable!()
+    };
+    // Emulate compiler-owned metadata, including a linked definition whose
+    // callers were emitted before its pass-through strategy was known.
+    leaf.trace_passthrough = true;
+    let program = convert_program(program).unwrap();
+    let instructions = ops(function(&program, "main"));
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|(_, op)| *op == OpCode::Call)
+            .count(),
+        2
+    );
+    assert!(
+        !instructions
+            .iter()
+            .any(|(_, op)| *op == OpCode::CallExactArgs)
+    );
+}
+
+#[test]
 fn nonmatching_argument_layout_stays_general() {
     let mut program = compile_source(SIMPLE);
     let index = program.rendered_callables()["user.main"].object.raw();
@@ -82,7 +108,7 @@ fn nonmatching_argument_layout_stays_general() {
     }
     main.bytecode.compact = None;
     let program = convert_program(program).unwrap();
-    let instructions = ops(function(&program, "user.main"));
+    let instructions = ops(function(&program, "main"));
     assert_eq!(
         instructions
             .iter()
@@ -112,7 +138,7 @@ fn writable_callee_globals_are_not_specialized() {
         .push(Instruction::StoreGlobal(global));
     leaf.bytecode.compact = None;
     let program = convert_program(program).unwrap();
-    let instructions = ops(function(&program, "user.main"));
+    let instructions = ops(function(&program, "main"));
     assert_eq!(
         instructions
             .iter()
@@ -124,13 +150,15 @@ fn writable_callee_globals_are_not_specialized() {
 
 #[test]
 fn generic_calls_keep_type_arguments() {
-    let source =
-        "function identity<T>(n: T) -> T { n } function main() -> int { identity<int>(42) }";
+    // `parse<int>` returns 42 only if `T` reaches the callee's frame.
+    let source = r#"
+        function parse<T>(s: string) -> T { baml.json.decode<T>(s) }
+        function main() -> int { parse<int>("42") }
+    "#;
     let program = convert_program(compile_source(source)).unwrap();
-    let instructions = ops(function(&program, "user.main"));
-    assert!(instructions.iter().any(|(_, op)| *op == OpCode::Call));
+    let instructions = ops(function(&program, "main"));
     assert!(
-        !instructions
+        instructions
             .iter()
             .any(|(_, op)| *op == OpCode::CallExactArgs)
     );
@@ -224,5 +252,55 @@ fn exact_transitions_preserve_resume_pc_across_callbacks_and_reused_depths() {
             "resumption stopped progressing at interval {interval}"
         );
         assert!(yields > 0, "interval {interval} did not exercise a handoff");
+    }
+}
+
+#[test]
+fn indirect_calls_enter_closures_functions_and_bound_methods() {
+    // A capturing closure called directly, a plain function and a capturing
+    // closure called through a parameter, a generic closure whose body needs
+    // its captured `T`, and a generic class's bound method, whose receiver
+    // type arguments must still reach the frame.
+    let source = r#"
+        class Box<T> {
+            value T
+            function parse(self, s: string) -> T { baml.json.decode<T>(s) }
+        }
+        function leaf(n: int) -> int { n }
+        function invoke(f: (int) -> int, n: int) -> int { f(n) }
+        function parse_later<T>(s: string) -> () -> T throws baml.json.DecodeError | baml.json.ParseError {
+            () -> T { baml.json.decode<T>(s) }
+        }
+        function main() -> int {
+            let k = 3;
+            let add = (x: int) -> int { x + k };
+            let later = parse_later<int>("10");
+            let b = Box<int> { value: 0 };
+            let parse = b.parse;
+            add(1) + invoke(leaf, 5) + invoke(add, 2) + later() + parse("18")
+        }
+    "#;
+    let program = convert_program(compile_source(source)).unwrap();
+    assert!(
+        ops(function(&program, "main"))
+            .iter()
+            .any(|(_, op)| *op == OpCode::CallIndirect)
+    );
+    assert_eq!(run(source), 42);
+    // Hand off at varying points, including right after a closure frame is
+    // entered, and resume inside it.
+    for interval in [1, 2, 3, 5, 11] {
+        let program = compile_source(source);
+        let entry = program.rendered_callables()["user.main"].object.raw();
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut vm = BexVm::from_program(program, Arc::clone(&flag)).unwrap();
+        vm.early_yield = bex_vm_types::EarlyYieldCheck::with_interval(flag, interval);
+        vm.set_entry_point(vm.heap.compile_time_ptr(entry), &[]);
+        let result = (0..500).find_map(|_| match vm.exec().unwrap() {
+            VmExecState::EarlyYield => None,
+            VmExecState::Complete(value) => Some(value.as_int()),
+            other => panic!("unexpected state at interval {interval}: {other:?}"),
+        });
+        assert_eq!(result, Some(Some(42)), "interval {interval}");
     }
 }

@@ -349,7 +349,7 @@ function write_issue(fb: Feedback, repro: Repro, run: ReproRun) -> IssueDraft {
 // ==================== Helpers ====================
 
 function toolchain_version() -> string {
-    baml.env.get("BAML_VERSION") ?? "unknown"
+    baml.env.get("BAML_TOOLCHAIN") ?? "unknown"
 }
 
 function format_comments(comments: Comment[]) -> string {
@@ -484,7 +484,7 @@ function supabase_get(query: string) -> string {
 function load_issues() -> map<string, IssueRow> {
     let out: map<string, IssueRow> = {};
     for (
-        let row in baml.json.from_string<IssueRow[]>(
+        let row in baml.json.decode<IssueRow[]>(
             supabase_get("triage_issues?select=*&order=number"),
         )
     ) {
@@ -494,7 +494,7 @@ function load_issues() -> map<string, IssueRow> {
 }
 
 function load_feedback() -> FeedbackRow[] {
-    baml.json.from_string<FeedbackRow[]>(supabase_get("triage_feedback?select=*&order=id"))
+    baml.json.decode<FeedbackRow[]>(supabase_get("triage_feedback?select=*&order=id"))
 }
 
 /// Fraction of `keywords` present in `ours` (case-insensitive; "baml-cli"
@@ -514,13 +514,13 @@ function keyword_recall(ours: string, keywords: string[]) -> float {
 }
 
 function draft_text(d: IssueDraft) -> string {
-    baml.json.stringify_pretty(d.to_json()) catch (_) {
+    baml.json.stringify(d.to_json(), indent = 2) catch (_) {
         _ => "<unserializable>",
     }
 }
 
 function reference_text(r: ReferenceIssue) -> string {
-    baml.json.stringify_pretty(r.to_json()) catch (_) {
+    baml.json.stringify(r.to_json(), indent = 2) catch (_) {
         _ => "<unserializable>",
     }
 }
@@ -670,43 +670,41 @@ testset "difficulty_estimate" with testing.PassRate(0.8) {
 
 // ==================== Unit tests ====================
 // Token-free: parsing runs through the same machinery as live replies
-// (Fn$parse / from_string). Checks needing the runtime compiler (absent in
+// (Fn$parse / baml.json.to). Checks needing the runtime compiler (absent in
 // the `baml test` VM) live in `smoke()`: baml run -e 'smoke()'.
 
 testset "feedback" {
     test "parses and picks the strongest identity" {
-        let raw = `
+        let fb = baml.json.to<Feedback>(
             {
-              "id": "FB-1",
-              "title": "match on enum broken",
-              "body": "…",
-              "source": "Github",
-              "author": { "email": null, "github": "octocat", "device_id": "dev-9" },
-              "toolchain": "0.17.0",
-              "files": {},
-              "comments": [],
-              "issue_ids": []
-            }
-        `;
-        let fb = baml.json.from_string<Feedback>(raw);
+                "id": "FB-1",
+                "title": "match on enum broken",
+                "body": "…",
+                "source": "Github",
+                "author": { "email": null, "github": "octocat", "device_id": "dev-9" },
+                "toolchain": "0.17.0",
+                "files": {},
+                "comments": [],
+                "issue_ids": [],
+            },
+        );
         assert.equal(author_identity(fb.author), "octocat");
     }
 
     test "a report without a toolchain still parses and reads as unknown" {
-        let raw = `
+        let fb = baml.json.to<Feedback>(
             {
-              "id": "FB-3",
-              "title": "t",
-              "body": "b",
-              "source": "BamlFeedback",
-              "author": { "email": null, "github": null, "device_id": "dev-1" },
-              "toolchain": null,
-              "files": {},
-              "comments": [],
-              "issue_ids": []
-            }
-        `;
-        let fb = baml.json.from_string<Feedback>(raw);
+                "id": "FB-3",
+                "title": "t",
+                "body": "b",
+                "source": "BamlFeedback",
+                "author": { "email": null, "github": null, "device_id": "dev-1" },
+                "toolchain": null,
+                "files": {},
+                "comments": [],
+                "issue_ids": [],
+            },
+        );
         assert.equal(reporter_toolchain(fb), "unknown");
     }
 
@@ -771,7 +769,7 @@ testset "llm_parsing" {
         let repro = create_repro@parse(raw);
         assert.is_true(repro.files.has("main.baml"));
         match (repro.expectation) {
-            let e: ShouldEvaluateTo => assert.equal(baml.json.stringify(e.expected), "-1"),
+            let e: ShouldEvaluateTo => assert.equal(baml.json.to<int>(e.expected), -1),
             _ => baml.sys.panic("expected should_evaluate_to"),
         }
     }

@@ -24,6 +24,8 @@ fn normalize_symbol(symbol: &Symbol) -> Symbol {
     match symbol {
         Symbol::Function(function) => Symbol::Function(normalize_function(function)),
         Symbol::Class(class) => Symbol::Class(Class {
+            crossing: class.crossing,
+            json_omit_nulls: class.json_omit_nulls,
             name: class.name.clone(),
             generic_params: class.generic_params.clone(),
             docstring: class.docstring.clone(),
@@ -34,6 +36,9 @@ fn normalize_symbol(symbol: &Symbol) -> Symbol {
                     name: property.name.clone(),
                     docstring: property.docstring.clone(),
                     ty: normalize_ty(&property.ty),
+                    json_rename: property.json_rename.clone(),
+                    json_flatten: property.json_flatten,
+                    json_fallback: property.json_fallback,
                 })
                 .collect(),
             static_methods: class
@@ -58,6 +63,7 @@ fn normalize_symbol(symbol: &Symbol) -> Symbol {
                     name: variant.name.clone(),
                     docstring: variant.docstring.clone(),
                     value: variant.value.clone(),
+                    json_rename: variant.json_rename.clone(),
                 })
                 .collect(),
             origin: enumeration.origin.clone(),
@@ -133,6 +139,7 @@ fn normalize_canonical(ty: Ty) -> Ty {
                 .collect(),
         ),
         Ty::List(inner) => Ty::List(Box::new(normalize_ty(&inner))),
+        Ty::Tuple(items) => Ty::Tuple(items.iter().map(normalize_ty).collect()),
         Ty::Map { key, value } => Ty::Map {
             key: Box::new(normalize_ty(&key)),
             value: Box::new(normalize_ty(&value)),

@@ -25,8 +25,8 @@ source: crates/baml_tests/src/generated_tests.rs
   × scoped type `T` cannot leave the block that binds it
     ╭─[scoped_type_escape.baml:40:5]
  40 │     risky<T>(as_t<T>("x"), false)
-    ·     ────┬───
-    ·         ╰── this throws `Boom<T>`, which would be published past the block; catch it inside the block, or declare `throws unknown`
+    ·     ──┬──
+    ·       ╰── this throws `Boom<T>`, which would be published past the block; catch it inside the block, or declare `throws unknown`
     ╰────
 
   [type] E0172
@@ -34,8 +34,8 @@ source: crates/baml_tests/src/generated_tests.rs
   × scoped type `T` cannot leave the block that binds it
     ╭─[scoped_type_escape.baml:47:9]
  47 │         risky<T>(as_t<T>("x"), false)
-    ·         ────┬───
-    ·             ╰── this throws `Boom<T>`, which would be published past the block; catch it inside the block, or declare `throws unknown`
+    ·         ──┬──
+    ·           ╰── this throws `Boom<T>`, which would be published past the block; catch it inside the block, or declare `throws unknown`
     ╰────
 
   [type] E0172
@@ -43,8 +43,8 @@ source: crates/baml_tests/src/generated_tests.rs
   × scoped type `T` cannot leave the block that binds it
     ╭─[scoped_type_escape.baml:56:9]
  56 │         risky<T>(as_t<T>("x"), true)
-    ·         ────┬───
-    ·             ╰── this throws `Boom<T>`, which would be published past the block; catch it inside the block, or declare `throws unknown`
+    ·         ──┬──
+    ·           ╰── this throws `Boom<T>`, which would be published past the block; catch it inside the block, or declare `throws unknown`
     ╰────
 
   [type] E0172
@@ -70,7 +70,7 @@ source: crates/baml_tests/src/generated_tests.rs
   ⚠ extraneous throws declaration: unknown[]
     ╭─[scoped_type_escape.baml:87:84]
  87 │ ╭─▶ function list_relaxed_wrongly(t: reflect.Type) -> string throws unknown[] | string {
- 88 │ │       type T = unreflect(t)
+ 88 │ │       let type T = t;
  89 │ │       let v: T = as_t<T>(1)
  90 │ │       let a: T[] = [v]
  91 │ │       throw a
@@ -90,7 +90,7 @@ source: crates/baml_tests/src/generated_tests.rs
   ⚠ extraneous throws declaration: Boom<unknown>
     ╭─[scoped_type_escape.baml:94:85]
  94 │ ╭─▶ function boom_relaxed_wrongly(t: reflect.Type) -> int throws Boom<unknown> | string {
- 95 │ │       type T = unreflect(t)
+ 95 │ │       let type T = t;
  96 │ │       risky<T>(as_t<T>("x"), true)
  97 │ ╰─▶ }
     ╰────
@@ -100,7 +100,7 @@ source: crates/baml_tests/src/generated_tests.rs
   × declared throws is `string | Boom<unknown>`, but this function may also throw `Boom<T>`
     ╭─[scoped_type_escape.baml:96:5]
  96 │     risky<T>(as_t<T>("x"), true)
-    ·     ────────
+    ·     ─────
     ╰────
 
   [type] E0097
@@ -108,7 +108,7 @@ source: crates/baml_tests/src/generated_tests.rs
   × `throws unknown` is imprecise: this function throws `string | (() -> unknown throws never)`; write `throws string | (() -> unknown throws never)`
      ╭─[scoped_type_escape.baml:104:74]
  104 │ ╭─▶ function imprecise_unknown_clause(t: reflect.Type) -> int throws unknown {
- 105 │ │       type T = unreflect(t)
+ 105 │ │       let type T = t;
  106 │ │       let v: T = as_t<T>(1)
  107 │ │       throw () -> { ident<T>(v) }
  108 │ ╰─▶ }
@@ -189,17 +189,9 @@ source: crates/baml_tests/src/generated_tests.rs
 
   × scoped type `T` cannot leave the block that binds it
      ╭─[scoped_type_escape.baml:204:9]
- 204 │         map { key: as_t<T>(1) }
-     ·         ───────────┬───────────
-     ·                    ╰── this has type `map<string, T>`; a value leaves the block only through a type that does not mention `T`, such as `unknown`
-     ╰────
-
-  [type] E0002
-
-  × cannot infer type parameter `T`
-     ╭─[scoped_type_escape.baml:215:17]
- 215 │         xs.push(Cell { value: ident(as_t<T>(1)) })
-     ·                 ─────────────────────────────────
+ 204 │         map { "key": as_t<T>(1) }
+     ·         ────────────┬────────────
+     ·                     ╰── this has type `map<string, T>`; a value leaves the block only through a type that does not mention `T`, such as `unknown`
      ╰────
 
   [type] E0172
@@ -235,7 +227,7 @@ source: crates/baml_tests/src/generated_tests.rs
      ╭─[scoped_type_escape.baml:252:82]
  252 │ ╭─▶ function lambda_partial_clause_too_narrow(t: reflect.Type) -> int throws unknown {
  253 │ │       let f = () -> int throws string | _ {
- 254 │ │           type T = unreflect(t)
+ 254 │ │           let type T = t;
  255 │ │           throw as_t<T>(1)
  256 │ │       }
  257 │ │       f()
@@ -248,7 +240,7 @@ source: crates/baml_tests/src/generated_tests.rs
      ╭─[scoped_type_escape.baml:252:82]
  252 │ ╭─▶ function lambda_partial_clause_too_narrow(t: reflect.Type) -> int throws unknown {
  253 │ │       let f = () -> int throws string | _ {
- 254 │ │           type T = unreflect(t)
+ 254 │ │           let type T = t;
  255 │ │           throw as_t<T>(1)
  256 │ │       }
  257 │ │       f()

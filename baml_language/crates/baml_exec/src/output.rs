@@ -1,52 +1,28 @@
 // Output formatting for `BexExternalValue` — shared by `baml run` and
 // packaged binaries produced by `baml pack`.
 //
-// Two formats, per BEP-027:
-//   - Debug: human-readable, with type annotations. Default for `baml run`.
-//   - Json:  single JSON document, no wrapping. Default for `baml pack`,
-//            designed for pipelines / CI / agents.
+// Two formats, chosen at run time with `--output-format` by both `baml run`
+// and packed binaries:
+//   - Text: human-readable, with type annotations. The default.
+//   - Json: single JSON document, no wrapping; for pipelines, CI and agents.
 
 #![allow(clippy::print_stdout)]
 
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use bex_engine::{BexEngine, BexExternalValue, RuntimeTy};
+use bex_engine::{BexCallArg, BexEngine, BexExternalValue};
 
 use crate::HelperCallContext;
 
 /// Serialization format for a target's return value.
-#[derive(
-    Copy, Clone, Debug, Default, borsh::BorshSerialize, borsh::BorshDeserialize, clap::ValueEnum,
-)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable formatting with type annotations.
     #[default]
-    Debug,
+    Text,
     /// Single JSON document with no wrapping noise.
     Json,
-}
-
-/// Write the target's return value to stdout per the selected format.
-///
-/// `json` mode dispatches to the stdlib JSON serializer so the spec's
-/// "no wrapping" rule is enforced by the stdlib serializer (which also
-/// honors user `to_json` overrides). `debug` mode uses [`format_value`].
-pub async fn write_output(
-    engine: &Arc<BexEngine>,
-    value: BexExternalValue,
-    return_type: &RuntimeTy,
-    format: OutputFormat,
-) -> Result<()> {
-    write_output_with_context(
-        engine,
-        value,
-        return_type,
-        format,
-        &HelperCallContext::disabled(),
-        || {},
-    )
-    .await
 }
 
 /// Write a target's return value while preserving logger/cancellation context
@@ -58,13 +34,12 @@ pub async fn write_output(
 pub async fn write_output_with_context(
     engine: &Arc<BexEngine>,
     value: BexExternalValue,
-    return_type: &RuntimeTy,
     format: OutputFormat,
     helper_context: &HelperCallContext,
     before_print: impl FnOnce(),
 ) -> Result<()> {
     match format {
-        OutputFormat::Debug => {
+        OutputFormat::Text => {
             // TODO: route debug mode through a stdlib `baml.debug.format<T>`
             // (or auto-derived `to_string` on user classes) so user-defined
             // display overrides are honored, mirroring how `json` mode goes
@@ -77,7 +52,7 @@ pub async fn write_output_with_context(
             Ok(())
         }
         OutputFormat::Json => {
-            let text = serialize_via_baml_json(engine, value, return_type, helper_context).await?;
+            let text = serialize_via_baml_json(engine, value, helper_context).await?;
             before_print();
             println!("{text}");
             Ok(())
@@ -85,32 +60,36 @@ pub async fn write_output_with_context(
     }
 }
 
-/// Serialize a value via the BAML stdlib's `baml.json.serialize<T>`.
+/// Serialize a value via the BAML stdlib's `baml.json.stringify`, with every
+/// option left at its default.
 ///
-/// `serialize<T>` delegates to `baml.json.to_string(v)` in BAML, whose
-/// runtime-value dispatch honors user `baml.ToJson` overrides at every depth.
+/// `stringify` follows the value's runtime type and honors user
+/// `baml.ToJson` overrides at every depth.
 async fn serialize_via_baml_json(
     engine: &Arc<BexEngine>,
     value: BexExternalValue,
-    return_type: &RuntimeTy,
     helper_context: &HelperCallContext,
 ) -> Result<String> {
+    // The result goes back in as a host value: its union envelopes are the
+    // engine's description of what it handed out, not part of the value.
     let result = engine
-        .call_function(
-            "baml.json.serialize",
-            vec![value],
-            helper_context.call_context(indexmap::IndexMap::from([(
-                "T".to_string(),
-                return_type.clone(),
-            )])),
+        .call_function_bound_args(
+            "baml.json.stringify",
+            vec![
+                BexCallArg::Provided(Box::new(value.into_host_value())),
+                BexCallArg::OmittedDefault,
+                BexCallArg::OmittedDefault,
+                BexCallArg::OmittedDefault,
+            ],
+            helper_context.call_context(indexmap::IndexMap::new()),
             true,
         )
         .await
-        .map_err(|e| anyhow!("baml.json.serialize failed: {e:?}"))?;
+        .map_err(|e| anyhow!("baml.json.stringify failed: {e:?}"))?;
     match result {
         BexExternalValue::String(s) => Ok(s.to_string()),
         other => Err(anyhow!(
-            "baml.json.serialize returned non-string value: {other:?}"
+            "baml.json.stringify returned non-string value: {other:?}"
         )),
     }
 }

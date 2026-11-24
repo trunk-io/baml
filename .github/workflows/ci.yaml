@@ -28,10 +28,12 @@ env:
 jobs:
   determine_changes:
     name: "Determine changes"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=small..memory=low
     outputs:
       # Flag that is raised when any code in baml_language is changed
       code: ${{ steps.check_code.outputs.changed }}
+      # Wrapper source, harness, installer, or build inputs require conformance.
+      wrapper: ${{ steps.check_wrapper.outputs.changed }}
       # Flag for lexer changes
       lexer: ${{ steps.check_lexer.outputs.changed }}
       # Flag for parser changes
@@ -44,8 +46,6 @@ jobs:
       codegen: ${{ steps.check_codegen.outputs.changed }}
       # Docs example changes need the CLI, but not the full platform/SDK matrix.
       documentation_snippets: ${{ steps.check_documentation_snippets.outputs.changed }}
-      # Flag for docs/frontend changes
-      docs: ${{ steps.check_docs.outputs.changed }}
       # Flag for typescript2/webview changes
       webview: ${{ steps.check_webview.outputs.changed }}
       # Flag for typescript2 grammar changes
@@ -58,15 +58,40 @@ jobs:
       bridge_cffi_release: ${{ steps.check_bridge_cffi_release.outputs.changed }}
       # Flag for SDK test changes - triggers the SDK parity analysis pipeline
       sdk_tests: ${{ steps.check_sdk_tests.outputs.changed }}
-      # Flag that is raised when perf benchmarks (CodSpeed) should run: always
-      # after merge (push to main/canary) and on manual dispatch; on PRs only
-      # when the PR title/body or a commit message opts in.
-      run_perf: ${{ steps.check_perf.outputs.run }}
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v7
         with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
           fetch-depth: 0
           persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
 
       - name: Determine merge base
         id: merge_base
@@ -90,6 +115,9 @@ jobs:
             ':scripts/baml-wrapper-version' \
             ':scripts/baml-release-manifests' \
             ':scripts/baml-package-manager-artifacts' \
+            ':scripts/baml-pack-wrapper-release' \
+            ':scripts/baml-test-homebrew-package' \
+            ':scripts/baml-test-aur-package' \
             ':scripts/baml-release-platforms' \
             ':scripts/baml_release_platforms.py' \
             ':tools/baml_nightly_select.py' \
@@ -102,6 +130,7 @@ jobs:
             ':tools/pkg_boundaryml_com/**' \
             ':.github/workflows/ci.yaml' \
             ':.github/workflows/release-baml-language.yml' \
+            ':.github/workflows/build2-baml-wrapper.reusable.yaml' \
             ':.github/workflows/nightly-release.yml' \
             ':.github/workflows/build2-bridge-cffi.reusable.yaml' \
             ':.github/workflows/build2-python-sdk.reusable.yaml' \
@@ -119,13 +148,59 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check if wrapper inputs changed
+        id: check_wrapper
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          paths=(
+            'baml_language/**'
+            'baml_language/wrapper/**'
+            'baml_language/wrapper_tests/**'
+            'scripts/install.*'
+            'scripts/baml-wrapper-version'
+            'scripts/baml_release_platforms.py'
+            'scripts/tests/test_installer_bootstrap.py'
+            'release/platforms.json'
+            'mise.toml'
+            '.envrc'
+            'tools/baml-sccache'
+            '.github/actions/setup-rust/**'
+            '.github/actions/setup-musl-cross/**'
+            '.github/actions/setup-mise/**'
+            '.github/actions/export-build-fingerprint/**'
+            '.github/workflows/wrapper-tests.reusable.yaml'
+            '.github/workflows/ci.yaml'
+          )
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$MERGE_BASE"
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            if [[ -z "$PUSH_BEFORE" || "$PUSH_BEFORE" == '0000000000000000000000000000000000000000' ]]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            base="$PUSH_BEFORE"
+          fi
+          if git diff --quiet "$base" HEAD -- "${paths[@]}"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check if lexer code changed
         id: check_lexer
         env:
           MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
         run: |
           if git diff --quiet "${MERGE_BASE}...HEAD" -- \
-            ':baml_language/crates/baml_compiler_lexer/**' \
+            ':baml_language/crates/baml_syntax/**' \
+            ':baml_language/crates/baml_syntax_macros/**' \
             ':baml_language/crates/baml_base/**' \
             ':baml_language/Cargo.toml' \
             ':baml_language/Cargo.lock' \
@@ -141,9 +216,9 @@ jobs:
           MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
         run: |
           if git diff --quiet "${MERGE_BASE}...HEAD" -- \
-            ':baml_language/crates/baml_compiler_parser/**' \
-            ':baml_language/crates/baml_compiler_syntax/**' \
-            ':baml_language/crates/baml_compiler_lexer/**' \
+            ':baml_language/crates/baml_parser/**' \
+            ':baml_language/crates/baml_syntax/**' \
+            ':baml_language/crates/baml_syntax_macros/**' \
             ':baml_language/crates/baml_base/**' \
           ; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -157,8 +232,8 @@ jobs:
           MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
         run: |
           if git diff --quiet "${MERGE_BASE}...HEAD" -- \
-            ':baml_language/crates/baml_compiler_hir/**' \
-            ':baml_language/crates/baml_compiler_parser/**' \
+            ':baml_language/crates/baml_compiler2_hir/**' \
+            ':baml_language/crates/baml_parser/**' \
             ':baml_language/crates/baml_base/**' \
           ; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -223,20 +298,6 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check if docs changed
-        id: check_docs
-        env:
-          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
-        run: |
-          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
-            ':fern/**' \
-            ':.github/workflows/docs.reusable.yaml' \
-          ; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check if webview changed
@@ -369,86 +430,54 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Decide whether perf benchmarks (CodSpeed) should run for this event.
-      # Policy: benchmarks run AFTER MERGE (push to main/canary) only when the
-      # merge actually touched baml_language/, and on manual dispatch. On PRs
-      # they are OPT-IN — they no longer run on every code change. A PR opts in
-      # by mentioning one of the perf markers in its title, body, OR any of its
-      # commit messages. merge_group is always skipped (the PR already had its
-      # chance to run).
-      - name: Check perf benchmark opt-in
-        id: check_perf
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.sha }}
-        run: |
-          # Any of these, case-insensitive, in the PR title/body or a commit
-          # message opts a PR into a perf run. Keep in sync with the instructions
-          # posted by the "Perf benchmarks (PR notice)" job below.
-          PATTERN='RUN_CODSPEED=1|run-perf|/perf'
-
-          # After merge (push to canary/main): only run when the merge actually
-          # touched baml_language/. NOTE: we diff the pushed range (before..after)
-          # directly rather than reuse determine_changes' `code` flag — on a push
-          # the merge-base of HEAD and origin/<branch> collapses to HEAD, so that
-          # diff is always empty here. The push payload's before/after are the
-          # real merged range.
-          if [ "$EVENT_NAME" = "push" ]; then
-            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              # Branch creation / unknown previous tip — nothing to diff against,
-              # so run to be safe rather than silently skip.
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if git diff --quiet "$PUSH_BEFORE" "$PUSH_AFTER" -- ':baml_language/**'; then
-              echo "run=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "run=true" >> "$GITHUB_OUTPUT"
-            fi
-            exit 0
-          fi
-
-          # Manual dispatch always runs.
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Never run in the merge queue — it already ran (or was opted out) on
-          # the PR.
-          if [ "$EVENT_NAME" = "merge_group" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # On PRs: opt in via the PR title/body or any commit message in the PR.
-          if printf '%s\n%s' "$PR_TITLE" "$PR_BODY" | grep -qiE "$PATTERN"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ -n "$MERGE_BASE" ] && git log --format='%B' "${MERGE_BASE}..HEAD" | grep -qiE "$PATTERN"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "run=false" >> "$GITHUB_OUTPUT"
+  wrapper-tests:
+    name: Wrapper tests
+    needs: determine_changes
+    if: needs.determine_changes.outputs.wrapper == 'true'
+    uses: ./.github/workflows/wrapper-tests.reusable.yaml
+    secrets: inherit
 
   # Lint checks
   prek:
     name: "Pre-commit Checks"
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=large..memory=low
     needs: determine_changes
     if: needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary'
     timeout-minutes: 20
     steps:
       - name: "Checkout Branch"
-        uses: useblacksmith/checkout@v1
+        uses: actions/checkout@v7
         with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
           persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
 
       # Install Rust toolchain BEFORE rust-cache so cache key uses correct Rust version
       - name: "Install Rust toolchain"
@@ -456,13 +485,6 @@ jobs:
           rustup toolchain install
           rustup toolchain install 1.97.1 --profile minimal --component rustc-dev
         working-directory: baml_language
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "baml_language -> target"
-          # See the cache strategy explanation at the top of cargo-tests.reusable.yaml.
-          save-if: false
-          shared-key: "linux-cargo"
 
       # prek hooks invoke cargo (from rustup), mise tasks that shell out
       # to cargo, and python scripts that begin with `#!/usr/bin/env -S
@@ -472,6 +494,7 @@ jobs:
       - name: "Install mise"
         uses: ./.github/actions/setup-mise
         with:
+          cache: "false"
           # Temporarily omit Hawk while its CI check is disabled.
           # install_args: "cargo:prek cargo:https://github.com/astral-sh/hawk python uv node clang-format"
           install_args: "sccache cargo:prek python uv node clang-format"
@@ -500,16 +523,45 @@ jobs:
 
   release-metadata:
     name: "Release Metadata"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=medium..memory=low
     needs: determine_changes
     if: needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary'
     timeout-minutes: 5
     steps:
       - name: "Checkout"
-        uses: useblacksmith/checkout@v1
+        uses: actions/checkout@v7
         with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
           fetch-depth: 0
           persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
 
       - name: "Validate baml_language release metadata"
         run: scripts/baml-language-version check
@@ -604,7 +656,6 @@ jobs:
     secrets:
       BAML_SCCACHE_R2_ACCESS_KEY_ID: ${{ secrets.BAML_SCCACHE_R2_ACCESS_KEY_ID }}
       BAML_SCCACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BAML_SCCACHE_R2_SECRET_ACCESS_KEY }}
-      TRUNK_ORG_TOKEN: ${{ secrets.TRUNK_ORG_TOKEN }}
 
   documentation-snippets:
     name: "Documentation examples"
@@ -621,12 +672,14 @@ jobs:
     secrets:
       BAML_SCCACHE_R2_ACCESS_KEY_ID: ${{ secrets.BAML_SCCACHE_R2_ACCESS_KEY_ID }}
       BAML_SCCACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BAML_SCCACHE_R2_SECRET_ACCESS_KEY }}
-      TRUNK_ORG_TOKEN: ${{ secrets.TRUNK_ORG_TOKEN }}
 
   size-gate:
     name: "Size Gate"
     needs: determine_changes
-    if: needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary'
+    # Disabled: two fat-LTO release builds per push for an advisory comment.
+    # To re-enable, restore the condition below and the schedule in
+    # size-gate-baseline-refresh.yml.
+    if: false # needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary'
     uses: ./.github/workflows/size-gate.reusable.yaml
     # Structural mapping only; see cargo-tests above.
     secrets:
@@ -643,16 +696,6 @@ jobs:
     uses: ./.github/workflows/wasm-pack-tests.reusable.yaml
     secrets: inherit
 
-  docs:
-    name: "Docs"
-    needs: determine_changes
-    uses: ./.github/workflows/docs.reusable.yaml
-    with:
-      docs_changed: ${{ needs.determine_changes.outputs.docs }}
-      is_canary: ${{ github.ref == 'refs/heads/canary' }}
-    secrets: inherit
-    permissions: write-all
-
   webview-tests:
     name: "Webview Tests"
     needs: determine_changes
@@ -662,14 +705,43 @@ jobs:
 
   grammar-tests:
     name: "Grammar Tests"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=medium
     needs: determine_changes
     if: needs.determine_changes.outputs.grammar == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary'
     steps:
       - name: "Checkout Branch"
-        uses: useblacksmith/checkout@v1
+        uses: actions/checkout@v7
         with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
           persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
 
       - name: "Setup Node.js for typescript2"
         uses: ./.github/actions/setup-node2
@@ -685,40 +757,14 @@ jobs:
         run: git diff --exit-code -- typescript2/pkg-grammar typescript2/app-vscode-ext
 
       - name: "Run grammar tests"
-        id: grammar-tests
-        continue-on-error: true
         run: pnpm --filter @b/pkg-grammar test
         working-directory: typescript2
-
-      - name: "Analyze grammar test results in Trunk"
-        uses: ./.github/actions/upload-test-results
-        with:
-          junit-path: typescript2/pkg-grammar/junit.xml
-          # https://app.trunk.io/boundaryml/flaky-tests/collections/xl5LO9gK
-          collection: xl5LO9gK
-          normalize: prefix
-          path-prefix: typescript2/pkg-grammar
-          test-outcome: ${{ steps.grammar-tests.outcome }}
-          token: ${{ secrets.TRUNK_ORG_TOKEN }}
 
       - name: "Run highlight.js grammar tests"
         # The hljs port validates against pkg-grammar's fixtures, so a grammar
         # change that the port doesn't handle fails here (conformance gate).
-        id: hljs-tests
-        continue-on-error: true
         run: pnpm --filter @b/pkg-grammar-hljs test
         working-directory: typescript2
-
-      - name: "Analyze highlight.js results in Trunk"
-        uses: ./.github/actions/upload-test-results
-        with:
-          junit-path: typescript2/pkg-grammar-hljs/junit.xml
-          # https://app.trunk.io/boundaryml/flaky-tests/collections/xl5LO9gK
-          collection: xl5LO9gK
-          normalize: prefix
-          path-prefix: typescript2/pkg-grammar-hljs
-          test-outcome: ${{ steps.hljs-tests.outcome }}
-          token: ${{ secrets.TRUNK_ORG_TOKEN }}
 
       - name: "Run tree-sitter grammar tests"
         # Generates the parser and runs the corpus + fixture parse gate.
@@ -792,6 +838,8 @@ jobs:
     # TODO: Re-enable once miri test performance is addressed
     if: false # needs.determine_changes.outputs.unsafe == 'true'
     timeout-minutes: 25
+    env:
+      MIRI_TOOLCHAIN: nightly-2026-10-29
     steps:
       - name: "Checkout"
         uses: useblacksmith/checkout@v1
@@ -800,13 +848,13 @@ jobs:
 
       - name: "Install Rust nightly and Miri"
         run: |
-          rustup toolchain install nightly --component miri
-          rustup override set nightly
+          rustup toolchain install "$MIRI_TOOLCHAIN" --component miri
+          rustup override set "$MIRI_TOOLCHAIN"
         working-directory: baml_language
 
       # Separate step so if fetch is slow, build is fast.
       - name: "Fetch cargo dependencies"
-        run: cargo +nightly fetch
+        run: cargo "+$MIRI_TOOLCHAIN" fetch
         working-directory: baml_language
 
       - name: "Run Miri tests on bex_heap"
@@ -815,35 +863,58 @@ jobs:
 
   proto-sync:
     name: "proto generated files sync"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=medium
     needs: determine_changes
     if: needs.determine_changes.outputs.proto == 'true'
     timeout-minutes: 20
     steps:
       - name: "Checkout"
-        uses: useblacksmith/checkout@v1
+        uses: actions/checkout@v7
         with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
           persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
 
       # Install Rust toolchain BEFORE rust-cache so cache key uses correct Rust version.
       - name: "Install Rust toolchain"
         run: rustup toolchain install
         working-directory: baml_language
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "baml_language -> target"
-          # See the cache strategy explanation at the top of cargo-tests.reusable.yaml.
-          save-if: false
-          shared-key: "linux-cargo"
-
-      # bridge_ctypes/build.rs needs `protoc`; bridge_go/build.sh needs
+      # bridge_ctypes/build.rs needs `protoc`; baml_go's generate.sh needs
       # `protoc` + `protoc-gen-go`; bridge_typescript needs node + pnpm.
       # The `cargo build -p bridge_ctypes` step uses cargo from rustup
       # (not mise), so we don't need `go` itself here either.
       - name: "Install mise"
         uses: ./.github/actions/setup-mise
         with:
+          cache: "false"
           install_args: "node npm:pnpm protoc protoc-gen-go"
 
       # Separate step so if fetch is slow, build is fast.
@@ -854,13 +925,20 @@ jobs:
       # Rust (prost) + Python (protoc) — both driven by bridge_ctypes/build.rs.
       # Writes Python pb2/pyi into baml_language/sdks/python/src/baml_bridge/cffi/v1/.
       - name: "Generate Rust + Python proto bindings (bridge_ctypes)"
-        run: cargo build -p bridge_ctypes
+        # bridge_ctypes/build.rs writes the bindings into the source tree but
+        # does not track them, so cargo skips it on a warm target/ tree when its
+        # inputs are unchanged, and a hand edit to a generated file would pass
+        # the check below. Touch build.rs (it is a rerun-if-changed input) so
+        # the script always runs and writes the bindings again.
+        run: |
+          touch crates/bridge_ctypes/build.rs
+          cargo build -p bridge_ctypes
         working-directory: baml_language
 
-      # Go (protoc-gen-go) — writes into sdks/go/bridge_go/cffi/proto/baml_bridge/cffi/v1/.
-      - name: "Generate Go proto bindings (sdks/go/bridge_go)"
-        run: ./build.sh
-        working-directory: baml_language/sdks/go/bridge_go
+      # Go (protoc-gen-go) — writes into sdks/go/baml_go/internal/cffi/.
+      - name: "Generate Go proto bindings (sdks/go/baml_go)"
+        run: ./generate.sh
+        working-directory: baml_language/sdks/go/baml_go/internal/cffi
 
       # --ignore-workspace: install from bridge_typescript's own pnpm-lock.yaml
       # rather than the root workspace lockfile. The two resolve different
@@ -904,7 +982,7 @@ jobs:
           PATHS=(
             baml_language/sdks/typescript/bridge_typescript
             baml_language/crates/bridge_ctypes
-            baml_language/sdks/go/bridge_go
+            baml_language/sdks/go/baml_go/internal/cffi
             baml_language/sdks/python/src/baml_bridge/cffi
             baml_language/sdks/rust/bridge_rust/src/wire
             baml_language/sdks/swift/Sources/BamlBridge/Proto
@@ -930,31 +1008,55 @@ jobs:
 
   sdk_parity_check:
     name: "SDK parity lint"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=medium..memory=low
     needs: determine_changes
     if: needs.determine_changes.outputs.sdk_tests == 'true'
     timeout-minutes: 15
     steps:
       - name: "Checkout Branch"
-        uses: useblacksmith/checkout@v1
+        uses: actions/checkout@v7
         with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
           fetch-depth: 0
           persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
 
       - name: "Install mise"
         uses: ./.github/actions/setup-mise
         with:
+          cache: "false"
           install_args: "ast-grep"
 
       - name: "Install Rust toolchain"
         working-directory: baml_language
         run: rustup show
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "baml_language -> target"
-          save-if: ${{ github.ref == 'refs/heads/canary' }}
-          shared-key: "sdk-parity-baml-cli"
 
       - name: "Build local BAML CLI"
         run: cargo build --manifest-path baml_language/Cargo.toml -p baml_cli --bin baml-cli
@@ -970,260 +1072,6 @@ jobs:
           path: baml_language/sdk_tests/crates/parity_analysis.new.md
           if-no-files-found: ignore
           retention-days: 14
-
-  # Benchmarks are split into two jobs so the slow compile happens on a fast,
-  # cheap machine while the actual measurement happens on a stable CodSpeed
-  # macro runner.
-  #
-  #   benchmarks-build  -> compiles the bench binaries (the part that used to
-  #                        time out on the small CodSpeed runner)
-  #   benchmarks-run    -> ONLY executes those prebuilt binaries on codspeed-macro
-  #
-  # CRITICAL — no double-build / flag mismatch:
-  #   `cargo codspeed build` compiles each bench target with CodSpeed's own
-  #   compilation flags and copies the resulting executables into
-  #   target/codspeed/walltime/<pkg>/<bench>. `cargo codspeed run` then ONLY
-  #   executes those copies — it never invokes the compiler. So the run job
-  #   cannot accidentally rebuild with default flags; if the artifact is missing
-  #   it errors ("No benchmarks found") instead of measuring the wrong binary.
-  #
-  # CRITICAL — ABI match:
-  #   codspeed-macro is an ARM64 machine, so the binaries MUST be built on ARM64
-  #   too. We build on the OLDEST Ubuntu we have an ARM runner for (22.04,
-  #   glibc 2.35) so the binaries stay forward-compatible with whatever (newer
-  #   or equal) glibc the macro runner ships.
-  benchmarks-build:
-    name: "benchmarks build (baml)"
-    runs-on: blacksmith-8vcpu-ubuntu-2204-arm
-    needs: determine_changes
-    # Perf benchmarks run AFTER MERGE (push to main/canary, only when the merge
-    # touched baml_language/) and on manual dispatch. On PRs they are OPT-IN: a
-    # PR runs them only when its title/body or a commit message mentions a perf
-    # marker (RUN_CODSPEED=1, run-perf, /perf). See the `check_perf` step for the
-    # policy
-    # and the "Perf benchmarks (PR notice)" job for the comment PRs get when
-    # benchmarks are skipped. Skipped in merge_group (already settled on the PR).
-    if: needs.determine_changes.outputs.run_perf == 'true'
-    timeout-minutes: 30
-    steps:
-      - name: "Checkout Branch"
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      # Install Rust toolchain BEFORE rust-cache so cache key uses correct Rust version
-      - name: "Install Rust toolchain"
-        run: rustup show
-        working-directory: baml_language
-
-      # Swatinem caches the compiled target/ for this build job's own speed
-      # (canary is the sole saver; PRs restore read-only). It is bench-specific
-      # on purpose — its only saver compiles just baml_tests benches, a thin
-      # seed not worth sharing with a general ARM job.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "baml_language -> target"
-          save-if: ${{ github.ref == 'refs/heads/canary' }}
-          cache-all-crates: true
-          cache-workspace-crates: true
-          shared-key: "linux-arm-bench"
-
-      # Pin to the same major+minor as codspeed-divan-compat in Cargo.lock
-      # (4.7.0). cargo codspeed run aborts on a major-version mismatch.
-      - name: "Install cargo-codspeed"
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-codspeed@4.7.0
-
-      # Separate step so if fetch is slow, build is fast.
-      - name: "Fetch cargo dependencies"
-        run: cargo fetch
-        working-directory: baml_language
-
-      # Only runtime_benchmark — cache_profile is a macOS/kperf harness that's a
-      # no-op on Linux, so there's no reason to build or run it here.
-      - name: "Build benchmarks (walltime)"
-        run: cargo codspeed build -p baml_tests --bench runtime_benchmark -m walltime
-        working-directory: baml_language
-
-      - name: "Upload prebuilt benchmark binaries"
-        uses: actions/upload-artifact@v7
-        with:
-          name: codspeed-walltime-benches
-          path: baml_language/target/codspeed/walltime
-          if-no-files-found: error
-          retention-days: 1
-
-      # Hand the resolved cargo home to benchmarks-run via an ARTIFACT, not a
-      # cache. actions/cache addresses entries by (key, version) where version
-      # depends on the runner's compression tooling, so a cache saved on this
-      # blacksmith runner is invisible to the codspeed-macro run job even with an
-      # identical key (verified: same key 4f01266e…, "Cache not found"). Artifacts
-      # are content-addressed by name and transfer cleanly across runners.
-      # benchmarks-run untars this into ~/.cargo so its offline `cargo metadata`
-      # has every dep locally — no ~24-min cold git re-clone.
-      # Exclude registry/src (extracted dep sources — the bulk of ~/.cargo). The
-      # run job only does offline `cargo metadata`, which needs the registry
-      # index + git checkouts, not the unpacked sources, so this keeps the
-      # artifact (and the run job's download/untar) small.
-      - name: "Pack cargo home for benchmarks-run"
-        run: |
-          mkdir -p "$HOME/.cargo/git"
-          tar -C "$HOME" --exclude='.cargo/registry/src' -cf cargo-home.tar .cargo/registry .cargo/git
-      - name: "Upload cargo home"
-        uses: actions/upload-artifact@v7
-        with:
-          name: codspeed-cargo-home
-          path: cargo-home.tar
-          if-no-files-found: error
-          retention-days: 1
-
-  benchmarks-run:
-    name: "benchmarks instrumented (baml)"
-    runs-on: codspeed-macro
-    needs:
-      - determine_changes
-      - benchmarks-build
-    # Same gate as benchmarks-build — see determine_changes' `check_perf` step.
-    if: needs.determine_changes.outputs.run_perf == 'true'
-    timeout-minutes: 30
-    steps:
-      - name: "Checkout Branch"
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      # `cargo codspeed run` needs `cargo metadata` to locate the benches and
-      # their working directories. It does NOT compile anything here.
-      - name: "Install Rust toolchain"
-        run: rustup show
-        working-directory: baml_language
-
-      # Restore the resolved cargo home that benchmarks-build packed, so this
-      # job's offline `cargo metadata` has every dep locally instead of cold
-      # re-cloning git deps on the bare codspeed-macro runner (~24 min). Comes
-      # via artifact, not cache — see the build job for why cache misses here.
-      - name: "Download cargo home"
-        uses: actions/download-artifact@v8
-        with:
-          name: codspeed-cargo-home
-          path: /tmp/cargo-home
-      - name: "Unpack cargo home into ~/.cargo"
-        run: tar -C "$HOME" -xf /tmp/cargo-home/cargo-home.tar
-
-      - name: "Install cargo-codspeed"
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-codspeed@4.7.0
-
-      - name: "Download prebuilt benchmark binaries"
-        uses: actions/download-artifact@v8
-        with:
-          name: codspeed-walltime-benches
-          path: baml_language/target/codspeed/walltime
-
-      # actions/upload-artifact drops the Unix executable bit; restore it so the
-      # binaries can be exec'd by `cargo codspeed run`.
-      - name: "Restore executable bit on bench binaries"
-        run: chmod -R +x baml_language/target/codspeed/walltime
-
-      - name: "Run benchmarks (walltime)"
-        uses: CodSpeedHQ/action@v4
-        # Benchmarks are advisory — never block a merge on a measurement blip.
-        continue-on-error: true
-        env:
-          # The cargo home is restored above, so `cargo metadata` has every dep
-          # locally. Force offline so it physically cannot stall on the network
-          # (no index update, no git fetch) — turns the old ~24-min metadata
-          # phase into seconds. Fails fast and loud if the cache ever misses,
-          # instead of silently re-cloning for half an hour.
-          CARGO_NET_OFFLINE: "true"
-          # Adaptive sampling: cap each bench at ~2s of wall time instead of
-          # CodSpeed walltime's fixed 100 samples/bench. divan then runs as many
-          # samples as fit the budget — ~100 for cheap benches (full statistical
-          # power kept), down to 1 for the heavy O(n²)/1M-iter workloads (whose
-          # run-to-run variance is already tiny, so a single sample suffices).
-          #
-          # WHY: at fixed 100 samples the suite blew past the 30-min timeout. The
-          # long pole was compute::bubble_sort_5k — ~14s/sample on the (≈5×
-          # slower than local) codspeed-macro runner × 100 = ~23min for ONE
-          # bench. With this cap the whole 36-bench suite finishes in ~2 min.
-          # Measured locally: fixed-100 bubble_sort alone >90s; with the budget
-          # the full suite ran in 80s. Tune the budget here, not in code.
-          DIVAN_MAX_TIME: "2"
-        with:
-          mode: walltime
-          # Executes ONLY the prebuilt binaries downloaded above; no compiler runs.
-          #
-          # Every bench is a `vm_speedtest_*` function auto-generated from the
-          # cross-language workload corpus under tools/speedtest/workloads/*.md
-          # (see baml_tests/build.rs). They measure *pure VM execution*: the BAML
-          # is compiled and the tokio runtime is built once, OUTSIDE the measured
-          # region (see bench_vm_main), so only `main()` is timed. Sleep-based
-          # workloads are excluded at build time.
-          #
-          # The `vm_speedtest` filter selects exactly that suite; DIVAN_MAX_TIME
-          # (above) bounds each bench so the pass stays well under the timeout.
-          run: cd baml_language && cargo codspeed run -m walltime 'vm_speedtest'
-          token: ${{ secrets.CODSPEED_TOKEN }}
-
-  # Leaves (and keeps up to date) a single sticky comment on each PR explaining
-  # the perf-benchmark policy: either confirming benchmarks were triggered, or —
-  # when they were skipped — telling the author exactly how to opt in. Runs on
-  # every PR event so the same comment is edited in place (no spam) and flips
-  # between the two states as the author edits the PR / pushes commits.
-  perf-pr-notice:
-    name: "Perf benchmarks (PR notice)"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    needs: determine_changes
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
-    permissions:
-      pull-requests: write
-    steps:
-      - name: "Comment perf opt-in instructions"
-        uses: actions/github-script@v9
-        env:
-          RUN_PERF: ${{ needs.determine_changes.outputs.run_perf }}
-        with:
-          script: |
-            // Hidden marker so we find & update our own comment instead of
-            // posting a new one on every push.
-            const marker = '<!-- perf-benchmarks-pr-notice -->';
-            const triggered = process.env.RUN_PERF === 'true';
-            const body = triggered
-              ? [
-                  marker,
-                  '### 🏎️ Performance benchmarks are running for this PR',
-                  '',
-                  'CodSpeed perf benchmarks were triggered because this PR opted in. ' +
-                    'Results will appear in the CodSpeed check / dashboard once they finish.',
-                ].join('\n')
-              : [
-                  marker,
-                  '### ⏭️ Performance benchmarks were skipped',
-                  '',
-                  'Perf benchmarks (CodSpeed) are **opt-in** on pull requests — they no ' +
-                    'longer run on every push. They always run automatically after merge ' +
-                    'to `canary`/`main`.',
-                  '',
-                  'To run them on **this** PR, do any of the following, then push a commit ' +
-                    '(or re-run CI):',
-                  '',
-                  '- Add `RUN_CODSPEED=1` to the PR description, **or**',
-                  '- Include `run-perf` or `/perf` in the PR title or any commit message.',
-                ].join('\n');
-
-            const { owner, repo } = context.repo;
-            const issue_number = context.issue.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number,
-            });
-            const existing = comments.find((c) => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
 
   # CI Failure Alert - Required status check using "skipped = success" pattern
   # See: https://devopsdirective.com/posts/2025/08/github-actions-required-checks-for-conditional-jobs/
@@ -1241,9 +1089,9 @@ jobs:
       - release-metadata
       - bridge-cffi-release
       - cargo-tests
+      - wrapper-tests
       - documentation-snippets
       - wasm-pack-tests
-      - docs
       - webview-tests
       - grammar-tests
       - linguist-compile-gate
@@ -1270,9 +1118,9 @@ jobs:
           echo "| release-metadata | ${{ needs.release-metadata.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| bridge-cffi-release | ${{ needs.bridge-cffi-release.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| cargo-tests | ${{ needs.cargo-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| wrapper-tests | ${{ needs.wrapper-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| documentation-snippets | ${{ needs.documentation-snippets.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| wasm-pack-tests | ${{ needs.wasm-pack-tests.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| docs | ${{ needs.docs.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| webview-tests | ${{ needs.webview-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| grammar-tests | ${{ needs.grammar-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| linguist-compile-gate | ${{ needs.linguist-compile-gate.result }} |" >> $GITHUB_STEP_SUMMARY
@@ -1309,9 +1157,9 @@ jobs:
       - release-metadata
       - bridge-cffi-release
       - cargo-tests
+      - wrapper-tests
       - documentation-snippets
       - wasm-pack-tests
-      - docs
       - webview-tests
       - grammar-tests
       - linguist-compile-gate

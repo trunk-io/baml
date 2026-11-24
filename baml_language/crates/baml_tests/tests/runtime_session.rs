@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use baml_tests::{baml_test, engine::TestOutput};
 use bex_engine::{BexEngine, BexExternalValue, EngineError, FunctionCallContextBuilder};
-use bex_heap::{CollectionLevel, HeapPermit};
+use bex_heap::HeapPermit;
 use bex_vm_types::Object;
 use sys_native::SysOpsExt;
 
@@ -117,7 +117,7 @@ function escape_one_session_value() -> reflect.Type {
   s.eval(`let first = Escaped { value: "first" }`)
   s.eval(`let count = 2`)
   s.eval(`let note = "history"`)
-  s.eval<reflect.Type>(`reflect.Type.of<Escaped>()`)
+  s.eval<reflect.Type>(`Escaped.type()`)
 }
 "#####;
 
@@ -262,8 +262,8 @@ function package_current_is_rejected() -> bool {
 
 function runtime_and_failed_contracts() -> bool {
   let s = reflect.Session.new()
-  let string_t = reflect.Type.of<string>()
-  type StringT = unreflect(string_t)
+  let string_t = string.type()
+  let type StringT = string_t;
   let value = s.eval<StringT>(`"ok"`)
   let rejected = (s.eval<string>(`
     let should_not_exist = 7
@@ -330,12 +330,12 @@ function client_declaration_is_lazy() -> bool {
 function runtime_type_binding_persists() -> bool {
   let s = reflect.Session.new()
   let first = s.eval<bool>(`
-    type T = unreflect(reflect.Type.of<string>());
-    reflect.Type.of<T>() == reflect.Type.of<string>()
+    let type T = string.type();
+    reflect.Type.of<T>() == string.type()
   `)
-  let later = s.eval<bool>(`reflect.Type.of<T>() == reflect.Type.of<string>()`)
-  s.eval(`type T = unreflect(reflect.Type.of<int>());`)
-  let rebound = s.eval<bool>(`reflect.Type.of<T>() == reflect.Type.of<int>()`)
+  let later = s.eval<bool>(`reflect.Type.of<T>() == string.type()`)
+  s.eval(`let type T = int.type();`)
+  let rebound = s.eval<bool>(`reflect.Type.of<T>() == int.type()`)
   first && later && rebound
 }
 
@@ -344,7 +344,7 @@ function runtime_type_binding_persists() -> bool {
 // read the value through a global. Narrowing recovers it.
 function binding_typed_step_value_leaves_as_unknown() -> bool {
   let s = reflect.Session.new()
-  s.eval(`type T = unreflect(reflect.Type.of<int>());`)
+  s.eval(`let type T = int.type();`)
   s.eval(`let v = match (1) { let x: T => x, _ => 0 }`)
   let narrowed = s.eval<int>(`match (v) { let n: int => n, _ => -1 }`)
   let unrelated = s.eval<string>(`"plain"`)
@@ -356,8 +356,8 @@ function session_declarations_are_generative() -> bool {
   let right = reflect.Session.new()
   left.eval(`class SameName { value string }`)
   right.eval(`class SameName { value string }`)
-  let left_type = left.eval<reflect.Type>(`reflect.Type.of<SameName>()`)
-  let right_type = right.eval<reflect.Type>(`reflect.Type.of<SameName>()`)
+  let left_type = left.eval<reflect.Type>(`SameName.type()`)
+  let right_type = right.eval<reflect.Type>(`SameName.type()`)
   left_type != right_type
 }
 
@@ -425,7 +425,7 @@ function refused() -> reflect.Session {
   b.eval(`let m = 1`);
   let artifact = a._compile<unknown>(`n = 9`);
   let _ = b._finish<unknown>(artifact) catch (e) {
-    baml.errors.InvalidArgument => { null },
+    reflect.errors.InvalidArgument => { null },
   };
   b
 }
@@ -471,11 +471,10 @@ async fn session_shape(engine: &Arc<BexEngine>, name: &str) -> PackageShape {
         .resolve_handle(active.proof(), &handle)
         .expect("the handle roots the session wrapper");
     // SAFETY: the active permit excludes collection; the handle roots the wrapper.
-    let Object::Instance(wrapper) = (unsafe { wrapper_ptr.get() }) else {
-        panic!("a Session handle wraps an instance")
-    };
+    let wrapper = unsafe { bex_vm_types::InstanceRef::of(wrapper_ptr) }
+        .expect("a Session handle wraps an instance");
     let package_ptr = wrapper
-        .load_field(0)
+        .load_value(0)
         .as_object_ptr()
         .expect("the wrapper holds its package");
     // SAFETY: the wrapper roots its package payload under the same permit.
@@ -511,7 +510,7 @@ async fn session_shape(engine: &Arc<BexEngine>, name: &str) -> PackageShape {
 /// history unchanged.
 #[tokio::test]
 async fn a_refused_submission_publishes_nothing() {
-    let program = baml_db::testing::compile_source(REFUSED_SUBMISSION_PROBE);
+    let program = baml_tests::stdlib_prefix::compile_source(REFUSED_SUBMISSION_PROBE);
     let engine = Arc::new(
         BexEngine::new_with_runtime_compiler(
             program,
@@ -532,7 +531,7 @@ async fn a_refused_submission_publishes_nothing() {
 
 #[tokio::test]
 async fn escaped_session_type_retains_provenance_only_while_handle_is_live() {
-    let program = baml_db::testing::compile_source(S11_LIVENESS_PROBE);
+    let program = baml_tests::stdlib_prefix::compile_source(S11_LIVENESS_PROBE);
     let engine = Arc::new(
         BexEngine::new_with_runtime_compiler(
             program,
@@ -555,7 +554,7 @@ async fn escaped_session_type_retains_provenance_only_while_handle_is_live() {
         panic!("expected escaped type handle, got {escaped:?}")
     };
 
-    let with_escape_gc = engine.collect_garbage(CollectionLevel::Major).await;
+    let with_escape_gc = engine.collect_garbage().await;
     let inactive = engine.heap_permit_manager().new_permit(()).await;
     let active = inactive.acquire().await;
     let escaped_ptr = engine
@@ -598,9 +597,18 @@ async fn escaped_session_type_retains_provenance_only_while_handle_is_live() {
         session_history = owner.session().map_or(0, |state| state.history.len());
         retained_globals = owner.slots.own().map_or(0, <[_]>::len);
         retained_objects = owner.objects.own().map_or(0, <[_]>::len);
-        retained_dependencies = owner.declared().count();
-        retained_dependency_objects = owner
-            .declared()
+        // The ordinary packages the session reaches: its mounts, not the
+        // prelude.
+        let declared: Vec<_> = owner
+            .dependencies()
+            .filter(|dependency| {
+                matches!(unsafe { dependency.get() }, Object::Package(package)
+                    if package.kind == bex_vm_types::types::PackageKind::Ordinary)
+            })
+            .collect();
+        retained_dependencies = declared.len();
+        retained_dependency_objects = declared
+            .iter()
             .map(|dependency| match unsafe { dependency.get() } {
                 Object::Package(package) => package.objects.own().map_or(0, <[_]>::len),
                 _ => 0,
@@ -609,7 +617,7 @@ async fn escaped_session_type_retains_provenance_only_while_handle_is_live() {
     }
     drop(active);
     drop(handle);
-    let without_escape_gc = engine.collect_garbage(CollectionLevel::Major).await;
+    let without_escape_gc = engine.collect_garbage().await;
     let escaped_graph_objects = with_escape_gc
         .live_count
         .saturating_sub(without_escape_gc.live_count);
@@ -680,7 +688,7 @@ fn trim_allocator() {}
 
 #[tokio::test]
 async fn five_hundred_evals_have_flat_latency_and_bounded_artifacts() {
-    let program = baml_db::testing::compile_source(SCENARIO_7);
+    let program = baml_tests::stdlib_prefix::compile_source(SCENARIO_7);
     let engine = Arc::new(
         BexEngine::new_with_runtime_compiler(
             program,
@@ -690,7 +698,7 @@ async fn five_hundred_evals_have_flat_latency_and_bounded_artifacts() {
         )
         .expect("Session perf engine"),
     );
-    let before_objects = engine.heap_stats().runtime_objects;
+    let before_words = engine.heap_stats().runtime_words;
     trim_allocator();
     let before_rss = resident_kib();
     let result = engine
@@ -702,7 +710,7 @@ async fn five_hundred_evals_have_flat_latency_and_bounded_artifacts() {
         )
         .await
         .expect("500 Session evals");
-    let after_objects = engine.heap_stats().runtime_objects;
+    let after_words = engine.heap_stats().runtime_words;
     trim_allocator();
     let after_rss = resident_kib();
     let BexExternalValue::String(timing) = result else {
@@ -712,11 +720,11 @@ async fn five_hundred_evals_have_flat_latency_and_bounded_artifacts() {
         .split_once(',')
         .map(|(a, b)| (a.parse::<u128>().unwrap(), b.parse::<u128>().unwrap()))
         .expect("two timing samples");
-    let object_growth = after_objects.saturating_sub(before_objects);
+    let word_growth = after_words.saturating_sub(before_words);
     let rss_growth = after_rss.saturating_sub(before_rss);
     eprintln!(
         "SESSION_PERF eval10_ns={tenth} eval500_ns={five_hundredth} \
-         runtime_object_growth={object_growth} rss_growth_kib={rss_growth}"
+         runtime_word_growth={word_growth} rss_growth_kib={rss_growth}"
     );
 
     // A 100ms floor keeps the wall-clock pin stable on loaded CI machines;
@@ -726,8 +734,8 @@ async fn five_hundred_evals_have_flat_latency_and_bounded_artifacts() {
         "eval #500 regressed against eval #10: {timing}"
     );
     assert!(
-        object_growth < 10_000,
-        "500 constant-size submissions retained too many VM objects: {object_growth}"
+        word_growth < 10_000 * bex_vm_types::OBJECT_CELL_WORDS,
+        "500 constant-size submissions retained too many heap words: {word_growth}"
     );
     assert!(
         rss_growth < 256 * 1024,

@@ -21,8 +21,6 @@
 /// token.cancel();
 /// ```
 class CancelToken {
-    _handle: $rust_type,
-
     /// Create a fresh, un-cancelled token.
     //baml:mut_vm
     function new() -> CancelToken throws never {
@@ -49,6 +47,8 @@ class CancelToken {
     function is_cancelled(self) -> bool throws never {
         $rust_function
     }
+
+    @@rust_type("CancelToken")
 }
 
 /// A value written after `with` in a `spawn`: it transforms the spawn's
@@ -80,9 +80,9 @@ class Plan<T, E> {
     body: () -> T throws E,
     /// The task's name in traces and error reports.
     name: string?,
-    /// The limits the task waits on. It starts once every one of them has
-    /// room, and holds none of them while it waits.
-    limits: Limit[],
+    /// The semaphores the task waits on. It starts once every one of them
+    /// has a free slot, and holds none of them while it waits.
+    semaphores: root.sync.Semaphore[],
     /// Cancelling any of these tokens cancels the task.
     cancel_tokens: CancelToken[],
     /// Whether the task keeps running when its spawner is cancelled.
@@ -90,7 +90,13 @@ class Plan<T, E> {
 
     /// A plan that runs `body`, with nothing added to it.
     function new(body: () -> T throws E, name: string? = null) -> Plan<T, E> throws never {
-        Plan { body: body, name: name, limits: [], cancel_tokens: [], root: false }
+        Plan {
+            body: body,
+            name: name,
+            semaphores: [],
+            cancel_tokens: [],
+            root: false,
+        }
     }
 
     /// Returns this plan with a new body: `wrapper`, called with the old one.
@@ -106,11 +112,9 @@ class Plan<T, E> {
     ) -> Plan<Output, Error> throws never {
         let body = self.body;
         Plan<Output, Error> {
-            body: () -> Output throws Error {
-                wrapper(body)
-            },
+            body: () -> Output throws Error { wrapper(body) },
             name: self.name,
-            limits: self.limits,
+            semaphores: self.semaphores,
             cancel_tokens: self.cancel_tokens,
             root: self.root,
         }
@@ -129,52 +133,6 @@ class Plan<T, E> {
     }
 }
 
-/// Caps how many tasks spawned `with` it run at once.
-///
-/// Tasks over the cap wait in line; the `spawn` still returns its `Future` at
-/// once. A waiting task can be cancelled. A task spawned with several limits
-/// starts once every one of them has room, and holds none of them while it
-/// waits. Two spawns share a cap only if they use the same `Limit` value, and
-/// a spawn that lists the same limit twice takes one slot.
-///
-/// # Examples
-///
-/// ```baml
-/// let provider = baml.spawn.Limit.new(8);
-/// let futures = ids.map((id) -> { spawn with provider { fetch(id) } });
-/// ```
-class Limit {
-    _handle: $rust_type,
-
-    /// Creates a limit that admits `capacity` tasks at a time.
-    ///
-    /// # Throws
-    ///
-    /// `InvalidArgument` if `capacity` is not positive.
-    //baml:mut_vm
-    function new(capacity: int) -> Limit throws baml.errors.InvalidArgument {
-        $rust_function
-    }
-
-    /// How many tasks this limit admits at a time.
-    //baml:vm
-    function capacity(self) -> int throws never {
-        $rust_function
-    }
-
-    /// How many tasks hold a slot right now.
-    //baml:vm
-    function active_count(self) -> int throws never {
-        $rust_function
-    }
-
-    /// How many tasks are waiting for a slot right now.
-    //baml:vm
-    function queued_count(self) -> int throws never {
-        $rust_function
-    }
-}
-
 /// Spawns a task whose cancellation parent is the runtime, not the spawning
 /// task: cancelling the spawner no longer cancels it.
 ///
@@ -187,21 +145,21 @@ class Root {
     }
 }
 
-implements<T, E> Modifier<T, E> for Limit {
+implement<T, E> Modifier<T, E> for Root {
     function apply(self, plan: Plan<T, E>) -> Plan<T, E> throws never {
-        Plan { ...plan, limits: plan.limits.concat([self]) }
+        Plan {
+            ...plan,
+            root: true,
+        }
     }
 }
 
-implements<T, E> Modifier<T, E> for Root {
+implement<T, E> Modifier<T, E> for CancelToken {
     function apply(self, plan: Plan<T, E>) -> Plan<T, E> throws never {
-        Plan { ...plan, root: true }
-    }
-}
-
-implements<T, E> Modifier<T, E> for CancelToken {
-    function apply(self, plan: Plan<T, E>) -> Plan<T, E> throws never {
-        Plan { ...plan, cancel_tokens: plan.cancel_tokens.concat([self]) }
+        Plan {
+            ...plan,
+            cancel_tokens: plan.cancel_tokens.concat([self]),
+        }
     }
 }
 
@@ -210,6 +168,6 @@ implements<T, E> Modifier<T, E> for CancelToken {
 /// `spawn ... { }`.
 ///
 /// Starts `plan` and returns the new task's future. Never throws.
-function __spawn<T, E>(plan: Plan<T, E>) -> baml.future.Future<T, E> throws never {
+function __spawn<T, E>(plan: Plan<T, E>) -> root.future.Future<T, E> throws never {
     $spawn
 }

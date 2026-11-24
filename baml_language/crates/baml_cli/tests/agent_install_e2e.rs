@@ -6,11 +6,11 @@ use std::{fs, process::Command};
 
 fn run_from(project: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_baml-cli"))
+        .args(["--agent-skill-check", "warn"])
         .args(args)
         .current_dir(project)
         .env("HOME", project.parent().unwrap_or(project))
         .env("DO_NOT_TRACK", "1")
-        .env("BAML_AGENT_SKILL_CHECK", "warn")
         .env("HTTP_PROXY", "http://127.0.0.1:1")
         .env("HTTPS_PROXY", "http://127.0.0.1:1")
         .env("ALL_PROXY", "http://127.0.0.1:1")
@@ -60,10 +60,10 @@ fn init_warns_then_embedded_install_silences_authoring_commands() {
         "fmt --dry-run failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("baml skill"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        !stderr.contains("baml skill") && !stderr.contains("BAML agent skill"),
+        "{stderr}"
     );
 }
 

@@ -34,14 +34,15 @@ use std::{
     path::PathBuf,
 };
 
-use baml_base::qualified_name::AI_STREAM_STREAM;
-use baml_sdkgen_types::{Class, Name, Symbol, SymbolPool, Ty, TypeAlias};
+use baml_sdkgen_types::{
+    Class, ClassCrossing, ClassProperty, Name, ParamTy, Symbol, SymbolPool, Ty, TypeAlias,
+};
 pub use baml_sdkgen_types::{NamingConvention, OutputType};
 use emit::{
     FnKind, RenderedField, indent_lines, render_callable, render_class, render_enum,
-    render_type_alias, sort_key,
+    render_opaque_class, render_type_alias, sort_key,
 };
-use translate_ty::{TranslateCtx, normalize_union, translate_ty};
+use translate_ty::{TranslateCtx, holds_native_tuple, normalize_union, slot_expr, translate_ty};
 
 /// Build the Swift SDK output tree using precompiled BAML bytecode as
 /// the runtime payload. Returned paths are relative to the generated
@@ -75,6 +76,10 @@ fn to_source_code_with_optional_metadata(
         render_inlined_baml(baml_bytecode, embedded_baml_toml),
     );
 
+    out.insert(
+        PathBuf::from("_Invocation.swift"),
+        include_str!("invocation_facade.swift").to_string(),
+    );
     let ctx = build_translate_ctx(pool);
     let boxed_fields = compute_boxed_fields(pool, &ctx);
 
@@ -94,17 +99,26 @@ fn to_source_code_with_optional_metadata(
     let mut namespaces: BTreeMap<Vec<String>, BTreeMap<String, String>> = BTreeMap::new();
     for (key, symbol) in sorted_pool {
         let fqn = key.to_string();
-        // `ai.stream.Stream` is runtime-owned (BamlStream wraps the
-        // engine handle) — never emitted as a generated struct.
-        if fqn == AI_STREAM_STREAM {
+        // A class the BamlBridge runtime spells (`BamlStream`,
+        // `BamlFunctionSpec`, `BamlPrompt`, `BamlHandle`) is never a
+        // generated struct.
+        if let Symbol::Class(class) = symbol
+            && runtime_owned(class.crossing)
+        {
             continue;
         }
         let ns = translate_ty::namespace_for(key);
         let rendered = match symbol {
             Symbol::Function(function) => {
-                let binding_name = &free_callable_names[&fqn];
-                let rendered =
-                    render_callable(&key.to_string(), binding_name, function, FnKind::Free, &ctx);
+                let (binding_name, sync_name) = &free_callable_names[&fqn];
+                let rendered = render_callable(
+                    &key.to_string(),
+                    binding_name,
+                    sync_name,
+                    function,
+                    FnKind::Free,
+                    &ctx,
+                );
                 if rendered.is_none() {
                     skips.push(diagnostics::Skip {
                         fqn: fqn.clone(),
@@ -125,7 +139,18 @@ fn to_source_code_with_optional_metadata(
                     });
                     None
                 } else {
-                    render_supported_class(class, key, &ctx, &boxed_fields, &mut skips)
+                    match render_supported_class(class, key, &ctx, &boxed_fields, &mut skips) {
+                        Ok(rendered) => Some(rendered),
+                        Err(reason) => {
+                            skips.push(diagnostics::Skip {
+                                fqn: fqn.clone(),
+                                kind: "class",
+                                reason,
+                                is_user: key.package().as_str() == "user",
+                            });
+                            None
+                        }
+                    }
                 }
             }
             Symbol::Enum(enum_) => Some(render_enum(enum_, key)),
@@ -245,12 +270,24 @@ fn build_translate_ctx(pool: &SymbolPool) -> TranslateCtx {
         }
     }
 
+    let mut crossings = BTreeMap::new();
+    let mut class_names = BTreeMap::new();
+    for (key, symbol) in pool {
+        if let Symbol::Class(class) = symbol {
+            crossings.insert(key.to_string(), class.crossing);
+            class_names.insert(key.to_string(), key.clone());
+        }
+    }
+
     loop {
         let ctx = TranslateCtx {
             supported_classes: supported_classes.clone(),
             supported_enums: supported_enums.clone(),
             supported_aliases: supported_aliases.clone(),
             nullable_aliases: nullable_aliases_for(pool, &supported_aliases),
+            alias_bodies: alias_bodies_for(pool, &supported_aliases),
+            crossings: crossings.clone(),
+            class_names: class_names.clone(),
         };
         let mut changed = false;
         for (key, symbol) in pool {
@@ -258,8 +295,7 @@ fn build_translate_ctx(pool: &SymbolPool) -> TranslateCtx {
             match symbol {
                 Symbol::Class(class) => {
                     if supported_classes.contains(&fqn)
-                        && class
-                            .properties
+                        && stored_fields(class)
                             .iter()
                             .any(|p| translate_ty(&p.ty, &ctx).is_none())
                     {
@@ -278,19 +314,20 @@ fn build_translate_ctx(pool: &SymbolPool) -> TranslateCtx {
         }
         if !changed {
             let nullable_aliases = nullable_aliases_for(pool, &supported_aliases);
+            let alias_bodies = alias_bodies_for(pool, &supported_aliases);
             return TranslateCtx {
                 supported_classes,
                 supported_enums,
                 supported_aliases,
                 nullable_aliases,
+                alias_bodies,
+                crossings,
+                class_names,
             };
         }
     }
 }
 
-/// Direct (non-heap) class targets of a field type: bare class refs
-/// and refs behind Optional (null-unions) store inline in a Swift
-/// struct; List/Map contents are already heap-allocated and never
 /// force boxing. Aliases resolve through (they're non-recursive here).
 fn direct_class_targets(ty: &Ty, pool: &SymbolPool, out: &mut Vec<String>) {
     match ty {
@@ -305,6 +342,11 @@ fn direct_class_targets(ty: &Ty, pool: &SymbolPool, out: &mut Vec<String>) {
             // Only the Optional collapse (1 arm) stores inline.
             if non_null.len() == 1 {
                 direct_class_targets(&non_null[0], pool, out);
+            }
+        }
+        Ty::Tuple(items) => {
+            for item in items {
+                direct_class_targets(item, pool, out);
             }
         }
         Ty::TypeAlias(name) => {
@@ -333,7 +375,7 @@ fn compute_boxed_fields(pool: &SymbolPool, ctx: &TranslateCtx) -> BTreeSet<(Stri
         if !ctx.supported_classes.contains(&fqn) {
             continue;
         }
-        for prop in &class.properties {
+        for prop in stored_fields(class) {
             let mut targets = Vec::new();
             direct_class_targets(&prop.ty, pool, &mut targets);
             targets.retain(|t| ctx.supported_classes.contains(t));
@@ -374,22 +416,88 @@ fn compute_boxed_fields(pool: &SymbolPool, ctx: &TranslateCtx) -> BTreeSet<(Stri
     boxed
 }
 
+/// Whether the `BamlBridge` runtime spells a class crossing this way, so no
+/// generated struct stands for it.
+fn runtime_owned(crossing: ClassCrossing) -> bool {
+    match crossing {
+        ClassCrossing::Stream
+        | ClassCrossing::FunctionSpec
+        | ClassCrossing::Prompt
+        | ClassCrossing::HostValue => true,
+        ClassCrossing::Fields | ClassCrossing::Opaque | ClassCrossing::Media(_) => false,
+    }
+}
+
+/// The type variables `ty` mentions.
+fn type_vars_in(ty: &Ty, out: &mut Vec<String>) {
+    if let Ty::TypeVar(param) = ty {
+        out.push(param.as_str().to_string());
+    }
+    baml_sdkgen_types::any_type_child(ty, |child| {
+        type_vars_in(child, out);
+        false
+    });
+}
+
+/// The Swift declaration of `class`, or why it has none.
 fn render_supported_class(
     class: &Class,
     key: &Name,
     ctx: &TranslateCtx,
     boxed_fields: &BTreeSet<(String, String)>,
     skips: &mut Vec<diagnostics::Skip>,
-) -> Option<String> {
+) -> Result<String, String> {
     let fqn = key.to_string();
+    // Inside the class's own codec, a type variable is the type argument the
+    // instance's slot was stated with, so every one a field names must be
+    // the class's own.
+    for prop in stored_fields(class) {
+        let mut vars = Vec::new();
+        type_vars_in(&prop.ty, &mut vars);
+        if let Some(unbound) = vars.iter().find(|var| {
+            !class
+                .generic_params
+                .iter()
+                .any(|p| p.as_str() == var.as_str())
+        }) {
+            return Err(format!(
+                "field `{}` names `{unbound}`, which the class does not bind",
+                prop.name.as_str()
+            ));
+        }
+    }
+    let class_argument = |param: &ParamTy| {
+        class
+            .generic_params
+            .iter()
+            .position(|p| p.as_str() == param.as_str())
+            .map(emit::class_argument_local)
+            .unwrap_or_else(|| unreachable!("every field's type variable is the class's own"))
+    };
     let mut fields = Vec::new();
-    for prop in &class.properties {
+    for prop in stored_fields(class) {
+        let unrepresentable = || {
+            format!(
+                "field `{}`: type `{}` is not representable in Swift",
+                prop.name.as_str(),
+                prop.ty
+            )
+        };
         fields.push(RenderedField {
             name: escape_ident(prop.name.as_str()),
-            ty: translate_ty(&prop.ty, ctx)?,
+            ty: translate_ty(&prop.ty, ctx).ok_or_else(unrepresentable)?,
             boxed: boxed_fields.contains(&(fqn.clone(), prop.name.as_str().to_string())),
             doc: prop.docstring.clone(),
-            is_rust: matches!(prop.ty, Ty::RustType),
+            is_handle: translate_ty::is_handle(&prop.ty, ctx),
+            slot: slot_expr(&prop.ty, ctx, &class_argument).ok_or_else(unrepresentable)?,
+            equal_slot: if holds_native_tuple(&prop.ty, ctx) {
+                Some(
+                    slot_expr(&prop.ty, ctx, &translate_ty::generic_param_slot)
+                        .ok_or_else(unrepresentable)?,
+                )
+            } else {
+                None
+            },
         });
     }
 
@@ -397,20 +505,29 @@ fn render_supported_class(
     // an unemittable method never drops the class (fields alone decide
     // supportability, matching Python).
     let mut methods = Vec::new();
+    let field_names: BTreeSet<String> = class
+        .properties
+        .iter()
+        .map(|prop| prop.name.as_str().to_string())
+        .collect();
     let method_names = allocate_callable_names(
         class
             .static_methods
             .iter()
             .chain(&class.instance_methods)
             .map(|method| method.name.as_str()),
+        &field_names,
     );
     for method in &class.static_methods {
         let method_fqn = format!("{fqn}.{}", method.name.as_str());
         if let Some(rendered) = render_callable(
             &method_fqn,
-            &method_names[method.name.as_str()],
+            &method_names[method.name.as_str()].0,
+            &method_names[method.name.as_str()].1,
             method,
-            FnKind::Static,
+            FnKind::Static {
+                class_params: &class.generic_params,
+            },
             ctx,
         ) {
             methods.push(rendered);
@@ -427,9 +544,12 @@ fn render_supported_class(
         let method_fqn = format!("{fqn}.{}", method.name.as_str());
         if let Some(rendered) = render_callable(
             &method_fqn,
-            &method_names[method.name.as_str()],
+            &method_names[method.name.as_str()].0,
+            &method_names[method.name.as_str()].1,
             method,
-            FnKind::Instance,
+            FnKind::Instance {
+                class_params: &class.generic_params,
+            },
             ctx,
         ) {
             methods.push(rendered);
@@ -443,24 +563,86 @@ fn render_supported_class(
         }
     }
 
-    Some(render_class(class, key, &fields, &methods))
+    match class.crossing {
+        ClassCrossing::Opaque => Ok(render_opaque_class(class, key, &methods)),
+        ClassCrossing::Fields => Ok(render_class(class, key, &fields, &methods, None)),
+        ClassCrossing::Media(kind) => {
+            // A media class is the media type itself on the wire. It declares
+            // no fields; the struct stores the engine's handle to its media.
+            debug_assert!(fields.is_empty(), "a media class stores only its media");
+            let data = media_handle_field();
+            Ok(render_class(
+                class,
+                key,
+                std::slice::from_ref(&data),
+                &methods,
+                Some((kind, &data)),
+            ))
+        }
+        ClassCrossing::Stream
+        | ClassCrossing::FunctionSpec
+        | ClassCrossing::Prompt
+        | ClassCrossing::HostValue => {
+            unreachable!("a runtime-owned class is never rendered")
+        }
+    }
 }
 
-fn allocate_free_callable_names(pool: &SymbolPool) -> HashMap<String, String> {
+/// The one field of a media struct, `_data`: the engine's handle to the media.
+fn media_handle_field() -> RenderedField {
+    RenderedField {
+        name: "_data".to_string(),
+        ty: translate_ty::HANDLE.to_string(),
+        boxed: false,
+        doc: Some("The engine's handle to the media.".to_string()),
+        is_handle: true,
+        slot: translate_ty::engine_handle_slot(),
+        equal_slot: None,
+    }
+}
+
+/// The declared fields the generated Swift type of `class` stores, which
+/// decide whether the class is emitted. An opaque class stores none: it holds
+/// the engine's instance, whose fields are the runtime's own. A media class
+/// declares none: its struct stores its media's handle ([`media_handle_field`]).
+fn stored_fields(class: &Class) -> &[ClassProperty] {
+    match class.crossing {
+        ClassCrossing::Opaque | ClassCrossing::Media(_) => &[],
+        ClassCrossing::Fields
+        | ClassCrossing::Stream
+        | ClassCrossing::FunctionSpec
+        | ClassCrossing::Prompt
+        | ClassCrossing::HostValue => &class.properties,
+    }
+}
+
+fn allocate_free_callable_names(pool: &SymbolPool) -> HashMap<String, (String, String)> {
     let mut scopes: BTreeMap<Vec<String>, Vec<(String, String)>> = BTreeMap::new();
+    // Child namespaces are enums in the same Swift scope as the functions,
+    // so a generated name (a companion or a `_sync` twin) must avoid them.
+    let mut children: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
     for (name, symbol) in pool {
+        let ns = translate_ty::namespace_for(name);
+        for depth in 0..ns.len() {
+            children
+                .entry(ns[..depth].to_vec())
+                .or_default()
+                .insert(ns[depth].clone());
+        }
         if !matches!(symbol, Symbol::Function(_)) {
             continue;
         }
         scopes
-            .entry(translate_ty::namespace_for(name))
+            .entry(ns)
             .or_default()
             .push((name.to_string(), name.name().as_str().to_string()));
     }
 
     let mut allocated = HashMap::new();
-    for callables in scopes.values() {
-        let names = allocate_callable_names(callables.iter().map(|(_, raw)| raw.as_str()));
+    for (scope, callables) in &scopes {
+        let reserved = children.get(scope).cloned().unwrap_or_default();
+        let names =
+            allocate_callable_names(callables.iter().map(|(_, raw)| raw.as_str()), &reserved);
         for (fqn, raw) in callables {
             allocated.insert(fqn.clone(), names[raw].clone());
         }
@@ -468,29 +650,47 @@ fn allocate_free_callable_names(pool: &SymbolPool) -> HashMap<String, String> {
     allocated
 }
 
-/// Preserve authored Swift API names and suffix only synthesized companions
-/// when replacing `@` with `_` would collide in the same declaration scope.
+/// Allocate every callable in one Swift declaration scope in a single
+/// pass: `(async name, blocking name)`. Authored API names keep their
+/// spelling; synthesized names (`@` companions, then every `_sync` twin)
+/// take a numeric suffix when they would collide with an authored name,
+/// another synthesized name, or a `reserved` name (child namespaces,
+/// stored properties) in the same scope.
 fn allocate_callable_names<'a>(
     raw_names: impl IntoIterator<Item = &'a str>,
-) -> HashMap<String, String> {
+    reserved: &BTreeSet<String>,
+) -> HashMap<String, (String, String)> {
     let mut raw_names: Vec<&str> = raw_names.into_iter().collect();
     raw_names.sort_by_key(|name| (name.contains(['@', '$']), *name));
 
-    let mut used = BTreeSet::new();
-    let mut allocated = HashMap::new();
-    for raw in raw_names {
-        let base = raw.replace(['@', '$'], "_");
+    let mut used = reserved.clone();
+    let allocate = |base: String, used: &mut BTreeSet<String>| {
         let mut candidate = base.clone();
         let mut suffix = 2;
-        while used.contains(&candidate) || used.contains(&format!("{candidate}_async")) {
+        while used.contains(&candidate) {
             candidate = format!("{base}_{suffix}");
             suffix += 1;
         }
         used.insert(candidate.clone());
-        used.insert(format!("{candidate}_async"));
-        allocated.insert(raw.to_string(), candidate);
+        candidate
+    };
+    let mut plain: Vec<(&str, String)> = Vec::new();
+    // Authored names first, so a synthesized name never displaces one.
+    for raw in raw_names.iter().filter(|raw| !raw.contains(['@', '$'])) {
+        used.insert((*raw).to_string());
+        plain.push((raw, (*raw).to_string()));
     }
-    allocated
+    for raw in raw_names.iter().filter(|raw| raw.contains(['@', '$'])) {
+        let name = allocate(raw.replace(['@', '$'], "_"), &mut used);
+        plain.push((raw, name));
+    }
+    plain
+        .into_iter()
+        .map(|(raw, name)| {
+            let sync = allocate(format!("{name}_sync"), &mut used);
+            (raw.to_string(), (name, sync))
+        })
+        .collect()
 }
 
 /// `Some(non-null arms)` when this alias is a recursive union with >=2
@@ -530,6 +730,24 @@ fn nullable_aliases_for(
     out
 }
 
+/// Bodies of the supported non-recursive aliases, which a slot spells in
+/// place of the alias.
+fn alias_bodies_for(
+    pool: &SymbolPool,
+    supported_aliases: &BTreeSet<String>,
+) -> BTreeMap<String, Ty> {
+    pool.iter()
+        .filter_map(|(key, symbol)| match symbol {
+            Symbol::TypeAlias(alias)
+                if !alias.recursive && supported_aliases.contains(&key.to_string()) =>
+            {
+                Some((key.to_string(), alias.resolves_to.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Can this alias's definition be emitted under `ctx`?
 fn alias_definition_ok(alias: &TypeAlias, ctx: &TranslateCtx) -> bool {
     if let Some((arms, _)) = recursive_union_alias_arms(alias) {
@@ -543,8 +761,8 @@ fn alias_definition_ok(alias: &TypeAlias, ctx: &TranslateCtx) -> bool {
 /// everything else is a plain `typealias` (union targets spell as
 /// `BamlUnionN<...>` via `translate_ty`).
 fn render_alias(alias: &TypeAlias, key: &Name, ctx: &TranslateCtx) -> Option<String> {
-    if let Some((arms, _)) = recursive_union_alias_arms(alias) {
-        return emit::render_recursive_union_alias(key, &arms, ctx);
+    if let Some((arms, nullable)) = recursive_union_alias_arms(alias) {
+        return emit::render_recursive_union_alias(key, &arms, nullable, ctx);
     }
     render_type_alias(alias, key, ctx)
 }
@@ -749,17 +967,45 @@ mod tests {
 
     #[test]
     fn companion_bindings_do_not_collide_with_authored_swift_names() {
-        let allocated = allocate_callable_names([
-            "extract_spec",
-            "extract@spec",
-            "extract_stream_async",
-            "extract@stream",
-        ]);
+        let allocated = allocate_callable_names(
+            [
+                "extract_spec",
+                "extract@spec",
+                "extract_stream_sync",
+                "extract@stream",
+            ],
+            &BTreeSet::new(),
+        );
 
-        assert_eq!(allocated["extract_spec"], "extract_spec");
-        assert_eq!(allocated["extract_stream_async"], "extract_stream_async");
-        assert_eq!(allocated["extract@spec"], "extract_spec_2");
-        assert_eq!(allocated["extract@stream"], "extract_stream_2");
+        assert_eq!(allocated["extract_spec"].0, "extract_spec");
+        assert_eq!(allocated["extract_stream_sync"].0, "extract_stream_sync");
+        assert_eq!(allocated["extract@spec"].0, "extract_spec_2");
+        assert_eq!(allocated["extract@stream"].0, "extract_stream");
+        // `extract_stream_sync` is authored, so the companion's twin moves.
+        assert_eq!(allocated["extract@stream"].1, "extract_stream_sync_2");
+    }
+
+    #[test]
+    fn sync_twins_never_displace_authored_names() {
+        // Sibling `foo` and `foo_sync`: both authored names survive, and
+        // `foo`'s blocking twin takes the next free spelling.
+        let allocated = allocate_callable_names(["foo", "foo_sync"], &BTreeSet::new());
+        assert_eq!(
+            allocated["foo"],
+            ("foo".to_string(), "foo_sync_2".to_string())
+        );
+        assert_eq!(
+            allocated["foo_sync"],
+            ("foo_sync".to_string(), "foo_sync_sync".to_string())
+        );
+        // A reserved name (a child namespace or a stored property) is
+        // avoided the same way.
+        let reserved = BTreeSet::from(["bar_sync".to_string()]);
+        let allocated = allocate_callable_names(["bar"], &reserved);
+        assert_eq!(
+            allocated["bar"],
+            ("bar".to_string(), "bar_sync_2".to_string())
+        );
     }
 
     fn int() -> Ty {
@@ -793,6 +1039,716 @@ mod tests {
         Ty::Literal(value, baml_sdkgen_types::Freshness::Regular)
     }
 
+    fn origin() -> baml_sdkgen_types::Origin {
+        baml_sdkgen_types::Origin {
+            source_file_path: "slots.baml".to_string(),
+            span_start: 0,
+        }
+    }
+
+    fn function(name: &str, arguments: Vec<(&str, Ty)>, return_type: Ty) -> Symbol {
+        Symbol::Function(baml_sdkgen_types::Function {
+            name: name.into(),
+            generic_params: Vec::new(),
+            docstring: None,
+            arguments: arguments
+                .into_iter()
+                .map(|(name, ty)| baml_sdkgen_types::FunctionArgument {
+                    name: name.into(),
+                    docstring: None,
+                    ty,
+                    default: None,
+                    injected: false,
+                })
+                .collect(),
+            return_type,
+            throws: None,
+            watchers: Vec::new(),
+            origin: origin(),
+        })
+    }
+
+    fn user(name: &str) -> Name {
+        Name::new("user".into(), Vec::new(), name.into())
+    }
+
+    fn emit(pool: &SymbolPool) -> String {
+        to_source_code_with_bytecode(pool, &[], NamingConvention::PreserveCase)
+            .into_values()
+            .collect()
+    }
+
+    fn string_literal(value: &str) -> Ty {
+        literal(baml_base::Literal::String(value.into()))
+    }
+
+    fn callback(ret: Ty, throws: Ty) -> Ty {
+        Ty::Function {
+            params: Box::new([]),
+            ret: Box::new(ret),
+            throws: Box::new(throws),
+        }
+    }
+
+    #[test]
+    fn literal_types_are_stated_as_declared() {
+        // Swift spells a literal by its base type; the slot still carries the
+        // literal, in a list's element type and in a class's type argument.
+        let box_class = Symbol::Class(baml_sdkgen_types::Class {
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
+            name: user("Box"),
+            generic_params: vec!["T".into()],
+            docstring: None,
+            properties: vec![baml_sdkgen_types::ClassProperty {
+                name: "items".into(),
+                docstring: None,
+                ty: list(Ty::TypeVar(ParamTy::new(0, "T".into()))),
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
+            }],
+            static_methods: Vec::new(),
+            instance_methods: Vec::new(),
+            origin: origin(),
+            json_omit_nulls: false,
+        });
+        let pool = SymbolPool::from([
+            (user("Box"), box_class),
+            (
+                user("send"),
+                function(
+                    "send",
+                    vec![
+                        (
+                            "statuses",
+                            list(union(vec![string_literal("draft"), string_literal("sent")])),
+                        ),
+                        (
+                            "boxed",
+                            Ty::Class(user("Box"), Box::new([string_literal("a")])),
+                        ),
+                    ],
+                    int(),
+                ),
+            ),
+        ]);
+        let emitted = emit(&pool);
+        assert!(
+            emitted.contains(
+                "BamlArgument(\"statuses\", statuses, as: BamlSlots.list(BamlSlot<Swift.String>.oneOf(\
+                 BamlSlot<Swift.String>.literal(\"draft\"), BamlSlot<Swift.String>.literal(\"sent\"))))"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "BamlArgument(\"boxed\", boxed, as: BamlSlot<Baml.Box<Swift.String>>._classType(\
+                 \"user.Box\", BamlSlot<Swift.String>.literal(\"a\")))"
+            ),
+            "{emitted}"
+        );
+        // The field typed by `T` is encoded under the instance's argument.
+        assert!(
+            emitted
+                .contains("BamlField(\"items\", self.items, as: BamlSlots.list(_bamlArgument0))"),
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn opaque_classes_are_engine_handles() {
+        let package = || Name::new("reflect".into(), Vec::new(), "Package".into());
+        let package_ty = || Ty::Class(package(), Box::new([]));
+        let Symbol::Function(current) = function("current", Vec::new(), package_ty()) else {
+            unreachable!("`function` builds a function symbol");
+        };
+        let Symbol::Function(name) = function("name", Vec::new(), string()) else {
+            unreachable!("`function` builds a function symbol");
+        };
+        let class = Symbol::Class(baml_sdkgen_types::Class {
+            crossing: ClassCrossing::Opaque,
+            name: package(),
+            generic_params: Vec::new(),
+            docstring: None,
+            // Not representable in Swift, and the runtime's own either way.
+            properties: vec![baml_sdkgen_types::ClassProperty {
+                name: "_inner".into(),
+                docstring: None,
+                ty: Ty::Unknown,
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
+            }],
+            static_methods: vec![current],
+            instance_methods: vec![name],
+            origin: origin(),
+            json_omit_nulls: false,
+        });
+        let pool = SymbolPool::from([
+            (package(), class),
+            (
+                user("reload"),
+                function("reload", vec![("package", package_ty())], package_ty()),
+            ),
+        ]);
+        let emitted = emit(&pool);
+        let opaque = emitted
+            .split_once("public struct Package: ")
+            .and_then(|(_, rest)| rest.split_once("\n\t\t}\n\t}\n"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("`reflect.Package` is emitted\n{emitted}"));
+        assert!(
+            opaque
+                .starts_with("Equatable, Sendable, BamlTyped, BamlLeafEncodable, BamlDecodable {"),
+            "{opaque}"
+        );
+        // The handle is the whole value, read-only and internal to the
+        // generated module: no field, no public initializer.
+        assert!(
+            opaque.contains("\tinternal let _bamlHandle: BamlHandle"),
+            "{opaque}"
+        );
+        assert!(!opaque.contains("_inner"), "{opaque}");
+        assert!(!opaque.contains("public var"), "{opaque}");
+        assert!(!opaque.contains("public nonisolated init"), "{opaque}");
+        assert!(!opaque.contains("public init"), "{opaque}");
+        // It decodes from the handle of an instance of the class, and encodes
+        // as that handle, also as a method's receiver.
+        assert!(
+            opaque.contains(
+                "Self(_bamlHandle: try BamlHandle._bamlDecodeOpaque(v, of: \"reflect.Package\"))"
+            ),
+            "{opaque}"
+        );
+        assert!(
+            opaque.contains("_bamlHandle._bamlEncode(as: ._leaf(slot.type))"),
+            "{opaque}"
+        );
+        assert!(
+            opaque.contains("._leaf(.classType(\"reflect.Package\"))"),
+            "{opaque}"
+        );
+        assert!(
+            emitted.contains(
+                "callSync(\"reflect.Package.name\", args: [BamlArgument(\"self\", self, as: BamlSlot<Self>.own)]"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "public static func current(baml: Baml.BamlOptions = .init()) async throws -> Baml.vendor.reflect.Package"
+            ),
+            "{emitted}"
+        );
+        // Typed positions elsewhere use it like any class.
+        assert!(
+            emitted.contains(
+                "public static func reload(package: Baml.vendor.reflect.Package, baml: Baml.BamlOptions = .init()) async throws -> Baml.vendor.reflect.Package"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "BamlArgument(\"package\", package, as: BamlSlot<Baml.vendor.reflect.Package>.own)"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// A generic opaque class states its type arguments: its slot names the
+    /// class at them, it decodes only an instance at exactly them, and its
+    /// methods bind the class's parameters from the receiver's Swift type.
+    #[test]
+    fn generic_opaque_classes_state_their_type_arguments() {
+        let cache = || user("Cache");
+        let t = || Ty::TypeVar(baml_sdkgen_types::ParamTy::new(0, "T".into()));
+        let Symbol::Function(get) = function("get", Vec::new(), t()) else {
+            unreachable!("`function` builds a function symbol");
+        };
+        let class = Symbol::Class(baml_sdkgen_types::Class {
+            crossing: ClassCrossing::Opaque,
+            name: cache(),
+            generic_params: vec!["T".into()],
+            docstring: None,
+            properties: Vec::new(),
+            static_methods: Vec::new(),
+            instance_methods: vec![get],
+            origin: origin(),
+            json_omit_nulls: false,
+        });
+        let pool = SymbolPool::from([(cache(), class)]);
+        let emitted = emit(&pool);
+        for expected in [
+            "public struct Cache<T: BamlCodableValue>: Equatable, Sendable, BamlTyped, BamlLeafEncodable, BamlDecodable {",
+            "._leaf(.classType(\"user.Cache\", typeArguments: [BamlSlot<T>.own.type]))",
+            "BamlHandle._bamlDecodeOpaque(v, of: \"user.Cache\")",
+            "typeArgs: [BamlTypeArgument(\"T\", BamlSlot<T>.own.type)]",
+        ] {
+            assert!(
+                emitted.contains(expected),
+                "missing {expected} in\n{emitted}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_calls_name_every_type_parameter() {
+        let t = || Ty::TypeVar(ParamTy::new(0, "T".into()));
+        let generic = |name: &str, arguments: Vec<(&str, Ty)>, return_type: Ty| {
+            let Symbol::Function(mut function) = function(name, arguments, return_type) else {
+                unreachable!("`function` builds a function symbol");
+            };
+            function.generic_params = vec!["T".into()];
+            Symbol::Function(function)
+        };
+        let pool = SymbolPool::from([
+            (
+                user("first_or"),
+                generic(
+                    "first_or",
+                    vec![("xs", list(t()))],
+                    union(vec![t(), null()]),
+                ),
+            ),
+            (
+                user("parse_as"),
+                generic("parse_as", vec![("source", string())], t()),
+            ),
+        ]);
+        let emitted = emit(&pool);
+        let type_args = "typeArgs: [BamlTypeArgument(\"T\", BamlSlot<T>.own.type)]";
+        // A parameter a value's Swift type mentions is inferred by Swift; the
+        // wire still names it.
+        assert!(
+            emitted.contains(
+                "public static func first_or<T: BamlCodableValue>(xs: [T], baml: Baml.BamlOptions = .init())"
+            ),
+            "{emitted}"
+        );
+        // One no value mentions is named by the caller with a metatype.
+        assert!(
+            emitted.contains(
+                "public static func parse_as<T: BamlCodableValue>(source: Swift.String, T _: T.Type, baml: Baml.BamlOptions = .init())"
+            ),
+            "{emitted}"
+        );
+        assert_eq!(emitted.matches(type_args).count(), 4, "{emitted}");
+    }
+
+    #[test]
+    fn callback_types_are_stated_exactly() {
+        let effect_param = ParamTy::new(1, "__effect_param_0".into());
+        assert!(baml_sdkgen_types::is_synthetic_effect_param(
+            effect_param.name()
+        ));
+        let effect = Ty::TypeVar(effect_param);
+        let pool = SymbolPool::from([(
+            user("call"),
+            function(
+                "call",
+                vec![
+                    ("diverge", callback(Ty::Never, Ty::Never)),
+                    (
+                        "pick",
+                        callback(
+                            union(vec![string_literal("a"), string_literal("b")]),
+                            effect,
+                        ),
+                    ),
+                ],
+                int(),
+            ),
+        )]);
+        let emitted = emit(&pool);
+        // `never` returns nothing: the closure can only throw.
+        assert!(
+            emitted.contains("diverge: @escaping @Sendable () async throws -> Swift.Never"),
+            "{emitted}"
+        );
+        let wrapper = emitted
+            .split_once("returns: .never, throws: .never), thrown: []) { _bamlArgs in\n")
+            .map(|(_, rest)| rest.lines().next().unwrap_or_default().trim())
+            .unwrap_or_default();
+        assert_eq!(wrapper, "try await diverge()", "{emitted}");
+        // A covariant return is stated as declared, literals and all.
+        assert!(
+            emitted.contains(
+                "let _baml_p1_returns = BamlSlot<Swift.String>.oneOf(\
+                 BamlSlot<Swift.String>.literal(\"a\"), BamlSlot<Swift.String>.literal(\"b\"))"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("returns: _baml_p1_returns.type, throws: .unknown)"),
+            "{emitted}"
+        );
+        assert!(!emitted.contains("?? .unknown"), "{emitted}");
+    }
+
+    #[test]
+    fn callable_parameter_locals_never_collide() {
+        // `f`'s return slot must not be `f_returns`'s wrapper, and no local
+        // may shadow a parameter spelled like a generated one.
+        let pool = SymbolPool::from([(
+            user("two"),
+            function(
+                "two",
+                vec![
+                    ("f", callback(int(), Ty::Never)),
+                    ("f_returns", callback(int(), Ty::Never)),
+                    ("_baml_p2", int()),
+                    ("g", callback(int(), Ty::Never)),
+                ],
+                int(),
+            ),
+        )]);
+        let emitted = emit(&pool);
+        for local in [
+            "_baml_p_0",
+            "_baml_p_0_returns",
+            "_baml_p_1",
+            "_baml_p_1_returns",
+            "_baml_p_3",
+            "_baml_p_3_returns",
+        ] {
+            // Once per sync/async overload.
+            assert_eq!(
+                emitted.matches(&format!("let {local} = ")).count(),
+                2,
+                "{local}: {emitted}"
+            );
+        }
+        assert!(
+            emitted.contains(
+                "args: [BamlArgument(\"f\", _baml_p_0), BamlArgument(\"f_returns\", _baml_p_1), \
+                 BamlArgument(\"_baml_p2\", _baml_arg__baml_p2, as: BamlSlot<Swift.Int>.own), \
+                 BamlArgument(\"g\", _baml_p_3)]"
+            ),
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn parameters_spelled_like_the_bodys_names_keep_their_label() {
+        // The body names `Baml`, `BamlRuntime` and its `_baml` locals
+        // unqualified; a parameter spelled like one is read by its own name
+        // while callers still write the BAML name.
+        let pool = SymbolPool::from([(
+            user("shadow"),
+            function(
+                "shadow",
+                vec![
+                    ("Baml", int()),
+                    ("BamlRuntime", int()),
+                    ("_bamlArgs", callback(int(), Ty::Never)),
+                ],
+                int(),
+            ),
+        )]);
+        let emitted = emit(&pool);
+        assert!(
+            emitted.contains(
+                "shadow(Baml _baml_arg_Baml: Swift.Int, BamlRuntime _baml_arg_BamlRuntime: Swift.Int, \
+                 _bamlArgs _baml_arg__bamlArgs: @escaping"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("BamlArgument(\"Baml\", _baml_arg_Baml, as: BamlSlot<Swift.Int>.own)"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("try await _baml_arg__bamlArgs("),
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn a_received_closures_nameless_parameters_are_bound_by_position() {
+        // `hof(cb: ((int) -> int) -> int)`: the closure the callback receives
+        // has a nameless parameter, which the engine binds as `arg0`.
+        let received = Ty::Function {
+            params: Box::new([baml_sdkgen_types::CallableParam {
+                name: None,
+                ty: int(),
+                mode: baml_sdkgen_types::CodegenFunctionParamMode::Required,
+            }]),
+            ret: Box::new(int()),
+            throws: Box::new(Ty::Never),
+        };
+        let cb = Ty::Function {
+            params: Box::new([baml_sdkgen_types::CallableParam {
+                name: Some("f".into()),
+                ty: received,
+                mode: baml_sdkgen_types::CodegenFunctionParamMode::Required,
+            }]),
+            ret: Box::new(int()),
+            throws: Box::new(Ty::Never),
+        };
+        let pool = SymbolPool::from([(user("hof"), function("hof", vec![("cb", cb)], int()))]);
+        let emitted = emit(&pool);
+        assert!(
+            emitted.contains("BamlArgument(\"arg0\", _arg0, as: BamlSlot<Swift.Int>.own)"),
+            "{emitted}"
+        );
+        assert!(emitted.contains("public static func hof("), "{emitted}");
+    }
+
+    #[test]
+    fn a_skip_names_the_parameter_that_fails() {
+        // A supported callback before an unsupported parameter: the skip
+        // blames the unsupported one.
+        let pool = SymbolPool::from([(
+            user("mixed"),
+            function(
+                "mixed",
+                vec![("cb", callback(int(), Ty::Never)), ("x", Ty::Unknown)],
+                int(),
+            ),
+        )]);
+        let files = to_source_code_with_bytecode(&pool, &[], NamingConvention::PreserveCase);
+        let manifest = &files[&PathBuf::from("_BamlSkipped.swift")];
+        assert!(
+            manifest.contains("parameter `x`: type `unknown` is not representable in Swift"),
+            "{manifest}"
+        );
+    }
+
+    #[test]
+    fn a_sync_twin_never_collides_with_a_child_namespace() {
+        // `foo`'s blocking twin would be `foo_sync`, which a `foo_sync`
+        // child namespace already occupies in the same Swift scope: the
+        // twin moves to `foo_sync_2` and both declarations survive.
+        let pool = SymbolPool::from([
+            (user("foo"), function("foo", Vec::new(), int())),
+            (
+                Name::new("user".into(), vec!["foo_sync".into()], "bar".into()),
+                function("bar", Vec::new(), int()),
+            ),
+        ]);
+        let files = to_source_code_with_bytecode(&pool, &[], NamingConvention::PreserveCase);
+        let emitted: String = files.values().map(String::as_str).collect();
+        assert!(emitted.contains("func foo("), "{emitted}");
+        assert!(emitted.contains("func foo_sync_2("), "{emitted}");
+        assert!(!emitted.contains("func foo_sync("), "{emitted}");
+        assert!(emitted.contains("func bar("), "{emitted}");
+    }
+
+    #[test]
+    fn method_sync_twins_avoid_sibling_methods_and_fields() {
+        // Methods `foo` and `foo_sync` plus a stored property `bar_sync`
+        // next to method `bar`: every declaration in the struct is unique.
+        let Symbol::Function(foo) = function("foo", Vec::new(), int()) else {
+            unreachable!("`function` builds a function symbol");
+        };
+        let Symbol::Function(foo_sync) = function("foo_sync", Vec::new(), int()) else {
+            unreachable!("`function` builds a function symbol");
+        };
+        let Symbol::Function(bar) = function("bar", Vec::new(), int()) else {
+            unreachable!("`function` builds a function symbol");
+        };
+        let thing = Name::new("user".into(), Vec::new(), "Thing".into());
+        let class = Symbol::Class(baml_sdkgen_types::Class {
+            crossing: ClassCrossing::Fields,
+            name: thing.clone(),
+            generic_params: Vec::new(),
+            docstring: None,
+            properties: vec![baml_sdkgen_types::ClassProperty {
+                name: "bar_sync".into(),
+                docstring: None,
+                ty: Ty::Int,
+                json_fallback: false,
+                json_flatten: false,
+                json_rename: None,
+            }],
+            static_methods: vec![foo, foo_sync],
+            instance_methods: vec![bar],
+            origin: origin(),
+            json_omit_nulls: false,
+        });
+        let emitted = emit(&SymbolPool::from([(thing, class)]));
+        for decl in [
+            "func foo(",
+            "func foo_sync(",
+            "func foo_sync_2(",
+            "func foo_sync_sync(",
+            "func bar(",
+            "func bar_sync_2(",
+        ] {
+            assert!(emitted.contains(decl), "missing `{decl}`:\n{emitted}");
+        }
+        assert!(!emitted.contains("func bar_sync("), "{emitted}");
+    }
+
+    #[test]
+    fn closure_struct_names_are_fixed_by_their_site() {
+        // FNV-1a of the site, the same on every toolchain.
+        assert_eq!(
+            emit::closure_type_name("user.hof(0).0"),
+            emit::closure_type_name("user.hof(0).0")
+        );
+        assert_eq!(emit::closure_type_name(""), "_BamlClosure_cbf29ce484222325");
+    }
+
+    #[test]
+    fn runtime_owned_classes_are_decided_by_their_crossing() {
+        // A class the compiler says crosses as the rendered prompt is the
+        // bridge's `BamlPrompt`, whatever it is named, and no generated
+        // struct stands for it.
+        let prompt = || Name::new("user".into(), Vec::new(), "Rendered".into());
+        let class = Symbol::Class(baml_sdkgen_types::Class {
+            crossing: ClassCrossing::Prompt,
+            name: prompt(),
+            generic_params: Vec::new(),
+            docstring: None,
+            properties: Vec::new(),
+            static_methods: Vec::new(),
+            instance_methods: Vec::new(),
+            origin: origin(),
+            json_omit_nulls: false,
+        });
+        let pool = SymbolPool::from([
+            (prompt(), class),
+            (
+                user("render"),
+                function("render", Vec::new(), Ty::Class(prompt(), Box::new([]))),
+            ),
+        ]);
+        let emitted = emit(&pool);
+        assert!(emitted.contains("throws -> BamlPrompt {"), "{emitted}");
+        assert!(!emitted.contains("struct Rendered"), "{emitted}");
+        assert!(
+            !emitted.contains("SKIPPED class `user.Rendered`"),
+            "{emitted}"
+        );
+    }
+
+    /// A host's own value is the host's handle, `BamlHandle?`, in every
+    /// position a type names it, and its class emits nothing.
+    #[test]
+    fn host_value_class_is_the_host_handle() {
+        let host_value = Name::new("baml".into(), vec!["host".into()], "Value".into());
+        let class = |name: Name, crossing, properties: Vec<(&str, Ty)>| {
+            Symbol::Class(baml_sdkgen_types::Class {
+                crossing,
+                name,
+                generic_params: Vec::new(),
+                docstring: None,
+                properties: properties
+                    .into_iter()
+                    .map(|(name, ty)| baml_sdkgen_types::ClassProperty {
+                        name: name.into(),
+                        docstring: None,
+                        ty,
+                        json_fallback: false,
+                        json_flatten: false,
+                        json_rename: None,
+                    })
+                    .collect(),
+                static_methods: Vec::new(),
+                instance_methods: Vec::new(),
+                origin: origin(),
+                json_omit_nulls: false,
+            })
+        };
+        let pool_with = |handle: Ty| {
+            let mut optional = function("optional", vec![("value", handle.clone())], int());
+            if let Symbol::Function(function) = &mut optional {
+                function.arguments[0].default =
+                    Some(baml_sdkgen_types::FunctionArgumentDefault::Null);
+            }
+            SymbolPool::from([
+                (
+                    user("Holder"),
+                    class(
+                        user("Holder"),
+                        ClassCrossing::Fields,
+                        vec![
+                            ("handle", handle.clone()),
+                            ("maybe", Ty::Union(Box::new([handle.clone(), null()]))),
+                            ("many", Ty::List(Box::new(handle.clone()))),
+                            ("either", Ty::Union(Box::new([handle.clone(), int()]))),
+                        ],
+                    ),
+                ),
+                (
+                    user("Only"),
+                    class(
+                        user("Only"),
+                        ClassCrossing::Fields,
+                        vec![("handle", handle.clone())],
+                    ),
+                ),
+                (
+                    user("echo"),
+                    function("echo", vec![("value", handle.clone())], handle),
+                ),
+                (user("optional"), optional),
+            ])
+        };
+        let generate = |pool: &SymbolPool| {
+            to_source_code_with_bytecode(pool, &[], NamingConvention::PreserveCase)
+        };
+        let mut pool = pool_with(Ty::Class(host_value.clone(), Box::new([])));
+        pool.insert(
+            host_value.clone(),
+            class(host_value, ClassCrossing::HostValue, Vec::new()),
+        );
+        let host_value = generate(&pool);
+
+        let all: String = host_value.values().cloned().collect();
+        assert!(all.contains("BamlHandle?"), "{all}");
+        assert!(all.contains("BamlHandle._bamlDecode(v)"), "{all}");
+        assert!(!all.contains("struct Value"), "{all}");
+    }
+
+    #[test]
+    fn a_parameter_named_args_keeps_its_value() {
+        // The kwargs local must not shadow a parameter named `args`.
+        let mut symbol = function("cache", vec![("args", int())], int());
+        if let Symbol::Function(function) = &mut symbol {
+            function.arguments[0].default = Some(baml_sdkgen_types::FunctionArgumentDefault::Null);
+        }
+        let emitted = emit(&SymbolPool::from([(user("cache"), symbol)]));
+        assert!(
+            emitted
+                .contains("args._appendIfSet(\"args\", as: BamlSlot<Swift.Int>.own, to: &args_)"),
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn unit_return_has_no_result() {
+        // A function returning the unit type (`null`, also spelled `void`) has
+        // no Swift result and calls the envelope-discarding `callSyncVoid`,
+        // rather than decoding a `BamlNull`.
+        let unit = null();
+        let function = baml_sdkgen_types::Function {
+            name: "settle".into(),
+            generic_params: Vec::new(),
+            docstring: None,
+            arguments: Vec::new(),
+            return_type: unit,
+            throws: None,
+            watchers: Vec::new(),
+            origin: baml_sdkgen_types::Origin {
+                source_file_path: "unit.baml".to_string(),
+                span_start: 0,
+            },
+        };
+        let pool = SymbolPool::from([(
+            Name::new("user".into(), Vec::new(), "settle".into()),
+            Symbol::Function(function),
+        )]);
+        let files = to_source_code_with_bytecode(&pool, &[], NamingConvention::PreserveCase);
+        let emitted: String = files.values().map(String::as_str).collect();
+        assert!(
+            emitted.contains("callSyncVoid(\"user.settle\""),
+            "{emitted}"
+        );
+        assert!(!emitted.contains("-> BamlNull"), "{emitted}");
+    }
+
     #[test]
     fn translate_ty_primitive_subset() {
         let ctx = TranslateCtx {
@@ -800,6 +1756,10 @@ mod tests {
             supported_enums: BTreeSet::new(),
             supported_aliases: BTreeSet::new(),
             nullable_aliases: BTreeSet::new(),
+            alias_bodies: BTreeMap::new(),
+            // The stream is the bridge's `BamlStream` by its crossing.
+            crossings: BTreeMap::from([("ai.stream.Stream".to_string(), ClassCrossing::Stream)]),
+            class_names: BTreeMap::new(),
         };
         let t = |ty: &Ty| translate_ty(ty, &ctx);
         assert_eq!(t(&int()).as_deref(), Some("Swift.Int"));
@@ -846,5 +1806,304 @@ mod tests {
         );
         // map with non-string key — not yet
         assert_eq!(t(&map(int(), int())), None);
+        let tuple = Ty::Tuple(Box::new([int(), string()]));
+        assert_eq!(t(&tuple).as_deref(), Some("(Swift.Int, Swift.String)"));
+        assert_eq!(
+            t(&Ty::Tuple(Box::new([string(), int()]))).as_deref(),
+            Some("(Swift.String, Swift.Int)")
+        );
+        assert_eq!(
+            t(&Ty::Tuple(Box::new([int(), int(), int()]))).as_deref(),
+            Some("(Swift.Int, Swift.Int, Swift.Int)")
+        );
+        assert_eq!(
+            t(&Ty::Tuple(Box::new([string()]))).as_deref(),
+            Some("BamlBridge.Tuple1<Swift.String>")
+        );
+        assert_eq!(
+            t(&Ty::Tuple(Box::new([tuple.clone()]))).as_deref(),
+            Some("BamlBridge.Tuple1<(Swift.Int, Swift.String)>")
+        );
+        assert_eq!(
+            t(&list(tuple.clone())).as_deref(),
+            Some("[(Swift.Int, Swift.String)]")
+        );
+        assert_eq!(
+            t(&union(vec![tuple.clone(), null()])).as_deref(),
+            Some("(Swift.Int, Swift.String)?")
+        );
+        assert_eq!(
+            t(&union(vec![tuple.clone(), string()])).as_deref(),
+            Some("BamlUnion2<(Swift.Int, Swift.String), Swift.String>")
+        );
+        assert_eq!(
+            t(&Ty::Tuple(Box::new([tuple.clone(), Ty::Bool]))).as_deref(),
+            Some("((Swift.Int, Swift.String), Swift.Bool)")
+        );
+        let wide = Ty::Tuple(vec![int(); 14].into_boxed_slice());
+        assert_eq!(
+            t(&wide).as_deref(),
+            Some(format!("({})", vec!["Swift.Int"; 14].join(", ")).as_str())
+        );
+        let tuple_stream = Ty::Class(
+            Name::new(
+                baml_base::Name::new("ai"),
+                vec![baml_base::Name::new("stream")],
+                baml_base::Name::new("Stream"),
+            ),
+            Box::new([tuple]),
+        );
+        assert_eq!(
+            t(&tuple_stream).as_deref(),
+            Some("BamlStream<(Swift.Int, Swift.String)>")
+        );
+        assert_eq!(t(&Ty::Tuple(Box::new([int(), map(int(), int())]))), None);
+        assert_eq!(t(&Ty::Unknown), None);
+        assert_eq!(t(&Ty::Tuple(Box::new([int(), Ty::Unknown]))), None);
+        assert_eq!(t(&list(Ty::Unknown)), None);
+        let image = Ty::Media(baml_base::MediaKind::Image);
+        assert_eq!(t(&image), None);
+        assert_eq!(t(&Ty::Tuple(Box::new([image, int()]))), None);
+        assert_eq!(t(&Ty::Tuple(Box::new([]))), None);
+    }
+
+    #[test]
+    fn tuple_slots_state_every_slot_in_order() {
+        let ctx = TranslateCtx {
+            supported_classes: BTreeSet::new(),
+            supported_enums: BTreeSet::new(),
+            supported_aliases: BTreeSet::new(),
+            nullable_aliases: BTreeSet::new(),
+            alias_bodies: BTreeMap::new(),
+            crossings: BTreeMap::new(),
+            class_names: BTreeMap::new(),
+        };
+        let slot = |ty: &Ty| slot_expr(ty, &ctx, &translate_ty::generic_param_slot);
+        let image_class = Name::new(
+            baml_base::Name::new("baml"),
+            vec![baml_base::Name::new("media")],
+            baml_base::Name::new("Image"),
+        );
+        let media_ctx = TranslateCtx {
+            supported_classes: BTreeSet::from([image_class.to_string()]),
+            crossings: BTreeMap::from([(
+                image_class.to_string(),
+                ClassCrossing::Media(baml_base::ConcreteMediaKind::Image),
+            )]),
+            class_names: BTreeMap::from([(image_class.to_string(), image_class)]),
+            supported_enums: BTreeSet::new(),
+            supported_aliases: BTreeSet::new(),
+            nullable_aliases: BTreeSet::new(),
+            alias_bodies: BTreeMap::new(),
+        };
+        let image = Ty::Media(baml_base::MediaKind::Image);
+        let image_swift = translate_ty(&image, &media_ctx).expect("media has a struct");
+        assert_eq!(
+            translate_ty(&Ty::Tuple(Box::new([image.clone(), int()])), &media_ctx),
+            Some(format!("({image_swift}, Swift.Int)"))
+        );
+        assert_eq!(
+            slot_expr(
+                &Ty::Tuple(Box::new([image, int()])),
+                &media_ctx,
+                &translate_ty::generic_param_slot
+            ),
+            Some(format!(
+                "BamlSlots.tuple(BamlSlot<{image_swift}>.own, BamlSlot<Swift.Int>.own)"
+            ))
+        );
+        assert_eq!(
+            slot(&Ty::Tuple(Box::new([int(), string_literal("a")]))).as_deref(),
+            Some("BamlSlots.tuple(BamlSlot<Swift.Int>.own, BamlSlot<Swift.String>.literal(\"a\"))")
+        );
+        assert_eq!(
+            slot(&Ty::Tuple(Box::new([string()]))).as_deref(),
+            Some("BamlSlots.tuple(BamlSlot<Swift.String>.own)")
+        );
+        let mut slots = vec![int(); 13];
+        slots.push(type_var());
+        assert_eq!(
+            slot(&Ty::Tuple(slots.into_boxed_slice())).as_deref(),
+            Some(
+                format!(
+                    "BamlSlots.tuple({}, BamlSlot<T>.own)",
+                    vec!["BamlSlot<Swift.Int>.own"; 13].join(", ")
+                )
+                .as_str()
+            )
+        );
+    }
+
+    fn type_var() -> Ty {
+        Ty::TypeVar(ParamTy::new(0, "T".into()))
+    }
+
+    fn class(name: &str, generic_params: Vec<&str>, properties: Vec<(&str, Ty)>) -> Symbol {
+        Symbol::Class(baml_sdkgen_types::Class {
+            name: user(name),
+            generic_params: generic_params.into_iter().map(Into::into).collect(),
+            docstring: None,
+            properties: properties
+                .into_iter()
+                .map(|(name, ty)| baml_sdkgen_types::ClassProperty {
+                    name: name.into(),
+                    docstring: None,
+                    ty,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
+                })
+                .collect(),
+            static_methods: Vec::new(),
+            instance_methods: Vec::new(),
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
+            origin: origin(),
+            json_omit_nulls: false,
+        })
+    }
+
+    #[test]
+    fn tuple_signatures_are_native_tuples_at_every_arity() {
+        let pair = Ty::Tuple(Box::new([int(), string()]));
+        let single = Ty::Tuple(Box::new([string()]));
+        let wide = Ty::Tuple(vec![int(); 13].into_boxed_slice());
+        let pool = SymbolPool::from([
+            (
+                user("pair"),
+                function("pair", vec![("t", pair.clone())], pair),
+            ),
+            (
+                user("single"),
+                function("single", vec![("t", single.clone())], single),
+            ),
+            (
+                user("wide"),
+                function("wide", vec![("t", wide.clone())], wide),
+            ),
+        ]);
+        let files = to_source_code_with_bytecode(&pool, &[], NamingConvention::PreserveCase);
+        let emitted: String = files.values().map(String::as_str).collect();
+        assert!(
+            emitted.contains(
+                "public static func pair(t: (Swift.Int, Swift.String), baml: Baml.BamlOptions = .init()) \
+                 async throws -> (Swift.Int, Swift.String)"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "BamlArgument(\"t\", t, as: BamlSlots.tuple(BamlSlot<Swift.Int>.own, \
+                 BamlSlot<Swift.String>.own))"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "public static func single(t: BamlBridge.Tuple1<Swift.String>, baml: \
+                 Baml.BamlOptions = .init()) async throws -> BamlBridge.Tuple1<Swift.String>"
+            ),
+            "{emitted}"
+        );
+        let ints = vec!["Swift.Int"; 13].join(", ");
+        assert!(
+            emitted.contains(&format!("public static func wide(t: ({ints}), ")),
+            "{emitted}"
+        );
+        assert!(!files.contains_key(&PathBuf::from("_BamlTuples.swift")));
+        assert!(!emitted.contains("struct Tuple"), "{emitted}");
+        let manifest = &files[&PathBuf::from("_BamlSkipped.swift")];
+        for name in ["pair", "single", "wide"] {
+            assert!(!manifest.contains(&format!("`user.{name}`")), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn structs_holding_tuples_spell_their_equality_out() {
+        let pair = Ty::Tuple(Box::new([int(), string()]));
+        let pool = SymbolPool::from([
+            (
+                user("Holder"),
+                class(
+                    "Holder",
+                    Vec::new(),
+                    vec![("pair", pair.clone()), ("n", int()), ("pairs", list(pair))],
+                ),
+            ),
+            (
+                user("Single"),
+                class(
+                    "Single",
+                    Vec::new(),
+                    vec![("one", Ty::Tuple(Box::new([int()])))],
+                ),
+            ),
+        ]);
+        let emitted = emit(&pool);
+        for expected in [
+            "public struct Holder: Equatable, Sendable, BamlTyped, BamlDecodable {",
+            "public nonisolated static func == (lhs: Self, rhs: Self) -> Swift.Bool {",
+            "(BamlSlots.tuple(BamlSlot<Swift.Int>.own, BamlSlot<Swift.String>.own))\
+             ._bamlEqual(lhs.pair, rhs.pair)",
+            "&& lhs.n == rhs.n",
+            "&& (BamlSlots.list(BamlSlots.tuple(BamlSlot<Swift.Int>.own, \
+             BamlSlot<Swift.String>.own)))._bamlEqual(lhs.pairs, rhs.pairs)",
+        ] {
+            assert!(emitted.contains(expected), "{expected}\n{emitted}");
+        }
+        let single = emitted
+            .split_once("public struct Single:")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        assert!(!single.contains("static func =="), "{single}");
+    }
+
+    #[test]
+    fn tuples_cannot_be_generic_arguments() {
+        let pair = Ty::Tuple(Box::new([int(), string()]));
+        let boxed = |arg: Ty| Ty::Class(user("Box"), Box::new([arg]));
+        let pool = SymbolPool::from([
+            (
+                user("Box"),
+                class("Box", vec!["T"], vec![("value", type_var())]),
+            ),
+            (
+                user("boxed_pair"),
+                function("boxed_pair", vec![("b", boxed(pair))], int()),
+            ),
+            (
+                user("boxed_single"),
+                function(
+                    "boxed_single",
+                    vec![("b", boxed(Ty::Tuple(Box::new([int()]))))],
+                    int(),
+                ),
+            ),
+        ]);
+        let files = to_source_code_with_bytecode(&pool, &[], NamingConvention::PreserveCase);
+        let emitted: String = files.values().map(String::as_str).collect();
+        let manifest = &files[&PathBuf::from("_BamlSkipped.swift")];
+        assert!(manifest.contains("`user.boxed_pair`"), "{manifest}");
+        assert!(
+            emitted.contains("b: Baml.Box<BamlBridge.Tuple1<Swift.Int>>"),
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn a_class_reached_through_a_tuple_slot_is_boxed() {
+        let node = Ty::Union(Box::new([Ty::Class(user("Node"), Box::new([])), null()]));
+        let pool = SymbolPool::from([(
+            user("Node"),
+            class(
+                "Node",
+                Vec::new(),
+                vec![("next", Ty::Tuple(Box::new([int(), node])))],
+            ),
+        )]);
+        let emitted = emit(&pool);
+        assert!(
+            emitted.contains("@BamlIndirect public var next: (Swift.Int, Baml.Node?)"),
+            "{emitted}"
+        );
     }
 }

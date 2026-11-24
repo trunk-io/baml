@@ -243,9 +243,10 @@ pub struct DiagnosticCandidate {
 }
 
 impl DiagnosticCandidate {
-    /// Whether any file of the root carries an error. Emit is only attempted
-    /// for a clean candidate, so the host's build pipeline reads this instead
-    /// of re-deriving the check through `get_bytecode`'s own error gate.
+    /// Whether any file of the root carries an error: the host's build
+    /// pipeline does not attempt emit for such a candidate. It covers the
+    /// root's own files; `get_bytecode` checks the whole world before it
+    /// emits.
     pub fn has_errors(&self) -> bool {
         self.files
             .iter()
@@ -676,12 +677,6 @@ impl GlobalState {
         Arc::make_mut(&mut self.open_documents).insert(path, doc);
     }
 
-    pub fn set_document_version(&mut self, path: &Path, version: Option<i32>) {
-        if let Some(doc) = Arc::make_mut(&mut self.open_documents).get_mut(path) {
-            doc.version = version;
-        }
-    }
-
     /// Open documents whose path lies under `root_path`.
     pub fn open_documents_under<'a>(
         &'a self,
@@ -866,6 +861,7 @@ impl GlobalState {
                                 self_name: spec.self_name.clone(),
                                 interface: None,
                                 dependencies: Vec::new(),
+                                claim: spec.claim.clone(),
                             })
                             .map_err(|e| LspError::RequestFailed(e.to_string()))?;
                         applied.roots_changed = true;
@@ -875,6 +871,10 @@ impl GlobalState {
                         root
                     }
                 };
+                // A root that already exists takes the claim too: its
+                // manifest may have changed, or it was created before
+                // discovery read one.
+                self.db.set_claimed_identity(root, spec.claim.clone());
                 // Open overlays are authoritative over the disk text. A
                 // BTreeMap keeps the root's file order deterministic (path
                 // order — the same order CLI discovery loads), so the emitted
@@ -960,9 +960,6 @@ impl GlobalState {
             .map(|root| RootEntry {
                 root,
                 path: root.path(&self.db).clone(),
-                spelling: baml_db::baml_compiler2_hir::package::spelling(&self.db)
-                    .of(root)
-                    .clone(),
                 self_name: root.self_name(&self.db),
                 kind: root.kind(&self.db),
             })

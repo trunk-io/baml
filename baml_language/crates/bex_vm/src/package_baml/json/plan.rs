@@ -1,0 +1,246 @@
+//! What decoding needs to know about a class, worked out once and kept with
+//! the VM's decode lookups instead of worked out once per instance.
+
+use std::sync::{Arc, OnceLock};
+
+use bex_vm_types::{HeapPtr, Object, RealizedTy, RootHaver, RootVisitor, TypeHead};
+use rustc_hash::FxHashMap;
+use sys_types::JsonNaming;
+
+use crate::BexVm;
+
+/// A class instantiated with its type arguments, as JSON reads it under one
+/// naming.
+#[derive(Clone)]
+pub(super) struct ClassPlan {
+    pub(super) head: TypeHead,
+    pub(super) class: HeapPtr,
+    pub(super) type_args: Box<[RealizedTy]>,
+    /// Each field, in slot order.
+    pub(super) fields: Vec<FieldPlan>,
+    /// Two shown fields go by the same JSON key, so one key fills both.
+    pub(super) shared_keys: bool,
+}
+
+/// What a `map<string, json>` field reads instead of a key of its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rest {
+    /// `@json.flatten`: the keys no other field took.
+    Unclaimed,
+    /// `@json.fallback`: the whole object.
+    Whole,
+}
+
+#[derive(Clone)]
+pub(super) struct FieldPlan {
+    /// The JSON key under the plan's naming.
+    pub(super) key: String,
+    /// The key's map hash, to look it up in a `json` object; worked out the
+    /// first time it is needed.
+    hash: OnceLock<u64>,
+    /// Whether JSON carries the field under its key: a `@skip` field under
+    /// aliased names holds its type's empty value instead, a `rest` field the
+    /// object's keys, and the other fields of a `@json.fallback` class their
+    /// literals.
+    pub(super) shown: bool,
+    /// The keys the field holds, for `@json.flatten` and `@json.fallback`.
+    pub(super) rest: Option<Rest>,
+    /// The field's type with the class's type arguments substituted.
+    pub(super) ty: RealizedTy,
+    /// A field whose type admits `null` may be absent, and then decodes to
+    /// `null`.
+    pub(super) may_be_absent: bool,
+}
+
+impl FieldPlan {
+    /// The map hash of the field's JSON key.
+    pub(super) fn hash(&self) -> u64 {
+        *self
+            .hash
+            .get_or_init(|| bex_vm_types::map_string_hash(&self.key))
+    }
+}
+
+impl ClassPlan {
+    /// The class's name in messages.
+    pub(super) fn named(&self) -> String {
+        baml_type::HeadDisplay::head_display_name(&self.head)
+    }
+
+    /// The declared name of field `index`, for messages.
+    pub(super) fn field_name(&self, vm: &BexVm, index: usize) -> String {
+        match vm.get_object(self.class) {
+            Object::Class(class) => class.instance_fields()[index].name.clone(),
+            _ => self.fields[index].key.clone(),
+        }
+    }
+
+    /// The plan for the class at `head` instantiated with `type_args`, or the
+    /// class's name when `head` does not hold a class.
+    fn new(
+        vm: &BexVm,
+        head: TypeHead,
+        type_args: &[RealizedTy],
+        naming: JsonNaming,
+    ) -> Result<Self, String> {
+        let class = head.ptr();
+        let Object::Class(declaration) = vm.get_object(class) else {
+            return Err(baml_type::HeadDisplay::head_display_name(&head));
+        };
+        // A class only the runtime builds has no JSON form, which the
+        // analysis reports before any plan is made.
+        let Ok(declared) = declaration.buildable_fields() else {
+            return Err(baml_type::HeadDisplay::head_display_name(&head));
+        };
+        let fallback = declared.iter().any(|field| field.json_fallback);
+        let fields: Vec<FieldPlan> = declared
+            .iter()
+            .map(|field| {
+                // Substitute class-level type-args into the field's template so
+                // a `Container<User>::item` field decodes against `User` rather
+                // than erased runtime metadata.
+                let ty = vm.realize_field_ty(&field.field_template, type_args);
+                let key = naming
+                    .key(
+                        &field.name,
+                        field.alias.as_deref(),
+                        field.json_rename.as_deref(),
+                    )
+                    .to_owned();
+                FieldPlan {
+                    hash: OnceLock::new(),
+                    key,
+                    shown: naming.shows(field.skip) && !field.json_flatten && !fallback,
+                    rest: if field.json_fallback {
+                        Some(Rest::Whole)
+                    } else {
+                        field.json_flatten.then_some(Rest::Unclaimed)
+                    },
+                    may_be_absent: baml_type::accepts_null::accepts_null(ty.as_ty(), &|head| {
+                        baml_type::normalize::TypeContext::alias_def(vm, head)
+                    }),
+                    ty,
+                }
+            })
+            .collect();
+        let shown: Vec<&str> = fields
+            .iter()
+            .filter(|field| field.shown)
+            .map(|field| field.key.as_str())
+            .collect();
+        let shared_keys = shown
+            .iter()
+            .enumerate()
+            .any(|(i, key)| shown[..i].contains(key));
+        Ok(Self {
+            head,
+            class,
+            type_args: type_args.into(),
+            fields,
+            shared_keys,
+        })
+    }
+
+    /// Whether the class has a `@json.fallback` field.
+    pub(super) fn is_fallback(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.rest == Some(Rest::Whole))
+    }
+
+    /// Whether a field reads the object's keys rather than one key.
+    pub(super) fn reads_rest(&self) -> bool {
+        self.fields.iter().any(|field| field.rest.is_some())
+    }
+
+    /// The shown fields JSON names `key`: one, unless keys are shared.
+    pub(super) fn fields_named<'a>(&'a self, key: &'a str) -> impl Iterator<Item = usize> + 'a {
+        let mut found = false;
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(move |(_, field)| {
+                if found && !self.shared_keys {
+                    return false;
+                }
+                let hit = field.shown && field.key == key;
+                found |= hit;
+                hit
+            })
+            .map(|(i, _)| i)
+    }
+}
+
+/// Every heap pointer the plan holds.
+impl RootHaver for ClassPlan {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            head,
+            class,
+            type_args,
+            fields,
+            shared_keys: _,
+        } = self;
+        head.visit_roots(visitor);
+        class.visit_roots(visitor);
+        type_args.visit_roots(visitor);
+        for FieldPlan {
+            key: _,
+            hash: _,
+            shown: _,
+            rest: _,
+            ty,
+            may_be_absent: _,
+        } in fields
+        {
+            ty.visit_roots(visitor);
+        }
+    }
+}
+
+/// The class and union plans worked out under one naming.
+pub(super) struct Plans {
+    pub(super) naming: JsonNaming,
+    classes: FxHashMap<(TypeHead, Box<[RealizedTy]>), Arc<ClassPlan>>,
+    /// Each union met, with how it picks a member when it has a fallback.
+    pub(super) unions: FxHashMap<Box<[RealizedTy]>, Option<Arc<super::union::UnionTags>>>,
+    /// Each union a decode failed against, with the members no JSON value
+    /// can be, for its error message.
+    pub(super) impossible: FxHashMap<Box<[RealizedTy]>, Impossible>,
+}
+
+/// The members of a union no JSON value can be: each one's index, with why.
+pub(super) type Impossible = Arc<[(usize, String)]>;
+
+impl Plans {
+    pub(super) fn new(naming: JsonNaming) -> Self {
+        Self {
+            naming,
+            classes: FxHashMap::default(),
+            unions: FxHashMap::default(),
+            impossible: FxHashMap::default(),
+        }
+    }
+
+    /// The plan for the class at `head` with `type_args`, or the class's name
+    /// when `head` does not hold a class.
+    pub(super) fn class(
+        &mut self,
+        vm: &BexVm,
+        head: TypeHead,
+        type_args: &[RealizedTy],
+    ) -> Result<Arc<ClassPlan>, String> {
+        if let Some(plan) = self.classes.get(&(head, type_args.into())) {
+            return Ok(Arc::clone(plan));
+        }
+        let plan = Arc::new(ClassPlan::new(vm, head, type_args, self.naming)?);
+        self.classes
+            .insert((head, type_args.into()), Arc::clone(&plan));
+        Ok(plan)
+    }
+
+    /// How many plans are kept.
+    pub(super) fn len(&self) -> usize {
+        self.classes.len() + self.unions.len() + self.impossible.len()
+    }
+}

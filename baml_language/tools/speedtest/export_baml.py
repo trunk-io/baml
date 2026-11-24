@@ -2,12 +2,12 @@
 """Emit every speedtest workload's *expanded* BAML source as JSON.
 
 This is the bridge that lets the Rust benchmark suite (crates/baml_tests)
-reuse the workloads under tools/speedtest/workloads/ as CodSpeed benches
-without duplicating the .md parsing / eval-setup / $$-templating logic that
-already lives in speedtest.loader.
+reuse the workloads under tools/speedtest/workloads/ as divan benches
+without duplicating what speedtest.loader defines a workload to be. Each bench
+calls the workload's zero-argument `main()`.
 
 Output (stdout): a JSON array of {"name", "category", "baml"} objects.
-Anything that can't be parsed is skipped (loader.py prints a WARN to stderr).
+A malformed workload fails the export with the reason on stderr.
 
 Usage:
     python3 export_baml.py [workloads_dir]

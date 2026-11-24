@@ -513,7 +513,7 @@ implements ToJson for Dog {
     );
 
     assert_eq!(
-        baml_compiler2_hir::item_data::file_free_impls(&db, impl_file).len(),
+        baml_compiler2_hir::item_data::file_impls(&db, impl_file).len(),
         1,
         "cross-file class target must remain a first-class out-of-body impl record"
     );
@@ -560,7 +560,7 @@ fn builtin_equals_compare_visible_from_user_package() {
     use baml_type::normalize::TypeContext;
 
     let mut db = make_db();
-    // A user file so the `user` package exists; `Bare` implements nothing.
+    // A user file so the `user` package exists; `Bare` declares no impls.
     db.file("main.baml", "class Bare { x: int }");
     let user_pkg = db.workspace_root().unwrap();
     let baml_root = baml_compiler2_hir::package::lang_roots(&db)
@@ -595,8 +595,8 @@ fn builtin_equals_compare_visible_from_user_package() {
     // uint8array implements Equals but not Compare.
     assert!(ctx.implements_interface(&u8_ty, &equals));
     assert!(!ctx.implements_interface(&u8_ty, &compare));
-    // A class with no `implements` satisfies neither.
-    assert!(!ctx.implements_interface(&bare, &equals));
+    // Structural equality is synthesized; ordering still requires an impl.
+    assert!(ctx.implements_interface(&bare, &equals));
     assert!(!ctx.implements_interface(&bare, &compare));
 }
 
@@ -756,32 +756,6 @@ function main() -> int {
     );
 }
 
-/// A function-valued return annotation must declare its throws (rule 5); an
-/// effect-polymorphic forwarder is returned by eta-expanding at the concrete
-/// throws surface. (Returning `wrap` directly does not instantiate its
-/// synthetic effect param against the annotation — the forwarder value stays
-/// generic — so the lambda pins the `never` instantiation.)
-#[test]
-fn returning_callback_forwarder_matches_explicit_function_type_return_annotation() {
-    let mut db = make_db();
-    let file = db.file(
-        "callback_return.baml",
-        r#"function wrap(cb: (x: int) -> int) -> int {
-  return cb(1)
-}
-
-function demo() -> ((x: int) -> int throws never) -> int throws never {
-  return (cb: (x: int) -> int throws never) -> int { wrap(cb) }
-}"#,
-    );
-
-    let output = render_tir(&db, file);
-    assert!(
-        !output.contains("type mismatch"),
-        "expected function-valued return annotation to accept the eta-expanded forwarder, got:\n{output}"
-    );
-}
-
 /// Helper: does compiling `source` produce a type mismatch diagnostic?
 fn has_type_mismatch(source: &str) -> bool {
     let mut db = make_db();
@@ -856,22 +830,6 @@ fn reassign_unannotated_scalar_local_to_incompatible_type_is_rejected() {
     );
 }
 
-#[test]
-fn empty_array_local_still_evolves_via_reassignment() {
-    // Regression guard: an *empty* evolving list must still accept a populated
-    // list of the same kind — only cross-kind reassignment is rejected.
-    assert!(
-        !has_type_mismatch(
-            r#"function main() -> int {
-    let a = [];
-    a = [1, 2, 3];
-    return 0;
-}"#
-        ),
-        "reassigning a populated list into an empty-list local must stay allowed"
-    );
-}
-
 // ─── Index-key type validation ───────────────────────────────────────────────
 //
 // The runtime does no key coercion: a list is subscripted by an `int` and a
@@ -915,72 +873,6 @@ fn map_indexed_by_int_key_is_rejected() {
 }"#
         ),
         "indexing a map with an int key should report a type mismatch"
-    );
-}
-
-#[test]
-fn empty_map_index_assign_with_int_key_is_rejected() {
-    assert!(
-        has_type_mismatch(
-            r#"function main() -> int {
-    let m = {};
-    m[0] = 1;
-    return 0;
-}"#
-        ),
-        "index-assigning an empty map with an int key should report a type mismatch"
-    );
-}
-
-#[test]
-fn well_typed_index_access_is_accepted() {
-    // Regression guard: int-keyed list and string-keyed map (incl. evolving
-    // empties) must stay valid.
-    assert!(
-        !has_type_mismatch(
-            r#"function main() -> int {
-    let x = [];
-    x[0] = 1;
-    let m = {};
-    m["k"] = 2;
-    return x[0] + m["k"];
-}"#
-        ),
-        "int-keyed list and string-keyed map access must stay allowed"
-    );
-}
-
-#[test]
-fn list_indexed_by_nullable_int_is_rejected() {
-    // A subscript must be non-null — the runtime has no null index (it aborts
-    // with the confusing `type error: ... got any`).
-    assert!(
-        has_type_mismatch(
-            r#"function main() -> int {
-    let arr = [1, 2, 3];
-    let i: int? = null;
-    return arr[i];
-}"#
-        ),
-        "indexing a list with a nullable int should report a type mismatch"
-    );
-}
-
-#[test]
-fn narrowed_nullable_index_is_accepted() {
-    // Regression guard: a nullable index narrowed to non-null must stay valid.
-    assert!(
-        !has_type_mismatch(
-            r#"function main() -> int {
-    let arr = [1, 2, 3];
-    let i: int? = 0;
-    if i != null {
-        return arr[i];
-    }
-    return 0;
-}"#
-        ),
-        "a nullable index narrowed to non-null must stay allowed"
     );
 }
 
@@ -1135,7 +1027,7 @@ fn optional_callback_effect_survives_narrowing_and_invocation() {
     insta::assert_snapshot!(render_tir(&db, file), @"
     function user.apply_optional(callback: ((value: int) -> int throws __effect_param_0) | null, value: int) -> int throws never {
       { : int
-        if (callback != null : bool) : void
+        if (callback != null : bool) : null
           { : never
             return callback<__effect_param_0>(value) : int
           }

@@ -14,7 +14,7 @@
 //!
 //! ## Per-file pipeline
 //!
-//! 1. **Parse errors** — via `baml_compiler_parser::parse_errors`. Always fast
+//! 1. **Parse errors** — via `baml_parser::typed_parse_errors`. Always fast
 //!    because parsing is Salsa-cached per file.
 //! 2. **HIR2 diagnostics** — stored in `file_semantic_index(...).extra`. These
 //!    cover duplicate field/variant/binding names found during scope tree
@@ -40,11 +40,11 @@ use std::collections::{HashMap, HashSet};
 use baml_base::{FileId, Name, SourceFile, Span};
 use baml_compiler_diagnostics::{
     Diagnostic, DiagnosticId, DiagnosticIdentifierKind, DiagnosticPhase, DiagnosticText,
-    ParseError, ToDiagnostic, runtime_type,
+    runtime_type, typed_parse_error_diagnostic,
 };
-use baml_compiler2_hir::{file_semantic_index, package::PackageItems, scope::ScopeKind};
+use baml_compiler2_hir::{file_semantic_index, scope::ScopeKind};
 use baml_compiler2_hir_ty::diagnostics::{ScopedTypeEscapeKind, TirTypeError};
-use baml_type::{DeclName, Ty, TyRenderStrategy};
+use baml_type::Ty;
 use text_size::TextRange;
 
 use crate::ProjectDatabase;
@@ -195,14 +195,60 @@ pub fn check_files_parallel(db: &ProjectDatabase, files: &[SourceFile]) -> Vec<V
     slots.into_iter().map(Option::unwrap_or_default).collect()
 }
 
+/// The project's diagnostics as one of this crate's collectors produced them
+/// ([`Self::collect`], or a narrowed collection's
+/// [`NarrowedDiagnostics::merged`]): the only evidence
+/// [`crate::CheckedWorld::check`] accepts. It borrows the database, so no
+/// edit can land between the collection and the check; nothing outside this
+/// crate can build one from an arbitrary list.
+pub struct ProjectDiagnostics<'db> {
+    db: &'db ProjectDatabase,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'db> ProjectDiagnostics<'db> {
+    /// Every file's diagnostics and the package-level ones
+    /// ([`collect_compiler2_diagnostics`]).
+    pub fn collect(db: &'db ProjectDatabase) -> Self {
+        Self {
+            db,
+            diagnostics: collect_compiler2_diagnostics(db),
+        }
+    }
+
+    /// The database the diagnostics were collected from.
+    pub fn db(&self) -> &'db ProjectDatabase {
+        self.db
+    }
+
+    pub fn into_vec(self) -> Vec<Diagnostic> {
+        self.diagnostics
+    }
+}
+
+impl std::fmt::Debug for ProjectDiagnostics<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(&self.diagnostics).finish()
+    }
+}
+
+impl std::ops::Deref for ProjectDiagnostics<'_> {
+    type Target = [Diagnostic];
+
+    fn deref(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
 /// The per-checked-file split alongside the merged, honest-ordered set produced
 /// by [`collect_compiler2_diagnostics_narrowed`].
-pub struct NarrowedDiagnostics {
+pub struct NarrowedDiagnostics<'db> {
     /// Merged set: freshly-checked files' diagnostics, the caller-supplied
     /// clean-file `precomputed`, and the always-recomputed package-level
     /// diagnostics — sorted by the same comparator as the honest collector, so
-    /// it renders byte-identically to a full run.
-    pub merged: Vec<Diagnostic>,
+    /// it renders byte-identically to a full run. The `precomputed` rows are
+    /// the caller's to vouch for: a store that serves them answers for them.
+    pub merged: ProjectDiagnostics<'db>,
     /// Only the diagnostics `check_file` freshly produced for the checked
     /// files. Excludes `precomputed` and the package-level set, so it is exactly
     /// what the caller persists per dirty file (the package-level set is never
@@ -218,11 +264,11 @@ pub struct NarrowedDiagnostics {
 /// conflicts/shadows are always recomputed. The final sort re-runs on
 /// current-process `FileId`s, so the merged set renders byte-identically to the
 /// honest collector when `should_check` is all-true and `precomputed` is empty.
-pub fn collect_compiler2_diagnostics_narrowed(
-    db: &ProjectDatabase,
+pub fn collect_compiler2_diagnostics_narrowed<'db>(
+    db: &'db ProjectDatabase,
     should_check: &dyn Fn(SourceFile) -> bool,
     precomputed: Vec<Diagnostic>,
-) -> NarrowedDiagnostics {
+) -> NarrowedDiagnostics<'db> {
     let source_files = baml_compiler2_hir::compiler2_all_files(db);
     // Even a fully-served (zero-checked-files) collection ends in
     // `package_level_diagnostics`, which derives the whole-package aggregates
@@ -257,7 +303,13 @@ pub fn collect_compiler2_diagnostics_narrowed(
     merged.extend(precomputed);
     merged.extend(package_level_diagnostics(db, &source_files));
     sort_diagnostics(&mut merged);
-    NarrowedDiagnostics { merged, fresh }
+    NarrowedDiagnostics {
+        merged: ProjectDiagnostics {
+            db,
+            diagnostics: merged,
+        },
+        fresh,
+    }
 }
 
 /// Public wrapper over the private `package_level_diagnostics` for callers that assemble
@@ -382,18 +434,15 @@ impl ProjectDatabase {
 pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diagnostic> {
     let file_id = file.file_id(db);
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let vp = baml_compiler2_hir_ty::render::Viewpoint::user_facing(
-        db,
-        baml_compiler2_hir::file_package::file_package(db, file).root,
-    );
+    let vp = baml_compiler2_hir_ty::render::Viewpoint::for_file(db, file);
 
     // ── 1. Parse errors ───────────────────────────────────────────────────────
     //
-    // `parse_errors` is Salsa-cached per file. Calling it here is cheap after
-    // the first call for a given file revision.
-    let parse_errors = baml_compiler_parser::parse_errors(db, file);
-    for err in &parse_errors {
-        diagnostics.push(err.to_diagnostic());
+    // The parse is Salsa-cached per file. Reading its errors here is cheap
+    // after the first call for a given file revision.
+    let parse_errors = baml_parser::typed_parse_errors(db, file);
+    for err in parse_errors.iter() {
+        diagnostics.push(typed_parse_error_diagnostic(err, file_id));
     }
 
     // ── 2. HIR2 diagnostics ───────────────────────────────────────────────────
@@ -516,6 +565,59 @@ pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diag
                 };
                 diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
             }
+            for diagnostic in
+                baml_compiler2_hir_ty::infer::trace_hooks::declaration_diagnostics(db, func_loc)
+            {
+                diagnostics.push(tir_rendered_to_diagnostic_for_file(
+                    db,
+                    file,
+                    diagnostic.render(db, file, None),
+                ));
+            }
+            // LLM OUTPUT warnings: a return-type member a model can never
+            // return (E0184), at the written return type.
+            let findings = baml_compiler2_hir_ty::llm_output::llm_output_findings(db, func_loc);
+            if !findings.dropped.is_empty() {
+                let data = baml_compiler2_hir::item_data::elaborated_function_data(db, func_loc);
+                let source_map =
+                    baml_compiler2_hir::item_data::elaborated_function_source_map(db, func_loc);
+                let range = data.return_type.map_or_else(
+                    || baml_compiler2_hir::item_data::function_source_map(db, func_loc).name_span,
+                    |ret| source_map.type_refs.span(ret),
+                );
+                let function = baml_compiler2_hir::item_data::function_data(db, func_loc)
+                    .name
+                    .clone();
+                for (member, no_values) in &findings.dropped {
+                    let error = TirTypeError::LlmOutputMemberDropped {
+                        function: function.clone(),
+                        member: member.clone(),
+                        no_values: *no_values,
+                        kept: findings.kept.clone(),
+                    };
+                    let rendered = baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic {
+                        message: error.render(&vp),
+                        error,
+                        range,
+                        severity: baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Warning,
+                        related: Vec::new(),
+                    };
+                    diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
+                }
+            }
+        }
+        // BEP-042: `cleanup` is a reserved finalizer name, so a class's own
+        // method called `cleanup` must have the finalizer's shape (E0144).
+        for &func_loc in baml_compiler2_hir::item_data::file_functions(db, file) {
+            match baml_compiler2_hir_ty::cleanup::cleanup_method(db, func_loc) {
+                Some(baml_compiler2_hir_ty::cleanup::CleanupMethod::Malformed) => {
+                    diagnostics.push(malformed_cleanup_diagnostic(db, file, func_loc));
+                }
+                Some(baml_compiler2_hir_ty::cleanup::CleanupMethod::Native) => {
+                    diagnostics.push(native_cleanup_diagnostic(db, file, func_loc));
+                }
+                Some(baml_compiler2_hir_ty::cleanup::CleanupMethod::Finalizer) | None => {}
+            }
         }
         // TOP-LEVEL DECLARATION effect diagnostics: io reachable from a
         // `client`/`let` initializer, which `$init` cannot run (E0158).
@@ -538,17 +640,59 @@ pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diag
                             .any(|i| tainted.contains(&(i as usize)))
                 }
             });
+            // The written `: T` is a declaration-level type, checked like a
+            // type alias body: unresolved names, argument counts, bounds.
+            let annotation = baml_compiler2_hir_ty::lower::let_lowering_diagnostics(db, let_loc);
             if tainted_decl {
+                for (range, error) in annotation {
+                    let rendered = baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic {
+                        message: error.render(&vp),
+                        error,
+                        range,
+                        severity: baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Error,
+                        related: Vec::new(),
+                    };
+                    diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
+                }
                 continue;
             }
-            for (range, error) in
-                baml_compiler2_hir_ty::init_io::let_init_io_diagnostics(db, let_loc)
+            // Effects `$init` cannot perform (E0163, E0182), a throw nothing
+            // catches (E0183), and initialization cycles (E0181). An effect
+            // error already explains a throw its io would raise, so the
+            // throw is reported only on its own.
+            let effects = baml_compiler2_hir_ty::init_io::let_init_io_diagnostics(db, let_loc);
+            let throws = if effects.is_empty() {
+                baml_compiler2_hir_ty::globals::let_init_throw_diagnostics(db, let_loc)
+            } else {
+                Vec::new()
+            };
+            let throws = throws.into_iter().map(|(range, error)| {
+                (
+                    range,
+                    error,
+                    baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Warning,
+                )
+            });
+            for (range, error, severity) in annotation
+                .into_iter()
+                .chain(effects)
+                .chain(baml_compiler2_hir_ty::globals::let_init_cycle_diagnostics(
+                    db, let_loc,
+                ))
+                .map(|(range, error)| {
+                    (
+                        range,
+                        error,
+                        baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Error,
+                    )
+                })
+                .chain(throws)
             {
                 let rendered = baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic {
                     message: error.render(&vp),
                     error,
                     range,
-                    severity: baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Error,
+                    severity,
                     related: Vec::new(),
                 };
                 diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
@@ -567,6 +711,114 @@ pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diag
                     related: Vec::new(),
                 };
                 diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
+            }
+        }
+        // `@json` ATTRIBUTE errors: a declaration's own, and each union its
+        // types spell that can't pick a member by tag.
+        let package = baml_compiler2_hir::file_package::file_package(db, file).root;
+        let overrides = baml_compiler2_hir_ty::json_attrs::json_overrides(db, package);
+        let mut errors = Vec::new();
+        for &class_loc in baml_compiler2_hir::item_data::file_classes(db, file) {
+            let data = baml_compiler2_hir::item_data::class_data(db, class_loc);
+            let head = baml_compiler2_hir_ty::lower::qualify_def(
+                db,
+                baml_compiler2_hir::contributions::Definition::Class(class_loc),
+                &data.name,
+            );
+            errors.extend(baml_compiler2_hir_ty::json_attrs::class_errors(
+                db, class_loc, &head, overrides,
+            ));
+            let source_map = baml_compiler2_hir::item_data::class_source_map(db, class_loc);
+            let fields = baml_compiler2_hir_ty::lower::resolve_class_fields(db, class_loc);
+            for (field, (_, ty, _)) in data.fields.iter().zip(fields.iter()) {
+                if let Some(error) = baml_compiler2_hir_ty::json_attrs::union_error(db, ty) {
+                    errors.push((source_map.type_refs.span(field.type_ref), error));
+                }
+            }
+        }
+        for &enum_loc in baml_compiler2_hir::item_data::file_enums(db, file) {
+            let data = baml_compiler2_hir::item_data::enum_data(db, enum_loc);
+            let head = baml_compiler2_hir_ty::lower::qualify_def(
+                db,
+                baml_compiler2_hir::contributions::Definition::Enum(enum_loc),
+                &data.name,
+            );
+            let renames = data
+                .variants
+                .iter()
+                .any(|variant| variant.attrs.json_rename.is_some());
+            if renames
+                && let Some(interface) =
+                    baml_compiler2_hir_ty::json_attrs::override_of(overrides, &head)
+            {
+                errors.push((
+                    baml_compiler2_hir::item_data::enum_source_map(db, enum_loc).name_span,
+                    TirTypeError::JsonAttributesWithOverride {
+                        name: data.name.clone(),
+                        interface: interface.to_string(),
+                    },
+                ));
+            }
+        }
+        for &func_loc in baml_compiler2_hir::item_data::file_functions(db, file) {
+            let signature = baml_compiler2_hir_ty::lower::function_signature(db, func_loc);
+            let error = signature
+                .params
+                .iter()
+                .map(|param| &param.ty)
+                .chain([&signature.ret])
+                .find_map(|ty| baml_compiler2_hir_ty::json_attrs::union_error(db, ty));
+            if let Some(error) = error {
+                let name_span =
+                    baml_compiler2_hir::item_data::function_source_map(db, func_loc).name_span;
+                errors.push((name_span, error));
+            }
+        }
+        for (range, error) in errors {
+            let rendered = baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic {
+                message: error.render(&vp),
+                error,
+                range,
+                severity: baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Error,
+                related: Vec::new(),
+            };
+            diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
+        }
+        // LLM OUTPUT field warnings: an optional field an LLM function's
+        // output reaches, which a model can never fill (E0185), at the
+        // field's written type.
+        let always_null = baml_compiler2_hir_ty::llm_output::package_always_null_fields(
+            db,
+            baml_compiler2_hir::file_package::file_package(db, file).root,
+        );
+        if !always_null.is_empty() {
+            for &class_loc in baml_compiler2_hir::item_data::file_classes(db, file) {
+                let data = baml_compiler2_hir::item_data::class_data(db, class_loc);
+                let head = baml_compiler2_hir_ty::lower::qualify_def(
+                    db,
+                    baml_compiler2_hir::contributions::Definition::Class(class_loc),
+                    &data.name,
+                );
+                let source_map = baml_compiler2_hir::item_data::class_source_map(db, class_loc);
+                for field in &data.fields {
+                    if always_null
+                        .binary_search(&(head.clone(), field.name.clone()))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let error = TirTypeError::LlmOutputFieldAlwaysNull {
+                        field: field.name.clone(),
+                    };
+                    let rendered = baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic {
+                        message: error.render(&vp),
+                        error,
+                        range: source_map.type_refs.span(field.type_ref),
+                        severity: baml_compiler2_hir_ty::diagnostics::DiagnosticSeverity::Warning,
+                        related: Vec::new(),
+                    };
+                    diagnostics.push(tir_rendered_to_diagnostic_for_file(db, file, rendered));
+                }
             }
         }
         // INTERFACE requires-clause diagnostics.
@@ -595,8 +847,15 @@ pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diag
         let Definition::TypeAlias(alias_loc) = contrib.definition else {
             continue;
         };
+        let value = baml_compiler2_hir_ty::lower::type_alias_value(db, alias_loc);
+        let untagged = baml_compiler2_hir_ty::json_attrs::union_error(db, &value);
+        let declaration_span =
+            baml_compiler2_hir::item_data::type_alias_source_map(db, alias_loc).name_span;
         for (range, error) in
             baml_compiler2_hir_ty::lower::type_alias_lowering_diagnostics(db, alias_loc)
+                .iter()
+                .cloned()
+                .chain(untagged.map(|error| (declaration_span, error)))
         {
             let rendered = baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic {
                 message: error.render(&vp),
@@ -611,10 +870,10 @@ pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diag
 
     let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
     let pkg_id = pkg_info.root;
-    let res_ctx = baml_compiler2_hir_ty::package_interface::package_resolution_context(db, pkg_id);
-    let pkg_items = &res_ctx.own_items;
-    // Salsa-cached per package — previously rebuilt (and cloned per function
-    // below) on every file check.
+    // This validation needs only the package's symbols. A full resolution
+    // context also derives and clones every dependency interface, needlessly
+    // serializing otherwise independent file checks on those shared queries.
+    let pkg_items = baml_compiler2_hir::package::package_items(db, pkg_id);
     // Reuse the memoized CST → AST lowering instead of re-lowering here.
     let ast_items = &baml_compiler2_hir::file_ast(db, file).items;
     diagnostics.extend(validate_associated_type_bindings_in_items(
@@ -655,18 +914,11 @@ pub fn check_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> Vec<Diag
 /// are ignored here, leaving genuine type errors elsewhere in the file intact.
 fn parse_error_tainted_scopes(
     index: &baml_compiler2_hir::semantic_index::FileSemanticIndex<'_>,
-    parse_errors: &[ParseError],
+    parse_errors: &[baml_parser::ParseError],
 ) -> HashSet<usize> {
     let mut tainted = HashSet::new();
     for err in parse_errors {
-        let span = match err {
-            ParseError::UnexpectedToken { span, .. }
-            | ParseError::UnexpectedEof { span, .. }
-            | ParseError::InvalidSyntax { span, .. }
-            | ParseError::AmbiguousUnion { span, .. }
-            | ParseError::RemovedFeature { span, .. } => span,
-        };
-        let fsid = index.scope_at_offset(span.range.start(), None);
+        let fsid = index.scope_at_offset(err.range().start(), None);
         let scope = &index.scopes[fsid.index() as usize];
         if !matches!(
             scope.kind,
@@ -716,10 +968,7 @@ fn check_interfaces(
     use baml_compiler2_hir_ty::interfaces::ImplDataError;
 
     let mut diagnostics = Vec::new();
-    let vp = baml_compiler2_hir_ty::render::Viewpoint::user_facing(
-        db,
-        baml_compiler2_hir::file_package::file_package(db, file).root,
-    );
+    let vp = baml_compiler2_hir_ty::render::Viewpoint::for_file(db, file);
 
     // ── 1. Coherence (E0132) ─────────────────────────────────────────────────
     //
@@ -879,12 +1128,7 @@ dependency's `{partner}`)"
                     ));
                 }
             }
-            let out_of_body = match &block.subject {
-                baml_compiler2_hir::item_data::ImplSubjectData::InClass { out_of_body, .. } => {
-                    *out_of_body
-                }
-                baml_compiler2_hir::item_data::ImplSubjectData::Free { .. } => true,
-            };
+            let out_of_body = block.origin == baml_compiler2_ast::ImplOrigin::OutOfBody;
             if out_of_body && !fields.is_empty() {
                 mounted_structural.push((
                     TirTypeError::OutOfBodyImplementsFieldInterface {
@@ -1020,19 +1264,6 @@ fn validate_associated_type_bindings_in_items(
                         namespace_path,
                         &mut diagnostics,
                     );
-                }
-                for block in &class.implements {
-                    for method in &block.methods {
-                        validate_associated_type_bindings_in_function(
-                            db,
-                            file_id,
-                            method,
-                            &outer_bounds,
-                            pkg_items,
-                            namespace_path,
-                            &mut diagnostics,
-                        );
-                    }
                 }
             }
             baml_compiler2_ast::Item::Interface(iface) => {
@@ -1250,37 +1481,38 @@ fn validate_ambiguous_typevar_associated_projection_in_type_expr(
 
     match &expr.kind {
         TypeExprKind::Path {
-            segments,
+            path,
             generic_args,
             associated_type_bindings,
             ..
         } => {
-            if segments.len() == 2 && generic_args.is_empty() && associated_type_bindings.is_empty()
-            {
-                let base = &segments[0];
-                let member = &segments[1];
+            if path.len() == 2 && generic_args.is_empty() && associated_type_bindings.is_empty() {
+                let base = &path[0];
+                let member = &path[1];
                 if let Some(bounds) = generic_bounds.get(base) {
                     // The legacy structural renderer below is loc-based. A
                     // mounted bound has no InterfaceLoc; hir_ty's ordinary
                     // projection lowering owns its loc-free requires walk and
                     // diagnostics, so do not manufacture an "unknown" here.
                     let has_mounted_bound = bounds.iter().any(|bound| {
-                        let TypeExprKind::Path { segments, .. } = &bound.kind else {
+                        let TypeExprKind::Path { path, .. } = &bound.kind else {
                             return false;
                         };
-                        segments.first().is_some_and(|package| {
-                            baml_compiler2_hir::package::accessible_package(
-                                db,
-                                pkg_items.root,
-                                package,
-                            )
-                            .and_then(|root| {
+                        match baml_compiler2_hir::package::path_head(
+                            db,
+                            pkg_items.root,
+                            namespace_path,
+                            path,
+                        ) {
+                            baml_compiler2_hir::package::PathHead::Package(root)
+                            | baml_compiler2_hir::package::PathHead::Lang(root) => {
                                 baml_compiler2_hir_ty::package_interface::mounted_interface(
                                     db, root,
                                 )
-                            })
-                            .is_some()
-                        })
+                                .is_some()
+                            }
+                            baml_compiler2_hir::package::PathHead::Plain => false,
+                        }
                     });
                     if has_mounted_bound {
                         return;
@@ -1302,9 +1534,10 @@ fn validate_ambiguous_typevar_associated_projection_in_type_expr(
                         .filter_map(|loc| {
                             baml_compiler2_hir_ty::interfaces::interface_loc_qtn(db, loc).map(
                                 |qtn| {
-                                    baml_compiler2_hir_ty::render::Viewpoint::user_facing(
+                                    baml_compiler2_hir_ty::render::Viewpoint::for_namespace(
                                         db,
                                         pkg_items.root,
+                                        std::borrow::Cow::Borrowed(namespace_path),
                                     )
                                     .path(&qtn)
                                 },
@@ -1548,11 +1781,16 @@ fn tir_rendered_to_diagnostic_with_message(
             range: related.range,
         };
         let message = related.message;
+        // The reachability family labels the code it talks about in the
+        // same frame: the unreachable branch, body or arm of a constant
+        // condition, and the never-ending loop that leaves the code after
+        // it dead.
         if matches!(
             rendered.error,
             TirTypeError::UncalledFunctionInCondition { .. }
                 | TirTypeError::ConditionAlwaysConstant { .. }
                 | TirTypeError::ComparisonAlwaysDisjoint { .. }
+                | TirTypeError::DeadCode { .. }
         ) {
             return diag.with_secondary(span, message);
         }
@@ -1571,11 +1809,70 @@ fn tir_rendered_to_diagnostic_for_file(
     rendered: baml_compiler2_hir_ty::diagnostics::RenderedTirDiagnostic,
 ) -> Diagnostic {
     let message = rich_source_aware_tir_type_error_message(db, file, &rendered.error);
-    let vp = baml_compiler2_hir_ty::render::Viewpoint::user_facing(
-        db,
-        baml_compiler2_hir::file_package::file_package(db, file).root,
-    );
+    let vp = baml_compiler2_hir_ty::render::Viewpoint::for_file(db, file);
     tir_rendered_to_diagnostic_with_message(&vp, rendered, file.file_id(db), message)
+}
+
+/// E0144 for a class's own `cleanup` method that is not shaped as a
+/// finalizer, at the method's name.
+fn malformed_cleanup_diagnostic<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    file: SourceFile,
+    method: baml_compiler2_hir::loc::FunctionLoc<'db>,
+) -> Diagnostic {
+    use baml_compiler2_hir::item_data::{
+        MethodOwner, class_data, function_source_map, method_owner,
+    };
+    let Some(MethodOwner::Class(class)) = method_owner(db, method) else {
+        unreachable!("only a class's own method is a `cleanup` finalizer")
+    };
+    let class_name = &class_data(db, class).name;
+    Diagnostic::error(
+        DiagnosticId::CleanupMagicMethodSignature,
+        format!(
+            "`cleanup` on class `{class_name}` must have the signature \
+             `cleanup(self) -> void`; it is a reserved magic finalizer name"
+        ),
+    )
+    .with_primary(
+        Span {
+            file_id: file.file_id(db),
+            range: function_source_map(db, method).name_span,
+        },
+        "expected `cleanup(self) -> void`",
+    )
+    .with_phase(DiagnosticPhase::Type)
+}
+
+/// The E0144 report for a native `cleanup`, which the run-once guard cannot
+/// wrap, at the method's name.
+fn native_cleanup_diagnostic<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    file: SourceFile,
+    method: baml_compiler2_hir::loc::FunctionLoc<'db>,
+) -> Diagnostic {
+    use baml_compiler2_hir::item_data::{
+        MethodOwner, class_data, function_source_map, method_owner,
+    };
+    let Some(MethodOwner::Class(class)) = method_owner(db, method) else {
+        unreachable!("only a class's own method is a `cleanup` finalizer")
+    };
+    let class_name = &class_data(db, class).name;
+    Diagnostic::error(
+        DiagnosticId::CleanupMagicMethodSignature,
+        format!(
+            "`cleanup` on class `{class_name}` must have a BAML body: it runs at most once \
+             per instance, which a native body cannot guarantee"
+        ),
+    )
+    .with_primary(
+        Span {
+            file_id: file.file_id(db),
+            range: function_source_map(db, method).name_span,
+        },
+        "a native `cleanup`",
+    )
+    .with_phase(DiagnosticPhase::Type)
 }
 
 fn new_tir_diagnostic(
@@ -1596,8 +1893,18 @@ fn new_tir_diagnostic(
             .with_primary(span, label)
             .with_phase(DiagnosticPhase::Type);
     }
-    if let TirTypeError::ComputedGenericArgumentRequiresUnreflect { name } = error {
-        return runtime_type::computed_generic_argument_requires_unreflect(name.as_str())
+    if let TirTypeError::ComputedGenericArgumentRequiresLetType { name } = error {
+        return runtime_type::computed_generic_argument_requires_let_type(name.as_str())
+            .with_primary_span(span)
+            .with_phase(DiagnosticPhase::Type);
+    }
+    if let TirTypeError::BoundedLetTypeRequiresElse { name } = error {
+        return runtime_type::bounded_let_type_requires_else(name.as_str())
+            .with_primary_span(span)
+            .with_phase(DiagnosticPhase::Type);
+    }
+    if let TirTypeError::LetTypePendingOperand = error {
+        return runtime_type::let_type_pending_operand()
             .with_primary_span(span)
             .with_phase(DiagnosticPhase::Type);
     }
@@ -1645,7 +1952,12 @@ fn new_tir_diagnostic(
         .with_primary_span(span)
         .with_phase(DiagnosticPhase::Type);
     }
-    if matches!(error, TirTypeError::TypeMismatch { .. }) {
+    if matches!(
+        error,
+        TirTypeError::TypeMismatch { .. }
+            | TirTypeError::UnitExpected { .. }
+            | TirTypeError::ListPatternNeverMatches { .. }
+    ) {
         let base = runtime_type::mismatched_types();
         let diagnostic = if warning {
             Diagnostic::warning(base.id, base.message)
@@ -1658,7 +1970,7 @@ fn new_tir_diagnostic(
     }
     let id = tir_type_error_to_diagnostic_id(error);
     let headline = match error {
-        TirTypeError::MissingReturn { .. } => Some("missing return expression"),
+        TirTypeError::ImplicitUnit { .. } => Some("missing value"),
         _ => None,
     };
     let diagnostic = match headline {
@@ -1694,28 +2006,73 @@ fn rich_source_aware_tir_type_error_message(
             .type_expr(ty(expected))
             .text(", found ")
             .type_expr(ty(got)),
-        TirTypeError::UnresolvedName { name, .. } => DiagnosticText::new()
-            .text("unresolved name: ")
-            .identifier(name, DiagnosticIdentifierKind::Variable),
+        TirTypeError::UnresolvedName { name, suggestions } => {
+            let text = DiagnosticText::new()
+                .text("unresolved name: ")
+                .identifier(name, DiagnosticIdentifierKind::Variable);
+            match &**suggestions {
+                [] => text,
+                [only] => text.text(". Did you mean ").code(only).text("?"),
+                [first, rest @ ..] => rest
+                    .iter()
+                    .fold(
+                        text.text(". Did you mean one of these: ").code(first),
+                        |text, suggestion| text.text(", ").code(suggestion),
+                    )
+                    .text("?"),
+            }
+        }
         TirTypeError::UnresolvedMember {
             base_type, member, ..
-        } => DiagnosticText::new()
-            .text("type ")
-            .type_expr(ty(base_type))
-            .text(" has no member ")
-            .identifier(member, DiagnosticIdentifierKind::Field),
+        } => {
+            let message = DiagnosticText::new()
+                .text("type ")
+                .type_expr(ty(base_type))
+                .text(" has no member ")
+                .identifier(member, DiagnosticIdentifierKind::Field);
+            if matches!(base_type, Ty::Tuple(_)) {
+                message.text("; tuple slots are numbered, such as `.0`")
+            } else {
+                message
+            }
+        }
         TirTypeError::NotCallable { ty: callee_ty } => DiagnosticText::new()
             .type_expr(ty(callee_ty))
             .text(" is not a function and cannot be called"),
         TirTypeError::NotIterable { ty: iter_ty } => DiagnosticText::new()
             .text("cannot iterate over type ")
             .type_expr(ty(iter_ty)),
-        TirTypeError::NotIndexable { ty: index_ty } => DiagnosticText::new()
-            .text("cannot index into type ")
-            .type_expr(ty(index_ty)),
-        TirTypeError::MissingReturn { expected } => DiagnosticText::new()
-            .text("expected return value of type ")
-            .type_expr(ty(expected)),
+        TirTypeError::NotIndexable { ty: index_ty } => {
+            let message = DiagnosticText::new()
+                .text("cannot index into type ")
+                .type_expr(ty(index_ty));
+            if matches!(index_ty, Ty::Tuple(_)) {
+                message.text("; tuples use fixed dot slots such as `.0`; use `reflect.Tuple.get_element` for a runtime-selected slot")
+            } else {
+                message
+            }
+        }
+        TirTypeError::ImplicitUnit {
+            form,
+            expected,
+            admits_unit,
+        } => {
+            let (before, after) = form.around_expected(*admits_unit);
+            DiagnosticText::new()
+                .text(before)
+                .type_expr(ty(expected))
+                .text(after)
+        }
+        TirTypeError::ListPatternNeverMatches { scrutinee } => DiagnosticText::new()
+            .text("a list pattern never matches a value of type ")
+            .type_expr(ty(scrutinee)),
+        TirTypeError::UnitExpected { context, found } => {
+            let (before, after) = context.around_found();
+            DiagnosticText::new()
+                .text(before)
+                .type_expr(ty(found))
+                .text(after)
+        }
         _ => DiagnosticText::from(source_aware_tir_type_error_message(db, file, error)),
     }
 }
@@ -1787,9 +2144,6 @@ fn source_aware_tir_type_error_message(
                 ty(rhs)
             )
         }
-        TirTypeError::MissingReturn { expected } => {
-            format!("missing return value of type {}", ty(expected))
-        }
         TirTypeError::NonExhaustiveMatch {
             scrutinee_type,
             missing_cases,
@@ -1805,14 +2159,15 @@ fn source_aware_tir_type_error_message(
             }
         }
         TirTypeError::NonExhaustiveCatchAll {
+            keyword,
             caught_type,
             missing_cases,
         } => {
             if missing_cases.is_empty() {
-                format!("non-exhaustive catch_all on type {}", ty(caught_type))
+                format!("non-exhaustive {keyword} on type {}", ty(caught_type))
             } else {
                 format!(
-                    "non-exhaustive catch_all on type {}; missing: {}",
+                    "non-exhaustive {keyword} on type {}; missing: {}",
                     ty(caught_type),
                     missing_cases.join(", ")
                 )
@@ -1859,9 +2214,8 @@ fn source_aware_tir_type_error_message(
         TirTypeError::InvalidInterfaceUpcastTarget { target } => {
             format!("expected an interface qualifier, got {}", ty(target))
         }
-        _ => error.render(&baml_compiler2_hir_ty::render::Viewpoint::user_facing(
-            db,
-            baml_compiler2_hir::file_package::file_package(db, file).root,
+        _ => error.render(&baml_compiler2_hir_ty::render::Viewpoint::for_file(
+            db, file,
         )),
     }
 }
@@ -1875,9 +2229,13 @@ fn tir_type_error_to_diagnostic_id(
 ) -> DiagnosticId {
     use baml_compiler2_hir_ty::diagnostics::TirTypeError;
     match error {
-        TirTypeError::TypeMismatch { .. } => DiagnosticId::TypeMismatch,
+        TirTypeError::InvalidTraceHook { .. } => DiagnosticId::MalformedAttribute,
+        TirTypeError::TypeMismatch { .. } | TirTypeError::ListPatternNeverMatches { .. } => {
+            DiagnosticId::TypeMismatch
+        }
         TirTypeError::UnresolvedMember { .. } => DiagnosticId::NoSuchField,
         TirTypeError::UnionMemberNoCommonInterface { .. } => DiagnosticId::NoSuchField,
+        TirTypeError::UnionMemberAssociatedTypeConflict { .. } => DiagnosticId::TypeMismatch,
         TirTypeError::UnknownClassField { .. } | TirTypeError::UnknownClassPatternField { .. } => {
             DiagnosticId::NoSuchField
         }
@@ -1886,24 +2244,28 @@ fn tir_type_error_to_diagnostic_id(
         TirTypeError::UnresolvedName { .. } | TirTypeError::UnresolvedPropertyShorthand { .. } => {
             DiagnosticId::UnknownVariable
         }
-        TirTypeError::ComputedGenericArgumentRequiresUnreflect { name } => {
-            runtime_type::computed_generic_argument_requires_unreflect(name.as_str()).id
+        TirTypeError::ComputedGenericArgumentRequiresLetType { name } => {
+            runtime_type::computed_generic_argument_requires_let_type(name.as_str()).id
         }
+        TirTypeError::BoundedLetTypeRequiresElse { name } => {
+            runtime_type::bounded_let_type_requires_else(name.as_str()).id
+        }
+        TirTypeError::LetTypePendingOperand => runtime_type::let_type_pending_operand().id,
         TirTypeError::MountedPackageCallUnsupported { path } => {
             runtime_type::mounted_package_call_unsupported(path.as_str()).id
         }
+        TirTypeError::InvalidAssignmentTarget { .. } => DiagnosticId::InvalidSyntax,
         TirTypeError::InvalidRegexPattern { .. } => DiagnosticId::InvalidRegexPattern,
         TirTypeError::CannotConstructReflectionKind { .. } => DiagnosticId::TypeMismatch,
-        TirTypeError::CannotConstructAlias { .. } => DiagnosticId::TypeMismatch,
+        TirTypeError::CannotConstructAlias { .. }
+        | TirTypeError::ConstructedTypeParameter { .. } => DiagnosticId::TypeMismatch,
         TirTypeError::CannotConstructBuiltinCompanion { .. } => {
             DiagnosticId::CannotConstructBuiltinCompanion
         }
         TirTypeError::DeadCode { .. } => DiagnosticId::UnreachableCode,
         TirTypeError::ConditionAlwaysConstant { .. }
         | TirTypeError::UncalledFunctionInCondition { .. } => DiagnosticId::ConditionAlwaysConstant,
-        TirTypeError::VoidUsedAsValue => DiagnosticId::TypeMismatch,
-        TirTypeError::VoidFunctionResultUsed => DiagnosticId::TypeMismatch,
-        TirTypeError::TraceOpaqueValue => DiagnosticId::TypeMismatch,
+        TirTypeError::UnitExpected { .. } => DiagnosticId::TypeMismatch,
         TirTypeError::NotCallable { .. } => DiagnosticId::NotCallable,
         TirTypeError::NotIterable { .. } => DiagnosticId::NotCallable,
         TirTypeError::NotIndexable { .. } => DiagnosticId::NotIndexable,
@@ -1914,8 +2276,14 @@ fn tir_type_error_to_diagnostic_id(
         | TirTypeError::ComparisonAlwaysDisjoint { .. } => DiagnosticId::InvalidOperator,
         TirTypeError::InvalidUnaryOp { .. } => DiagnosticId::InvalidOperator,
         TirTypeError::UnresolvedType { .. } => DiagnosticId::UnknownType,
+        TirTypeError::ItemShadowsPackage { .. } => DiagnosticId::UnknownVariable,
         TirTypeError::RemovedReflectSpelling { .. } => DiagnosticId::RemovedFeature,
         TirTypeError::NonInterfaceProjectionQualifier => DiagnosticId::TypeMismatch,
+        TirTypeError::TupleElementNotAssignable | TirTypeError::FunctionFieldNeedsParens => {
+            DiagnosticId::TypeMismatch
+        }
+        TirTypeError::TupleIndexOutOfRange { .. } => DiagnosticId::TypeMismatch,
+        TirTypeError::TupleTypeTestNeverMatches { .. } => DiagnosticId::TypeMismatch,
         TirTypeError::UnknownAssociatedType { .. } => DiagnosticId::UnknownType,
         TirTypeError::AmbiguousAssociatedTypeProjection { .. } => DiagnosticId::TypeMismatch,
         TirTypeError::ArgumentCountMismatch { .. }
@@ -1928,7 +2296,7 @@ fn tir_type_error_to_diagnostic_id(
         TirTypeError::RequiredParamAfterDefault { .. }
         | TirTypeError::SelfParamDefault
         | TirTypeError::DefaultParamForwardReference { .. } => DiagnosticId::TypeMismatch,
-        TirTypeError::MissingReturn { .. } => DiagnosticId::MissingReturnExpression,
+        TirTypeError::ImplicitUnit { .. } => DiagnosticId::MissingReturnExpression,
         TirTypeError::AliasCycle { .. } => DiagnosticId::AliasCycle,
         TirTypeError::ClassCycle { .. } => DiagnosticId::ClassCycle,
         TirTypeError::NonExhaustiveMatch { .. } | TirTypeError::NonExhaustiveCatchAll { .. } => {
@@ -1945,14 +2313,17 @@ fn tir_type_error_to_diagnostic_id(
         TirTypeError::IrrefutablePatternInWhileLet => DiagnosticId::IrrefutablePatternInWhileLet,
         TirTypeError::InvalidCatchBindingType { .. } => DiagnosticId::InvalidCatchBindingType,
         TirTypeError::DeferControlFlowEscape { .. } => DiagnosticId::DeferControlFlowEscape,
+        TirTypeError::LoopControlOutsideLoop { .. } => DiagnosticId::LoopControlOutsideLoop,
+        TirTypeError::LoopControlInLoopHeader { .. } => DiagnosticId::LoopControlInLoopHeader,
         TirTypeError::ThrowsContractViolation { .. }
         | TirTypeError::CallbackThrowsContractViolation { .. } => {
             DiagnosticId::ThrowsContractViolation
         }
         TirTypeError::ExtraneousThrowsDeclaration { .. }
         | TirTypeError::ImpreciseUnknownThrows { .. } => DiagnosticId::ThrowsContractExtraneous,
-        TirTypeError::CannotInferTypeParameter { .. } => DiagnosticId::UnknownType,
-        TirTypeError::TypeParamShadowed { .. } => DiagnosticId::TypeMismatch,
+        TirTypeError::CannotInferTypeParameter { .. }
+        | TirTypeError::CannotInferAssociatedType { .. }
+        | TirTypeError::ConflictingTypeArguments { .. } => DiagnosticId::UnknownType,
         TirTypeError::CannotInferLambdaParamType { .. } => DiagnosticId::UnknownType,
         TirTypeError::WrongNumberOfTypeArgs { .. } => DiagnosticId::TypeMismatch,
         TirTypeError::TypeIsNotGeneric { .. } => DiagnosticId::TypeMismatch,
@@ -1972,7 +2343,7 @@ fn tir_type_error_to_diagnostic_id(
             DiagnosticId::TypeMismatch
         }
         TirTypeError::InterpolatedValueMaybeNull { .. }
-        | TirTypeError::TypeNotInterpolatable { .. }
+        | TirTypeError::RoleMarkerInUntaggedTemplate { .. }
         | TirTypeError::OutputFormatNotCalled => DiagnosticId::TypeMismatch,
         TirTypeError::AmbiguousInterfaceMethod { .. } => DiagnosticId::AmbiguousInterfaceMethod,
         TirTypeError::AmbiguousInterfaceField { .. } => DiagnosticId::AmbiguousInterfaceField,
@@ -1998,12 +2369,16 @@ fn tir_type_error_to_diagnostic_id(
         }
         TirTypeError::BuiltinInterfaceNotABound { .. } => DiagnosticId::BuiltinInterfaceNotABound,
         // A `_` placeholder in a non-inferable position.
-        TirTypeError::CannotInferType => DiagnosticId::WildcardTypeNotAllowed,
+        TirTypeError::CannotInferType | TirTypeError::WildcardInProjectionSubject => {
+            DiagnosticId::WildcardTypeNotAllowed
+        }
         TirTypeError::TypeMustBeKnown { .. } => DiagnosticId::TypeMustBeKnown,
+        TirTypeError::ReceiverTypeMustBeKnown { .. } => DiagnosticId::TypeMustBeKnown,
         TirTypeError::AmbiguousImplementation { .. } => DiagnosticId::TypeMustBeKnown,
         // Generic-parameter / associated-type declaration hygiene.
-        TirTypeError::TypeParamShadowedImplParam { .. } => DiagnosticId::TypeMismatch,
-        TirTypeError::DuplicateGenericParam { .. }
+        TirTypeError::TypeParamShadowed { .. }
+        | TirTypeError::TypeParamShadowedImplParam { .. }
+        | TirTypeError::DuplicateGenericParam { .. }
         | TirTypeError::DuplicateAssociatedType { .. }
         | TirTypeError::AssociatedTypeConflictsWithGenericParam { .. } => {
             DiagnosticId::DuplicateField
@@ -2015,6 +2390,23 @@ fn tir_type_error_to_diagnostic_id(
         TirTypeError::InterfaceProjectionBase { .. } => DiagnosticId::InterfaceProjectionBase,
         // `$init` effect rules.
         TirTypeError::InitIoNotAllowed { .. } => DiagnosticId::InitIoNotAllowed,
+        TirTypeError::InitSuspendNotAllowed { .. } => DiagnosticId::InitSuspendNotAllowed,
+        TirTypeError::InitThrowNotHandled { .. } => DiagnosticId::InitThrowNotHandled,
+        TirTypeError::LlmOutputMemberDropped { .. } => DiagnosticId::LlmOutputMemberDropped,
+        TirTypeError::LlmOutputFieldAlwaysNull { .. } => DiagnosticId::LlmOutputFieldAlwaysNull,
+        TirTypeError::JsonAttributesWithOverride { .. }
+        | TirTypeError::JsonRestFieldType { .. }
+        | TirTypeError::JsonRestRenamed { .. }
+        | TirTypeError::JsonRestRepeated { .. }
+        | TirTypeError::JsonAttributeSkipped { .. }
+        | TirTypeError::JsonFallbackFieldNotLiteral { .. }
+        | TirTypeError::JsonFallbackNoTag { .. }
+        | TirTypeError::JsonFallbackUntaggedMember { .. }
+        | TirTypeError::JsonFallbackOverlap { .. } => DiagnosticId::InvalidJsonAttribute,
+        // Global variables.
+        TirTypeError::AssignmentToGlobal { .. } => DiagnosticId::AssignmentToGlobal,
+        TirTypeError::ReturnOutsideFunctionBody { .. } => DiagnosticId::ReturnOutsideFunctionBody,
+        TirTypeError::GlobalInitializationCycle { .. } => DiagnosticId::GlobalInitializationCycle,
         // Interface impl conformance (BEP-044, E0113–E0139): tir2 owns these and
         // check.rs surfaces them via `check_interfaces`.
         TirTypeError::MissingInterfaceMethod { .. } => DiagnosticId::MissingInterfaceMethod,
@@ -2071,87 +2463,28 @@ fn tir_type_error_to_diagnostic_id(
 
 // ── File-contextual type rendering ───────────────────────────────────────────
 
-/// Context for file-relative type rendering: knows the file's current package
-/// and namespace so qualified names collapse to the shortest unambiguous form
-/// (bare when in scope, `root.path` when not, the dependency package prefix
-/// for cross-package types). Implements [`TyRenderStrategy`] so the
-/// structural walk lives once in `baml_type`.
-struct TyDisplayContext<'db> {
-    current_root: baml_base::SourceRoot,
-    current_namespace: Vec<Name>,
-    package_items: &'db PackageItems<'db>,
-    /// How this package spells other packages: the viewer's edge names.
-    viewpoint: baml_compiler2_hir_ty::render::Viewpoint<'db>,
-}
-
-impl TyDisplayContext<'_> {
-    fn display_qtn(&self, qtn: &DeclName) -> String {
-        if qtn.root() != self.current_root {
-            // Cross-package: the package prefix disambiguates, spelled the
-            // way this package writes it (its edge name), or by provenance
-            // when it has no edge to that package.
-            return self.viewpoint.path(qtn);
-        }
-
-        if self.can_use_bare_name(qtn) {
-            return qtn.name().to_string();
-        }
-
-        let path = qtn
-            .namespace()
-            .iter()
-            .chain(std::iter::once(qtn.name()))
-            .map(Name::as_str)
-            .collect::<Vec<_>>()
-            .join(".");
-        format!("root.{path}")
-    }
-
-    fn can_use_bare_name(&self, qtn: &DeclName) -> bool {
-        if qtn.namespace() == &self.current_namespace {
-            return true;
-        }
-
-        if qtn.namespace().is_empty() {
-            return self
-                .package_items
-                .lookup_type(&self.current_namespace, qtn.name())
-                .is_none();
-        }
-
-        false
-    }
-}
-
-impl TyRenderStrategy<DeclName> for TyDisplayContext<'_> {
-    fn qtn(&self, qtn: &DeclName) -> String {
-        self.display_qtn(qtn)
-    }
-
-    fn type_var(&self, name: &Name) -> String {
-        if baml_type::is_synthetic_effect_param(name) {
-            "callback".to_string()
-        } else {
-            name.to_string()
-        }
-    }
-}
-
-/// Render `ty` as seen from `file`: names in the file's own package collapse
-/// to their bare (or `root.`-qualified) spelling, cross-package names keep
-/// their package prefix. This is the type printer every diagnostic message
-/// produced by [`check_file`] uses; IDE surfaces that must match diagnostic
-/// wording render through it too.
+/// Render `ty` as seen from `file`: a declaration of the file's namespace
+/// bare, the rest of its package `root.`-qualified, cross-package names by
+/// the package's edge name
+/// ([`Viewpoint::for_file`](baml_compiler2_hir_ty::render::Viewpoint::for_file)). This is the type
+/// printer every diagnostic message produced by [`check_file`] uses; IDE
+/// surfaces that must match diagnostic wording render through it too.
 pub fn display_ty_for_file(db: &dyn baml_compiler2_hir::Db, file: SourceFile, ty: &Ty) -> String {
-    let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
-    let package_items = baml_compiler2_hir::package::package_items(db, pkg_info.root);
-    let ctx = TyDisplayContext {
-        current_root: pkg_info.root,
-        current_namespace: pkg_info.namespace_path,
-        package_items,
-        viewpoint: baml_compiler2_hir_ty::render::Viewpoint::user_facing(db, pkg_info.root),
-    };
-    ty.render_with(&ctx)
+    ty.render_with(&baml_compiler2_hir_ty::render::Viewpoint::for_file(
+        db, file,
+    ))
+}
+
+#[cfg(test)]
+impl<'db> ProjectDiagnostics<'db> {
+    /// A collection with exactly `diagnostics`, for this crate's tests of
+    /// what the check does with them.
+    pub(crate) fn from_parts_for_test(
+        db: &'db ProjectDatabase,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self { db, diagnostics }
+    }
 }
 
 #[cfg(test)]
@@ -2176,7 +2509,7 @@ mod tests {
     fn b_1681_if_let_function_return_and_throws_unions_compile_without_parse_errors() {
         let source = "function Demo(x: unknown) -> int { if let callback: (int, image) -> string | int throws unknown = x { 1 } else { 0 } }";
         let (db, file) = single_file(source);
-        let parse_errors = baml_compiler_parser::parse_errors(&db, file);
+        let parse_errors = baml_parser::typed_parse_errors(&db, file);
         assert!(
             parse_errors.is_empty(),
             "unparenthesized bare return and throws unions must parse: {parse_errors:#?}"
@@ -2252,19 +2585,12 @@ mod tests {
         }
     }
 
-    static EMPTY_SPELLING: std::sync::LazyLock<baml_compiler2_hir::package::Spelling> =
-        std::sync::LazyLock::new(|| baml_compiler2_hir::package::Spelling::from_pairs([]));
-
-    /// A viewpoint over no packages: enough for diagnostics that spell only
-    /// primitive types.
-    fn dummy_viewpoint() -> baml_compiler2_hir_ty::render::Viewpoint<'static> {
-        baml_compiler2_hir_ty::render::Viewpoint::over(&EMPTY_SPELLING, None)
-    }
-
     #[test]
     fn tir_warning_severity_maps_to_warning_diagnostic() {
+        let (db, _) = single_file("");
+        let viewpoint = baml_compiler2_hir_ty::render::Viewpoint::canonical(&db);
         let rendered = dummy_rendered(DiagnosticSeverity::Warning);
-        let diag = tir_rendered_to_diagnostic(&dummy_viewpoint(), rendered, dummy_file_id());
+        let diag = tir_rendered_to_diagnostic(&viewpoint, rendered, dummy_file_id());
         assert_eq!(
             diag.severity,
             Severity::Warning,
@@ -2274,8 +2600,10 @@ mod tests {
 
     #[test]
     fn tir_error_severity_maps_to_error_diagnostic() {
+        let (db, _) = single_file("");
+        let viewpoint = baml_compiler2_hir_ty::render::Viewpoint::canonical(&db);
         let rendered = dummy_rendered(DiagnosticSeverity::Error);
-        let diag = tir_rendered_to_diagnostic(&dummy_viewpoint(), rendered, dummy_file_id());
+        let diag = tir_rendered_to_diagnostic(&viewpoint, rendered, dummy_file_id());
         assert_eq!(
             diag.severity,
             Severity::Error,
@@ -2650,7 +2978,7 @@ interface Pair<A, B> {
         );
 
         let index = file_semantic_index(&db, file);
-        let parse_errors = baml_compiler_parser::parse_errors(&db, file);
+        let parse_errors = baml_parser::typed_parse_errors(&db, file);
         assert!(
             !parse_errors.is_empty(),
             "missing right-hand operand should produce a parse error"
@@ -2696,7 +3024,7 @@ interface Pair<A, B> {
             single_file("class 123Bad {\n  field string\n}\n\nfunction Good() -> int {\n  42\n}\n");
 
         let index = file_semantic_index(&db, file);
-        let parse_errors = baml_compiler_parser::parse_errors(&db, file);
+        let parse_errors = baml_parser::typed_parse_errors(&db, file);
         assert!(
             !parse_errors.is_empty(),
             "invalid class name should produce a parse error"
@@ -2810,7 +3138,7 @@ interface Pair<A, B> {
         let honest = collect_compiler2_diagnostics(&db);
         let narrowed = collect_compiler2_diagnostics_narrowed(&db, &|_| true, Vec::new());
         assert_eq!(
-            honest, narrowed.merged,
+            honest, *narrowed.merged,
             "narrowed all-true must equal honest"
         );
         // `fresh` is exactly `merged` minus the always-recomputed package-level
@@ -2827,7 +3155,7 @@ interface Pair<A, B> {
         );
         let mut fresh_sorted = narrowed.fresh;
         sort_diagnostics(&mut fresh_sorted);
-        let mut merged_minus_pkg = narrowed.merged;
+        let mut merged_minus_pkg = narrowed.merged.into_vec();
         for pkg in &package_level {
             let pos = merged_minus_pkg
                 .iter()

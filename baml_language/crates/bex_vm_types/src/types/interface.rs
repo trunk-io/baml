@@ -5,8 +5,11 @@ use crate::{HeapPtr, ObjectIndex};
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct InterfaceDef {
-    // Signature
-    pub name: baml_type::TypeName,
+    /// Where this interface is declared inside its package: its namespace
+    /// path and item name. All of its name it carries — see [`Self::name`].
+    pub path: super::LocalName,
+    /// The implicit implementation shared by all types without an explicit impl.
+    pub structural_default: Option<StructuralDefault>,
 
     /// This interface's head identity — assigned by the linker (`CLASS_BASE +`
     /// its object index in the image) or minted fresh by the grafter; in a
@@ -38,6 +41,26 @@ pub struct InterfaceDef {
     pub owner: HeapPtr,
 }
 
+impl InterfaceDef {
+    /// How this interface is named: its path under its package's display
+    /// name. Display and boundary spelling only — see
+    /// [`declaration_name`](super::declaration_name). An interface
+    /// always belongs to a package, so the name is declared once it is
+    /// loaded; before the loader places it, it is the path alone.
+    #[must_use]
+    pub fn name(&self) -> crate::DeclarationName {
+        super::declaration_name((!self.owner.is_null()).then_some(self.owner), &self.path)
+    }
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct StructuralDefault {
+    pub kind: baml_type::StructuralInterface,
+    pub function: ObjectIndex,
+    #[borsh(skip)]
+    pub function_ptr: HeapPtr,
+}
+
 /// One field an interface declares, at its dispatch index (its position in
 /// [`InterfaceDef::fields`]).
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -49,6 +72,9 @@ pub struct InterfaceFieldDef {
     /// both — and is resolved dynamically against the receiver's impl, never
     /// pre-collapsed to a frame slot (an interface *declaration* has no frame).
     pub ty: crate::RuntimeTy,
+    /// The field's `///` doc comment, which `reflect.Class.extends` copies onto
+    /// the class field it mints. Interface fields carry no other metadata.
+    pub docstring: Option<String>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -164,7 +190,7 @@ pub struct RuntimeImplRule {
     /// function of the impl block, stable under interface evolution.
     pub methods: IndexMap<baml_type::Name, MethodImpl>,
     /// Interface field index → the implementor's physical slot in
-    /// [`Instance::fields`](super::Instance::fields). Indexed by position in the
+    /// an instance's fields, as [`InstanceRef`](crate::InstanceRef) reads them. Indexed by position in the
     /// implemented [`InterfaceDef::fields`], so a virtual field access carries only
     /// that index — no name on the operand stack, no lookup at dispatch.
     ///

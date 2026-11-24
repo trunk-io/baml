@@ -10,18 +10,18 @@ source: crates/baml_tests/src/generated_tests.rs
 
 // Removed: `client<llm>` config block.
 client<llm> LegacyOpenAI {
-    provider: openai,
-    options: {
-        model: "gpt-4",
-        max_tokens: 100,
-        temperature: 0.7,
-        base_url: "https://api.openai.com/v1",
-    },
+    provider openai
+    options {
+        model "gpt-4"
+        max_tokens 100
+        temperature 0.7
+        base_url "https://api.openai.com/v1"
+    }
 }
 
 // Removed: `retry_policy` block.
 retry_policy LegacyRetry {
-    max_retries: 3,
+    max_retries 3
 }
 
 // Jinja prompt migrated to a backtick prompt.
@@ -43,11 +43,15 @@ function UnknownProviderPrefix(input: string) -> string {
     prompt: `${input}`
 }
 
+// Removed: Azure has no shorthand, since a model name does not identify a
+// deployment.
+function AzureShorthand(input: string) -> string {
+    client: "azure/gpt-4o"
+    prompt: `${input}`
+}
+
 // Control: the new-world replacement compiles cleanly.
-client ValidClient = openai.ResponsesClient.new(
-    model = "gpt-4",
-    api_key = "test-key",
-);
+client ValidClient = openai.ResponsesClient.new(model = "gpt-4", api_key = "test-key");
 
 function ValidFunction(input: string) -> string {
     client: ValidClient

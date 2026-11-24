@@ -33,7 +33,7 @@ class GenericClient {
     top_p: float?,
     stop: string[]?,
     seed: int?,
-    // Record request/response bodies (and raw SSE events) on the LLMCall wire
+    // Record request/response bodies (and raw SSE events) on the ModelCall wire
     // records delivered through on_event. Status, headers, and timing are
     // always recorded; this flag only gates the bodies.
     capture_wire: bool,
@@ -94,14 +94,14 @@ class GenericClient {
         throw root.internal._reject(
             "openai-generic",
             `openai.GenericClient requires base_url (a literal or env.NAME naming a set variable): the endpoint of the OpenAI-compatible server, e.g. "http://localhost:8000/v1". Checked: ${ai.wire.credential_sources(self.base_url, null)}`,
-        )
+        );
     }
 
     /// The provider record: everything the shared chat core needs to know
     /// about this endpoint.
     function compat(self) -> root.internal.ChatCompat {
         root.internal.ChatCompat.new(
-            provider = "openai-generic",
+            provider = self.provider(),
             base_url = self.resolved_base_url(),
             collapse_text_content = true,
         )
@@ -133,14 +133,19 @@ class GenericClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `openai-generic/${self.model}`
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "openai-generic"
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            openai.internal.chat_preview(self.compat(), self.params(preview = true), input) catch_all (e) {
-                _ => throw ai.errors.normalize(e),
-            }
+            root.internal
+                .chat_preview(self.compat(), self.params(preview = true), input) catch_all (e) {
+                    _ => throw ai.errors.normalize(e),
+                }
         }
 
         function invoke(self, input: ai.ModelTurnInput) -> ai.ModelTurn {

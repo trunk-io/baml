@@ -57,65 +57,65 @@ namespace baml_bridge {
 namespace cffi {
 namespace v1 {
 PROTOBUF_CONSTINIT const uint32_t BamlHandleType_internal_data_[] = {
-    196608u, 32u, 65020u, };
+    65536u, 32u, 2090482u, };
 static ::google::protobuf::internal::ExplicitlyConstructed<::std::string>
     BamlHandleType_strings[16] = {};
 
 static const char BamlHandleType_names[] = {
     "ADT_FUNCTION_SPEC"
     "ADT_MEDIA_AUDIO"
-    "ADT_MEDIA_GENERIC"
     "ADT_MEDIA_IMAGE"
     "ADT_MEDIA_PDF"
     "ADT_MEDIA_VIDEO"
     "ADT_PROMPT_AST"
     "ADT_RUNTIME_VALUE"
     "ADT_TAGGED_HEAP_HANDLE"
-    "ADT_TYPE"
     "FUNCTION_REF"
     "HANDLE_UNSPECIFIED"
     "HOST_VALUE_CALLABLE"
     "HOST_VALUE_OPAQUE"
+    "HOST_VALUE_PIN"
+    "INVOCATION_STATE"
+    "TRACE_RESERVATION"
     "UNTAGGED_BEX_HEAP"
-    "UNTAGGED_RUST_DATA"
 };
 
 static const ::google::protobuf::internal::EnumEntry BamlHandleType_entries[] = {
     {{&BamlHandleType_names[0], 17}, 17},
     {{&BamlHandleType_names[17], 15}, 7},
-    {{&BamlHandleType_names[32], 17}, 10},
-    {{&BamlHandleType_names[49], 15}, 6},
-    {{&BamlHandleType_names[64], 13}, 9},
-    {{&BamlHandleType_names[77], 15}, 8},
-    {{&BamlHandleType_names[92], 14}, 11},
-    {{&BamlHandleType_names[106], 17}, 18},
-    {{&BamlHandleType_names[123], 22}, 14},
-    {{&BamlHandleType_names[145], 8}, 13},
-    {{&BamlHandleType_names[153], 12}, 5},
-    {{&BamlHandleType_names[165], 18}, 0},
-    {{&BamlHandleType_names[183], 19}, 15},
-    {{&BamlHandleType_names[202], 17}, 16},
-    {{&BamlHandleType_names[219], 17}, 2},
-    {{&BamlHandleType_names[236], 18}, 1},
+    {{&BamlHandleType_names[32], 15}, 6},
+    {{&BamlHandleType_names[47], 13}, 9},
+    {{&BamlHandleType_names[60], 15}, 8},
+    {{&BamlHandleType_names[75], 14}, 11},
+    {{&BamlHandleType_names[89], 17}, 18},
+    {{&BamlHandleType_names[106], 22}, 14},
+    {{&BamlHandleType_names[128], 12}, 5},
+    {{&BamlHandleType_names[140], 18}, 0},
+    {{&BamlHandleType_names[158], 19}, 15},
+    {{&BamlHandleType_names[177], 17}, 16},
+    {{&BamlHandleType_names[194], 14}, 21},
+    {{&BamlHandleType_names[208], 16}, 19},
+    {{&BamlHandleType_names[224], 17}, 20},
+    {{&BamlHandleType_names[241], 17}, 2},
 };
 
 static const int BamlHandleType_entries_by_number[] = {
-    11,  // 0 -> HANDLE_UNSPECIFIED
-    15,  // 1 -> UNTAGGED_RUST_DATA
-    14,  // 2 -> UNTAGGED_BEX_HEAP
-    10,  // 5 -> FUNCTION_REF
-    3,  // 6 -> ADT_MEDIA_IMAGE
+    9,  // 0 -> HANDLE_UNSPECIFIED
+    15,  // 2 -> UNTAGGED_BEX_HEAP
+    8,  // 5 -> FUNCTION_REF
+    2,  // 6 -> ADT_MEDIA_IMAGE
     1,  // 7 -> ADT_MEDIA_AUDIO
-    5,  // 8 -> ADT_MEDIA_VIDEO
-    4,  // 9 -> ADT_MEDIA_PDF
-    2,  // 10 -> ADT_MEDIA_GENERIC
-    6,  // 11 -> ADT_PROMPT_AST
-    9,  // 13 -> ADT_TYPE
-    8,  // 14 -> ADT_TAGGED_HEAP_HANDLE
-    12,  // 15 -> HOST_VALUE_CALLABLE
-    13,  // 16 -> HOST_VALUE_OPAQUE
+    4,  // 8 -> ADT_MEDIA_VIDEO
+    3,  // 9 -> ADT_MEDIA_PDF
+    5,  // 11 -> ADT_PROMPT_AST
+    7,  // 14 -> ADT_TAGGED_HEAP_HANDLE
+    10,  // 15 -> HOST_VALUE_CALLABLE
+    11,  // 16 -> HOST_VALUE_OPAQUE
     0,  // 17 -> ADT_FUNCTION_SPEC
-    7,  // 18 -> ADT_RUNTIME_VALUE
+    6,  // 18 -> ADT_RUNTIME_VALUE
+    13,  // 19 -> INVOCATION_STATE
+    14,  // 20 -> TRACE_RESERVATION
+    12,  // 21 -> HOST_VALUE_PIN
 };
 
 const ::std::string& BamlHandleType_Name(BamlHandleType value) {

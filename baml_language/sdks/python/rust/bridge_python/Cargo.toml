@@ -20,24 +20,32 @@ default = [ "bundle-http", "aws-crypto" ]
 bundle-http = [ "bridge_cffi/bundle-http" ]
 aws-crypto = [ "bundle-http", "bex_project/aws-crypto", "bridge_cffi/aws-crypto" ]
 ring-crypto = [ "bundle-http", "bex_project/ring-crypto", "bridge_cffi/ring-crypto" ]
+telemetry_diagnostics = [ "bex_project/telemetry_diagnostics" ]
 # Do not add a Cargo `extension-module` feature here. PyO3 0.28 expects
 # maturin to set PYO3_BUILD_EXTENSION_MODULE only while packaging; making it a
 # normal feature lets `cargo test --all-features` disable libpython linking.
 
 [dependencies]
+baml_sdkgen_types = { workspace = true }
+baml_type = { workspace = true }
 baml_version = { workspace = true }
 bex_events = { workspace = true }
 bex_project = { workspace = true }
 bridge_cffi = { workspace = true }
 bridge_ctypes = { workspace = true }
+bridge_encode = { workspace = true }
+btel_snapshot = { workspace = true }
+btel_types = { workspace = true }
 sys_native = { workspace = true }
+futures = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }
+num-bigint = { workspace = true }
 prost = { workspace = true }
 pyo3 = { workspace = true, features = [ "abi3-py310", "indexmap", "multiple-pymethods" ] }
 pyo3-async-runtimes = { workspace = true, features = [ "tokio-runtime" ] }
 pyo3-stub-gen = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = [ "arbitrary_precision", "preserve_order" ] }
 tokio = { workspace = true, features = [ "rt", "rt-multi-thread" ] }
 
 [build-dependencies]

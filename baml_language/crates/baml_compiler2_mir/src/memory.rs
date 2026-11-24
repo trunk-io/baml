@@ -55,16 +55,6 @@ pub struct Resources {
 }
 
 impl Resources {
-    pub fn is_empty(&self) -> bool {
-        self.locals.is_empty()
-            && self.cells.is_empty()
-            && self.type_slots.is_empty()
-            && self.fields.is_empty()
-            && !self.elements
-            && !self.heap
-            && !self.order
-    }
-
     pub fn extend(&mut self, other: &Resources) {
         self.locals.extend(other.locals.iter().copied());
         self.cells.extend(other.cells.iter().copied());
@@ -138,7 +128,7 @@ pub fn walk_rvalue_places<'a>(rvalue: &'a Rvalue<'_>, f: &mut impl FnMut(&'a Pla
             walk_operand_places(right, f);
         }
         Rvalue::UnaryOp { operand, .. } => walk_operand_places(operand, f),
-        Rvalue::Array(_, elements) => {
+        Rvalue::Array(_, elements) | Rvalue::ConcatStrings(elements) => {
             for elem in elements {
                 walk_operand_places(elem, f);
             }
@@ -156,7 +146,9 @@ pub fn walk_rvalue_places<'a>(rvalue: &'a Rvalue<'_>, f: &mut impl FnMut(&'a Pla
             }
         }
         Rvalue::Discriminant(place) | Rvalue::TypeTag(place) | Rvalue::Len(place) => f(place),
-        Rvalue::IsType { operand, .. } | Rvalue::IsTypeTag { operand, .. } => {
+        Rvalue::IsType { operand, .. }
+        | Rvalue::IsTypeTag { operand, .. }
+        | Rvalue::SatisfiesBound { ty: operand, .. } => {
             walk_operand_places(operand, f);
         }
         Rvalue::MakeClosure { captures, .. } => {
@@ -174,7 +166,10 @@ pub fn walk_rvalue_places<'a>(rvalue: &'a Rvalue<'_>, f: &mut impl FnMut(&'a Pla
                 walk_operand_places(arg, f);
             }
         }
-        Rvalue::LoadType(_) | Rvalue::CurrentPackage(_) | Rvalue::MakeGenericFunction { .. } => {
+        Rvalue::LoadType(_)
+        | Rvalue::TraceHookSettings { .. }
+        | Rvalue::CurrentPackage
+        | Rvalue::MakeGenericFunction { .. } => {
             // No place operands — the templates are compile-time data.
         }
         Rvalue::MakeGenericFunctionFromValue { value, .. } => {
@@ -198,15 +193,20 @@ pub fn walk_rvalue_type_slots(rvalue: &Rvalue<'_>, f: &mut impl FnMut(u32)) {
         }
         Rvalue::Aggregate { kind, .. } => match kind {
             AggregateKind::Class {
-                type_arg_templates, ..
+                type_arg_templates: templates,
+                ..
+            }
+            | AggregateKind::Tuple {
+                element_templates: templates,
             } => {
-                for template in type_arg_templates {
+                for template in templates {
                     template.for_each_type_arg_ref(f);
                 }
             }
             AggregateKind::Array => {}
         },
         Rvalue::IsType { test, .. } => test.for_each_type_arg_ref(f),
+        Rvalue::SatisfiesBound { bound, .. } => bound.for_each_type_arg_ref(f),
         Rvalue::MakeClosure {
             type_arg_templates, ..
         }
@@ -237,13 +237,22 @@ pub fn walk_rvalue_type_slots(rvalue: &Rvalue<'_>, f: &mut impl FnMut(u32)) {
         Rvalue::Use(_)
         | Rvalue::BinaryOp { .. }
         | Rvalue::UnaryOp { .. }
+        | Rvalue::ConcatStrings(_)
         | Rvalue::Uint8Array(_)
         | Rvalue::Len(_)
         | Rvalue::Discriminant(_)
         | Rvalue::TypeTag(_)
         | Rvalue::IsTypeTag { .. }
-        | Rvalue::MakeBoundMethod { .. }
-        | Rvalue::CurrentPackage(_) => {}
+        | Rvalue::TraceHookSettings { .. }
+        | Rvalue::CurrentPackage => {}
+        Rvalue::MakeBoundMethod { frame, .. } => match frame {
+            crate::BoundFrame::Receiver => {}
+            crate::BoundFrame::Explicit(type_arg_templates) => {
+                for template in type_arg_templates {
+                    template.for_each_type_arg_ref(f);
+                }
+            }
+        },
     }
 }
 
@@ -279,7 +288,6 @@ pub fn walk_terminator_type_slots(terminator: &Terminator<'_>, f: &mut impl FnMu
         | Terminator::Spawn { .. }
         | Terminator::Throw { .. }
         | Terminator::Rethrow { .. }
-        | Terminator::ThrowIfPanic { .. }
         | Terminator::ShortCircuit { .. } => {}
     }
 }
@@ -295,13 +303,6 @@ pub fn place_cell(place: &Place) -> Option<CellId> {
         Place::Field { base, .. } | Place::Index { base, .. } => place_cell(base),
         Place::Local(_) | Place::Capture(_) => None,
     }
-}
-
-/// Whether evaluating an rvalue reads through a cell anywhere.
-pub fn rvalue_reads_cell(rvalue: &Rvalue<'_>) -> bool {
-    let mut reads = false;
-    walk_rvalue_places(rvalue, &mut |place| reads |= place_cell(place).is_some());
-    reads
 }
 
 /// The cells a body shares with the tasks it spawns: every cell a spawned
@@ -483,11 +484,18 @@ pub fn rvalue_reads(
     match rvalue {
         // A length lives with the elements: a push changes it.
         Rvalue::Len(_) => out.elements = true,
+        Rvalue::TraceHookSettings { .. } => {
+            out.heap = true;
+            out.order = true;
+        }
         // Some field of the receiver, resolved at run time — any field.
         Rvalue::VirtualFieldAccess { .. } => out.heap = true,
+        // The impl registry, which a runtime registration extends.
+        Rvalue::SatisfiesBound { .. } => out.heap = true,
         Rvalue::Use(_)
         | Rvalue::BinaryOp { .. }
         | Rvalue::UnaryOp { .. }
+        | Rvalue::ConcatStrings(_)
         | Rvalue::Array(..)
         | Rvalue::Uint8Array(_)
         | Rvalue::Map(..)
@@ -501,7 +509,7 @@ pub fn rvalue_reads(
         | Rvalue::MakeVirtualBoundMethod { .. }
         | Rvalue::MakeVirtualFunction { .. }
         | Rvalue::LoadType(_)
-        | Rvalue::CurrentPackage(_)
+        | Rvalue::CurrentPackage
         | Rvalue::MakeGenericFunction { .. }
         | Rvalue::MakeGenericFunctionFromValue { .. } => {}
     }
@@ -555,7 +563,10 @@ pub fn statement_clobbers(
                 out.order = true;
             }
             // The evaluation may trap, and the trap is an event.
-            if rvalue_can_trap(body, value) {
+            if matches!(value, Rvalue::TraceHookSettings { .. }) {
+                out.heap = true;
+                out.order = true;
+            } else if rvalue_can_trap(body, value) {
                 out.order = true;
             }
         }
@@ -571,6 +582,10 @@ pub fn statement_clobbers(
         }
         StatementKind::Intrinsic { op, .. } => match op {
             IntrinsicOp::Log(_) => out.order = true,
+            IntrinsicOp::ApplyTraceHook | IntrinsicOp::BuiltinTraceHook(_) => {
+                out.order = true;
+                out.heap = true;
+            }
             IntrinsicOp::BindType(slot) => {
                 out.type_slots.insert(*slot);
             }
@@ -616,7 +631,7 @@ pub fn terminator_clobbers(model: ClobberModel, terminator: &Terminator<'_>) -> 
             out.heap = true;
             out.order = true;
         }
-        Terminator::Throw { .. } | Terminator::Rethrow { .. } | Terminator::ThrowIfPanic { .. } => {
+        Terminator::Throw { .. } | Terminator::Rethrow { .. } => {
             out.order = true;
         }
     }
@@ -655,20 +670,24 @@ pub fn rvalue_allocates_identity(rvalue: &Rvalue<'_>) -> bool {
         | Rvalue::MakeClosure { .. }
         | Rvalue::MakeBoundMethod { .. }
         | Rvalue::MakeVirtualBoundMethod { .. }
-        | Rvalue::MakeVirtualFunction { .. } => true,
+        | Rvalue::MakeVirtualFunction { .. }
+        | Rvalue::TraceHookSettings { .. } => true,
+        // A string has no identity: two joins of the same parts are equal.
         Rvalue::Use(_)
         | Rvalue::BinaryOp { .. }
         | Rvalue::UnaryOp { .. }
+        | Rvalue::ConcatStrings(_)
         | Rvalue::Discriminant(_)
         | Rvalue::TypeTag(_)
         | Rvalue::Len(_)
         | Rvalue::IsType { .. }
         | Rvalue::IsTypeTag { .. }
+        | Rvalue::SatisfiesBound { .. }
         | Rvalue::VirtualFieldAccess { .. }
         | Rvalue::MakeGenericFunction { .. }
         | Rvalue::MakeGenericFunctionFromValue { .. }
         | Rvalue::LoadType(_)
-        | Rvalue::CurrentPackage(_) => false,
+        | Rvalue::CurrentPackage => false,
     }
 }
 
@@ -687,6 +706,9 @@ pub fn rvalue_allocates_identity(rvalue: &Rvalue<'_>) -> bool {
 /// compile here rather than default into the infallible group.
 pub fn rvalue_can_trap<'db>(body: &MirFunctionBody<'db>, rvalue: &Rvalue<'db>) -> bool {
     match rvalue {
+        // Treat this state transition as an ordering event even when the
+        // selected hook needs no allocating snapshot.
+        Rvalue::TraceHookSettings { .. } => true,
         Rvalue::BinaryOp { op, left, right } => match op {
             // `/` rejects a zero divisor on both numeric paths — BAML throws
             // rather than yielding IEEE infinity (`OpCode::DivFloat`), so this
@@ -716,7 +738,9 @@ pub fn rvalue_can_trap<'db>(body: &MirFunctionBody<'db>, rvalue: &Rvalue<'db>) -
         // Allocation can report `AllocFailure`, but that is a host resource
         // condition rather than a property of the program point, and treating
         // every allocation as a barrier would disable virtualization outright.
+        // Joining strings is concatenation, never arithmetic.
         Rvalue::Array(..)
+        | Rvalue::ConcatStrings(_)
         | Rvalue::Uint8Array(_)
         | Rvalue::Map(..)
         | Rvalue::Aggregate { .. }
@@ -725,6 +749,7 @@ pub fn rvalue_can_trap<'db>(body: &MirFunctionBody<'db>, rvalue: &Rvalue<'db>) -
         | Rvalue::Len(_)
         | Rvalue::IsType { .. }
         | Rvalue::IsTypeTag { .. }
+        | Rvalue::SatisfiesBound { .. }
         | Rvalue::MakeClosure { .. }
         | Rvalue::MakeBoundMethod { .. }
         | Rvalue::MakeVirtualBoundMethod { .. }
@@ -733,7 +758,7 @@ pub fn rvalue_can_trap<'db>(body: &MirFunctionBody<'db>, rvalue: &Rvalue<'db>) -
         | Rvalue::MakeGenericFunctionFromValue { .. }
         | Rvalue::MakeVirtualFunction { .. }
         | Rvalue::LoadType(_)
-        | Rvalue::CurrentPackage(_) => false,
+        | Rvalue::CurrentPackage => false,
     }
 }
 
@@ -778,7 +803,6 @@ fn ty_could_be_int(ty: &RuntimeTy) -> bool {
         | RuntimeTy::String
         | RuntimeTy::Bool
         | RuntimeTy::Null
-        | RuntimeTy::Void
         | RuntimeTy::Media(..)
         | RuntimeTy::Class(..)
         | RuntimeTy::Enum(..)
@@ -787,7 +811,6 @@ fn ty_could_be_int(ty: &RuntimeTy) -> bool {
         | RuntimeTy::Map { .. }
         | RuntimeTy::Function { .. }
         | RuntimeTy::Future(..)
-        | RuntimeTy::RustType
         | RuntimeTy::Type
         | RuntimeTy::Resource
         | RuntimeTy::PromptAst => false,

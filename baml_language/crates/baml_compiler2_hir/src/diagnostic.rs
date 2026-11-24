@@ -54,9 +54,13 @@ pub enum Hir2Diagnostic {
     },
     /// Builtin-only syntax used outside builtin stdlib files.
     BuiltinOnlySyntax { feature: String, span: TextRange },
-    /// A value binding or body type binding named a package root the
-    /// compiler emits in a desugar.
-    ReservedBindingName { name: Name, span: TextRange },
+    /// A `@@rust_type` class declared a field; `span` is the first one's name.
+    RustTypeClassHasFields { class_name: Name, span: TextRange },
+    /// A binding, item, or type parameter named `root`, the path to the
+    /// package itself.
+    RootIsReserved { span: TextRange },
+    /// A file under a directory `ns_root/`: a namespace named `root`.
+    RootNamespace { span: TextRange },
     /// Generic single-span diagnostic for builtin contract validation.
     DiagnosticMessage {
         diagnostic_id: DiagnosticId,
@@ -74,6 +78,10 @@ pub enum Hir2Diagnostic {
     DuplicatePatternBinding { name: Name, sites: Vec<TextRange> },
     /// A class destructure names the same field more than once.
     DuplicatePatternField { name: Name, sites: Vec<TextRange> },
+    /// A class literal names the same field more than once (e.g.
+    /// `Pair { a: null, a: 1 }`). `sites` lists every field-name span for
+    /// `name` in source order; the first is the original.
+    DuplicateObjectField { name: Name, sites: Vec<TextRange> },
     /// Two or more members of a class or enum serialize to the same JSON key —
     /// either two members share an `@alias("k")`, or one member's name equals
     /// another member's `@alias`. Because an aliased member's real name is never
@@ -185,10 +193,6 @@ pub enum Hir2Diagnostic {
     /// must live inside an `implements baml.FromJson { ... }` block. (The
     /// auto-derived structural-default `from_json` delegate is exempt.)
     FromJsonMustImplementInterface { class_name: Name, span: TextRange },
-    /// A class declares a `cleanup` method whose signature is not the reserved
-    /// magic-finalizer shape `cleanup(self) -> void` (BEP-042). `cleanup` is a
-    /// reserved magic method name, so it must have that exact shape.
-    CleanupMagicMethodSignature { class_name: Name, span: TextRange },
     /// A class field has a different type than the interface declares for
     /// that name.
     InterfaceFieldTypeMismatch {
@@ -375,7 +379,7 @@ impl Hir2Diagnostic {
                 span,
             } => {
                 let sigil = position.sigil();
-                let valid = baml_base::schema_attribute_specs_at(*position)
+                let valid = baml_base::user_attribute_specs_at(*position)
                     .map(|spec| format!("`{sigil}{}`", spec.name))
                     .collect::<Vec<_>>();
                 let valid = if valid.is_empty() {
@@ -414,12 +418,11 @@ impl Hir2Diagnostic {
                 .with_primary(Span { file_id, range: *span }, "not valid here")
                 .with_phase(DiagnosticPhase::Hir)
             }
-            Hir2Diagnostic::ReservedBindingName { name, span } => Diagnostic::error(
-                DiagnosticId::ReservedBindingName,
+            Hir2Diagnostic::RustTypeClassHasFields { class_name, span } => Diagnostic::error(
+                DiagnosticId::RustTypeClassHasFields,
                 format!(
-                    "`{name}` cannot be used as a binding name: syntax such as `spawn` and \
-                     `env.X` refers to the `{name}` package, which this binding would hide. A \
-                     class or function may still be named `{name}`."
+                    "class `{class_name}` is a `@@rust_type` class and cannot declare fields: its \
+                     state lives in Rust"
                 ),
             )
             .with_primary(
@@ -427,7 +430,35 @@ impl Hir2Diagnostic {
                     file_id,
                     range: *span,
                 },
-                "reserved binding name",
+                "field on a `@@rust_type` class",
+            )
+            .with_phase(DiagnosticPhase::Hir),
+            Hir2Diagnostic::RootIsReserved { span } => Diagnostic::error(
+                DiagnosticId::RootIsReserved,
+                "`root` is the path to this package and cannot name a binding, an item, or a \
+                 type parameter"
+                    .to_string(),
+            )
+            .with_primary(
+                Span {
+                    file_id,
+                    range: *span,
+                },
+                "`root` is this package",
+            )
+            .with_phase(DiagnosticPhase::Hir),
+            Hir2Diagnostic::RootNamespace { span } => Diagnostic::error(
+                DiagnosticId::RootIsReserved,
+                "`root` is the path to this package and cannot name a namespace: rename the \
+                 directory `ns_root/`"
+                    .to_string(),
+            )
+            .with_primary(
+                Span {
+                    file_id,
+                    range: *span,
+                },
+                "this file is in `ns_root/`",
             )
             .with_phase(DiagnosticPhase::Hir),
             Hir2Diagnostic::BuiltinOnlySyntax { feature, span } => Diagnostic::error(
@@ -495,6 +526,31 @@ impl Hir2Diagnostic {
                             range: *range,
                         },
                         format!("field `{name}` destructured again here"),
+                    );
+                }
+                diag.with_phase(DiagnosticPhase::Hir)
+            }
+            Hir2Diagnostic::DuplicateObjectField { name, sites } => {
+                let first = sites.first().copied().unwrap_or_default();
+                let rest = sites.get(1..).unwrap_or(&[]);
+                let mut diag = Diagnostic::error(
+                    DiagnosticId::DuplicateField,
+                    format!("duplicate field `{name}` in class literal"),
+                )
+                .with_secondary(
+                    Span {
+                        file_id,
+                        range: first,
+                    },
+                    format!("field `{name}` first set here"),
+                );
+                for range in rest {
+                    diag = diag.with_primary(
+                        Span {
+                            file_id,
+                            range: *range,
+                        },
+                        format!("field `{name}` set again here"),
                     );
                 }
                 diag.with_phase(DiagnosticPhase::Hir)
@@ -768,21 +824,6 @@ impl Hir2Diagnostic {
             )
             .with_phase(DiagnosticPhase::Hir),
 
-            Hir2Diagnostic::CleanupMagicMethodSignature { class_name, span } => Diagnostic::error(
-                DiagnosticId::CleanupMagicMethodSignature,
-                format!(
-                    "`cleanup` on class `{class_name}` must have the signature \
-                     `cleanup(self) -> void`; it is a reserved magic finalizer name"
-                ),
-            )
-            .with_primary(
-                Span {
-                    file_id,
-                    range: *span,
-                },
-                "expected `cleanup(self) -> void`",
-            )
-            .with_phase(DiagnosticPhase::Hir),
             Hir2Diagnostic::InterfaceFieldTypeMismatch {
                 class_name,
                 field_name,

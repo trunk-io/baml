@@ -1,7 +1,9 @@
 //! Chunk-backed processing: combine all function completions and forward spans.
 //! Captures must be independently owned before publication; this crate never
 //! accesses VM heaps. One bound worker scans original storage, with no event
-//! cloning or dynamic dispatch. Producers keep spin-only backpressure.
+//! cloning or dynamic dispatch. Producers never wait forever: out of storage,
+//! they wait a bounded time for some to come back and then take more
+//! ([`btel_settings::overage`]).
 //!
 //! The default publisher has zero sinks: it merges bounded aggregate windows and
 //! releases spans. It neither exports nor retains telemetry beyond those windows.
@@ -17,7 +19,7 @@ use std::{
 
 pub use bex_chunkedringbuffer::DrainStatus as Progress;
 use bex_chunkedringbuffer::{Consumer, ProducerId, SpanChunk, TransportFailed};
-use btel_records::{SpanRecord, TimingRecord};
+use btel_records::{Capture, SpanRecord, TimingRecord};
 use btel_types::{
     AwaitDuration, CallPathId, CallPathNodeId, ClockInstant, InvocationOutcome, TelemetryId,
 };
@@ -44,10 +46,20 @@ const _: () =
 struct Processing<P> {
     publisher: P,
     cache: CombiningCache,
-    contexts: Box<[DecoderContext]>,
+    /// One per producer index, grown as threads beyond the pool's table
+    /// bind producers of their own.
+    contexts: Vec<DecoderContext>,
 }
 
 impl<P> Processing<P> {
+    fn context(&mut self, producer: ProducerId) -> &mut DecoderContext {
+        let index = producer.index();
+        if index >= self.contexts.len() {
+            self.contexts.resize(index + 1, DecoderContext::default());
+        }
+        &mut self.contexts[index]
+    }
+
     fn sample<I, V>(
         &mut self,
         path: CallPathId,
@@ -77,7 +89,7 @@ impl<P> Processing<P> {
     where
         P: Publisher<I, V>,
     {
-        let mut thread = self.contexts[producer.index()].timing;
+        let mut thread = self.context(producer).timing;
         for record in records.as_slice() {
             match *record {
                 TimingRecord::ThreadSelected { thread_id } => thread = Some(thread_id),
@@ -103,11 +115,11 @@ impl<P> Processing<P> {
                 }
             }
         }
-        self.contexts[producer.index()].timing = thread;
+        self.context(producer).timing = thread;
         drop(records);
     }
 
-    fn spans<I, V>(
+    fn spans<I: Capture, V: Capture>(
         &mut self,
         producer: ProducerId,
         mut records: SpanChunk<TimingRecord, SpanRecord<I, V>>,
@@ -116,7 +128,13 @@ impl<P> Processing<P> {
         P: Publisher<I, V>,
     {
         self.publisher.before_span_chunk(records.as_slice().len());
-        let initial_thread = self.contexts[producer.index()].span;
+        // The chunk is the processor's now, its captures with it: they stop
+        // counting against the producers' budget before anything downstream
+        // can hold them up.
+        for record in records.as_slice() {
+            record.uncharge_captures();
+        }
+        let initial_thread = self.context(producer).span;
         let mut thread = initial_thread;
         if P::DETACH_RECORDS {
             assert!(detached.is_empty());
@@ -132,7 +150,7 @@ impl<P> Processing<P> {
             records.consume_in_place(|record| self.span(&mut thread, record));
             drop(records);
         }
-        self.contexts[producer.index()].span = thread;
+        self.context(producer).span = thread;
     }
 
     fn span<I, V>(&mut self, thread: &mut Option<TelemetryId>, record: &mut SpanRecord<I, V>)
@@ -143,6 +161,20 @@ impl<P> Processing<P> {
             SpanRecord::ThreadSelected { thread_id } => {
                 *thread = Some(*thread_id);
                 return;
+            }
+            SpanRecord::ManualSpanCompletion(done) => {
+                // Neutral closure measures resource lifetime, not a completed
+                // request. Include only terminal success/error in latency stats.
+                if let Some(outcome) = done.outcome {
+                    self.sample::<I, V>(
+                        done.call_path,
+                        done.entered_at,
+                        done.exited_at,
+                        done.await_time,
+                        false,
+                        outcome,
+                    );
+                }
             }
             // Every function completion form is one population invocation. Its
             // variant fixes the outcome; thread completions are not invocations.
@@ -414,7 +446,14 @@ impl<P> Processing<P> {
 mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime::{
-    ExecutionScope, FutureErrorLinks, RecordingControl, RuntimeError, TelemetryRuntime,
+    ExecutionScope, FutureErrorLinks, RecordingControl, RuntimeError, SpanOwner, TelemetryRuntime,
+};
+/// What [`TelemetryRuntime::diagnostics`] reads, and the transport readings
+/// it is made of, so a reader need not name the transport crate.
+#[cfg(all(not(target_arch = "wasm32"), feature = "diagnostics"))]
+pub use {
+    bex_chunkedringbuffer::{PoolDiagnostics as LaneDiagnostics, Stats as TransportStats},
+    runtime::Diagnostics,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -433,6 +472,16 @@ impl fmt::Display for ProcessorError {
 
 impl std::error::Error for ProcessorError {}
 
+type DeferredSpans<I, V> = std::sync::Arc<
+    std::sync::Mutex<
+        Vec<(
+            TelemetryId,
+            btel_records::ContextReference,
+            SpanRecord<I, V>,
+        )>,
+    >,
+>;
+
 /// One exclusive consumer of a chunk pool, bound to the current OS thread.
 /// No SPSC backend, heap access, record cloning, or dynamic dispatch.
 pub struct Processor<InputCapture, ValueCapture, P = NoSinkPublisher> {
@@ -440,14 +489,16 @@ pub struct Processor<InputCapture, ValueCapture, P = NoSinkPublisher> {
     max_chunks: NonZeroUsize,
     processing: Processing<P>,
     // Two capacity-sized buffers for opted-in publishers, with one live chunk
-    // at a time. Capture owners still share the existing VM snapshot pool.
+    // at a time. Their captures are the processor's, uncharged from the
+    // producers' budget, until the publisher takes or drops them.
     detached: Vec<SpanRecord<InputCapture, ValueCapture>>,
     detached_timing: Vec<TimingRecord>,
     next_flush: Instant,
     finished: bool,
+    deferred_spans: Option<DeferredSpans<InputCapture, ValueCapture>>,
 }
 
-impl<I, V> Processor<I, V> {
+impl<I: Capture, V: Capture> Processor<I, V> {
     pub fn new(
         consumer: Consumer<TimingRecord, SpanRecord<I, V>>,
         max_chunks: NonZeroUsize,
@@ -456,14 +507,13 @@ impl<I, V> Processor<I, V> {
     }
 }
 
-impl<I, V, P: Publisher<I, V>> Processor<I, V, P> {
+impl<I: Capture, V: Capture, P: Publisher<I, V>> Processor<I, V, P> {
     pub fn with_publisher(
         consumer: Consumer<TimingRecord, SpanRecord<I, V>>,
         max_chunks: NonZeroUsize,
         publisher: P,
     ) -> Self {
-        let contexts =
-            vec![DecoderContext::default(); consumer.producer_capacity()].into_boxed_slice();
+        let contexts = Vec::new();
         let max_chunks = NonZeroUsize::new(max_chunks.get().min(if P::DETACH_RECORDS {
             1
         } else {
@@ -492,7 +542,14 @@ impl<I, V, P: Publisher<I, V>> Processor<I, V, P> {
             },
             next_flush: Instant::now() + CACHE_FLUSH_INTERVAL_DURATION,
             finished: false,
+            deferred_spans: None,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_deferred_spans(mut self, spans: DeferredSpans<I, V>) -> Self {
+        self.deferred_spans = Some(spans);
+        self
     }
 
     pub fn publisher(&self) -> &P {
@@ -569,6 +626,43 @@ impl<I, V, P: Publisher<I, V>> Processor<I, V, P> {
                     self.processing.cache.flush(|delta| {
                         publisher::publish_aggregate(&mut self.processing.publisher, delta);
                     });
+                    // Destructors cannot bind producers under GC locks, and
+                    // shutdown must not reserve another OS-worker slot. Once
+                    // producers have drained, publish the remaining owned
+                    // completions directly on the consumer before sealing.
+                    if let Some(deferred) = &self.deferred_spans {
+                        let pending = std::mem::take(
+                            &mut *deferred
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
+                        for (thread, context, record) in pending {
+                            use btel_records::ContextReference;
+                            // Deferred records never went through a chunk.
+                            record.uncharge_captures();
+                            let marker = match context {
+                                ContextReference::Empty => SpanRecord::ContextCleared,
+                                ContextReference::Unavailable => SpanRecord::ContextSelected {
+                                    captured_context: None,
+                                },
+                                ContextReference::Snapshot(id) => {
+                                    SpanRecord::ContextReferenced { id }
+                                }
+                            };
+                            self.processing.publisher.before_batch(2);
+                            let mut selected = Some(thread);
+                            for mut record in [marker, record] {
+                                if P::DETACH_RECORDS {
+                                    self.processing.publisher.before_detached_span(&record);
+                                }
+                                self.processing.span(&mut selected, &mut record);
+                                if P::DETACH_RECORDS {
+                                    self.processing.publisher.after_detached_span();
+                                }
+                            }
+                            self.processing.publisher.after_batch(2);
+                        }
+                    }
                     self.processing.publisher.finish();
                     self.processing.contexts.fill(DecoderContext::default());
                     self.finished = true;

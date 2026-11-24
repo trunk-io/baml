@@ -18,7 +18,7 @@
 
 use std::ops::Index;
 
-use baml_base::{Literal, MediaKind, Name};
+use baml_base::{Literal, MediaKind, Name, Path};
 use la_arena::{Arena, Idx};
 use text_size::TextRange;
 
@@ -35,9 +35,11 @@ pub struct TypeRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRefKind {
-    /// Named type path: `User`, `baml.http.Request`, `Stream<T>`.
+    /// Named type path: `User`, `baml.http.Request`, `Stream<T>`. The path
+    /// carries who wrote it, which decides how its first segment is read
+    /// (`hir::package::path_head_for`).
     Path {
-        segments: Vec<Name>,
+        path: Path,
         /// Generic type arguments (`<T>` in `Stream<T>`). Empty for non-generic paths.
         generic_args: Box<[TypeRefId]>,
         /// Named associated type bindings, e.g. `Iterator<Item = int>`.
@@ -56,8 +58,6 @@ pub enum TypeRefKind {
     Bool,
     Null,
     Never,
-    /// The `void` type — valid only as a function return type.
-    Void,
     /// `Uint8Array` (binary data).
     Uint8Array,
     Media {
@@ -80,6 +80,9 @@ pub enum TypeRefKind {
     Union {
         variants: Box<[TypeRefId]>,
     },
+    Tuple {
+        elements: Box<[TypeRefId]>,
+    },
     /// Literal types in unions: `"user"`, `200`, `3.14`, `true`.
     Literal {
         value: Literal,
@@ -94,8 +97,6 @@ pub enum TypeRefKind {
     Unknown,
     /// The `type` meta-type keyword.
     Type,
-    /// `$rust_type` — opaque Rust-managed state field type.
-    Rust,
     /// Error-recovery sentinel.
     Error,
     /// No type was written at this slot (an omitted annotation), as distinct
@@ -188,15 +189,10 @@ impl std::fmt::Display for TypeRefDisplay<'_> {
         let store = self.store;
         match &store[self.id].kind {
             TypeRefKind::Path {
-                segments,
+                path,
                 generic_args,
                 associated_type_bindings,
             } => {
-                let path = segments
-                    .iter()
-                    .map(Name::as_str)
-                    .collect::<Vec<_>>()
-                    .join(".");
                 write!(f, "{path}")?;
                 if !generic_args.is_empty() || !associated_type_bindings.is_empty() {
                     write!(f, "<")?;
@@ -243,7 +239,6 @@ impl std::fmt::Display for TypeRefDisplay<'_> {
             TypeRefKind::Bool => write!(f, "bool"),
             TypeRefKind::Null => write!(f, "null"),
             TypeRefKind::Never => write!(f, "never"),
-            TypeRefKind::Void => write!(f, "void"),
             TypeRefKind::Uint8Array => write!(f, "uint8array"),
             TypeRefKind::Media { kind } => write!(f, "{}", format!("{kind:?}").to_lowercase()),
             TypeRefKind::Optional { inner } => {
@@ -269,6 +264,19 @@ impl std::fmt::Display for TypeRefDisplay<'_> {
                     }
                 }
                 Ok(())
+            }
+            TypeRefKind::Tuple { elements } => {
+                write!(f, "(")?;
+                for (i, &e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", store.display(e))?;
+                }
+                if elements.len() == 1 {
+                    write!(f, ",")?;
+                }
+                write!(f, ")")
             }
             TypeRefKind::Literal { value } => write!(f, "{value}"),
             TypeRefKind::Function {
@@ -301,7 +309,6 @@ impl std::fmt::Display for TypeRefDisplay<'_> {
             }
             TypeRefKind::Unknown => write!(f, "unknown"),
             TypeRefKind::Type => write!(f, "reflect.Type"),
-            TypeRefKind::Rust => write!(f, "$rust_type"),
             TypeRefKind::Error => write!(f, "error"),
             TypeRefKind::Missing => write!(f, "?"),
             TypeRefKind::Infer => write!(f, "_"),
@@ -377,12 +384,11 @@ impl TypeRefBuilder {
 
         let kind = match &te.kind {
             TypeExprKind::Path {
-                segments,
+                path,
                 generic_args,
                 associated_type_bindings,
-                ..
             } => TypeRefKind::Path {
-                segments: segments.clone(),
+                path: path.clone(),
                 generic_args: generic_args.iter().map(|arg| self.lower(arg)).collect(),
                 associated_type_bindings: associated_type_bindings
                     .iter()
@@ -409,7 +415,6 @@ impl TypeRefBuilder {
             TypeExprKind::Bool => TypeRefKind::Bool,
             TypeExprKind::Null => TypeRefKind::Null,
             TypeExprKind::Never => TypeRefKind::Never,
-            TypeExprKind::Void => TypeRefKind::Void,
             TypeExprKind::Uint8Array => TypeRefKind::Uint8Array,
             TypeExprKind::Media { kind, .. } => TypeRefKind::Media { kind: *kind },
             TypeExprKind::Optional { inner, .. } => TypeRefKind::Optional {
@@ -424,6 +429,9 @@ impl TypeRefBuilder {
             },
             TypeExprKind::Union { variants, .. } => TypeRefKind::Union {
                 variants: variants.iter().map(|v| self.lower(v)).collect(),
+            },
+            TypeExprKind::Tuple { elements } => TypeRefKind::Tuple {
+                elements: elements.iter().map(|e| self.lower(e)).collect(),
             },
             TypeExprKind::Literal { value, .. } => TypeRefKind::Literal {
                 value: value.clone(),
@@ -447,7 +455,6 @@ impl TypeRefBuilder {
             },
             TypeExprKind::Unknown => TypeRefKind::Unknown,
             TypeExprKind::Type => TypeRefKind::Type,
-            TypeExprKind::Rust => TypeRefKind::Rust,
             TypeExprKind::Error => TypeRefKind::Error,
             TypeExprKind::Missing => TypeRefKind::Missing,
             TypeExprKind::Infer => TypeRefKind::Infer,
@@ -572,7 +579,7 @@ mod tests {
         let prim = |k: TypeExprKind| k.at(sp);
         let path = |name: &str| {
             TypeExprKind::Path {
-                segments: name.split('.').map(Name::new).collect(),
+                path: baml_base::Path::new(name.split('.').map(Name::new).collect()),
                 generic_args: vec![],
                 associated_type_bindings: vec![],
             }
@@ -594,7 +601,7 @@ mod tests {
             path("baml.http.Request"),
             // `Stream<int, Item = string>` — generic args plus an assoc binding.
             TypeExprKind::Path {
-                segments: vec![Name::new("Stream")],
+                path: baml_base::Path::new(vec![Name::new("Stream")]),
                 generic_args: vec![prim(TypeExprKind::Int)],
                 associated_type_bindings: vec![AssociatedTypeBinding {
                     name: Name::new("Item"),
@@ -612,7 +619,7 @@ mod tests {
             }
             .at(sp),
             map_of_string_to_int_list(0),
-            // `int | string`, and `int | (() -> void)` (union parenthesizes fns).
+            // `int | string`, and `int | (() -> null)` (union parenthesizes fns).
             TypeExprKind::Union {
                 variants: vec![prim(TypeExprKind::Int), prim(TypeExprKind::String)],
             }
@@ -620,7 +627,7 @@ mod tests {
             TypeExprKind::Union {
                 variants: vec![
                     prim(TypeExprKind::Int),
-                    func(vec![], prim(TypeExprKind::Void), None),
+                    func(vec![], prim(TypeExprKind::Null), None),
                 ],
             }
             .at(sp),
@@ -641,8 +648,8 @@ mod tests {
                 prim(TypeExprKind::Bool),
                 Some(Box::new(path("MyError"))),
             ),
-            // `() -> (() -> void)` — a function return parenthesizes a function.
-            func(vec![], func(vec![], prim(TypeExprKind::Void), None), None),
+            // `() -> (() -> null)` — a function return parenthesizes a function.
+            func(vec![], func(vec![], prim(TypeExprKind::Null), None), None),
             // `T.Item` and `(T as Iterator).Item`.
             TypeExprKind::AssociatedTypeProjection {
                 base: Box::new(path("T")),

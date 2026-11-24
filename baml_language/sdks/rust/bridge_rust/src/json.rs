@@ -1,0 +1,473 @@
+//! [`Json`]: BAML's `baml.json.json` as `serde_json::Value`.
+
+use num_bigint::BigInt;
+
+use crate::{
+    DecodeError,
+    baml_value::internal::{
+        __BamlValuePrivate, EncodeError, Encoder, list_ty, map_ty, primitive_ty, type_alias_ty,
+    },
+    serde_json::{Number, Value},
+    wire::{
+        self, baml_outbound_value::Value as Out, inbound_map_entry::Key, inbound_value::Value as In,
+    },
+};
+
+/// BAML's `baml.json.json`, the recursive stdlib alias
+/// `null | bool | int | bigint | float | string | json[] | map<string, json>`.
+///
+/// - Integers: BAML `int` is 63-bit (the VM keeps a tag bit), so an integer
+///   outside `[-2^62, 2^62)` crosses as a BAML `bigint`, as
+///   `baml.json.parse` reads such a token, and a BAML `bigint` decodes when
+///   it fits `i64` or `u64`. Every `i64` and `u64` round-trips.
+/// - Floats: finite `f64`. An integral float stays a float.
+/// - Objects keep the key order `serde_json::Map` gives them: sorted,
+///   unless the build enables `serde_json`'s `preserve_order` feature.
+///
+/// The bridge turns on neither `preserve_order` nor `arbitrary_precision`,
+/// so it never changes how the rest of a build reads JSON. An app that wants
+/// either one enables it on its own dependency, and cargo applies it to this
+/// type too:
+///
+/// ```toml
+/// serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+/// ```
+///
+/// Decoding fails with [`DecodeError::NotJson`] on a `bigint` outside
+/// `i64`/`u64`, a non-finite float, or a value that is not JSON at all (a
+/// class, enum, media, bytes or handle).
+///
+/// Integers wider than `i64`/`u64` depend on `arbitrary_precision`:
+///
+/// - Without it, `serde_json` parses such an integer in JSON text as an
+///   approximate `f64`, so it is sent to BAML as an inexact float, and a
+///   float beyond `f64`'s range (`1e400`) fails to parse. (`json!` with a
+///   Rust integer wider than `u64`, such as a `u128`, panics instead.)
+/// - With it, the number keeps its exact text: a wider integer is sent
+///   exactly as a `bigint`, and a float beyond `f64`'s range is sent as
+///   infinity, as `str::parse::<f64>` reads it.
+///
+/// Either way, decoding a BAML `bigint` outside `i64`/`u64` fails.
+pub type Json = Value;
+
+/// Smallest BAML `int`.
+const BAML_INT_MIN: i64 = -(1 << 62);
+/// Largest BAML `int`.
+const BAML_INT_MAX: i64 = (1 << 62) - 1;
+
+/// A JSON value on the wire. A scalar's arm implies its type; a list or an
+/// object states the `json[]` or `map<string, json>` it is, as every
+/// container node must, so the engine builds exactly that.
+fn encode(value: &Json, encoder: &mut Encoder) -> Result<wire::InboundValue, EncodeError> {
+    let (value_type, value) = match value {
+        // An absent oneof is the wire's null.
+        Value::Null => (None, None),
+        Value::Bool(value) => (None, Some(In::BoolValue(*value))),
+        Value::Number(number) => (None, Some(encode_number(number))),
+        Value::String(value) => (None, Some(In::StringValue(value.clone()))),
+        Value::Array(items) => (
+            Some(list_ty(Json::baml_ty())),
+            Some(In::ListValue(wire::InboundListValue {
+                values: encoder.nested(|encoder| {
+                    items
+                        .iter()
+                        .map(|item| encode(item, encoder))
+                        .collect::<Result<_, _>>()
+                })?,
+            })),
+        ),
+        Value::Object(entries) => (
+            Some(map_ty(
+                primitive_ty(wire::BamlTyPrimitiveKind::BamlTyPrimitiveString),
+                Json::baml_ty(),
+            )),
+            Some(In::MapValue(wire::InboundMapValue {
+                entries: encoder.nested(|encoder| {
+                    entries
+                        .iter()
+                        .map(|(key, item)| {
+                            Ok(wire::InboundMapEntry {
+                                key: Some(Key::StringKey(key.clone())),
+                                value: Some(encode(item, encoder)?),
+                            })
+                        })
+                        .collect::<Result<_, _>>()
+                })?,
+            })),
+        ),
+    };
+    Ok(wire::InboundValue { value_type, value })
+}
+
+fn encode_number(number: &Number) -> In {
+    if let Some(int) = number
+        .as_i64()
+        .filter(|int| (BAML_INT_MIN..=BAML_INT_MAX).contains(int))
+    {
+        return In::IntValue(int);
+    }
+    // `as_f64` also rounds integers, so ask what the number *is*.
+    if let Some(float) = number.as_f64().filter(|_| number.is_f64()) {
+        return In::FloatValue(float);
+    }
+    let text = number.to_string();
+    match text.parse::<BigInt>() {
+        Ok(int) => In::BigintValue(format!("{int:x}")),
+        // Only an `arbitrary_precision` number beyond `f64`'s range.
+        Err(_) if text.starts_with('-') => In::FloatValue(f64::NEG_INFINITY),
+        Err(_) => In::FloatValue(f64::INFINITY),
+    }
+}
+
+fn decode(value: wire::BamlOutboundValue) -> Result<Json, DecodeError> {
+    let value = crate::decode::unwrap(value);
+    let not_json = |got| Err(DecodeError::NotJson { got });
+    match value.value {
+        None | Some(Out::NullValue(_)) => Ok(Value::Null),
+        Some(Out::BoolValue(value)) => Ok(Value::Bool(value)),
+        Some(Out::IntValue(value)) => Ok(Value::Number(value.into())),
+        Some(Out::BigintValue(hex)) => {
+            let int = BigInt::parse_bytes(hex.as_bytes(), 16)
+                .ok_or(DecodeError::InvalidBigint { len: hex.len() })?;
+            match (i64::try_from(&int), u64::try_from(&int)) {
+                (Ok(int), _) => Ok(Value::Number(int.into())),
+                (_, Ok(int)) => Ok(Value::Number(int.into())),
+                _ => not_json("an integer outside the i64/u64 range"),
+            }
+        }
+        Some(Out::FloatValue(value)) => match Number::from_f64(value) {
+            Some(number) => Ok(Value::Number(number)),
+            None => not_json("a non-finite float"),
+        },
+        Some(Out::StringValue(value)) => Ok(Value::String(value)),
+        Some(Out::ListValue(list)) => list
+            .items
+            .into_iter()
+            .map(decode)
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        Some(Out::MapValue(map)) => map
+            .entries
+            .into_iter()
+            .map(|entry| Ok((entry.key, decode(entry.value.unwrap_or_default())?)))
+            .collect::<Result<_, _>>()
+            .map(Value::Object),
+        Some(_) => not_json(crate::baml_value::wire_variant_kind(&value)),
+    }
+}
+
+impl __BamlValuePrivate for Json {
+    fn to_baml(&self, encoder: &mut Encoder) -> Result<wire::InboundValue, EncodeError> {
+        encode(self, encoder)
+    }
+
+    fn from_baml(value: wire::BamlOutboundValue) -> Result<Self, DecodeError> {
+        decode(value)
+    }
+
+    fn baml_ty() -> wire::BamlTy {
+        type_alias_ty("baml.json.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        serde_json::{self, json},
+        wire::baml_literal_value::Literal,
+    };
+
+    /// What the engine sends back for an inbound value it echoes: the same
+    /// tree on the outbound side, every node in the `union_variant`
+    /// envelope a value read through the json alias carries.
+    fn echoed(value: wire::InboundValue) -> wire::BamlOutboundValue {
+        let bare = value.value.map(|value| match value {
+            In::BoolValue(value) => Out::BoolValue(value),
+            In::IntValue(value) => Out::IntValue(value),
+            In::BigintValue(value) => Out::BigintValue(value),
+            In::FloatValue(value) => Out::FloatValue(value),
+            In::StringValue(value) => Out::StringValue(value),
+            In::ListValue(list) => Out::ListValue(wire::BamlValueList {
+                item_type: None,
+                items: list.values.into_iter().map(echoed).collect(),
+            }),
+            In::MapValue(map) => Out::MapValue(wire::BamlValueMap {
+                key_type: None,
+                value_type: None,
+                entries: map
+                    .entries
+                    .into_iter()
+                    .map(|entry| wire::BamlOutboundMapEntry {
+                        key: match entry.key {
+                            Some(Key::StringKey(key)) => key,
+                            other => panic!("json encodes string keys only, got {other:?}"),
+                        },
+                        value: entry.value.map(echoed),
+                    })
+                    .collect(),
+            }),
+            other => panic!("json never encodes {other:?}"),
+        });
+        outbound(Out::UnionVariantValue(Box::new(
+            wire::BamlValueUnionVariant {
+                value: Some(Box::new(wire::BamlOutboundValue { value: bare })),
+                ..Default::default()
+            },
+        )))
+    }
+
+    /// `value` encoded under its own type, as an argument would be.
+    fn encoded(value: &impl __BamlValuePrivate) -> wire::InboundValue {
+        value
+            .to_baml(&mut Encoder::new())
+            .expect("a value without handles encodes")
+    }
+
+    fn outbound(value: Out) -> wire::BamlOutboundValue {
+        wire::BamlOutboundValue { value: Some(value) }
+    }
+
+    fn round_trip(value: &Json) -> Json {
+        Json::from_baml(echoed(encoded(value))).expect("decodes")
+    }
+
+    fn not_json(got: &'static str) -> Result<Json, DecodeError> {
+        Err(DecodeError::NotJson { got })
+    }
+
+    #[test]
+    fn nested_values_round_trip() {
+        let value = json!({
+            "null": null,
+            "bool": true,
+            "int": -3,
+            "float": 2.25,
+            "integral_float": 2.0,
+            "string": "text",
+            "list": [null, false, 1, 0.5, "s", [], {}],
+            "object": { "child": [{ "deep": ["found"] }] },
+        });
+        let decoded = round_trip(&value);
+        assert_eq!(decoded, value);
+        assert!(decoded["integral_float"].is_f64());
+        assert!(decoded["int"].is_i64());
+    }
+
+    #[test]
+    fn integers_outside_baml_int_cross_as_bigint_and_round_trip() {
+        for int in [0, BAML_INT_MIN, BAML_INT_MAX] {
+            assert_eq!(encoded(&json!(int)).value, Some(In::IntValue(int)));
+        }
+        for (value, hex) in [
+            (json!(BAML_INT_MAX + 1), "4000000000000000"),
+            (json!(BAML_INT_MIN - 1), "-4000000000000001"),
+            (json!(i64::MAX), "7fffffffffffffff"),
+            (json!(i64::MIN), "-8000000000000000"),
+            (json!(u64::MAX), "ffffffffffffffff"),
+        ] {
+            assert_eq!(
+                encoded(&value).value,
+                Some(In::BigintValue(hex.to_string())),
+                "{value}"
+            );
+            let decoded = round_trip(&value);
+            assert_eq!(decoded, value);
+            assert!(!decoded.is_f64(), "{value} must stay an integer");
+        }
+    }
+
+    #[test]
+    fn numbers_only_arbitrary_precision_admits() {
+        // The dev-dependency turns `arbitrary_precision` on, as an app may:
+        // a wide integer keeps its exact text and crosses as a `bigint`, and
+        // a float beyond `f64` parses and crosses as infinity. (Without it,
+        // the integer parses as a rounded `f64` and `1e400` fails to parse.)
+        let text = "123456789012345678901234567890";
+        let wide: Json = serde_json::from_str(text).unwrap();
+        assert!(!wide.is_f64(), "arbitrary_precision keeps the exact text");
+        let hex = format!("{:x}", text.parse::<BigInt>().unwrap());
+        assert_eq!(encoded(&wide).value, Some(In::BigintValue(hex)));
+        assert_eq!(
+            Json::from_baml(echoed(encoded(&wide))),
+            not_json("an integer outside the i64/u64 range")
+        );
+        let huge: Json = serde_json::from_str("[1e400, -1e400]").unwrap();
+        let In::ListValue(list) = encoded(&huge).value.unwrap() else {
+            panic!("arrays encode as lists");
+        };
+        let floats: Vec<_> = list.values.into_iter().map(|value| value.value).collect();
+        assert_eq!(
+            floats,
+            [
+                Some(In::FloatValue(f64::INFINITY)),
+                Some(In::FloatValue(f64::NEG_INFINITY))
+            ]
+        );
+    }
+
+    #[test]
+    fn values_json_cannot_hold_fail_to_decode() {
+        let bigint = |hex: &str| outbound(Out::BigintValue(hex.to_string()));
+        // 2^64 and -(2^63) - 1.
+        for hex in ["10000000000000000", "-8000000000000001"] {
+            assert_eq!(
+                Json::from_baml(bigint(hex)),
+                not_json("an integer outside the i64/u64 range")
+            );
+        }
+        assert_eq!(
+            Json::from_baml(bigint("xyz")),
+            Err(DecodeError::InvalidBigint { len: 3 })
+        );
+        for float in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                Json::from_baml(outbound(Out::FloatValue(float))),
+                not_json("a non-finite float")
+            );
+        }
+        let class = outbound(Out::ClassValue(wire::BamlValueClass {
+            name: "user.Point".to_string(),
+            ..Default::default()
+        }));
+        let media = outbound(Out::MediaValue(wire::BamlValueMedia::default()));
+        let bytes = outbound(Out::Uint8arrayValue(vec![1]));
+        for (value, got) in [(class, "class"), (media, "media"), (bytes, "uint8array")] {
+            assert_eq!(Json::from_baml(value), not_json(got));
+        }
+        // Nested inside an otherwise valid value, the whole decode fails.
+        let nested = outbound(Out::ListValue(wire::BamlValueList {
+            item_type: None,
+            items: vec![outbound(Out::IntValue(1)), bigint("10000000000000000")],
+        }));
+        assert_eq!(
+            Json::from_baml(nested),
+            not_json("an integer outside the i64/u64 range")
+        );
+    }
+
+    #[test]
+    fn literal_envelopes_decode_to_plain_values() {
+        let literal = |literal| {
+            Json::from_baml(outbound(Out::LiteralValue(wire::BamlLiteralValue {
+                literal: Some(literal),
+            })))
+        };
+        assert_eq!(
+            literal(Literal::StringValue("ok".to_string())),
+            Ok(json!("ok"))
+        );
+        assert_eq!(literal(Literal::IntValue(7)), Ok(json!(7)));
+        assert_eq!(literal(Literal::BoolValue(true)), Ok(json!(true)));
+        assert_eq!(
+            literal(Literal::FloatValue("1.5".to_string())),
+            Ok(json!(1.5))
+        );
+        assert_eq!(
+            literal(Literal::BigintValue("ffffffffffffffff".to_string())),
+            Ok(json!(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn optional_json_decodes_null_as_none() {
+        let null = wire::BamlOutboundValue { value: None };
+        assert_eq!(Option::<Json>::from_baml(null), Ok(None));
+        assert_eq!(
+            Option::<Json>::from_baml(outbound(Out::StringValue("x".to_string()))),
+            Ok(Some(json!("x")))
+        );
+        // `Some(Null)` is the same BAML value as `None`.
+        assert_eq!(encoded(&Some(Value::Null)).value, None);
+    }
+
+    #[test]
+    fn baml_ty_names_the_canonical_alias() {
+        assert_eq!(
+            Json::baml_ty().ty,
+            Some(wire::baml_ty::Ty::TypeAlias(wire::BamlTyTypeAlias {
+                head: Some(wire::baml_ty_type_alias::Head::Name(
+                    "baml.json.json".to_string(),
+                )),
+                type_args: Vec::new(),
+            }))
+        );
+    }
+
+    /// `CallOptions::argument` encodes eagerly, outside any call. A json
+    /// number BAML `int` cannot hold must still encode (as a bigint), not
+    /// panic.
+    #[test]
+    fn call_options_accept_any_json_number() {
+        let mut arguments = crate::encode::Arguments::new();
+        crate::CallOptions::new()
+            .argument("extra", json!({ "id": u64::MAX }))
+            .append_to(&mut arguments)
+            .expect("a shallow json value is sent");
+        let (kwargs, _) = arguments.into_parts();
+        let Some(In::MapValue(map)) = kwargs[0].value.clone().unwrap().value else {
+            panic!("objects encode as maps");
+        };
+        assert_eq!(
+            map.entries[0].value.clone().unwrap().value,
+            Some(In::BigintValue("ffffffffffffffff".to_string()))
+        );
+    }
+
+    /// `1` wrapped in `depth` single-element arrays, built in linear time.
+    fn nested(depth: usize) -> Json {
+        (0..depth).fold(json!(1), |inner, _| Value::Array(vec![inner]))
+    }
+
+    /// A json list level is two wire messages and its statement two more:
+    /// 48 levels fit as an argument (`CallFunctionArgs` → `InboundMapEntry`
+    /// above it), 49 do not, and the refusal names the argument.
+    #[test]
+    fn json_is_measured_at_the_wire_boundary() {
+        let argument = |depth| {
+            let mut arguments = crate::encode::Arguments::new();
+            arguments.value("value", &nested(depth), &Json::baml_ty())
+        };
+        assert_eq!(argument(48), Ok(()));
+        assert_eq!(
+            argument(49),
+            Err(crate::encode::ArgumentError {
+                name: "value".to_string(),
+                error: crate::EncodeError::TooDeep { limit: 100 },
+            })
+        );
+        let result =
+            |depth| crate::encode::callback_value(|encoder| nested(depth).to_baml(encoder));
+        assert!(result(48).is_ok());
+        assert_eq!(
+            result(49).err(),
+            Some(crate::EncodeError::TooDeep { limit: 100 })
+        );
+    }
+
+    /// However deep the host value, the encoder refuses it after a bounded
+    /// descent rather than exhausting the stack.
+    #[test]
+    fn json_far_deeper_than_the_wire_is_refused_without_exhausting_the_stack() {
+        let deep = nested(50_000);
+        let mut arguments = crate::encode::Arguments::new();
+        assert_eq!(
+            arguments
+                .value("value", &deep, &Json::baml_ty())
+                .map_err(|error| error.error),
+            Err(crate::EncodeError::TooDeep { limit: 100 })
+        );
+        dismantle(deep);
+    }
+
+    /// Drop a deep value one level at a time: `serde_json::Value` drops its
+    /// children recursively.
+    fn dismantle(mut value: Json) {
+        while let Value::Array(items) = &mut value {
+            let Some(inner) = items.pop() else {
+                break;
+            };
+            value = inner;
+        }
+    }
+}

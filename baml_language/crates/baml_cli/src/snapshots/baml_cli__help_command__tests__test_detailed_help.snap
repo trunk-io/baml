@@ -51,24 +51,40 @@ Test output options:
           Set the BAML log level; overrides BAML_LOG [default: info] [possible values: off, error,
           warn, info, debug, trace]
 
-Global options:
-  -q, --quiet...
-          Suppress nonessential output
+Execution options:
+      --test-timeout <DURATION>
+          Fail any single test that runs longer than this.
 
-  -v, --verbose...
-          Increase diagnostic verbosity. Repeatable
+          Accepts durations such as `500ms`, `30s` or `15m`; `none` disables the per-test deadline.
+
+          [default: 5m]
+
+      --max-concurrency <N>
+          Run at most this many test bodies at once.
+
+          Defaults to twice the available CPU parallelism.
+
+Shutdown options:
+      --shutdown-timeout <DURATION>
+          Wait at most this long at exit for in-flight calls and background futures.
+
+          Accepts durations such as `500ms`, `15s` or `2m`; `none` waits forever. Ctrl+C still
+          cancels immediately.
+
+          [default: 15s]
+
+Global options:
+      --project-dir <PATH>
+          Discover the BAML project from this path
+
+  -q, --quiet
+          Print no status or progress on stderr
+
+      --output-format <FORMAT>
+          What goes to stdout [default: text] [possible values: text, json, jsonl]
 
       --color <WHEN>
           Control ANSI colors [possible values: auto, always, never]
-
-      --no-progress
-          Disable progress output
-
-      --directory <PATH>
-          Change to this directory before running the command
-
-      --project <PATH>
-          Discover the BAML project from this path
 
       --output-preset <PRESET>
           Select output defaults [default: auto] [possible values: auto, human, agent]
@@ -78,10 +94,6 @@ Global options:
 
       --diagnostic-format <FORMAT>
           Select the diagnostic format [possible values: human, agent, concise]
-
-      --agent-skill-check <MODE>
-          Control BAML agent skill validation [default: auto] [possible values: auto, require, warn,
-          off]
 
   -h, --help
           Display concise help for this command
@@ -105,5 +117,5 @@ PROFILES:
   Profile includes establish the initial candidates; direct CLI includes narrow
   them. Excludes accumulate and always win. Direct scalar options override
   profile scalar options. Profile args cannot contain --profile, --no-profile,
-  --project, --directory, --from, --features, or --help. With no default profile,
-  all tests are selected.
+  --project-dir, --agent-skill-check, --features, --output-format, or --help.
+  With no default profile, all tests are selected.

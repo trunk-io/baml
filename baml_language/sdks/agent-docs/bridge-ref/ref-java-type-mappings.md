@@ -31,7 +31,7 @@ mapping was cross-checked against real generated output under
   `BamlFfi.callSync/callAsync` (last positional arg) and that `registerClass` carries per field —
   a typed `baml_bridge.BamlType` **data structure** (not a string), produced by `descriptor_expr`
   (translate_ty.rs) as a builder expression. A wholly wire-driven type (bigint / uint8array / null /
-  void / media / callable / handle / the `unknown`-family) passes the literal **`null`** (decode
+  media / callable / handle / the `unknown`-family) passes the literal **`null`** (decode
   wire-driven); a `TypeVar` passes `BamlType.typeVar("T")` and the union-with-a-TypeVar-arm case
   passes `null`.
 - `> ⚠ **Deviation from Python:** …` flags every divergence from the Python bridge.
@@ -141,7 +141,7 @@ nullable slot; **descriptor** = the typed `baml_bridge.BamlType` (or `null` = wi
 | `Ty::Primitive(Float)` | `Ty::Float` | `score float` | `double` | `java.lang.Double` | `BamlType.FLOAT` | :87 |
 | `Ty::Primitive(String)` | `Ty::String` | `name string` | `java.lang.String` | `java.lang.String` | `BamlType.STRING` | :88 |
 | `Ty::Primitive(Bool)` | `Ty::Bool` | `active bool` | `boolean` | `java.lang.Boolean` | `BamlType.BOOL` | :89 |
-| `Ty::Primitive(Null)` | `Ty::Null` | `null` in a union | `java.lang.Void` | `java.lang.Void` | `null` (wire-driven) | :91 |
+| `Ty::Primitive(Null)` | `Ty::Null` | `null` in a union | `java.lang.Void`; as a function return (`-> null` / `-> void`, the unit type) the method is `void`, and as a callback return the shape is `Runnable`/`Consumer`/`BiConsumer` | `java.lang.Void` | `null` (wire-driven) | :91 |
 | `Ty::Primitive(Uint8Array)` | `Ty::Uint8Array` | `data uint8array` | `byte[]` | `byte[]` | `null` (wire-driven) | :100 |
 | `Ty::Primitive(Image)` | `Ty::Media(Image)` | `photo image` | `baml_sdk.baml.media.Image` | (same) | `null` (wire-driven) | :102 |
 | `Ty::Primitive(Audio)` | `Ty::Media(Audio)` | `clip audio` | `baml_sdk.baml.media.Audio` | (same) | `null` (wire-driven) | :103 |
@@ -162,11 +162,11 @@ nullable slot; **descriptor** = the typed `baml_bridge.BamlType` (or `null` = wi
 | `Ty::List(T, …)` | `Ty::List(T)` | `tags string[]` | `java.util.List<T>` (T boxed) | (same) | `BamlType.list(D)` | :136–139 |
 | `Ty::Map(K, V, …)` | `Ty::Map { key, value }` | `metadata map<string,int>` | `java.util.Map<java.lang.String, V>` (key forced to String) | (same) | `BamlType.map(BamlType.STRING, Dval)` | :142–145 |
 | `Ty::Union(types, …)` | `Ty::Union(types)` | `result string \| int` | `baml_bridge.Union2<…>` … `Union10<…>`; arity>10 → `java.lang.Object`; same-base literal union → base | (same) | `BamlType.union(a, b, …)` ordered | :146, :198–233 |
+| `Ty::Tuple(items, …)` | `Ty::Tuple(items)` | `pair (int, string)` | generated record `baml_sdk.Tuple2_IntString` (root package; components `item0`, `item1`, …); a tuple mentioning a type variable → `java.lang.Object` | (same) | `BamlType.tuple(a, b, …)` ordered — the identity the record is registered under (`TypeRegistry.registerTuple`) | `tuple_type` |
 | `Ty::Unknown { … }` | `Ty::Unknown` | `unknown` keyword | `java.lang.Object` | (same) | `null` (wire-driven) | :147 |
 | `Ty::Function { params, ret, throws, … }` | `Ty::Function { params, ret }` | callable type | `java.util.function.*` by arity; optional/arity>2 → generated `@FunctionalInterface` (`IntOptCallback` shape, landed `202883518`) | (same) | `null` (wire-driven) | :148, :407–435 |
-| `Ty::Void { … }` | `Ty::Void` (Python calls it `Ty::Unit`) | `-> void` | `void` | `java.lang.Void` | `null` (wire-driven) | :149–152 |
 | no direct TIR variant | `Ty::BamlOptions` (Python-only) | generated function options plumbing | — no CodegenTy variant; options ride the trailing configurator overload | — | — | n/a |
-| `Ty::RustType { … }` | `Ty::RustType` | opaque builtin state | `baml_bridge.BamlHandle` | (same) | `null` (wire-driven) | :153 |
+| `Ty::Class(baml.host.Value)` | `Ty::Class` (crossing `HostValue`) | a host's own value | `baml_bridge.BamlHandle` | (same) | `BamlType.OPAQUE` (decoded wire-driven, never stated) | :153 |
 | `Ty::Type { … }` | `Ty::Type` | `type` metatype keyword | `java.lang.Object` | (same) | `null` (wire-driven) | :157–162 |
 | `Ty::Never { … }` | `Ty::Never` | divergent expr / `throws never` | `java.lang.Object` | (same) | `null` (wire-driven) | :157–162 |
 | `Ty::Future(value, error, …)` | `Ty::Future` | `spawn { … }` before `await` | `java.lang.Object` | (same) | `null` (wire-driven) | :157–162 |
@@ -274,6 +274,12 @@ class/enum/alias arms → the identifier + `Value`; container arms → `{token}L
 "baml.json.json")), BamlType.map(BamlType.STRING, BamlType.classByFqn("baml.json.json"))}, {
 "…json$BooleanValue", "…json$IntValue", …})` plus a `registerUnionAlias("baml.json.json", …)`.
 
+### Tuples — generated records registered by identity
+
+Java has no native tuple, so every concrete tuple identity the pool mentions (at any depth, non-recursive aliases erased) gets a generated `public record TupleN_Type1Type2…(T1 item0, T2 item1, …)` in the root `baml_sdk` package (`sdkgen_java/src/tuples.rs`). Slot tokens come from `union_arm_token` in slot order with repeats kept (a union slot spells its members, `IntOrString`; an optional slot is `OptionalString`); colliding names get a trailing counter in identity order. `(int, string)` and `(string, int)` are two records, `(int,)` is `Tuple1_Int` (not `int`), and `(int | string, bool)` is a different record from the union `(int, bool) | (string, bool)`. The anchor registers each record under its tuple identity; decode constructs it by identity and encode states the identity its class was registered for (reverse lookup by class, never by name).
+
+Inbound, a record crosses as a list stating its tuple type; a plain `List` stands in for a tuple only under a slot that supplies the shape (a `BamlTypedValue`, a callback's declared return), with exactly its arity — a list member or open member keeps a list a list, and several same-arity tuple members are ambiguous. Outbound fallback when no record is registered: list of the slot join, then `List<Object>`.
+
 ### Callables — `java.util.function` by arity
 
 `translate_callable` (translate_ty.rs:407–435) maps a `(params) -> ret` onto a
@@ -289,7 +295,8 @@ Params and return are boxed. Verified `Function<java.lang.Long, java.lang.String
 `BiFunction<…>` in generated `Fns.java` and `Array.generate(…, Function<java.lang.Long, T> f)`.
 
 > ⚠ **Deviation from Python (callables):** Python renders `typing.Callable[[...], ret]` and widens
-> to `typing.Callable[..., ret]` when **any** parameter is optional. Java has no variadic callable
+> to `typing.Callable[..., ret]` when **any** parameter is optional (for a host callback, `ret` also
+> admits the coroutine of an `async def`). Java has no variadic callable
 > type, so it maps by concrete arity to `java.util.function.*`.
 
 > **LANDED (`202883518`, decision E1):** a callable **with any optional parameter or arity > 2**
@@ -348,7 +355,7 @@ Notes:
   `BamlType.classByFqn("<baml fqn>")` (registry resolves the kind); `BamlType.list(D)`;
   `BamlType.map(BamlType.STRING, D)`; ordered union `BamlType.union(D, D, …)`; a literal
   `BamlType.literalString("…")` / `literalInt(…L)` / …; a type var `BamlType.typeVar("<name>")`.
-  Everything wire-driven (bigint / uint8array / null / void / media / callable / handle / the
+  Everything wire-driven (bigint / uint8array / null / media / callable / handle / the
   `unknown`-family) passes the literal `null`. Decode without a descriptor, or on any
   descriptor/value mismatch that has a self-describing wire form, falls back to the wire-driven path
   (error/panic values are always wire-driven).
@@ -378,11 +385,9 @@ Function calls return a `BamlOutboundResult` envelope; `ProtoReader.decodeOutbou
   **`BamlPanic` re-parents to `java.lang.Error`** (`BamlPanic.java:20`) so it escapes
   `catch (Exception)` — the analog of Python raising `BamlPanic` off `BaseException`. **LANDED
   (`74782a679`).**
-- **Exit panics** (`baml.sys.exit`, `is_exit_panic`) → run the registered telemetry-flush hooks
-  (`BamlFfi.runExitFlushHooks()`, best-effort) then `Runtime.getRuntime().halt(exitCode)` (hard exit,
-  bypasses shutdown hooks — analog of Python `os._exit`). **Flush hook wired, LANDED (`eab6d37cc`);**
-  no telemetry ships in this slice, so the hook registry is empty by default. `ProtoReader.decodePanic`
-  decodes `is_exit` / `exit_code` and drives the flush-then-halt (`ProtoReader.java:313-319`).
+- **Exit panics** (`baml.sys.exit`, `is_exit_panic`) → `Runtime.getRuntime().halt(exitCode)`
+  (hard exit, bypasses shutdown hooks — analog of Python `os._exit`). `ProtoReader.decodePanic`
+  decodes `is_exit` / `exit_code` and terminates the process.
 - **Cancellation** — **DECIDED 2026-07-17 (D1), full Python parity plus a sync path.** Trailing
   `BamlCallContext` overloads (`f(req…, ctx)`, `f(req…, opts, ctx)`); engine-driven abort →
   `BamlCancelledError extends java.util.concurrent.CancellationException` (the future counts as
@@ -415,18 +420,18 @@ discriminator resolved from the per-call handle table.
 | `Uint8Array(Vec<u8>)` | `uint8array_value` (`bytes`) | `byte[]` (:356) |
 | — | `literal_value` (`BamlLiteralValue`) | `decodeLiteral` unwraps to the inner `Long` / `String` / `Boolean` / `BigInteger` / `Double`; envelope discarded. No BEX variant produces this on the FFI path (:352, :376–392) |
 | `Array { element_type, items }` | `list_value` (`BamlValueList`) | `java.util.List` (`ArrayList`), elements recursively decoded (:353, :394) |
+| `Tuple { items }` | `tuple_value` (`BamlValueTuple`) | with a tuple descriptor: the record registered for that identity (`TypeRegistry.constructTuple`), else an immutable list of the join of the slot types (`Union{k}` arms; one member → bare items), else an immutable `List<Object>`; arity mismatch → `BamlError` (lenient: the plain list). Without a descriptor (dynamic results, thrown values): the tuple's carried type (`BamlValueTuple.tuple_type`) supplies the identity for the same record → union list → plain list chain (`ProtoReader.decodeTuple`); a tuple whose carried type is absent, of another arity, or outside the token grammar is the immutable `List<Object>` of its slots, each decoded wire-driven. |
 | `Map { key_type, value_type, entries }` | `map_value` (`BamlValueMap`) | `java.util.Map` (`LinkedHashMap`), **String keys**, values recursively decoded (:354, :409) |
 | `Instance { class_name, fields, type_args }` | `class_value` (`BamlValueClass`) | generated class in `baml_sdk/`, resolved via `TypeRegistry`; `type_args` reify generics (:358) |
 | `Variant { enum_name, variant_name }` | `enum_value` (`BamlValueEnum`) | generated Java `enum`, resolved via `TypeRegistry` (:359) |
 | `Union { value, metadata }` | `union_variant_value` (`BamlValueUnionVariant`) | **type-directed reconstruction**: `self_type` tokenized to the sorted `\|`-signature, arm picked structurally from the inner value, `TypeRegistry.constructUnion` returns the generated arm record (`Union{n}` arm or recursive-alias sealed record); unregistered signature / unmatched arm → bare decoded inner value; `value_option_name` never trusted (:355, :452–484) |
 | `Handle(Handle)` | `handle_value` (`BamlOutboundHandle` — handle table) | media handle types → typed stdlib class wrapping `BamlHandle` (`Image` / `Audio` / `Video` / `Pdf`, dispatched on `ADT_MEDIA_*`); every other handle type → bare `baml_bridge.BamlHandle` (:360, :109–110) |
-| `FunctionRef { global_index }` | `handle_value` (`FUNCTION_REF`) | bare `baml_bridge.BamlHandle` — no wrapper, not callable back (parity with Python) |
-| `Adt(Type(RuntimeTy))` | `ty_value` (`BamlTy`) | lenient path → `null` (`OV_TY` skipped, :361–368); strict path → throws `unsupported`. BAML type-reference values do not round-trip. |
+| a BAML callable (closure, bound method, generic instantiation) | `handle_value` (`FUNCTION_REF`) with `ty` stating its specialized function type | at a function-typed position, an instance of the position's generated functional interface calling back through the handle (`BamlFfi.bamlClosure`); elsewhere a bare `baml_bridge.BamlHandle` |
+| `Adt(Type(RuntimeTy))` | `ty_value` (`BamlTy`) | a `baml_bridge.BamlType` (`BamlType.adoptWireTy`) holding one reference per runtime declaration's `live` head, released when the type is let go; an `anonymous_label` head is display text, never stated. A type the token grammar cannot hold is refused (strict) / `null` (lenient). |
 | `Adt(PromptAst(Arc<PromptAst>))` | handle table (`ADT_PROMPT_AST`) on the FFI path; inline `prompt_ast_value` never used | bare `baml_bridge.BamlHandle`; an inline `prompt_ast_value` (`OV_PROMPT_AST`) → `null` (lenient) / throws `unsupported` (strict) (:361–368) |
 | `Adt(Media(Arc<MediaValue>))` | handle table (`ADT_MEDIA_*`) on the FFI path; inline `media_value` never used | typed media stdlib class via the `Handle(...)` row; inline `media_value` (`OV_MEDIA`) → `null` (lenient) / throws `unsupported` (strict) (:361–368) |
-| `Adt(TaggedHeapHandle { ty, .. })` | `handle_value` with `handle_type = ADT_TAGGED_HEAP_HANDLE` (14); `ty` carries the erased `T` | `baml_bridge.BamlStream<T>` via `BamlStream.fromHandle` — the `handle_type` tag alone picks it (Java does **not** read `ty`). **`BamlStream` LANDED (`a6e3ca99e`)**, llm_functions 21/21. (`$rust_type` shells decode via the `class_value` path, not here.) |
-| `RustData(Arc<dyn Any>)` | `try_convert_rust_data`, else `handle_value` (`UNTAGGED_RUST_DATA`) | converted → recurse; otherwise bare `baml_bridge.BamlHandle` stored in the shell class's private `_handle` field |
-| `HostValue(HostValueArc)` | `handle_value` with `HOST_VALUE_CALLABLE` (15) / `HOST_VALUE_OPAQUE` (16) | **LANDED (`202883518`):** on the error arm a `HOST_VALUE_OPAQUE` throwable is rehydrated **by identity** from the Java-side registry (`lookupHostValue` → original `Throwable` via `sneakyThrow`); a foreign/released key falls through to a metadata `BamlError`. |
+| `Adt(TaggedHeapHandle { ty, .. })` | `handle_value` with `handle_type = ADT_TAGGED_HEAP_HANDLE` (14); `ty` carries the erased `T` | `baml_bridge.BamlStream<T>` via `BamlStream.fromHandle` — the `handle_type` tag alone picks it (Java does **not** read `ty`). **`BamlStream` LANDED (`a6e3ca99e`)**, llm_functions 21/21. |
+| a host value | `handle_value` with `HOST_VALUE_CALLABLE` (15) / `HOST_VALUE_OPAQUE` (16), plus a `pin` | a host callable coming back is the host's own object again (`HostCalls.lookup`; the pin is released at once); any other host value is a `BamlHandle` over the host's key that owns the pin; on the error arm a `HOST_VALUE_OPAQUE` throwable is rehydrated **by identity** from the Java-side registry (`HostCalls.lookup` → original `Throwable` via `sneakyThrow`); a foreign/released key falls through to a metadata `BamlError`. |
 | — | `media_value` (`BamlValueMedia`) inline | lenient → `null`; strict → throws `unsupported` — media always rides `handle_value` on the FFI path (:361–368) |
 | — | `prompt_ast_value` (`BamlValuePromptAst`) inline | lenient → `null`; strict → throws `unsupported` — same rationale (:361–368) |
 

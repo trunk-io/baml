@@ -23,8 +23,8 @@ use baml_compiler2_hir::{
 use baml_type::{DeclName, Interface, ParamTy, Ty};
 
 use crate::extern_loc::{
-    AliasRef, ClassRef, EnumRef, InterfaceRef, extern_alias_loc, extern_alias_row,
-    extern_class_loc, extern_class_row, extern_enum_loc, extern_enum_row, extern_interface_loc,
+    AliasRef, ClassRef, ClassRowBody, EnumRef, InterfaceRef, extern_alias_loc, extern_alias_row,
+    extern_class_loc, extern_class_row, extern_enum_row, extern_interface_loc,
     extern_interface_row, mounted_alias_loc, mounted_class_loc, mounted_enum_loc,
     mounted_interface_loc,
 };
@@ -128,17 +128,6 @@ pub fn enum_head<'db>(db: &'db dyn baml_compiler2_hir::Db, enum_ref: EnumRef<'db
     }
 }
 
-/// The head an interface declaration is spelled by.
-pub fn interface_head<'db>(
-    db: &'db dyn baml_compiler2_hir::Db,
-    interface: InterfaceRef<'db>,
-) -> DeclName {
-    match interface {
-        DeclRef::Source(interface) => crate::lower::interface_qualified_name(db, interface),
-        DeclRef::External(interface) => interface.head(db).clone(),
-    }
-}
-
 /// The head a type alias declaration is spelled by.
 pub fn alias_head<'db>(db: &'db dyn baml_compiler2_hir::Db, alias: AliasRef<'db>) -> DeclName {
     match alias {
@@ -229,24 +218,6 @@ pub fn package_classes(
     )
 }
 
-/// Every enum `root` declares.
-pub fn package_enums(
-    db: &dyn baml_compiler2_hir::Db,
-    root: SourceRoot,
-) -> impl Iterator<Item = EnumRef<'_>> + '_ {
-    use crate::package_interface::ExportedType;
-    package_declarations(
-        db,
-        root,
-        |def| match def {
-            Definition::Enum(enum_loc) => Some(enum_loc),
-            _ => None,
-        },
-        |row| matches!(row, ExportedType::Enum { .. }),
-        extern_enum_loc,
-    )
-}
-
 /// Every interface `root` declares.
 pub fn package_interfaces(
     db: &dyn baml_compiler2_hir::Db,
@@ -302,10 +273,48 @@ pub fn class_fields<'db>(
             .map(|(name, ty, _attrs)| (name.clone(), ty.clone()))
             .collect(),
         DeclRef::External(class) => extern_class_row(db, class)
-            .fields
+            .body
+            .fields()
             .iter()
             .map(|(name, ty, _attrs)| (name.clone(), ty.clone()))
             .collect(),
+    }
+}
+
+/// How an instance of `class` crosses the host boundary: decided here once
+/// for the engine, the code generators and the host-side walker. A
+/// `@@rust_type` class keeps its state in Rust, where no host can read or
+/// build it, so it crosses as its kind says ([`baml_type::ClassCrossing::of_kind`]):
+/// most as a reference to the engine's instance.
+pub fn class_crossing<'db>(
+    db: &'db dyn baml_compiler2_hir::Db,
+    class: ClassRef<'db>,
+) -> baml_type::ClassCrossing {
+    let declared = baml_type::ClassCrossing::of_declaration(
+        baml_compiler2_hir::package::lang_roots(db),
+        &class_head(db, class),
+    );
+    let rust_type = match class {
+        DeclRef::Source(class) => {
+            baml_compiler2_hir::item_data::class_data(db, class)
+                .attrs
+                .rust_type
+        }
+        DeclRef::External(class) => match extern_class_row(db, class).body {
+            ClassRowBody::RustType(kind) => Some(kind),
+            ClassRowBody::Fields(_) => None,
+        },
+    };
+    match rust_type {
+        Some(kind) => {
+            debug_assert_eq!(
+                declared,
+                baml_type::ClassCrossing::Fields,
+                "a `@@rust_type` class has a boundary rule of its own"
+            );
+            baml_type::ClassCrossing::of_kind(kind)
+        }
+        None => declared,
     }
 }
 
@@ -313,7 +322,7 @@ pub fn class_fields<'db>(
 pub fn class_field_count<'db>(db: &'db dyn baml_compiler2_hir::Db, class: ClassRef<'db>) -> usize {
     match class {
         DeclRef::Source(class) => crate::lower::resolve_class_fields(db, class).len(),
-        DeclRef::External(class) => extern_class_row(db, class).fields.len(),
+        DeclRef::External(class) => extern_class_row(db, class).body.fields().len(),
     }
 }
 
@@ -328,7 +337,8 @@ pub fn class_field_index<'db>(
             .iter()
             .position(|(name, ..)| name == field)?,
         DeclRef::External(class) => extern_class_row(db, class)
-            .fields
+            .body
+            .fields()
             .iter()
             .position(|(name, ..)| name == field)?,
     };
@@ -348,7 +358,8 @@ pub fn class_field_ty<'db>(
             .find(|(name, ..)| name == field)
             .map(|(_, ty, _)| ty.clone()),
         DeclRef::External(class) => extern_class_row(db, class)
-            .fields
+            .body
+            .fields()
             .iter()
             .find(|(name, ..)| name == field)
             .map(|(_, ty, _)| ty.clone()),
@@ -485,19 +496,6 @@ pub fn interface_method_names<'db>(
                 .map(|method| method.name.clone())
                 .collect()
         }
-    }
-}
-
-/// How many generic parameters `interface` declares (its frame minus `Self`).
-pub fn interface_generic_arity<'db>(
-    db: &'db dyn baml_compiler2_hir::Db,
-    interface: InterfaceRef<'db>,
-) -> usize {
-    match interface {
-        DeclRef::Source(interface) => baml_compiler2_hir::item_data::interface_data(db, interface)
-            .generic_params
-            .len(),
-        DeclRef::External(interface) => extern_interface_row(db, interface).generic_params.len(),
     }
 }
 

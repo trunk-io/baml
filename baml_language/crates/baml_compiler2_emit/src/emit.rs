@@ -14,6 +14,7 @@ use baml_compiler2_hir::loc::DeclRef;
 use baml_compiler2_hir_ty::{
     extern_loc::{ClassRef, FunctionRef},
     layout,
+    render::Viewpoint,
 };
 use baml_compiler2_mir::{
     BasicBlock, BinOp, BlockId, Constant, IndexKind, IntrinsicOp, Local, LogLevel, MirFunctionBody,
@@ -23,11 +24,12 @@ use baml_compiler2_mir::{
 };
 use baml_type::DeclName;
 use bex_vm_types::{
-    BinOp as VmBinOp, Bytecode, CmpOp, ConstValue, Function, FunctionKind, FunctionOrigin,
-    GlobalIndex, Instruction, Object, ObjectIndex, ObjectPool, UnaryOp as VmUnaryOp,
+    BinOp as VmBinOp, Bytecode, CmpOp, ConstValue, FloatBits, Function, FunctionKind,
+    FunctionOrigin, GlobalIndex, Instruction, Object, ObjectIndex, ObjectPool,
+    UnaryOp as VmUnaryOp,
     bytecode::{
-        ClassInitPlan, DebugLocalScope, FieldCopy, FieldCopySet, InstructionMeta, JumpTableData,
-        LineTableEntry, OperandMeta, SwitchKey, SwitchTable,
+        BlockPcs, ClassInitPlan, DebugLocalScope, FieldCopy, FieldCopySet, InstructionMeta,
+        JumpTableData, LineTableEntry, OperandMeta, SwitchKey, SwitchTable,
     },
 };
 
@@ -286,6 +288,14 @@ struct StackifyCodegen<'db: 'ctx, 'ctx, 'obj, 'w> {
     /// Instruction index where the currently emitted basic block starts.
     current_block_start: usize,
 
+    /// The instruction performing the terminator being emitted (a call, a
+    /// suspension, a raise, a return), for `Bytecode::block_pcs`.
+    terminator_pc: Option<usize>,
+    /// The `block_pcs` statement slots set in the current block since its
+    /// start or the last superinstruction fusion, as `(block, statement)`:
+    /// the only ones a later fusion can still replace (see `fuse_tail`).
+    current_block_statement_pcs: Vec<(usize, usize)>,
+
     /// MIR local types, for field-name resolution and instruction
     /// specialization. Kept at the compiler's head: layout facts are read by
     /// declaration, never through an anchored head.
@@ -323,6 +333,13 @@ struct StackifyCodegen<'db: 'ctx, 'ctx, 'obj, 'w> {
 
     /// Capture slots whose cell may be read or written by a spawned thread.
     spawn_captured_captures: HashSet<usize>,
+    /// Per local: an array iterator compiled as an index walk (O1+).
+    array_walks: Vec<bool>,
+    /// The hidden slot holding each walked iterator's next index.
+    walk_index_slots: HashMap<Local, usize>,
+    /// Which objects only this thread can reach, whose container accesses
+    /// skip the lock. `None` at O0, where every access keeps it.
+    escape: Option<baml_compiler2_mir::escape::EscapeFacts>,
 }
 
 impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
@@ -338,6 +355,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         line_starts: &'ctx [u32],
         ctx: MirCodegenContext<'db, 'ctx, 'obj, 'w>,
         analysis: AnalysisResult<'ctx>,
+        escape: Option<baml_compiler2_mir::escape::EscapeFacts>,
     ) -> Self {
         // Pre-size the hot output buffers from the MIR's shape. `emit` pushes
         // one instruction + one parallel `meta` entry per bytecode op, and a
@@ -380,6 +398,8 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             next_line_discriminator: HashMap::new(),
             next_block: None,
             current_block_start: 0,
+            terminator_pc: None,
+            current_block_statement_pcs: Vec::new(),
             local_types: HashMap::with_capacity(body.locals.len()),
             slot_names: Vec::new(),
             lambda_object_indices: ctx.lambda_object_indices.to_vec(),
@@ -388,7 +408,21 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             captured_locals: HashSet::new(),
             spawn_captured_locals: HashSet::new(),
             spawn_captured_captures: ctx.spawn_capture_indices.clone(),
+            array_walks: if escape.is_some() {
+                baml_compiler2_mir::escape::array_walks(ctx.db, body, arity)
+            } else {
+                Vec::new()
+            },
+            walk_index_slots: HashMap::new(),
+            escape,
         }
+    }
+
+    /// Whether the object `place` evaluates to is provably thread-local.
+    fn thread_local(&self, place: &Place) -> bool {
+        self.escape
+            .as_ref()
+            .is_some_and(|facts| facts.object_is_thread_local(place))
     }
 
     /// Append an object to the pool, returning its program-absolute index
@@ -428,20 +462,20 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             .map(|(name, _)| name.clone())
     }
 
-    /// A MIR template as the program spells it: what operand metadata
-    /// prints. Display only — nothing resolves a declaration from it.
+    /// A MIR template rendered canonically: what operand metadata prints.
+    /// Display only — nothing resolves a declaration from it.
     fn spelled_template(&self, template: &TyTemplate) -> String {
-        let spelling = baml_compiler2_hir::package::spelling(self.db);
+        let viewpoint = Viewpoint::canonical(self.db);
         template
-            .map_heads(&mut |decl: &DeclName| spelling.wire(decl))
+            .map_heads(&mut |decl: &DeclName| viewpoint.wire_head(decl))
             .to_string()
     }
 
-    /// A declaration's display name as the program spells it: what operand
-    /// metadata prints for a class or enum head.
+    /// A declaration's canonical display name: what operand metadata prints
+    /// for a class or enum head.
     fn spelled_head(&self, head: &DeclName) -> String {
-        baml_compiler2_hir::package::spelling(self.db)
-            .wire(head)
+        Viewpoint::canonical(self.db)
+            .wire_head(head)
             .display_name()
             .to_string()
     }
@@ -485,6 +519,14 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     _ => None,
                 }
             }
+            Place::Index {
+                base,
+                index,
+                kind: IndexKind::Tuple,
+            } => {
+                let base_ty = self.resolve_place_type(base)?.strip_null();
+                tuple_slot_type(&base_ty, self.constant_index(*index))
+            }
             Place::Index { base, .. } => {
                 let base_ty = self.resolve_place_type(base)?;
                 match base_ty {
@@ -493,6 +535,23 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     _ => None,
                 }
             }
+        }
+    }
+
+    fn constant_index(&self, index: Local) -> Option<i64> {
+        let index = self.analysis.resolve_copy_source(index);
+        if let Some(RuntimeTy::Literal(baml_type::Literal::Int(value), _)) =
+            self.local_types.get(&index)
+        {
+            return Some(*value);
+        }
+        let du = self.analysis.def_use.get(&index)?;
+        if du.all_defs.len() != 1 {
+            return None;
+        }
+        match &du.def.as_ref()?.rvalue {
+            Rvalue::Use(Operand::Constant(Constant::Int(value))) => Some(*value),
+            _ => None,
         }
     }
 
@@ -598,6 +657,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     || self.operand_reads_spawn_captured_local(right, seen)
             }
             Rvalue::Array(_, elements)
+            | Rvalue::ConcatStrings(elements)
             | Rvalue::Aggregate {
                 fields: elements, ..
             } => elements
@@ -608,7 +668,8 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 .any(|arg| self.operand_reads_spawn_captured_local(arg, seen)),
             Rvalue::Uint8Array(_)
             | Rvalue::LoadType(_)
-            | Rvalue::CurrentPackage(_)
+            | Rvalue::TraceHookSettings { .. }
+            | Rvalue::CurrentPackage
             | Rvalue::MakeGenericFunction { .. } => false,
             Rvalue::MakeGenericFunctionFromValue { value, .. } => {
                 self.operand_reads_spawn_captured_local(value, seen)
@@ -622,6 +683,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             }
             Rvalue::IsType { operand, .. }
             | Rvalue::IsTypeTag { operand, .. }
+            | Rvalue::SatisfiesBound { ty: operand, .. }
             | Rvalue::MakeBoundMethod {
                 receiver: operand, ..
             }
@@ -736,8 +798,27 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             .and_then(|def| self.span_for_statement_ref(def.block, def.statement_ref))
     }
 
+    /// Give the statement defining the virtual `local`, which emitted
+    /// nothing, the PC of its value inlined here from `start` on: the last
+    /// instruction, as for any statement (`emit_block`), at its first use.
+    fn note_inlined_definition(&mut self, local: Local, start: usize) {
+        let end = self.current_pc();
+        let def = self
+            .analysis
+            .def_use
+            .get(&local)
+            .and_then(|du| du.def.as_ref());
+        if let Some(def) = def
+            && let StatementRef::Statement(index) = def.statement_ref
+            && end > start
+        {
+            self.bytecode.block_pcs[def.block.0].statements[index].get_or_insert(end - 1);
+            self.current_block_statement_pcs.push((def.block.0, index));
+        }
+    }
+
     /// Compile a MIR function to bytecode.
-    fn compile(mut self) -> Function {
+    fn compile(mut self, identity: bex_vm_types::types::FunctionIdentity) -> Function {
         let mir = self.body;
         // 1. Allocate stack slots only for real locals
         self.allocate_real_locals(mir);
@@ -829,6 +910,14 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             }
         }
 
+        self.bytecode.block_pcs = mir
+            .blocks
+            .iter()
+            .map(|block| BlockPcs {
+                statements: vec![None; block.statements.len()],
+                ..BlockPcs::default()
+            })
+            .collect();
         for (i, &block_id) in rpo.iter().enumerate() {
             // Track the next *emitted* block for fall-through optimization.
             self.next_block = next_emitted_after[i];
@@ -844,9 +933,14 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             let block_start = self.current_pc();
             self.block_addresses.insert(block_id, block_start);
             self.current_block_start = block_start;
+            self.current_block_statement_pcs.clear();
             let block = mir.block(block_id);
             self.emit_block(block);
-            self.block_end_addresses.insert(block_id, self.current_pc());
+            let block_end = self.current_pc();
+            self.block_end_addresses.insert(block_id, block_end);
+            if block_end > block_start {
+                self.bytecode.block_pcs[block_id.0].start = Some(block_start);
+            }
         }
 
         // If any pending edges target dead-unreachable MIR blocks, patch them
@@ -864,13 +958,11 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         let debug_locals = Self::build_debug_locals(mir, &self.local_slots);
 
         // 5. Build the Function
-        // Note: `name` is set by the caller after `compile_mir_function` returns.
         // `span` is set by `compile_mir_function` from the MIR function span.
         Function {
-            name: String::new(),
+            identity,
             source_file: String::new(), // caller sets this after compile_mir_function returns
             docstring: None,
-            declared_name: None,
             arity: self.arity,
             real_local_count: self.real_local_count,
             bytecode: self.bytecode,
@@ -878,6 +970,8 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             telemetry_function_id: None,
             telemetry_registration: bex_vm_types::FunctionRegistration::default(),
             telemetry_policy_id: bex_vm_types::TelemetryPolicyId::none(),
+            hotswap_redirect: bex_vm_types::types::HotswapRedirect::default(),
+            compiled_body: None,
             local_names: self.slot_names,
             debug_locals,
             span: Span::fake(),
@@ -892,11 +986,10 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             display_return_type: "null".to_string(),
             throws_type: bex_vm_types::TyTemplate::Never,
             origin: FunctionOrigin::Internal,
-            is_interface_body: false, // set from the item tree by attach_function_metadata
             native_key: None,
             body_meta: None,
-
-            runtime_package: bex_vm_types::HeapPtr::null(),
+            trace_passthrough: false,
+            owner: bex_vm_types::HeapPtr::null(),
         }
     }
 
@@ -939,8 +1032,72 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             }
         }
 
+        // A walked iterator's slot holds its array; its index gets a slot of
+        // its own, which no MIR local names.
+        self.walk_index_slots.clear();
+        for (idx, &walk) in self.array_walks.iter().enumerate() {
+            if walk && self.local_slots.contains_key(&Local(idx)) {
+                self.walk_index_slots.insert(Local(idx), next_slot);
+                next_slot += 1;
+                slots_to_allocate += 1;
+            }
+        }
+
         // VM pre-allocates these slots when entering the frame.
         self.real_local_count = slots_to_allocate;
+    }
+
+    /// `it = xs.iter()` or `x = it.next()` on a walked iterator, emitted as
+    /// the index walk; `false` when the call is not one.
+    fn emit_array_walk_step(
+        &mut self,
+        method: &str,
+        args: &[Operand<'ctx>],
+        destination: &Place,
+        target: baml_compiler2_mir::BlockId,
+    ) -> bool {
+        let (
+            [Operand::Copy(Place::Local(receiver)) | Operand::Move(Place::Local(receiver))],
+            Place::Local(result),
+        ) = (args, destination)
+        else {
+            return false;
+        };
+        match method {
+            "iter" => {
+                let Some(&index) = self.walk_index_slots.get(result) else {
+                    return false;
+                };
+                // The iterator's slot holds the array; the walk starts at 0.
+                unwrap_infallible(pull_semantics::walk_call_direct_args(self, args));
+                self.emit_store_place(destination);
+                self.emit_constant(&Constant::Int(0));
+                let inst = self.emit(Instruction::StoreVar(index));
+                self.terminator_pc = Some(inst);
+            }
+            "next" => {
+                let (Some(&index), Some(&iterator)) = (
+                    self.walk_index_slots.get(receiver),
+                    self.local_slots.get(receiver),
+                ) else {
+                    return false;
+                };
+                let thread_local = self
+                    .escape
+                    .as_ref()
+                    .is_some_and(|facts| facts.contents_are_thread_local(*receiver));
+                let inst = self.emit(if thread_local {
+                    Instruction::ArrayIterNextLocal { iterator, index }
+                } else {
+                    Instruction::ArrayIterNext { iterator, index }
+                });
+                self.terminator_pc = Some(inst);
+                self.emit_store_place(destination);
+            }
+            _ => return false,
+        }
+        self.emit_jump_unless_fallthrough(target);
+        true
     }
 
     /// Get current program counter (next instruction index).
@@ -1085,8 +1242,13 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
     /// Emit a store to a (non-captured) local slot, folding `StoreVar(a);
     /// StoreVar(slot)` into `StoreVar2(a, slot)` (`STORE_FAST_STORE_FAST`).
     /// In-place rewrite confined to the current basic block, like
-    /// [`Self::emit_load_var`].
+    /// [`Self::emit_load_var`]. `LoadVar(src); LoadConst(k); AddInt;
+    /// StoreVar(slot)` with a small int `k` becomes
+    /// `AddLocalSmall(slot, src, k)` instead.
     fn emit_store_var(&mut self, slot: usize) {
+        if self.try_fuse_add_local_small(slot) {
+            return;
+        }
         // See `emit_load_var`: don't fuse across a pending sequence point.
         let n = self.bytecode.instructions.len();
         if n > self.current_block_start && !self.pending_sequence_point {
@@ -1098,6 +1260,127 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         }
         let inst = self.emit(Instruction::StoreVar(slot));
         self.set_var_operand(inst, slot);
+    }
+
+    /// Fuse the `LoadVar(src); LoadConst(k); AddInt` just emitted, `k` an
+    /// int that fits `i8`, with the `StoreVar(dst)` being emitted into
+    /// `AddLocalSmall(dst, src, k)`: the shape of `i += 1`.
+    fn try_fuse_add_local_small(&mut self, dst: usize) -> bool {
+        let n = self.bytecode.instructions.len();
+        if self.pending_sequence_point || n < self.current_block_start + 3 {
+            return false;
+        }
+        let first = n - 3;
+        let [
+            Instruction::LoadVar(src),
+            Instruction::LoadConst(constant),
+            Instruction::AddInt,
+        ] = self.bytecode.instructions[first..]
+        else {
+            return false;
+        };
+        let Some(&ConstValue::Int(addend)) = self.bytecode.constants.get(constant) else {
+            return false;
+        };
+        let Ok(addend) = i8::try_from(addend) else {
+            return false;
+        };
+        // `AddInt` is the step that can raise.
+        let span = self.span_at(n - 1);
+        self.fuse_tail(first, Instruction::AddLocalSmall(dst, src, addend), span)
+    }
+
+    /// The span a fused instruction that cannot raise a user-visible error
+    /// takes when it starts at `first`: the span of a sequence point there,
+    /// which it must keep, else `span`.
+    fn span_keeping_sequence_point(&self, first: usize, span: Option<Span>) -> Option<Span> {
+        self.bytecode
+            .line_table
+            .iter()
+            .rev()
+            .take_while(|entry| entry.pc >= first)
+            .find(|entry| entry.pc == first && entry.sequence_point)
+            .map_or(span, |entry| Some(entry.span))
+    }
+
+    /// The source span in effect for the instruction at `index`.
+    fn span_at(&self, index: usize) -> Option<Span> {
+        self.bytecode
+            .line_table
+            .iter()
+            .rev()
+            .find(|entry| entry.pc <= index)
+            .map(|entry| entry.span)
+    }
+
+    /// Replace the instructions from `first` on, all in the current basic
+    /// block, with the superinstruction `fused`, which takes `span`: the
+    /// span of the one replaced step that can raise, so errors keep their
+    /// source location. Declines, changing nothing, when that would drop a
+    /// sequence point or move one to another span.
+    fn fuse_tail(&mut self, first: usize, fused: Instruction, span: Option<Span>) -> bool {
+        debug_assert!(first >= self.current_block_start);
+        let from = self
+            .bytecode
+            .line_table
+            .partition_point(|entry| entry.pc < first);
+        let replaced = &self.bytecode.line_table[from..];
+        if replaced
+            .iter()
+            .any(|entry| entry.sequence_point && (entry.pc != first || Some(entry.span) != span))
+        {
+            return false;
+        }
+        let sequence_point = replaced
+            .first()
+            .filter(|entry| entry.sequence_point)
+            .cloned();
+        // A statement whose final instruction was replaced now ends in the
+        // superinstruction, which runs that instruction's operation.
+        let end = self.bytecode.instructions.len();
+        let replaced_pcs = first + 1..end;
+        if !replaced_pcs.is_empty() {
+            for &(block, statement) in &self.current_block_statement_pcs {
+                if let Some(pc) = &mut self.bytecode.block_pcs[block].statements[statement]
+                    && replaced_pcs.contains(pc)
+                {
+                    *pc = first;
+                }
+            }
+        }
+        // No later fusion reaches back past the superinstruction at `first`:
+        // every fused shape is made of plain instructions only. The slots
+        // seen so far are settled, so each is visited at most once.
+        self.current_block_statement_pcs.clear();
+        if let Some(pc) = &mut self.terminator_pc
+            && replaced_pcs.contains(pc)
+        {
+            *pc = first;
+        }
+        self.bytecode.line_table.truncate(from);
+        self.bytecode.instructions.truncate(first);
+        self.bytecode.meta.truncate(first);
+        self.bytecode.instructions.push(fused);
+        self.bytecode.meta.push(InstructionMeta { operand: None });
+        if let Some(entry) = sequence_point {
+            self.bytecode.line_table.push(entry);
+        } else if let Some(span) = span
+            && self
+                .bytecode
+                .line_table
+                .last()
+                .is_none_or(|entry| entry.span != span)
+        {
+            let line = self.span_to_line(span, false);
+            self.bytecode.line_table.push(LineTableEntry {
+                pc: first,
+                span,
+                line,
+                sequence_point: false,
+                discriminator: 0,
+            });
+        }
+        true
     }
 
     /// Set the resolved operand metadata for an already-emitted instruction.
@@ -1163,13 +1446,71 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         if matches!(resolved_else, PendingJumpTarget::Block(block) if Some(block) == self.next_block)
         {
             let target = self.resolve_pending_target(then_block);
-            let jump = self.emit(Instruction::PopJumpIfTrue(0));
+            let jump = self.emit_conditional_jump(true);
             self.pending_jumps.push((jump, target));
         } else {
-            let jump = self.emit(Instruction::PopJumpIfFalse(0));
+            let jump = self.emit_conditional_jump(false);
             self.pending_jumps.push((jump, resolved_else));
             self.emit_jump_unless_fallthrough(then_block);
         }
+    }
+
+    /// Emit `PopJumpIfTrue` (`jump_if`) or `PopJumpIfFalse`, to be patched,
+    /// and return its index. An int comparison just emitted on two locals
+    /// (`LoadVar2(a, b); CmpIntOp`) or on a local and a constant
+    /// (`LoadVar(a); LoadConst(c); CmpIntOp`) fuses with it into one
+    /// compare-and-branch; `PopJumpIfFalse` becomes the negated comparison.
+    fn emit_conditional_jump(&mut self, jump_if: bool) -> usize {
+        let n = self.bytecode.instructions.len();
+        if !self.pending_sequence_point {
+            let cmp_for = |cmp: CmpOp| if jump_if { cmp } else { cmp.negated_int() };
+            let tail = &self.bytecode.instructions[self.current_block_start..];
+            let fused = match tail {
+                [.., Instruction::LoadVar2(a, b), Instruction::CmpIntOp(cmp)] => Some((
+                    n - 2,
+                    Instruction::JumpIfLocalsCmp {
+                        cmp: cmp_for(*cmp),
+                        a: *a,
+                        b: *b,
+                        offset: 0,
+                    },
+                )),
+                [
+                    ..,
+                    Instruction::LoadVar(a),
+                    Instruction::LoadConst(constant),
+                    Instruction::CmpIntOp(cmp),
+                ] if matches!(
+                    self.bytecode.constants.get(*constant),
+                    Some(ConstValue::Int(_))
+                ) =>
+                {
+                    Some((
+                        n - 3,
+                        Instruction::JumpIfLocalConstCmp {
+                            cmp: cmp_for(*cmp),
+                            a: *a,
+                            constant: *constant,
+                            offset: 0,
+                        },
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((first, branch)) = fused {
+                // Nothing in it can raise; it takes the comparison's span,
+                // or that of a sequence point it starts with.
+                let span = self.span_keeping_sequence_point(first, self.span_at(n - 1));
+                if self.fuse_tail(first, branch, span) {
+                    return first;
+                }
+            }
+        }
+        self.emit(if jump_if {
+            Instruction::PopJumpIfTrue(0)
+        } else {
+            Instruction::PopJumpIfFalse(0)
+        })
     }
 
     /// Emit an unconditional jump to a target, even when the target is the
@@ -1222,18 +1563,30 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
     // Block Emission
     // ========================================================================
 
-    /// Emit a basic block.
+    /// Emit a basic block, recording where its statements and terminator
+    /// landed (`Bytecode::block_pcs`).
     fn emit_block(&mut self, block: &BasicBlock<'ctx>) {
-        // Emit all statements
-        for stmt in &block.statements {
+        // Emit all statements. A statement's PC is its last instruction,
+        // where its final operation runs: the line bytecode reports for an
+        // error it raises. One that emits nothing (a definition inlined at its
+        // use) gets its PC where it is inlined (`pull_local`).
+        for (index, stmt) in block.statements.iter().enumerate() {
             self.set_debug_span(stmt.span, true);
+            let start = self.current_pc();
             self.emit_statement(&stmt.kind);
+            let end = self.current_pc();
+            if end > start {
+                self.bytecode.block_pcs[block.id.0].statements[index] = Some(end - 1);
+                self.current_block_statement_pcs.push((block.id.0, index));
+            }
         }
 
         // Emit terminator
         if let Some(term) = &block.terminator {
             self.set_debug_span(block.terminator_span, true);
-            self.emit_terminator(term);
+            self.terminator_pc = None;
+            self.emit_terminator(block.id, term);
+            self.bytecode.block_pcs[block.id.0].terminator = self.terminator_pc.take();
         }
     }
 
@@ -1268,6 +1621,10 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     self,
                     destination,
                     value,
+                    |sink, value| {
+                        sink.emit_rvalue_pull(value);
+                        Ok(())
+                    },
                 )) {
                     return;
                 }
@@ -1330,6 +1687,20 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             }
             StatementKind::Intrinsic { op, args } => {
                 match op {
+                    IntrinsicOp::BuiltinTraceHook(mode) => {
+                        use baml_compiler2_mir::BuiltinTraceHook;
+                        self.emit(match mode {
+                            BuiltinTraceHook::Hidden => Instruction::TraceHookHidden,
+                            BuiltinTraceHook::Timing => Instruction::TraceHookTiming,
+                            BuiltinTraceHook::Span => Instruction::TraceHookSpan,
+                            BuiltinTraceHook::Rich => Instruction::TraceHookRich,
+                            BuiltinTraceHook::EmptySpan => Instruction::TraceHookEmptySpan,
+                        });
+                    }
+                    IntrinsicOp::ApplyTraceHook => {
+                        self.emit_operand_pull(&args[0]);
+                        self.emit(Instruction::EndTraceHook);
+                    }
                     IntrinsicOp::BindType(slot) => {
                         let [value] = args.as_slice() else {
                             unreachable!("`BindType` carries exactly one operand")
@@ -1450,7 +1821,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
     }
 
     fn emit_init_instance(&mut self, class: ClassRef<'ctx>, ntypeargs: u16, field_count: usize) {
-        let class_name = &baml_compiler2_mir::class_link_name(self.db, class);
+        let class_name = &baml_compiler2_mir::class_display_name(self.db, class);
         let class_obj_idx = self.refs.class(class);
         let fields = (0..field_count).collect::<Vec<_>>();
         let display_fields = fields
@@ -1635,13 +2006,13 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         let name = self.resolve_field_name(base, *field);
         unwrap_infallible(pull_semantics::walk_place_pull(self, base));
         self.emit(Instruction::Copy(0));
-        unwrap_infallible(self.load_field(*field, &name));
+        unwrap_infallible(self.load_field(*field, &name, base));
         self.emit_operand_pull(right);
         let instruction = self
             .try_specialize_binary_op(*op, left, right)
             .unwrap_or_else(|| Self::binop_instruction(*op));
         self.emit(instruction);
-        unwrap_infallible(self.store_field_value(*field, &name));
+        unwrap_infallible(self.store_field_value(*field, &name, base));
         true
     }
 
@@ -1688,17 +2059,41 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 return;
             }
         }
-        if let Rvalue::MakeBoundMethod { func, receiver } = rvalue {
-            // Emit the receiver onto the stack first.
-            self.emit_operand_pull(receiver);
+        if let Rvalue::MakeBoundMethod {
+            func,
+            receiver,
+            frame,
+        } = rvalue
+        {
             // Resolve the method to its GlobalIndex.
             let global_idx = self.function_global_index(*func, "MakeBoundMethod: global not found");
-            let inst = self.emit(Instruction::MakeBoundMethod(GlobalIndex::from_raw(
-                global_idx,
-            )));
+            let function = GlobalIndex::from_raw(global_idx);
+            let inst = match frame {
+                baml_compiler2_mir::BoundFrame::Receiver => {
+                    self.emit_operand_pull(receiver);
+                    self.emit(Instruction::MakeBoundMethod(function))
+                }
+                baml_compiler2_mir::BoundFrame::Explicit(type_arg_templates) => {
+                    // The frame (each slot resolved against the enclosing
+                    // frame by `LoadType`), then the receiver on top - the
+                    // opcode pops in reverse.
+                    for template in type_arg_templates {
+                        let anchored = self.refs.anchor_template(template);
+                        let const_idx = self.add_constant(ConstValue::Type(anchored));
+                        let inst = self.emit(Instruction::LoadType(const_idx));
+                        self.set_operand(inst, OperandMeta::Const(self.spelled_template(template)));
+                    }
+                    self.emit_operand_pull(receiver);
+                    self.emit(Instruction::MakeGenericBoundMethod {
+                        function,
+                        ntypeargs: u16::try_from(type_arg_templates.len())
+                            .expect("ntypeargs fits in u16"),
+                    })
+                }
+            };
             self.set_operand(
                 inst,
-                OperandMeta::Global(baml_compiler2_mir::function_link_name(self.db, *func)),
+                OperandMeta::Global(baml_compiler2_mir::function_display_name(self.db, *func)),
             );
             return;
         }
@@ -1743,7 +2138,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             // Stack layout mirrors `MakeVirtualBoundMethod` with the `Self`
             // TYPE in the receiver's slot: `Self`, then the method-level type
             // args (already `Object::Type` OPERANDS — every one of them a
-            // `LoadType` temp, a scoped `type T = …` slot included),
+            // `LoadType` temp, a scoped `let type T = …` slot included),
             // then the interface type, then the method name — the opcode pops
             // in reverse.
             let self_template = self.refs.anchor_template(self_ty);
@@ -1794,6 +2189,17 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         unwrap_infallible(pull_semantics::walk_rvalue_pull(self, rvalue));
     }
 
+    /// Whether `func` is `baml.ops.equals_equals`, the `==` driver, whose
+    /// direct calls become [`Instruction::CallEquals`].
+    fn is_equals_driver(&self, func: FunctionRef<'ctx>) -> bool {
+        baml_compiler2_hir_ty::callable::lang_function(
+            self.db,
+            baml_base::LangPackage::Baml,
+            &["ops"],
+            "equals_equals",
+        ) == Some(func)
+    }
+
     /// The global slot `func` links as, or `None` when this program slots
     /// nothing for it — [`Self::slots`] is the one registry, keyed by
     /// declaration identity on both lanes. A `None` is a callee the program
@@ -1809,7 +2215,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         {
             panic!(
                 "interface body has no Pass-1 slot: {}",
-                baml_compiler2_mir::function_link_name(self.db, func)
+                baml_compiler2_mir::function_display_name(self.db, func)
             );
         }
         // A method an impl of a SERVED package provides is slotted by no lane:
@@ -1823,7 +2229,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 "internal compiler error: `{}` is provided by an impl of a package served from \
                  its interface, so no lane slots it; it must be reached through its impl rule, \
                  never referenced directly",
-                baml_compiler2_mir::function_link_name(self.db, func)
+                baml_compiler2_mir::function_display_name(self.db, func)
             );
         }
         slot
@@ -1835,7 +2241,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         self.try_function_global_index(func).unwrap_or_else(|| {
             panic!(
                 "{what}: {}",
-                baml_compiler2_mir::function_link_name(self.db, func)
+                baml_compiler2_mir::function_display_name(self.db, func)
             )
         })
     }
@@ -1857,7 +2263,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         func: FunctionRef<'ctx>,
         type_args: &[baml_compiler2_mir::RealizedTy],
     ) {
-        let name_str = baml_compiler2_mir::function_link_name(self.db, func);
+        let name_str = baml_compiler2_mir::function_display_name(self.db, func);
         let global_idx = self.function_global_index(func, "undefined function");
         let gidx = GlobalIndex::from_raw(global_idx);
         // The pooled object carries runtime heads; anchor once and compare in
@@ -1912,7 +2318,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 self.set_operand(inst, OperandMeta::Const(operand_str));
             }
             Constant::Float(v) => {
-                let idx = self.add_constant(ConstValue::Float(*v));
+                let idx = self.add_constant(ConstValue::Float(FloatBits::new(*v)));
                 let inst = self.emit(Instruction::LoadConst(idx));
                 self.set_operand(inst, OperandMeta::Const(bex_vm_types::format_float(*v)));
             }
@@ -1950,12 +2356,9 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 self.emit_pooled_function_value(*func, &[]);
             }
             Constant::GlobalItem(binding) => {
-                // A top-level `let` (a client, ...): read the value `$init`
-                // stored in its slot, unwrapped.
-                let name_str = baml_compiler2_mir::definition_link_name(
-                    self.db,
-                    baml_compiler2_hir::contributions::Definition::Let(*binding),
-                );
+                // A top-level `let` (a global variable, a client, ...): read
+                // the value `$init` stored in its slot, unwrapped.
+                let name_str = baml_compiler2_mir::global_display_name(self.db, *binding);
                 let global_idx = self.refs.let_global(*binding).raw();
                 let inst = self.emit(Instruction::LoadGlobal(GlobalIndex::from_raw(global_idx)));
                 self.set_operand(inst, OperandMeta::Global(name_str));
@@ -1966,7 +2369,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 self.emit_pooled_function_value(*func, type_args);
             }
             Constant::EnumVariant { enum_ref, index } => {
-                let enum_name_str = baml_compiler2_mir::enum_link_name(self.db, *enum_ref);
+                let enum_name_str = baml_compiler2_mir::enum_display_name(self.db, *enum_ref);
                 // TIR admitted the enum and MIR resolved it to a declaration
                 // (`enum_ref_of`), so the resolver answers with its object: a
                 // local ordinal for this package's own enum, an import
@@ -1974,23 +2377,24 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 // never a `Null` where a variant belongs.
                 let enum_obj_idx = self.refs.enum_(*enum_ref);
 
-                // The discriminant travels in the constant; the name is
+                // The discriminant travels in the instruction; the name is
                 // rendered from the declaration only for operand metadata.
+                let variant = usize::try_from(*index).expect("u32 fits usize");
                 let variant_str = layout::enum_variants(self.db, *enum_ref)
-                    .get(usize::try_from(*index).expect("u32 fits usize"))
+                    .get(variant)
                     .map(ToString::to_string)
                     .unwrap_or_else(|| {
                         panic!("internal error: `{enum_name_str}` declares no variant #{index}")
                     });
 
-                let idx = self.add_constant(ConstValue::Int(i64::from(*index)));
-                let lc_inst = self.emit(Instruction::LoadConst(idx));
+                let inst = self.emit(Instruction::LoadVariant {
+                    enum_obj: enum_obj_idx,
+                    variant,
+                });
                 self.set_operand(
-                    lc_inst,
+                    inst,
                     OperandMeta::Const(format!("{enum_name_str}.{variant_str}")),
                 );
-                let inst = self.emit(Instruction::AllocVariant(enum_obj_idx));
-                self.set_operand(inst, OperandMeta::Object(enum_name_str));
             }
         }
     }
@@ -2102,7 +2506,8 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             | TyTemplate::TypeArgRef(_)
             | TyTemplate::Interface(..)
             | TyTemplate::AssociatedTypeProjection { .. }
-            | TyTemplate::Union(..) => emit_structural(self, ty_template),
+            | TyTemplate::Union(..)
+            | TyTemplate::Tuple(..) => emit_structural(self, ty_template),
 
             // ── Function signatures ──────────────────────────────────────────
             // Signature-precise, via the same value matcher every other
@@ -2150,11 +2555,9 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             | TyTemplate::Uint8Array
             | TyTemplate::Enum(..)
             | TyTemplate::EnumVariant(..)
-            | TyTemplate::RustType
             | TyTemplate::Type
             | TyTemplate::Resource
             | TyTemplate::PromptAst
-            | TyTemplate::Void
             | TyTemplate::TypeAlias(..)
             | TyTemplate::Never) => {
                 // A fully-realized leaf (primitive, enum, alias, literal, ...):
@@ -2181,12 +2584,12 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 } else if let Some(tag) = realized_type_tag(realized) {
                     let c = self.add_constant(ConstValue::Int(tag));
                     let inst = self.emit(Instruction::IsType(c));
-                    let spelling = baml_compiler2_hir::package::spelling(self.db);
+                    let viewpoint = Viewpoint::canonical(self.db);
                     self.set_operand(
                         inst,
                         OperandMeta::Const(
                             realized
-                                .map_heads(&mut |decl: &DeclName| spelling.wire(decl))
+                                .map_heads(&mut |decl: &DeclName| viewpoint.wire_head(decl))
                                 .to_string(),
                         ),
                     );
@@ -2218,7 +2621,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
     }
 
     /// Emit a terminator.
-    fn emit_terminator(&mut self, term: &Terminator<'ctx>) {
+    fn emit_terminator(&mut self, block: baml_compiler2_mir::BlockId, term: &Terminator<'ctx>) {
         match term {
             Terminator::Goto { target } => {
                 // Skip jump if target is the next block (fall-through)
@@ -2303,7 +2706,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
             Terminator::Return => {
                 // Use pull model for return value - if _0 is Virtual, inline it
                 unwrap_infallible(pull_semantics::walk_return_value(self));
-                self.emit(Instruction::Return);
+                self.terminator_pc = Some(self.emit(Instruction::Return));
             }
 
             Terminator::Call {
@@ -2335,9 +2738,42 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                         self.emit(Instruction::SetCallTrace);
                     }
 
-                    let instruction = Instruction::Call {
-                        callee: global_callee,
-                        ntypeargs,
+                    let hooked = callee_item.is_some_and(|function| match function {
+                        baml_compiler2_hir::loc::DeclRef::Source(function) => {
+                            baml_compiler2_hir::item_data::function_trace_hook(self.db, function)
+                                .is_some()
+                        }
+                        baml_compiler2_hir::loc::DeclRef::External(_) => false,
+                    });
+                    let thread_local = self
+                        .escape
+                        .as_ref()
+                        .is_some_and(|facts| facts.calls_thread_local_twin(block));
+                    let instruction = if hooked {
+                        Instruction::CallHooked {
+                            callee: global_callee,
+                            ntypeargs,
+                        }
+                    } else if !*has_trace
+                        && ntypeargs == 0
+                        && argument_layout.is_none()
+                        && args.len() == 2
+                        && callee_item.is_some_and(|func| self.is_equals_driver(func))
+                    {
+                        // `==`: the VM decides the common pairs in place and
+                        // calls the driver for the rest.
+                        Instruction::CallEquals(global_callee)
+                    } else if thread_local {
+                        // A builtin on a thread-local receiver: its lock-free twin.
+                        Instruction::CallLocal {
+                            callee: global_callee,
+                            ntypeargs,
+                        }
+                    } else {
+                        Instruction::Call {
+                            callee: global_callee,
+                            ntypeargs,
+                        }
                     };
                     // Pulling nested argument producers may install their own
                     // debug spans. Restore the terminator's enclosing call span
@@ -2345,11 +2781,12 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     // the offending call rather than its final nested operand.
                     self.set_debug_span(call_span, false);
                     let inst = self.emit(instruction);
+                    self.terminator_pc = Some(inst);
                     self.record_call_layout(inst, argument_layout.as_ref());
                     if let Some(func) = callee_item {
                         self.set_operand(
                             inst,
-                            OperandMeta::Callable(baml_compiler2_mir::function_link_name(
+                            OperandMeta::Callable(baml_compiler2_mir::function_display_name(
                                 self.db, func,
                             )),
                         );
@@ -2372,6 +2809,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     let instruction = Instruction::CallIndirect;
                     self.set_debug_span(call_span, false);
                     let inst = self.emit(instruction);
+                    self.terminator_pc = Some(inst);
                     self.record_call_layout(inst, argument_layout.as_ref());
                     self.emit_store_place(destination);
                     self.emit_jump_unless_fallthrough(*target);
@@ -2390,6 +2828,12 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 target,
                 unwind: _,
             } => {
+                if !*has_trace
+                    && *ntypeargs == 0
+                    && self.emit_array_walk_step(method, args, destination, *target)
+                {
+                    return;
+                }
                 // Push the method type args then the value args (declared
                 // order), then the interface type, then the method name — the
                 // layout `OpCode::VirtualCall` expects: it pops the method name,
@@ -2397,12 +2841,24 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 // reads value arg `self_arg` to resolve the impl at runtime.
                 let value_args = &args[..args.len() - usize::from(*has_trace)];
                 unwrap_infallible(pull_semantics::walk_call_direct_args(self, value_args));
-                let iface_template = self.refs.anchor_template(&iface.to_template());
+                // The VM picks the impl from the interface and its input
+                // arguments; associated-type bindings are outputs and select
+                // nothing, so the operand leaves them out. Without them it is
+                // a constant type wherever the input arguments are: an
+                // iterator adapter's `self.source.next()` names
+                // `Iterator<Item = T>`, which otherwise rebuilds from the
+                // frame's type arguments on every call.
+                let dispatch_iface = TyTemplate::interface(
+                    iface.name.clone(),
+                    iface.generics.clone(),
+                    Box::default(),
+                );
+                let iface_template = self.refs.anchor_template(&dispatch_iface);
                 let iface_const = self.add_constant(ConstValue::Type(iface_template));
                 let inst = self.emit(Instruction::LoadType(iface_const));
                 self.set_operand(
                     inst,
-                    OperandMeta::Const(self.spelled_template(&iface.to_template())),
+                    OperandMeta::Const(self.spelled_template(&dispatch_iface)),
                 );
                 self.emit_constant(&Constant::String(method.clone()));
                 if *has_trace {
@@ -2424,6 +2880,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                     self_arg,
                 };
                 let inst = self.emit(instruction);
+                self.terminator_pc = Some(inst);
                 self.record_call_layout(inst, argument_layout.as_ref());
                 self.set_operand(inst, OperandMeta::Callable(method.clone()));
                 self.emit_store_place(destination);
@@ -2435,7 +2892,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 // This should never happen - if it does, there's a bug in the
                 // compiler or type system (e.g., non-exhaustive match incorrectly
                 // marked as exhaustive).
-                self.emit(Instruction::Unreachable);
+                self.terminator_pc = Some(self.emit(Instruction::Unreachable));
             }
 
             Terminator::SysOp {
@@ -2462,10 +2919,11 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 unwrap_infallible(pull_semantics::walk_call_direct_args(self, args));
 
                 let inst = self.emit(Instruction::SysOp(global_callee));
+                self.terminator_pc = Some(inst);
                 if let Some(func) = callee_item {
                     self.set_operand(
                         inst,
-                        OperandMeta::Callable(baml_compiler2_mir::function_link_name(
+                        OperandMeta::Callable(baml_compiler2_mir::function_display_name(
                             self.db, func,
                         )),
                     );
@@ -2485,7 +2943,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 let spawn_span = self.current_debug_span;
                 self.emit_operand_pull(plan);
                 self.restore_debug_span(spawn_span);
-                self.emit(Instruction::Spawn);
+                self.terminator_pc = Some(self.emit(Instruction::Spawn));
                 self.emit_store_place(future);
                 self.emit_jump_unless_fallthrough(*resume);
             }
@@ -2499,7 +2957,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 let await_span = self.current_debug_span;
                 unwrap_infallible(pull_semantics::walk_await_future(self, future));
                 self.restore_debug_span(await_span);
-                self.emit(Instruction::Await);
+                self.terminator_pc = Some(self.emit(Instruction::Await));
 
                 self.emit_store_place(destination);
                 self.emit_jump_unless_fallthrough(*target);
@@ -2514,7 +2972,7 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 // Push the array of futures, then AWAIT_ANY pops it and pushes
                 // the winning `int` index (BEP-034 `baml.future.__await_any`).
                 self.emit_operand_pull(futures);
-                self.emit(Instruction::AwaitAny);
+                self.terminator_pc = Some(self.emit(Instruction::AwaitAny));
 
                 self.emit_store_place(destination);
                 self.emit_jump_unless_fallthrough(*target);
@@ -2526,27 +2984,14 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 let throw_span = self.current_debug_span;
                 self.emit_operand_pull(value);
                 self.restore_debug_span(throw_span);
-                self.emit(Instruction::Throw);
+                self.terminator_pc = Some(self.emit(Instruction::Throw));
             }
             Terminator::Rethrow { value, context } => {
                 let throw_span = self.current_debug_span;
                 self.emit_operand_pull(value);
                 self.emit_operand_pull(context);
                 self.restore_debug_span(throw_span);
-                self.emit(Instruction::Rethrow);
-            }
-
-            Terminator::ThrowIfPanic {
-                value,
-                context,
-                otherwise,
-            } => {
-                let throw_span = self.current_debug_span;
-                self.emit_operand_pull(value);
-                self.emit_operand_pull(context);
-                self.restore_debug_span(throw_span);
-                self.emit(Instruction::ThrowIfPanic);
-                self.emit_jump_unless_fallthrough(*otherwise);
+                self.terminator_pc = Some(self.emit(Instruction::Rethrow));
             }
 
             Terminator::ShortCircuit {
@@ -2694,6 +3139,20 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
                 self.bytecode.instructions[instruction_idx] =
                     Instruction::JumpIfNotNullOrPop(offset);
             }
+            Instruction::JumpIfLocalsCmp { cmp, a, b, .. } => {
+                self.bytecode.instructions[instruction_idx] =
+                    Instruction::JumpIfLocalsCmp { cmp, a, b, offset };
+            }
+            Instruction::JumpIfLocalConstCmp {
+                cmp, a, constant, ..
+            } => {
+                self.bytecode.instructions[instruction_idx] = Instruction::JumpIfLocalConstCmp {
+                    cmp,
+                    a,
+                    constant,
+                    offset,
+                };
+            }
             _ => panic!("expected jump instruction at index {instruction_idx}"),
         }
     }
@@ -2774,6 +3233,9 @@ impl<'db: 'ctx, 'ctx, 'obj, 'w> StackifyCodegen<'db, 'ctx, 'obj, 'w> {
         }
         for (start_pc, end_pc, handler) in coalesced {
             let (handler_pc, error_slot, context_slot) = self.landing_slots(mir, handler);
+            // A landing can be an empty redirect block. Native catches need
+            // the same resolved handler address as the exception table.
+            self.bytecode.block_pcs[handler.0].start = Some(handler_pc);
             self.bytecode.exception_table.push(ExceptionTableEntry {
                 start_pc,
                 end_pc,
@@ -3192,6 +3654,7 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
                 // expression, not to its last inlined operand.
                 let consumer_span = self.current_debug_span;
                 self.set_debug_span(self.def_span_for_local(local), false);
+                let start = self.current_pc();
                 // Inline the definition rvalue at use site.
                 let rvalue = self.analysis.def_use[&local]
                     .def
@@ -3219,6 +3682,7 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
                 } else {
                     pull_semantics::walk_rvalue_pull(self, &rvalue)?;
                 }
+                self.note_inlined_definition(local, start);
                 self.restore_debug_span(consumer_span);
                 LocalPullAction::Done
             }
@@ -3249,14 +3713,54 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
         Ok(action)
     }
 
-    fn load_field(&mut self, field: usize, name: &str) -> Result<(), Self::Error> {
-        let idx = self.emit(Instruction::LoadField(field));
+    fn load_field(&mut self, field: usize, name: &str, base: &Place) -> Result<(), Self::Error> {
+        let thread_local = self.thread_local(base);
+        // `LoadVar(slot); LoadField(field)` becomes `LoadVarField(slot,
+        // field)`, which takes the field load's span. A field load raises
+        // only internal errors (a well-typed program cannot reach them), so
+        // a statement-start sequence point on the `LoadVar` keeps its span.
+        let n = self.bytecode.instructions.len();
+        if !self.pending_sequence_point
+            && n > self.current_block_start
+            && let Instruction::LoadVar(slot) = self.bytecode.instructions[n - 1]
+        {
+            let fused = if thread_local {
+                Instruction::LoadVarFieldLocal(slot, field)
+            } else {
+                Instruction::LoadVarField(slot, field)
+            };
+            let span = self.span_keeping_sequence_point(n - 1, self.current_debug_span);
+            if self.fuse_tail(n - 1, fused, span) {
+                self.set_operand(n - 1, OperandMeta::Field(name.to_string()));
+                return Ok(());
+            }
+        }
+        let idx = self.emit(if thread_local {
+            Instruction::LoadFieldLocal(field)
+        } else {
+            Instruction::LoadField(field)
+        });
         self.set_operand(idx, OperandMeta::Field(name.to_string()));
         Ok(())
     }
 
-    fn load_index(&mut self, kind: IndexKind) -> Result<(), Self::Error> {
+    fn load_index(
+        &mut self,
+        kind: IndexKind,
+        base: &Place,
+        index: Local,
+    ) -> Result<(), Self::Error> {
         match kind {
+            IndexKind::Tuple => {
+                let slot = self
+                    .constant_index(index)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .expect("tuple projection has a constant slot");
+                self.emit(Instruction::LoadTupleField(slot));
+            }
+            IndexKind::Array if self.thread_local(base) => {
+                self.emit(Instruction::LoadArrayElementLocal);
+            }
             IndexKind::Array => {
                 self.emit(Instruction::LoadArrayElement);
             }
@@ -3286,12 +3790,32 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
         Ok(())
     }
 
+    fn null_test(&mut self, negate: bool) -> Result<(), Self::Error> {
+        self.emit(if negate {
+            Instruction::IsNotNull
+        } else {
+            Instruction::IsNull
+        });
+        Ok(())
+    }
+
+    fn concat_strings(&mut self, len: usize) -> Result<(), Self::Error> {
+        self.emit(Instruction::ConcatStrings(len));
+        Ok(())
+    }
+
     fn alloc_array(&mut self, element_ty: &TyTemplate, len: usize) -> Result<(), Self::Error> {
         // Push the (frame-resolved) element type on top of the `len` elements;
         // the VM's `AllocArray` pops it before draining the values, mirroring how
         // `AllocInstance` consumes its leading type args.
         self.load_type(element_ty)?;
         self.emit(Instruction::AllocArray(len));
+        Ok(())
+    }
+
+    fn alloc_tuple(&mut self, tuple_ty: &TyTemplate, len: usize) -> Result<(), Self::Error> {
+        self.load_type(tuple_ty)?;
+        self.emit(Instruction::AllocTuple(len));
         Ok(())
     }
 
@@ -3324,7 +3848,9 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
         });
         self.set_operand(
             inst,
-            OperandMeta::Callable(baml_compiler2_mir::function_link_name(self.db, deep_copy)),
+            OperandMeta::Callable(baml_compiler2_mir::function_display_name(
+                self.db, deep_copy,
+            )),
         );
         Ok(())
     }
@@ -3381,7 +3907,11 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
     fn len_of_place(&mut self, place: &Place) -> Result<(), Self::Error> {
         // MIR `Rvalue::Len` → dedicated ContainerLen opcode (no function call overhead).
         pull_semantics::walk_place_pull(self, place)?;
-        self.emit(Instruction::ContainerLen);
+        self.emit(if self.thread_local(place) {
+            Instruction::ContainerLenLocal
+        } else {
+            Instruction::ContainerLen
+        });
         Ok(())
     }
 
@@ -3432,12 +3962,13 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
         // to the tag checks `is_type` emits for realized leaves. The operand
         // meta reproduces the strings the wildcarded container templates used
         // to render (`_[]` / `map<_, _>`) so bytecode display stays stable
-        // across the `IsTypeTag` re-home; other tags have no MIR producer.
+        // across the `IsTypeTag` re-home; `PANIC` is a catch's panic test.
         let c = self.add_constant(ConstValue::Int(tag));
         let inst = self.emit(Instruction::IsType(c));
         let meta = match tag {
             baml_type::typetag::LIST => "_[]".to_string(),
             baml_type::typetag::MAP => "map<_, _>".to_string(),
+            baml_type::typetag::PANIC => "baml.panics.Panic".to_string(),
             other => format!("type tag {other}"),
         };
         self.set_operand(inst, OperandMeta::Const(meta));
@@ -3452,11 +3983,25 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
         Ok(())
     }
 
-    fn load_current_package(&mut self, package: &str) -> Result<(), Self::Error> {
+    fn trace_hook_settings(&mut self, with_settings: bool) -> Result<(), Self::Error> {
+        self.emit(Instruction::BeginTraceHook(with_settings));
+        Ok(())
+    }
+
+    fn satisfies_bound(&mut self) -> Result<(), Self::Error> {
+        self.emit(Instruction::SatisfiesBound);
+        Ok(())
+    }
+
+    fn load_current_package(&mut self) -> Result<(), Self::Error> {
         // The package is this unit's own; whoever lays the unit into an
-        // executable writes its ordinal here. The spelling is display only.
+        // executable writes its ordinal here. Displayed as the package
+        // spells itself.
         let inst = self.emit(Instruction::LoadCurrentPackage(0));
-        self.set_operand(inst, OperandMeta::Const(package.to_string()));
+        self.set_operand(
+            inst,
+            OperandMeta::Const(baml_compiler2_hir::package::ROOT_SEGMENT.to_string()),
+        );
         Ok(())
     }
 
@@ -3480,7 +4025,7 @@ impl<'db: 'ctx, 'ctx> PullSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
         func: FunctionRef<'ctx>,
         ntypeargs: usize,
     ) -> Result<(), Self::Error> {
-        let func_name = baml_compiler2_mir::function_link_name(self.db, func);
+        let func_name = baml_compiler2_mir::function_display_name(self.db, func);
         let global_idx = self.function_global_index(func, "MakeGenericFunction: global not found");
         let ntypeargs = u16::try_from(ntypeargs).expect("ntypeargs fits u16");
         let inst = self.emit(Instruction::MakeGenericFunction {
@@ -3538,7 +4083,7 @@ impl<'db: 'ctx, 'ctx> StackifyCodegen<'db, 'ctx, '_, '_> {
     /// `AllocInstance` for `class`: the `PullSink::alloc_class_instance`
     /// implementation above and the field-copy-set route share it.
     fn alloc_instance_of(&mut self, class: ClassRef<'ctx>, ntypeargs: u16) {
-        let class_name = &baml_compiler2_mir::class_link_name(self.db, class);
+        let class_name = &baml_compiler2_mir::class_display_name(self.db, class);
         let class_obj_idx = self.refs.class(class);
         let inst = self.emit(Instruction::AllocInstance {
             class_obj: class_obj_idx,
@@ -3549,16 +4094,31 @@ impl<'db: 'ctx, 'ctx> StackifyCodegen<'db, 'ctx, '_, '_> {
 }
 
 impl<'db: 'ctx, 'ctx> StackEffectSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '_> {
-    fn store_field_value(&mut self, field: usize, name: &str) -> Result<(), Self::Error> {
-        let idx = self.emit(Instruction::StoreField(field));
+    fn store_field_value(
+        &mut self,
+        field: usize,
+        name: &str,
+        base: &Place,
+    ) -> Result<(), Self::Error> {
+        let idx = self.emit(if self.thread_local(base) {
+            Instruction::StoreFieldLocal(field)
+        } else {
+            Instruction::StoreField(field)
+        });
         self.set_operand(idx, OperandMeta::Field(name.to_string()));
         Ok(())
     }
 
-    fn store_index_value(&mut self, kind: IndexKind) -> Result<(), Self::Error> {
+    fn store_index_value(&mut self, kind: IndexKind, base: &Place) -> Result<(), Self::Error> {
         match kind {
+            IndexKind::Array if self.thread_local(base) => {
+                self.emit(Instruction::StoreArrayElementLocal)
+            }
             IndexKind::Array => self.emit(Instruction::StoreArrayElement),
             IndexKind::Map => self.emit(Instruction::StoreMapElement),
+            IndexKind::Tuple => {
+                unreachable!("tuple slots are immutable: the checker rejects a store to one")
+            }
         };
         Ok(())
     }
@@ -3566,6 +4126,33 @@ impl<'db: 'ctx, 'ctx> StackEffectSink<'ctx> for StackifyCodegen<'db, 'ctx, '_, '
     fn pop_values(&mut self, n: usize) -> Result<(), Self::Error> {
         self.emit(Instruction::Pop(n));
         Ok(())
+    }
+}
+
+fn tuple_slot_type(base: &RuntimeTy, index: Option<i64>) -> Option<RuntimeTy> {
+    match base {
+        RuntimeTy::Tuple(elements) => match index {
+            Some(index) => elements.get(usize::try_from(index).ok()?).cloned(),
+            None => {
+                let (first, rest) = elements.split_first()?;
+                rest.iter().all(|e| e == first).then(|| first.clone())
+            }
+        },
+        RuntimeTy::Union(members) => {
+            let mut slots: Vec<RuntimeTy> = Vec::new();
+            for member in members {
+                let slot = tuple_slot_type(member, index)?;
+                if !slots.contains(&slot) {
+                    slots.push(slot);
+                }
+            }
+            match slots.len() {
+                0 => None,
+                1 => slots.pop(),
+                _ => Some(RuntimeTy::Union(slots.into())),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -3592,15 +4179,14 @@ fn realized_type_tag(ty: &RealizedTy) -> Option<i64> {
         // reaches here; returning `None` keeps that the only answer rather than
         // leaving a wrong one for the next caller to find.
         RealizedTy::Literal(..) => None,
+        RealizedTy::Tuple(..) => None,
         RealizedTy::Media(..)
         | RealizedTy::Class(..)
         | RealizedTy::Interface(..)
         | RealizedTy::Union(..)
         | RealizedTy::Future(..)
-        | RealizedTy::RustType
         | RealizedTy::Resource
         | RealizedTy::PromptAst
-        | RealizedTy::Void
         | RealizedTy::TypeAlias(..)
         | RealizedTy::Unknown
         | RealizedTy::Never
@@ -3620,6 +4206,7 @@ fn realized_type_tag(ty: &RealizedTy) -> Option<i64> {
 pub(crate) fn compile_mir_function<'db: 'mir, 'mir>(
     body: &'mir MirFunctionBody,
     arity: usize,
+    identity: bex_vm_types::types::FunctionIdentity,
     mir_span: Option<baml_base::Span>,
     line_starts: &'mir [u32],
     ctx: MirCodegenContext<'db, 'mir, '_, '_>,
@@ -3631,8 +4218,10 @@ pub(crate) fn compile_mir_function<'db: 'mir, 'mir>(
     crate::verifier::verify_mir_emit_invariants(body, arity, &analysis);
 
     // Compile with stackification
-    let codegen = StackifyCodegen::new(body, arity, line_starts, ctx, analysis);
-    let mut f = codegen.compile();
+    let escape = (opt != crate::analysis::OptLevel::Zero)
+        .then(|| baml_compiler2_mir::escape::analyze(ctx.db, ctx.refs.root, body, arity, opt));
+    let codegen = StackifyCodegen::new(body, arity, line_starts, ctx, analysis, escape);
+    let mut f = codegen.compile(identity);
     if let Some(span) = mir_span {
         f.span = span;
     }
@@ -3706,6 +4295,7 @@ mod tests {
         let function = compile_mir_function(
             &body,
             1,
+            bex_vm_types::types::FunctionIdentity::Init,
             None,
             &line_starts,
             MirCodegenContext {
@@ -3768,5 +4358,47 @@ mod tests {
             switch_discriminant_pulls(&arms(&[10, 2000, 300_000, 40_000_000]), false),
             1
         );
+    }
+
+    #[test]
+    fn tuple_slot_type_selects_and_joins_slots() {
+        use baml_compiler2_mir::RuntimeTy;
+
+        use super::tuple_slot_type;
+        let pair = |a: RuntimeTy, b: RuntimeTy| RuntimeTy::Tuple(vec![a, b].into());
+
+        let direct = pair(RuntimeTy::int(), RuntimeTy::string());
+        assert_eq!(tuple_slot_type(&direct, Some(0)), Some(RuntimeTy::int()));
+        assert_eq!(tuple_slot_type(&direct, Some(1)), Some(RuntimeTy::string()));
+        assert_eq!(tuple_slot_type(&direct, Some(2)), None);
+        assert_eq!(tuple_slot_type(&direct, Some(-1)), None);
+        assert_eq!(tuple_slot_type(&direct, None), None);
+        assert_eq!(
+            tuple_slot_type(&pair(RuntimeTy::int(), RuntimeTy::int()), None),
+            Some(RuntimeTy::int())
+        );
+
+        let agreeing = RuntimeTy::union([
+            direct.clone(),
+            RuntimeTy::Tuple(vec![RuntimeTy::int()].into()),
+        ]);
+        assert_eq!(tuple_slot_type(&agreeing, Some(0)), Some(RuntimeTy::int()));
+        assert_eq!(tuple_slot_type(&agreeing, Some(1)), None);
+
+        let differing = RuntimeTy::union([direct, pair(RuntimeTy::float(), RuntimeTy::string())]);
+        assert_eq!(
+            tuple_slot_type(&differing, Some(0)),
+            Some(RuntimeTy::union([RuntimeTy::int(), RuntimeTy::float()]))
+        );
+        assert_eq!(
+            tuple_slot_type(&differing, Some(1)),
+            Some(RuntimeTy::string())
+        );
+
+        let mixed = RuntimeTy::union([
+            pair(RuntimeTy::int(), RuntimeTy::int()),
+            RuntimeTy::string(),
+        ]);
+        assert_eq!(tuple_slot_type(&mixed, Some(0)), None);
     }
 }

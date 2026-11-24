@@ -7,10 +7,10 @@ during the host's own call/pull. Two call paths are exercised here:
 
   * plain call — `on_event_probe` is bound to a scripted client (canned
     parseable reply + fixed usage) in the fixture, so the full Agent journal
-    (RunStarted, AssistantMessage, Usage, FinalProduced) is deterministic and
+    (RunStarted, AssistantMessage, ModelCall, FinalProduced) is deterministic and
     keyless.
   * stream — the keyless replay harness (see `replay_harness.py`); settle
-    fires AssistantMessage then Usage exactly once, on either drain path.
+    fires AssistantMessage then ModelCall exactly once, on either drain path.
 
 A raising listener must never fail or alter the run — its error is swallowed
 engine-side by `ai.events.guard`.
@@ -31,44 +31,43 @@ def _raising_listener(_event):
 # SDK_PARITY_LINT(skip): host on_event listener coverage lands Python-first; other SDKs port separately
 def test_on_event_plain_call_delivers_events():
     import baml_sdk.ai.events as events
-    from baml_sdk.lorem import Resume, on_event_probe
+    from baml_sdk.lorem import Resume, on_event_probe_sync
 
     seen = []
-    result = on_event_probe("ignored-by-scripted-client", on_event=seen.append)
+    result = on_event_probe_sync("ignored-by-scripted-client", on_event=seen.append)
     assert isinstance(result, Resume)
     assert result.name == "Ada"
     # Journal order: one attempt, no tools, no repair re-asks; the scripted
-    # client's wire record rides between AssistantMessage and Usage.
+    # client's call record follows its AssistantMessage and carries its usage.
     assert [type(e) for e in seen] == [
         events.RunStarted,
         events.AssistantMessage,
-        events.LLMCall,
-        events.Usage,
+        events.ModelCall,
         events.FinalProduced,
     ]
-    usage = seen[3]
-    assert (usage.input_tokens, usage.output_tokens) == (3, 5)
+    call = seen[2]
+    assert (call.resolved_model.provider, call.resolved_model.model) == ("scripted", "scripted-model")
+    assert (call.usage.input_tokens, call.usage.output_tokens) == (3, 5)
 
 
 # SDK_PARITY_LINT(skip): host on_event listener coverage lands Python-first; other SDKs port separately
-def test_on_event_plain_call_delivers_llm_call_model():
+def test_on_event_plain_call_delivers_model_call_model():
     import baml_sdk.ai.events as events
-    from baml_sdk.lorem import on_event_probe
+    from baml_sdk.lorem import on_event_probe_sync
 
     seen = []
-    on_event_probe("ignored-by-scripted-client", on_event=seen.append)
+    on_event_probe_sync("ignored-by-scripted-client", on_event=seen.append)
     # The wire record is a generated model, delivered after AssistantMessage.
-    calls = [e for e in seen if isinstance(e, events.LLMCall)]
-    assert len(calls) == 1, f"expected one LLMCall, got {seen!r}"
+    calls = [e for e in seen if isinstance(e, events.ModelCall)]
+    assert len(calls) == 1, f"expected one ModelCall, got {seen!r}"
     assistant_at = next(
         i for i, e in enumerate(seen) if isinstance(e, events.AssistantMessage)
     )
     call_at = next(i for i, e in enumerate(seen) if e is calls[0])
     assert call_at > assistant_at
     call = calls[0]
-    assert call.selected is True
     assert isinstance(call.timing, events.Timing)
-    assert call.timing.duration_ms == 42
+    assert call.timing.duration.field_nanoseconds == 42_000_000
     assert isinstance(call.http_response, events.HttpResponse)
     assert call.http_response.status == 200
     assert call.http_request is None
@@ -77,9 +76,9 @@ def test_on_event_plain_call_delivers_llm_call_model():
 
 # SDK_PARITY_LINT(skip): host on_event listener coverage lands Python-first; other SDKs port separately
 def test_on_event_plain_call_raising_listener_does_not_fail():
-    from baml_sdk.lorem import Resume, on_event_probe
+    from baml_sdk.lorem import Resume, on_event_probe_sync
 
-    result = on_event_probe("ignored-by-scripted-client", on_event=_raising_listener)
+    result = on_event_probe_sync("ignored-by-scripted-client", on_event=_raising_listener)
     assert isinstance(result, Resume)
     assert result.name == "Ada"
 
@@ -95,24 +94,26 @@ def test_on_event_plain_call_raising_listener_does_not_fail():
 async def test_on_event_stream_delivers_settle_events():
     import baml_sdk.ai.events as events
     from baml_sdk.ai.stream import Done
-    from baml_sdk.lorem import stream_e2e_extract_stream_async
+    from baml_sdk.lorem import stream_e2e_extract_stream
 
     seen = []
-    stream = await stream_e2e_extract_stream_async(
+    stream = await stream_e2e_extract_stream(
         "ignored-by-replay-server", on_event=seen.append
     )
     while True:
-        if isinstance(await stream.next_async(), Done):
+        if isinstance(await stream.next(), Done):
             break
     # Extra pulls after Done must not re-emit settle events.
-    assert isinstance(await stream.next_async(), Done)
-    assert isinstance(await stream.final_async(), str)
+    assert isinstance(await stream.next(), Done)
+    assert isinstance(await stream.final(), str)
 
     assert isinstance(seen[0], events.RunStarted)
     assistant = [e for e in seen if isinstance(e, events.AssistantMessage)]
-    usage = [e for e in seen if isinstance(e, events.Usage)]
+    calls = [e for e in seen if isinstance(e, events.ModelCall)]
     assert len(assistant) == 1, f"expected one AssistantMessage, got {seen!r}"
-    assert len(usage) == 1, f"expected one Usage, got {seen!r}"
+    assert len(calls) == 1, f"expected one ModelCall, got {seen!r}"
+    assert (calls[0].resolved_model.provider, calls[0].resolved_model.model) == ("openai", "gpt-5.4-nano")
+    assert calls[0].usage is not None
     # Streams deliberately emit no FinalProduced (settle must not depend on
     # which drain path the host chose).
     assert not any(isinstance(e, events.FinalProduced) for e in seen)
@@ -122,12 +123,12 @@ async def test_on_event_stream_delivers_settle_events():
 @replay_server(recording_path="replay_extract_string")
 def test_on_event_stream_raising_listener_does_not_fail():
     from baml_sdk.ai.stream import Done
-    from baml_sdk.lorem import stream_e2e_extract_stream
+    from baml_sdk.lorem import stream_e2e_extract_stream_sync
 
-    stream = stream_e2e_extract_stream(
+    stream = stream_e2e_extract_stream_sync(
         "ignored-by-replay-server", on_event=_raising_listener
     )
     while True:
-        if isinstance(stream.next(), Done):
+        if isinstance(stream.next_sync(), Done):
             break
-    assert isinstance(stream.final(), str)
+    assert isinstance(stream.final_sync(), str)

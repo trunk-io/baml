@@ -68,7 +68,7 @@ class ImageClient {
     request_body: baml.json.json?,
     headers: map<string, string>?,
     query_params: map<string, string>?,
-    // Record request/response bodies on the LLMCall wire records delivered
+    // Record request/response bodies on the ModelCall wire records delivered
     // through on_event. Status, headers, and timing are always recorded; this
     // flag only gates the bodies.
     capture_wire: bool,
@@ -136,7 +136,7 @@ class ImageClient {
             status_code: null,
             detail: `no OpenAI API key: set the client's api_key (a literal or env.NAME), or export one of the variables it consulted — ${ai.wire.credential_sources(self.api_key, "OPENAI_API_KEY")}`,
             raw_body: null,
-        }
+        };
     }
 
     /// The request-time base URL, or null for the provider default.
@@ -145,12 +145,16 @@ class ImageClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            root.internal._oai_images_client_id(self)
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "openai-images"
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            openai.internal.images_render(self, input, preview = true) catch_all (e) {
+            root.internal.images_render(self, input, preview = true) catch_all (e) {
                 _ => throw ai.errors.normalize(e),
             }
         }

@@ -1,20 +1,18 @@
 package baml_bridge;
 
 import baml_bridge.internal.BamlTraceback;
+import baml_bridge.internal.EncodingScope;
 import baml_bridge.internal.NativeLibraryLoader;
 import baml_bridge.internal.ProtoReader;
 import baml_bridge.internal.ProtoWriter;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The native library ({@code libbridge_java.so} — the {@code bridge_java}
  * Rust cdylib) is loaded once via {@link NativeLibraryLoader}, following a
  * first-hit-wins ladder: (1) the system property {@code baml.bridge.lib} (dev
- * override), (2) the environment variable {@code BAML_JAVA_BRIDGE_LIB} (dev/test
+ * override), (2) the environment variable {@code BAML_BRIDGE_PATH} (dev/test
  * override), then (3) the bundled per-platform classpath resource
  * {@code /native/{os}-{arch}/{libname}} (extracted to a temp file and loaded) —
  * so a published {@code baml-bridge} + its {@code natives-*} jar is
@@ -46,7 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class BamlFfi {
     /** Env var / system property naming the native library to {@code System.load}. */
-    public static final String LIB_ENV_VAR = "BAML_JAVA_BRIDGE_LIB";
+    public static final String LIB_ENV_VAR = "BAML_BRIDGE_PATH";
     public static final String LIB_PROPERTY = "baml.bridge.lib";
 
     /**
@@ -74,29 +72,6 @@ public final class BamlFfi {
     private static final String CANCELLED_PANIC_CLASS = "baml.panics.Cancelled";
 
     /**
-     * Fallback call-id source, used only if the native counter is somehow
-     * unavailable. The Rust side owns the authoritative counter
-     * ({@code sys_types::CallId::next}); a nonzero id is mandatory (the engine
-     * rejects call_id 0).
-     */
-    private static final AtomicLong FALLBACK_CALL_ID = new AtomicLong(1);
-
-    /**
-     * Java-side host-value registry: callables handed to BAML as function
-     * arguments AND native throwables raised inside a callable, keyed by a
-     * process-unique {@code long}. Rust is a pure router — it forwards a key back
-     * to {@link #hostDispatch}/{@link #hostRelease}; storing the objects here (not
-     * behind a JNI {@code GlobalRef}) makes identity a plain JVM reference, so a
-     * rehydrated exception is {@code ==} the original (design points A + D).
-     * Callables and thrown objects share one keyspace ({@link #HOST_VALUE_KEY}) so
-     * keys never collide and a single {@link #hostRelease} clears either kind.
-     */
-    private static final ConcurrentHashMap<Long, Object> HOST_VALUES = new ConcurrentHashMap<>();
-
-    /** Shared key source for {@link #HOST_VALUES}; starts at 1 (0 is reserved). */
-    private static final AtomicLong HOST_VALUE_KEY = new AtomicLong(1);
-
-    /**
      * Dedicated dispatch executor: BAML→host callable invocations run here, off
      * the engine's runtime threads and the JNI attach frame, so a slow or blocking
      * user callable cannot starve the engine and concurrent dispatches (allowed by
@@ -116,24 +91,6 @@ public final class BamlFfi {
         };
     }
 
-    /** Empty payload: an {@code isError} completion with no bytes ⇒ BridgeFailure. */
-    private static final byte[] EMPTY_PAYLOAD = new byte[0];
-
-    /**
-     * Best-effort telemetry-flush hooks, run immediately before an {@code os-exit}
-     * panic hard-halts the process. A clean {@code baml.sys.exit} surfaces as an
-     * exit panic that terminates the JVM via {@link Runtime#halt(int)} — bypassing
-     * JVM shutdown hooks (the analog of Python's {@code os._exit}) — so any
-     * buffered telemetry would otherwise be dropped. This is the flush socket the
-     * spec calls for: registered hooks run just before the halt (see
-     * {@link #runExitFlushHooks()}, invoked from the outbound decoder). No
-     * telemetry ships in this slice, so the list is empty by default and the halt
-     * behavior is unchanged. {@link CopyOnWriteArrayList} so registration and the
-     * exit-time drain are safe under concurrency.
-     */
-    private static final CopyOnWriteArrayList<Runnable> EXIT_FLUSH_HOOKS =
-            new CopyOnWriteArrayList<>();
-
     static {
         // First-hit-wins ladder: system property → env var → bundled classpath
         // resource. See NativeLibraryLoader for the resolution + extraction logic.
@@ -143,38 +100,6 @@ public final class BamlFfi {
     }
 
     private BamlFfi() {}
-
-    // ---- os-exit telemetry-flush hooks --------------------------------------
-
-    /**
-     * Register a best-effort hook to run just before an {@code os-exit} panic
-     * hard-halts the process — the place to flush a telemetry buffer that JVM
-     * shutdown hooks would otherwise miss (the halt bypasses them, mirroring
-     * Python's {@code os._exit}). Hooks run in registration order; a hook's
-     * exception is swallowed, because nothing may prevent (or delay) the halt.
-     * Registering the same {@link Runnable} twice runs it twice. Thread-safe.
-     */
-    public static void registerExitFlushHooks(Runnable hook) {
-        EXIT_FLUSH_HOOKS.add(java.util.Objects.requireNonNull(hook, "hook"));
-    }
-
-    /**
-     * Run every registered {@linkplain #registerExitFlushHooks exit-flush hook},
-     * best-effort: each hook's {@link Throwable} is caught and swallowed so a
-     * misbehaving hook can neither prevent nor reorder the process halt. The
-     * outbound decoder calls this on an {@code os-exit} panic immediately before
-     * {@link Runtime#halt(int)}. Factored out of the halt itself so the hook
-     * mechanics stay unit-testable without terminating the test JVM.
-     */
-    public static void runExitFlushHooks() {
-        for (Runnable hook : EXIT_FLUSH_HOOKS) {
-            try {
-                hook.run();
-            } catch (Throwable ignored) {
-                // Best-effort: nothing a hook does may hold up the halt.
-            }
-        }
-    }
 
     // ---- Native methods (implemented in sdks/java/bridge_java) --------------
 
@@ -214,40 +139,63 @@ public final class BamlFfi {
 
     /** Mint a process-unique, nonzero function-call id from the engine counter. */
     static native long nativeNewCallId();
+    static native boolean nativeReleaseCallId(long callId);
+    static native long nativeInvocationClockNs(long callId);
+    static native InvocationOptions.TracePayload nativeTraceSelection(long callId, long key);
+    static native byte[] nativeInvocationContext(long state);
+    public static Object currentTraceContext(BamlType descriptor) { return ProtoReader.decodeWithDesc(nativeInvocationContext(baml_bridge.internal.InvocationFrames.currentState()), descriptor, false); }
+    private static byte[] prepareInvocation(long callId, InvocationOptions options) {
+        options = options == null ? InvocationOptions.EMPTY : options;
+        Long timeout = options.timeoutMs();
+        if (timeout != null && (timeout < 0 || timeout > 2147483647L)) throw new IllegalArgumentException("timeoutMs must be between 0 and 2147483647");
+        var writer = new baml_bridge.internal.WireWriter();
+        writer.writeInt64(4, baml_bridge.internal.InvocationFrames.currentState());
+        writer.writeInt64(5, callId);
+        if (timeout != null) writer.writeInt64(3, Math.addExact(nativeInvocationClockNs(callId), Math.multiplyExact(timeout, 1000000L)));
+        if (options.trace() != null) {
+            var trace = nativeTraceSelection(callId, options.trace().key());
+            baml_bridge.internal.EncodingScope.own(trace.reservation(), 20);
+            writer.writeMessage(1, trace.bytes());
+        }
+        if (options.cancel() != null) writer.writeMessage(2, ProtoWriter.encodeInboundValue(options.cancel()));
+        return writer.toByteArray();
+    }
 
     /**
      * Cancel an in-flight function call by its {@code call_id}
      * ({@code bridge_cffi::cancel_function_call_by_id}). Returns {@code true}
      * when the runtime accepted the cancel, {@code false} otherwise (unknown /
      * already-completed id, id 0, or an uninitialized runtime). Never throws —
-     * both {@link BamlCallContext#abort()} and a host {@code future.cancel(true)}
-     * fire it and tolerate a {@code false}.
+     * a host {@code future.cancel(true)} fires it and tolerates a {@code false}.
      */
     static native boolean nativeCancelFunctionCall(long callId);
 
     /**
      * Complete an in-flight host-callable dispatch
      * ({@code bridge_cffi::complete_host_call}). {@code content} is a
-     * protobuf-encoded {@code InboundValue} (the callable's result on success, or
-     * the thrown value on error); an empty {@code content} with {@code isError}
-     * true is the bridge-failure signal. Called from the dispatch executor once a
-     * host callable finishes; unknown / cancelled call ids are ignored
-     * engine-side.
+     * protobuf-encoded {@code HostCallCompletion} carrying the call's one
+     * outcome. Called from the dispatch executor once a host callable finishes;
+     * unknown / cancelled call ids are ignored engine-side.
      */
-    static native void nativeCompleteHostCall(long callId, boolean isError, byte[] content);
+    static native void nativeCompleteHostCall(long callId, byte[] content);
 
     // ---- Handle lifecycle + media (baml.media.*) ---------------------------
     // The JVM analog of bridge_python's media/handle FFI: media values are
     // minted as HANDLE_TABLE rows and referenced across JNI by their u64 key
     // (returned as a long). The `kind` argument is a proto MediaTypeEnum
-    // discriminant (IMAGE=1, AUDIO=2, PDF=3, VIDEO=4, OTHER=5). A native failure
-    // (bad kind, invalid key, alloc) throws an unchecked RuntimeException.
+    // discriminant (IMAGE=1, AUDIO=2, PDF=3, VIDEO=4); a media value always has
+    // one of these kinds. A native failure (any other kind, invalid key, alloc)
+    // throws an unchecked RuntimeException.
 
     /** Mint an `Adt(Media)` row from a URL; returns its handle key. */
     static native long nativeMediaFromUrl(int kind, String url, String mimeType);
 
-    /** Mint an `Adt(Media)` row from a local file path; returns its handle key. */
-    static native long nativeMediaFromFile(int kind, String path, String mimeType);
+    /**
+     * Mint an `Adt(Media)` row from base64 content read from {@code file},
+     * named by its base name; returns its handle key. Reads nothing.
+     */
+    static native long nativeMediaFromFileContent(
+            int kind, String file, String base64, String mimeType);
 
     /** Mint an `Adt(Media)` row from a base64 payload; returns its handle key. */
     static native long nativeMediaFromBase64(int kind, String base64, String mimeType);
@@ -255,8 +203,8 @@ public final class BamlFfi {
     /** The media's source URL, or {@code null} when it is not URL-backed. */
     static native String nativeMediaUrl(long key);
 
-    /** The media's local file path, or {@code null} when it is not file-backed. */
-    static native String nativeMediaFile(long key);
+    /** The base name of the file the content was read from, or {@code null}. */
+    static native String nativeMediaName(long key);
 
     /** The media's base64 payload (never {@code null}; empty when unavailable). */
     static native String nativeMediaBase64(long key);
@@ -264,7 +212,10 @@ public final class BamlFfi {
     /** The media's MIME type, or {@code null} when none is set. */
     static native String nativeMediaMimeType(long key);
 
-    /** Clone a handle key, minting a fresh owned key for the same row. */
+    /**
+     * Take one more ownership of a handle key: the same key for a row naming an
+     * engine object, a fresh key for an identity-free row.
+     */
     static native long nativeHandleClone(long key);
 
     /** Release one owned handle key (best-effort; a stale key is ignored). */
@@ -319,6 +270,9 @@ public final class BamlFfi {
 
     public static Object callHandleSync(
             BamlHandle handle, String[] names, Object[] args, BamlType returnDesc) {
+        return callHandleSync(handle, names, args, returnDesc, null);
+    }
+    public static Object callHandleSync(BamlHandle handle, String[] names, Object[] args, BamlType returnDesc, InvocationOptions controls) {
         Objects.requireNonNull(handle, "handle");
         Objects.requireNonNull(names, "names");
         Objects.requireNonNull(args, "args");
@@ -330,24 +284,67 @@ public final class BamlFfi {
             throw new IllegalArgumentException("function handle argument names and values differ in length");
         }
         long callId = newCallId();
-        byte[] request =
-                ProtoWriter.encodeHandleCallFunctionArgs(handle.key(), names, args, callId);
-        return decodeResult(nativeCallSync(request), returnDesc);
+        try (var encoding = new baml_bridge.internal.EncodingScope()) {
+            byte[] request = ProtoWriter.encodeHandleCallFunctionArgs(handle.key(), names, args, callId, prepareInvocation(callId, controls));
+            byte[] response = nativeCallSync(request); encoding.submitted();
+            return decodeResult(response, returnDesc);
+        } finally { nativeReleaseCallId(callId); }
     }
 
-    public static <T> T returnedClosure(
-            Class<T> callableType,
-            Object value,
-            String[] names,
-            BamlType returnDesc) {
-        Objects.requireNonNull(callableType, "callableType");
-        if (!(value instanceof BamlHandle handle)) {
-            throw new IllegalStateException(
-                    "Expected a returned BAML function handle, received "
-                            + (value == null ? "null" : value.getClass().getName()));
+    public static CompletableFuture<Object> callHandleAsync(BamlHandle handle, String[] names, Object[] args, BamlType returnDesc, InvocationOptions controls) {
+        if (handle.handleType() != BamlHandle.FUNCTION_REF) throw new IllegalArgumentException("expected a live BAML callable");
+        long callId = newCallId();
+        CompletableFuture<byte[]> raw = new CompletableFuture<>();
+        PENDING.put(callId, raw);
+        CancellableCall result = new CancellableCall(callId);
+        try (var encoding = new baml_bridge.internal.EncodingScope()) { nativeCallAsync(callId, ProtoWriter.encodeHandleCallFunctionArgs(handle.key(), names, args, callId, prepareInvocation(callId, controls))); encoding.submitted(); }
+        catch (Throwable error) { nativeReleaseCallId(callId); PENDING.remove(callId); raw.completeExceptionally(error); }
+        raw.whenComplete((bytes, error) -> { if (error != null) result.completeExceptionally(error); else { try { result.complete(decodeResult(bytes, returnDesc)); } catch (Throwable failure) { result.completeExceptionally(mapAsyncFailure(failure)); } } });
+        return result;
+    }
+
+    /**
+     * The handle a BAML closure (an instance {@link #bamlClosure} made) calls
+     * through, or {@code null} when {@code callable} is not one.
+     */
+    public static BamlHandle bamlClosureHandle(Object callable) {
+        if (callable != null && Proxy.isProxyClass(callable.getClass())
+                && Proxy.getInvocationHandler(callable) instanceof BamlClosure owner) {
+            owner.handle().key();
+            return owner.handle();
         }
-        InvocationHandler handler =
-                (proxy, method, arguments) -> {
+        return null;
+    }
+
+    public static DynamicTarget callableTarget(Object callable) {
+        BamlHandle handle = bamlClosureHandle(callable);
+        if (handle == null) throw new IllegalArgumentException("target must be a live returned BAML callable");
+        return DynamicTarget.callable(handle);
+    }
+    public static Object invoke(DynamicTarget target, Map<String,Object> arguments, BamlTypes types, InvocationOptions controls) {
+        String[] names = arguments.keySet().toArray(String[]::new);
+        Object[] values = java.util.Arrays.stream(names).map(arguments::get).toArray();
+        if (target.handle != null) { if (types != null && !types.isEmpty()) throw new IllegalArgumentException("specialized callable rejects type bindings"); return callHandleSync(target.handle, names, values, null, controls); }
+        return callSync(target.name, names, values, null, controls, types);
+    }
+    public static CompletableFuture<Object> invokeAsync(DynamicTarget target, Map<String,Object> arguments, BamlTypes types, InvocationOptions controls) {
+        String[] names = arguments.keySet().toArray(String[]::new);
+        Object[] values = java.util.Arrays.stream(names).map(arguments::get).toArray();
+        if (target.handle != null) { if (types != null && !types.isEmpty()) throw new IllegalArgumentException("specialized callable rejects type bindings"); return callHandleAsync(target.handle, names, values, null, controls); }
+        return callAsync(target.name, names, values, null, controls, types);
+    }
+
+    /**
+     * A BAML closure seen through a generated functional interface: the
+     * interface's call surfaces ({@code apply} and its kin, plus the generated
+     * {@code call} / {@code callAsync}) call the closure through {@code handle},
+     * passing the arguments by the closure's own parameter {@code names}, and
+     * decode its result against {@code returnDesc}. Every other default method
+     * ({@code andThen}, {@code __bamlDispatch}) is the interface's own behavior
+     * and runs as written.
+     */
+    private record BamlClosure(BamlHandle handle, String[] names, BamlType returnDesc) implements InvocationHandler {
+        @Override public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] arguments) throws Throwable {
                     if (method.getDeclaringClass() == Object.class) {
                         return switch (method.getName()) {
                             case "toString" -> "BAML closure " + handle.key();
@@ -356,7 +353,15 @@ public final class BamlFfi {
                             default -> throw new UnsupportedOperationException(method.toString());
                         };
                     }
+                    boolean callSurface = !method.isDefault()
+                            || method.getName().equals("call")
+                            || method.getName().equals("callAsync");
+                    if (!callSurface) {
+                        return InvocationHandler.invokeDefault(proxy, method, arguments);
+                    }
                     Object[] supplied = arguments == null ? new Object[0] : arguments;
+                    InvocationOptions controls = null;
+                    if (supplied.length == names.length + 1) { controls = (InvocationOptions) supplied[names.length]; supplied = java.util.Arrays.copyOf(supplied, names.length); }
                     if (supplied.length != names.length) {
                         throw new IllegalArgumentException(
                                 "BAML closure expected "
@@ -364,42 +369,35 @@ public final class BamlFfi {
                                         + " arguments, received "
                                         + supplied.length);
                     }
-                    return callHandleSync(handle, names, supplied, returnDesc);
-                };
-        Object proxy =
-                Proxy.newProxyInstance(
-                        callableType.getClassLoader(),
-                        new Class<?>[] {callableType},
-                        handler);
-        return callableType.cast(proxy);
+                    return method.getName().equals("callAsync") ? callHandleAsync(handle, names, supplied, returnDesc, controls) : callHandleSync(handle, names, supplied, returnDesc, controls);
+        }
     }
 
-    public static <T> CompletableFuture<T> returnedClosureAsync(
-            CompletableFuture<Object> source,
-            Class<T> callableType,
-            String[] names,
-            BamlType returnDesc) {
-        Objects.requireNonNull(source, "source");
-        CompletableFuture<T> mapped = new CompletableFuture<>();
-        source.whenComplete(
-                (value, error) -> {
-                    if (error != null) {
-                        mapped.completeExceptionally(error);
-                    } else {
-                        try {
-                            mapped.complete(returnedClosure(callableType, value, names, returnDesc));
-                        } catch (Throwable failure) {
-                            mapped.completeExceptionally(failure);
-                        }
-                    }
-                });
-        mapped.whenComplete(
-                (ignored, error) -> {
-                    if (mapped.isCancelled()) {
-                        source.cancel(true);
-                    }
-                });
-        return mapped;
+    /**
+     * The BAML closure behind {@code handle} as an instance of the functional
+     * interface {@code callableType}, calling it with arguments bound by its
+     * parameter {@code names} and decoding its result against
+     * {@code returnDesc}. Owns {@code handle}: the closure is released with it.
+     */
+    public static <T> T bamlClosure(
+            Class<T> callableType, BamlHandle handle, String[] names, BamlType returnDesc) {
+        Objects.requireNonNull(callableType, "callableType");
+        Objects.requireNonNull(handle, "handle");
+        Objects.requireNonNull(names, "names");
+        if (handle.handleType() != BamlHandle.FUNCTION_REF) {
+            throw new IllegalArgumentException(
+                    "expected a FUNCTION_REF handle, received " + handle.handleType());
+        }
+        // A java.util.function interface has no class loader of its own to name.
+        ClassLoader loader = callableType.getClassLoader() != null
+                ? callableType.getClassLoader()
+                : BamlFfi.class.getClassLoader();
+        Object proxy =
+                Proxy.newProxyInstance(
+                        loader,
+                        new Class<?>[] {callableType},
+                        new BamlClosure(handle, names, returnDesc));
+        return callableType.cast(proxy);
     }
 
     /**
@@ -416,24 +414,18 @@ public final class BamlFfi {
     }
 
     /**
-     * As {@link #callSync(String, String[], Object[], BamlType)}, but bound to an
-     * optional {@link BamlCallContext} for cancellation: the minted
-     * {@code call_id} is attached to {@code ctx} for the duration of the call and
-     * detached in a {@code finally}, so a concurrent {@link BamlCallContext#abort()}
-     * (or an abort that already happened) cancels this call engine-side. A sync
-     * cancellation surfaces as a {@link BamlPanic} whose {@code value()} is a
-     * {@code baml.panics.Cancelled} (the async path remaps that to
-     * {@link BamlCancelledError}; sync keeps the panic). A {@code null} {@code ctx}
-     * is exactly the four-arg behavior.
+     * As {@link #callSync(String, String[], Object[], BamlType)}, with a snapshot
+     * of cancellation, deadline, and tracing options prepared before submission.
+     * A {@code null} options value uses the current invocation's inherited controls.
      */
     public static Object callSync(
-            String fqn, String[] names, Object[] args, BamlType returnDesc, BamlCallContext ctx) {
+            String fqn, String[] names, Object[] args, BamlType returnDesc, InvocationOptions ctx) {
         return callSync(fqn, names, args, returnDesc, ctx, null);
     }
 
     /**
      * Explicit-generics variant of
-     * {@link #callSync(String, String[], Object[], BamlType, BamlCallContext)}:
+     * {@link #callSync(String, String[], Object[], BamlType, InvocationOptions)}:
      * threads a {@link BamlTypes} bag of TypeVar bindings into
      * {@code CallFunctionArgs.type_args} so a generic function/method's TypeVars
      * are bound at the call. Reached from the generated explicit-generics
@@ -445,23 +437,29 @@ public final class BamlFfi {
             String[] names,
             Object[] args,
             BamlType returnDesc,
-            BamlCallContext ctx,
+            InvocationOptions ctx,
             BamlTypes typeArgs) {
         long callId = newCallId();
-        if (ctx != null) {
-            ctx.attach(callId);
-        }
-        try {
+        try (var encoding = new baml_bridge.internal.EncodingScope()) {
             byte[] request =
                     ProtoWriter.encodeNamedCallFunctionArgs(
-                            fqn, names, args, callId, typeArgs);
-            byte[] response = nativeCallSync(request);
-            return decodeResult(response, returnDesc);
+                            fqn, names, args, callId, typeArgs, prepareInvocation(callId, ctx));
+            byte[] response = nativeCallSync(request); encoding.submitted();
+            return decodeResult(response, boundReturn(returnDesc, typeArgs));
         } finally {
-            if (ctx != null) {
-                ctx.detach(callId);
-            }
+            nativeReleaseCallId(callId);
         }
+    }
+
+    /**
+     * The declared return type with the call's explicit type arguments bound,
+     * so a `T` result decodes as what the caller named it (a tuple as its
+     * record, a union as its arm) rather than wire-driven.
+     */
+    private static BamlType boundReturn(BamlType returnDesc, BamlTypes typeArgs) {
+        return returnDesc == null || typeArgs == null || typeArgs.isEmpty()
+                ? returnDesc
+                : returnDesc.substitute(typeArgs.asMap());
     }
 
     /**
@@ -475,7 +473,7 @@ public final class BamlFfi {
     /**
      * Asynchronous sibling of
      * {@link #callSync(String, String[], Object[], BamlType)}. See
-     * {@link #callAsync(String, String[], Object[], BamlType, BamlCallContext)}.
+     * {@link #callAsync(String, String[], Object[], BamlType, InvocationOptions)}.
      */
     public static CompletableFuture<Object> callAsync(
             String fqn, String[] names, Object[] args, BamlType returnDesc) {
@@ -483,7 +481,7 @@ public final class BamlFfi {
     }
 
     /**
-     * The real async path, bound to an optional {@link BamlCallContext}. A
+     * The real async path, bound to an optional {@link InvocationOptions}. A
      * process-unique {@code call_id} is minted, a raw-bytes future registered in
      * {@link #PENDING}, and {@link #nativeCallAsync} spawns the engine call and
      * returns without blocking. When the engine completes it delivers the
@@ -507,13 +505,13 @@ public final class BamlFfi {
      * exceptionally with {@link BamlError} / {@link BamlPanic} unchanged.
      */
     public static CompletableFuture<Object> callAsync(
-            String fqn, String[] names, Object[] args, BamlType returnDesc, BamlCallContext ctx) {
+            String fqn, String[] names, Object[] args, BamlType returnDesc, InvocationOptions ctx) {
         return callAsync(fqn, names, args, returnDesc, ctx, null);
     }
 
     /**
      * Explicit-generics variant of
-     * {@link #callAsync(String, String[], Object[], BamlType, BamlCallContext)}:
+     * {@link #callAsync(String, String[], Object[], BamlType, InvocationOptions)}:
      * threads a {@link BamlTypes} bag of TypeVar bindings into
      * {@code CallFunctionArgs.type_args}. Reached from the generated
      * explicit-generics overloads; a {@code null} bag is exactly the five-arg
@@ -525,21 +523,20 @@ public final class BamlFfi {
             String[] names,
             Object[] args,
             BamlType returnDesc,
-            BamlCallContext ctx,
+            InvocationOptions ctx,
             BamlTypes typeArgs) {
         long callId = newCallId();
         CompletableFuture<byte[]> raw = new CompletableFuture<>();
         PENDING.put(callId, raw);
         CancellableCall result = new CancellableCall(callId);
-        if (ctx != null) {
-            ctx.attach(callId);
-        }
-        try {
+        BamlType boundReturn = boundReturn(returnDesc, typeArgs);
+        try (var encoding = new baml_bridge.internal.EncodingScope()) {
             byte[] request =
                     ProtoWriter.encodeNamedCallFunctionArgs(
-                            fqn, names, args, callId, typeArgs);
-            nativeCallAsync(callId, request);
+                            fqn, names, args, callId, typeArgs, prepareInvocation(callId, ctx));
+            nativeCallAsync(callId, request); encoding.submitted();
         } catch (Throwable t) {
+            nativeReleaseCallId(callId);
             // Arg-encode / JNI-glue failure before the engine took ownership of
             // the call: it will never call completeCall for this id, so
             // unregister and fail the future here rather than leak it. (A pre-call
@@ -556,14 +553,11 @@ public final class BamlFfi {
         // late engine envelope after a host cancel is harmlessly dropped.
         raw.whenComplete(
                 (bytes, err) -> {
-                    if (ctx != null) {
-                        ctx.detach(callId);
-                    }
                     if (err != null) {
                         result.completeExceptionally(err);
                     } else {
                         try {
-                            result.complete(decodeResult(bytes, returnDesc));
+                            result.complete(decodeResult(bytes, boundReturn));
                         } catch (Throwable t) {
                             result.completeExceptionally(mapAsyncFailure(t));
                         }
@@ -698,264 +692,158 @@ public final class BamlFfi {
     // ---- Host-callable registry + dispatch ---------------------------------
     // A BAML function parameter typed as a callable receives a host function;
     // mid-call the engine dispatches back into the host to invoke it. Encode
-    // registers the callable here and emits a Handle{HOST_VALUE_CALLABLE}; the
-    // engine's dispatch fires the Rust trampoline, which lands on hostDispatch;
-    // the result (or thrown value) flows back via nativeCompleteHostCall.
+    // registers the callable in HostCalls and emits a Handle{HOST_VALUE_CALLABLE};
+    // the engine's dispatch fires the Rust trampoline, which lands on
+    // hostDispatch; the call's one outcome flows back via nativeCompleteHostCall.
 
     /**
-     * Register a host callable handed to BAML as a function argument; returns its
-     * process-unique key (emitted as {@code Handle{key, HOST_VALUE_CALLABLE}} by
-     * {@code ProtoWriter}). The engine binds the key to an {@code Object::HostClosure}
-     * and dispatches back through {@link #hostDispatch} when BAML invokes it.
+     * Engine-driven release: the engine gives back {@code count} references to
+     * the host value {@code key} ({@link HostCalls#release}). Called from the
+     * Rust release trampoline after the engine collects the values holding
+     * them; an absent key is ignored.
      */
-    public static long registerHostCallable(Object callable) {
-        long key = HOST_VALUE_KEY.getAndIncrement();
-        HOST_VALUES.put(key, callable);
-        return key;
+    static void hostRelease(long key, long count) {
+        HostCalls.release(key, count);
     }
 
     /**
-     * Register an arbitrary host object — a native {@link Throwable} raised inside
-     * a callable — so a {@code baml.errors.HostCallable}'s {@code _handle} can
-     * resolve back to the original object by identity on round trip. Shares the
-     * keyspace with callables so keys never collide.
+     * The invocation a host call runs in: the caller's invocation state (so a
+     * BAML call the callable makes inherits its controls) and the call's
+     * cancellation, which a running callable's pending future observes.
      */
-    private static long registerHostOpaque(Object value) {
-        long key = HOST_VALUE_KEY.getAndIncrement();
-        HOST_VALUES.put(key, value);
-        return key;
+    private static final class HostFrame {
+        final baml_bridge.internal.InvocationFrames.Frame active;
+        volatile java.util.concurrent.CompletableFuture<?> pending;
+        final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        HostFrame(long key, byte[] cancel) { active = new baml_bridge.internal.InvocationFrames.Frame(new BamlHandle(key, 19), ProtoReader.decodeValue(new baml_bridge.internal.WireReader(cancel), false)); }
     }
+    private static final ConcurrentHashMap<Long, HostFrame> HOST_FRAMES = new ConcurrentHashMap<>();
 
-    /**
-     * Resolve a host-value key back to its object (callable or thrown), or
-     * {@code null} when the key is absent — released, or foreign to this runtime.
-     * Used by {@code ProtoReader} to rehydrate a host-thrown exception by
-     * identity, and never mints or mutates state.
-     */
-    public static Object lookupHostValue(long key) {
-        return HOST_VALUES.get(key);
-    }
-
-    /**
-     * Engine-driven release: drop the registry entry for {@code key} (the engine
-     * dropped the last reference to the host value). Called from the Rust release
-     * trampoline; a stale/absent key is a harmless no-op. Rarely fires per call
-     * (GC-driven) — hence the {@code @Disabled} release test.
-     */
-    static void hostRelease(long key) {
-        HOST_VALUES.remove(key);
+    static void hostCancel(long callId) {
+        HostFrame frame = HOST_FRAMES.get(callId);
+        if (frame != null) { frame.cancelled.set(true); var pending = frame.pending; if (pending != null) pending.cancel(true); }
     }
 
     /**
      * Engine→host callable dispatch entry point, called from the Rust dispatch
      * trampoline. Submits the decode / invoke / complete work to the dedicated
      * executor and returns promptly (api.rs: the callback must return promptly;
-     * dispatches may be concurrent). Never throws across the JNI boundary.
+     * dispatches may be concurrent). Never throws across the JNI boundary: a
+     * dispatch the bridge cannot even set up is its own failure.
      */
-    static void hostDispatch(long hostValueKey, long callId, byte[] bamlToHostCall) {
+    static void hostDispatch(long hostValueKey, long callId, byte[] bamlToHostCall, long effectiveState, byte[] effectiveCancel) {
+        HostFrame frame;
         try {
-            HOST_DISPATCH_EXECUTOR.execute(
-                    () -> runHostDispatch(hostValueKey, callId, bamlToHostCall));
+            frame = new HostFrame(effectiveState, effectiveCancel);
+        } catch (Throwable malformed) {
+            complete(callId, ProtoWriter.hostCallBridgeFailure(
+                    "the Java bridge could not read the host call's invocation: " + HostCalls.describe(malformed)));
+            return;
+        }
+        HOST_FRAMES.put(callId, frame);
+        try {
+            HOST_DISPATCH_EXECUTOR.execute(() -> {
+                if (frame.cancelled.get()) { complete(callId, ProtoWriter.hostCallBridgeFailure("host call cancelled before it started")); return; }
+                baml_bridge.internal.InvocationFrames.CURRENT.set(frame.active);
+                try { runHostDispatch(hostValueKey, callId, bamlToHostCall); }
+                finally { baml_bridge.internal.InvocationFrames.CURRENT.remove(); }
+            });
         } catch (Throwable t) {
-            // Could not even schedule (executor shut down / resource exhaustion):
-            // complete with a bridge failure so the engine never awaits forever.
-            safeComplete(callId, true, EMPTY_PAYLOAD);
+            complete(callId, ProtoWriter.hostCallBridgeFailure("the Java bridge could not schedule the host call: " + t));
         }
     }
 
     /**
-     * Run one dispatch on the executor: resolve the callable, decode the args,
-     * invoke, and complete the call with the result (awaiting a returned
-     * {@link CompletableFuture}) or the thrown value. Wrapped so a dropped
-     * dispatch can never leave the engine awaiting: any thrown value routes to
-     * {@link #completeHostError}, and the call is always completed exactly once.
+     * Run one dispatch on the executor: bind the arguments, invoke, and complete
+     * the call with what the callable produced, awaiting a returned
+     * {@link CompletableFuture}. The call completes exactly once:
      *
-     * <p>A callable registered wrapped in a {@link BamlTypedCallable} (the
-     * generated SDK's carrier) is unwrapped here: its declared parameter
-     * descriptors drive a type-directed arg decode — so the user's typed lambda
-     * receives the generated types its slot declares (e.g. the sealed
-     * {@code baml.json.json} union), never the raw wire value — and its return
-     * descriptor types the encode of the result.
+     * <ul>
+     *   <li>arguments the bridge cannot decode, or that the callable's Java shape
+     *       cannot take, are the bridge's own failure ({@link HostCalls#bind});
+     *   <li>a result is {@link HostCalls#returnedCompletion}; anything the callable throws
+     *       is {@link HostCalls#failedCompletion}.
+     * </ul>
+     *
+     * <p>The registered {@link BamlTypedCallable} carries the function type the
+     * callable was bound to: each argument decodes against its declared
+     * parameter (so the user's typed lambda receives the generated types its slot
+     * declares, e.g. the sealed {@code baml.json.json} union, never the raw wire
+     * value), and the result and a thrown error encode against the declared
+     * return and throws types.
      */
     private static void runHostDispatch(long hostValueKey, long callId, byte[] bamlToHostCall) {
-        Object registered = HOST_VALUES.get(hostValueKey);
-        if (registered == null) {
-            // The engine dispatched a key the bridge no longer holds — a bridge
-            // fault, not a user exception → BridgeFailure (empty error payload).
-            safeComplete(callId, true, EMPTY_PAYLOAD);
+        if (!(HostCalls.lookup(hostValueKey) instanceof BamlTypedCallable typed)) {
+            // The engine dispatched a key the bridge no longer holds as a
+            // callable — a bridge fault, not a user exception.
+            complete(callId, ProtoWriter.hostCallBridgeFailure("no Java host callable is registered for the dispatched key"));
             return;
         }
-        BamlTypedCallable typed = registered instanceof BamlTypedCallable t ? t : null;
-        Object callable = typed != null ? typed.callable() : registered;
-        BamlType returnDesc = typed != null ? typed.returnDesc() : null;
+        HostCalls.Bound bound = HostCalls.bind(typed, bamlToHostCall);
+        if (bound instanceof HostCalls.Bound.Refused refused) {
+            complete(callId, refused.completion());
+            return;
+        }
+        HostCalls.Bound.Call call = (HostCalls.Bound.Call) bound;
+        BamlType returnDesc = typed.returnDesc();
+        BamlType throwsDesc = typed.functionType().functionThrows();
         Object result;
         try {
-            ProtoReader.HostCallArgs args = typed != null
-                    ? ProtoReader.decodeBamlToHostCall(
-                            bamlToHostCall,
-                            typed.positionalDescs(),
-                            typed.optionalNames(),
-                            typed.optionalDescs())
-                    : ProtoReader.decodeBamlToHostCall(bamlToHostCall);
-            result = invokeHostCallable(callable, args);
-        } catch (Throwable userError) {
-            completeHostError(callId, userError);
+            result = call.adapter().invoke(typed.callable(), call.args().positional, call.args().optional);
+        } catch (Throwable thrown) {
+            completeEncoded(callId, () -> HostCalls.failedCompletion(thrown, throwsDesc));
             return;
         }
         // Async detection at the VALUE level (design point C): await a returned
-        // CompletableFuture, then encode; anything else encodes immediately. No
-        // typed async surface yet — this future-proofs the Object-typed slot.
+        // CompletableFuture, then encode; anything else encodes immediately.
         if (result instanceof CompletableFuture<?> future) {
+            HostFrame frame = HOST_FRAMES.get(callId);
+            if (frame != null) { frame.pending = future; if (frame.cancelled.get()) future.cancel(true); }
             future.whenComplete(
-                    (value, err) -> {
-                        if (err != null) {
-                            completeHostError(callId, unwrapCompletion(err));
-                        } else {
-                            completeHostSuccess(callId, value, returnDesc);
-                        }
-                    });
+                    (value, err) -> completeEncoded(
+                            callId,
+                            () -> err != null
+                                    ? HostCalls.failedCompletion(err, throwsDesc)
+                                    : HostCalls.returnedCompletion(value, returnDesc)));
         } else {
-            completeHostSuccess(callId, result, returnDesc);
+            completeEncoded(callId, () -> HostCalls.returnedCompletion(result, returnDesc));
         }
     }
 
     /**
-     * Invoke {@code callable} with the reshaped args — the invoke ladder. A
-     * generated {@link BamlHostCallable} folds the required + optional buckets
-     * back into its SAM ({@code __bamlDispatch}); the {@code java.util.function.*}
-     * shapes take their positional args directly (codegen only uses them for plain
-     * arity-&le;-2 all-required callables, so their optional bucket is empty).
+     * Compute a completion inside its own {@link EncodingScope} and deliver it:
+     * the references it hands the engine stay handed over once delivered, and
+     * every reference a refused encode took is taken back.
      */
-    private static Object invokeHostCallable(Object callable, ProtoReader.HostCallArgs args) {
-        List<Object> pos = args.positional;
-        if (callable instanceof BamlHostCallable hc) {
-            return hc.__bamlDispatch(pos, args.optional);
-        }
-        if (callable instanceof java.util.function.Function<?, ?>) {
-            @SuppressWarnings("unchecked")
-            java.util.function.Function<Object, Object> f =
-                    (java.util.function.Function<Object, Object>) callable;
-            return f.apply(pos.get(0));
-        }
-        if (callable instanceof java.util.function.BiFunction<?, ?, ?>) {
-            @SuppressWarnings("unchecked")
-            java.util.function.BiFunction<Object, Object, Object> f =
-                    (java.util.function.BiFunction<Object, Object, Object>) callable;
-            return f.apply(pos.get(0), pos.get(1));
-        }
-        if (callable instanceof java.util.function.Supplier<?> s) {
-            return s.get();
-        }
-        if (callable instanceof java.util.function.Consumer<?>) {
-            @SuppressWarnings("unchecked")
-            java.util.function.Consumer<Object> c = (java.util.function.Consumer<Object>) callable;
-            c.accept(pos.get(0));
-            return null;
-        }
-        if (callable instanceof java.util.function.BiConsumer<?, ?>) {
-            @SuppressWarnings("unchecked")
-            java.util.function.BiConsumer<Object, Object> c =
-                    (java.util.function.BiConsumer<Object, Object>) callable;
-            c.accept(pos.get(0), pos.get(1));
-            return null;
-        }
-        if (callable instanceof Runnable r) {
-            r.run();
-            return null;
-        }
-        // Defensive: only callables are registered, so this is unreachable.
-        throw new IllegalStateException(
-                "host-value key resolved to a non-callable object: " + callable.getClass());
-    }
-
-    /**
-     * Encode a successful callable result and complete the call.
-     * {@code returnDesc} (nullable) is the declared return-type descriptor a
-     * {@link BamlTypedCallable} carries; it types the encode exactly like a
-     * generated binding's argument descriptor ({@link BamlTypedValue}).
-     */
-    private static void completeHostSuccess(long callId, Object value, BamlType returnDesc) {
-        byte[] payload;
-        try {
-            Object encodable =
-                    returnDesc != null && value != null
-                            ? new BamlTypedValue(value, returnDesc)
-                            : value;
-            payload = ProtoWriter.encodeInboundValue(encodable);
-        } catch (Throwable encodeError) {
-            // The callable returned a value the encoder can't map to a BAML value:
-            // a bridge fault (the declared return type should have matched).
-            safeComplete(callId, true, EMPTY_PAYLOAD);
-            return;
-        }
-        safeComplete(callId, false, payload);
-    }
-
-    /**
-     * Complete the call with a thrown value, via the three-way error branch
-     * (design points D + F):
-     *
-     * <ul>
-     *   <li>A {@link BamlError} / {@link BamlPanic} wrapping a codegenned BAML
-     *       value → unwrap {@code .value()} and encode it as its real BAML class,
-     *       so BAML's typed {@code catch (e: ValidationError)} matches
-     *       structurally.
-     *   <li>Anything else → register the {@link Throwable} under a fresh key and
-     *       encode a {@code baml.errors.HostCallable} carrying {@code _handle}, so
-     *       the decoder rehydrates the SAME object by identity on round trip.
-     * </ul>
-     */
-    private static void completeHostError(long callId, Throwable error) {
-        Object unwrapped = null;
-        if (error instanceof BamlError be) {
-            unwrapped = be.value();
-        } else if (error instanceof BamlPanic bp) {
-            unwrapped = bp.value();
-        }
-        if (unwrapped != null) {
+    private static void completeEncoded(long callId, java.util.function.Supplier<HostCalls.Completion> completion) {
+        try (EncodingScope encoding = new EncodingScope()) {
+            HostCalls.Completion done;
             try {
-                byte[] payload = ProtoWriter.encodeInboundValue(unwrapped);
-                safeComplete(callId, true, payload);
-                return;
-            } catch (Throwable notABamlValue) {
-                // Not encodable as a BAML value — fall through to the opaque path.
+                done = completion.get();
+            } catch (Throwable bridgeFault) {
+                done = new HostCalls.Completion(ProtoWriter.hostCallBridgeFailure(
+                        "the Java bridge could not complete the host call: " + HostCalls.describe(bridgeFault)), false);
+            }
+            if (complete(callId, done.bytes()) && done.carriesReferences()) {
+                encoding.submitted();
             }
         }
-        long handleKey = registerHostOpaque(error);
-        String className = error.getClass().getSimpleName();
-        String message = error.getMessage() != null ? error.getMessage() : error.toString();
-        byte[] payload =
-                ProtoWriter.encodeHostCallableError(className, message, renderTraceback(error), handleKey);
-        safeComplete(callId, true, payload);
-    }
-
-    /** Render a throwable's stack trace as a string for the {@code HostCallable.traceback} field. */
-    private static String renderTraceback(Throwable error) {
-        java.io.StringWriter sw = new java.io.StringWriter();
-        try (java.io.PrintWriter pw = new java.io.PrintWriter(sw)) {
-            error.printStackTrace(pw);
-        }
-        return sw.toString();
     }
 
     /**
-     * A {@code whenComplete} error is a {@link CompletionException} wrapping the
-     * real cause; unwrap it so the callable's actual exception drives the error
-     * branch (and round-trips by identity).
+     * Deliver a host call's completion. Returns whether the engine took it; a
+     * native-completion failure is swallowed (the completion is written never
+     * to throw, and the executor task must not propagate it).
      */
-    private static Throwable unwrapCompletion(Throwable err) {
-        return err instanceof CompletionException && err.getCause() != null
-                ? err.getCause()
-                : err;
-    }
-
-    /** Complete a host call, swallowing any native-completion failure (nothing more to do). */
-    private static void safeComplete(long callId, boolean isError, byte[] content) {
+    private static boolean complete(long callId, byte[] completion) {
         try {
-            nativeCompleteHostCall(callId, isError, content);
+            nativeCompleteHostCall(callId, completion);
+            return true;
         } catch (Throwable ignored) {
-            // The native completion is written never to throw; if it somehow does,
-            // the executor task must not propagate it.
+            return false;
+        } finally {
+            HostFrame frame = HOST_FRAMES.remove(callId);
+            if (frame != null) frame.active.state().close();
         }
     }
 
@@ -975,8 +863,7 @@ public final class BamlFfi {
 
     private static long newCallId() {
         long id = nativeNewCallId();
-        // Defensive: the engine rejects call_id 0, and the native counter starts
-        // at 1, so this fallback should never trigger.
-        return id != 0 ? id : FALLBACK_CALL_ID.getAndIncrement();
+        if (id == 0) throw new IllegalStateException("Could not allocate a BAML invocation");
+        return id;
     }
 }

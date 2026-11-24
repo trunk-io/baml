@@ -28,7 +28,10 @@ use baml_type::{
     normalize::{TypeContext as _, normalize_interned},
 };
 
-use super::{Expectation, InferenceContext};
+use super::{
+    Expectation, InferenceContext, Suppress,
+    flow::{CondFacts, TestPosition},
+};
 use crate::exhaustiveness::{Ctor, DPat, PatCtx, compute_match_usefulness};
 
 /// One lowered pattern: the matrix row piece, the refined scrutinee type
@@ -85,6 +88,38 @@ impl<'db> InferenceContext<'db> {
             None => self.infer_expr(body, scrutinee, &Expectation::None),
         };
         let scrut_resolved = self.scrutinee_demand(&scrut_ty);
+        // An arm that writes a type or a shape is typed against the
+        // scrutinee's structure here - a typed arm narrows, a structural one
+        // destructures, and each catch-all after them is the scrutinee minus
+        // what they took - and judged for usefulness, so the type must be
+        // known at that point: a structural demand, like a member access,
+        // refused here whatever a variable later solves to (rustc resolves
+        // the scrutinee's structure where a pattern asks for it). Arms that
+        // only bind (`_`, `let rest`, a chain of them) ask for nothing: they
+        // take the scrutinee as it is, open or not, and cover it. The report
+        // owns the open classes (no "cannot infer" of their own, nor an arm
+        // pattern's), and a class an earlier error already owns is that
+        // error's cascade.
+        let needs_structure = arms
+            .iter()
+            .any(|&arm| !binds_without_a_type(body, body.match_arms[arm].pattern));
+        let refused_open = needs_structure
+            && !scrut_resolved.has_error()
+            && baml_type::interned::ClosedTy::try_from(&scrut_resolved).is_err();
+        if refused_open {
+            let roots = self.table.open_roots_in(&scrut_resolved);
+            let owed = roots.iter().any(|&root| !self.table.is_tainted(root));
+            for root in roots {
+                self.table.taint_root(root);
+            }
+            if owed {
+                let full_type = self.plain_finalized(&scrut_resolved);
+                self.report(super::PendingDiag::ScrutineeTypeMustBeKnown {
+                    expr: scrutinee,
+                    full_type,
+                });
+            }
+        }
         let scrut_binding = self.narrowable_binding(body, scrutinee);
         let branch_expectation = expected.adjust_for_branches(&mut self.table);
 
@@ -99,7 +134,7 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        let entry_diverges = self.diverges;
+        let entry_diverges = self.diverges();
         let mut arm_tys = Vec::new();
         let mut matrix_arms: Vec<DPat> = Vec::new();
         let mut matrix_arm_bodies: Vec<ExprId> = Vec::new();
@@ -110,10 +145,15 @@ impl<'db> InferenceContext<'db> {
         // catch-all arm sees the complement - the catch-residual
         // mechanism generalized to match.
         let mut residual = scrut_resolved.clone();
-        let pending_before = self.pending_diags.len();
+        let pending_before = self.journals.pending_diags.len();
         for &arm_id in arms {
             let arm = &body.match_arms[arm_id];
-            let outcome = self.lower_pattern(body, arm.pattern, &scrut_resolved);
+            // The arm's own catch-all bindings read the same way as the
+            // scrutinee does in the arm: `null => .., let rest => ..` binds
+            // `rest` to the non-null remainder. The matrix row stays a
+            // wildcard over the whole column.
+            let outcome =
+                self.lower_pattern_reaching(body, arm.pattern, &scrut_resolved, &residual);
             any_pattern_error |= outcome.matched_ty.has_error();
             // A pattern irrefutable against the full scrutinee is really
             // matching the residual; typed arms take their own refinement.
@@ -127,31 +167,13 @@ impl<'db> InferenceContext<'db> {
             if let Some(binding) = scrut_binding {
                 self.flow.insert(binding, narrow_ty);
             }
-            self.diverges = super::Diverges::Maybe;
+            self.set_diverges(super::Diverges::Maybe);
             if let Some(guard) = arm.guard {
-                self.check_condition(body, guard);
-                let guard_facts = self.condition_facts(body, guard);
+                let (_, guard_facts) = self.check_condition(body, guard);
                 self.apply_facts(&guard_facts.when_true);
             }
-            // A hard branch expectation CHECKS each arm (rustc coerces
-            // every arm to the expectation): a failing arm reports at
-            // ITSELF - and recovers as the expectation, so the join does
-            // not re-report the same mismatch on the whole match. A
-            // passing arm keeps its ACTUAL type (literal grain survives
-            // the join).
-            let arm_ty = match branch_expectation.only_has_type() {
-                Some(expected_ty) => {
-                    let expected_ty = expected_ty.clone();
-                    let actual = self.check_expr(body, arm.body, &expected_ty);
-                    if self.result.type_mismatches.contains_key(&arm.body) {
-                        expected_ty
-                    } else {
-                        actual
-                    }
-                }
-                None => self.infer_expr(body, arm.body, &branch_expectation),
-            };
-            all_diverge = all_diverge.and(self.diverges);
+            let arm_ty = self.infer_branch(body, arm.body, &branch_expectation);
+            all_diverge = all_diverge.and(self.diverges());
             self.flow = saved_flow;
             arm_tys.push(arm_ty);
             if arm.guard.is_none() {
@@ -162,11 +184,17 @@ impl<'db> InferenceContext<'db> {
                 matrix_arm_bodies.push(arm.body);
             }
         }
-        self.diverges = entry_diverges.or(all_diverge);
+        self.set_diverges(entry_diverges.or(all_diverge));
+        let parts = arms
+            .iter()
+            .zip(&arm_tys)
+            .map(|(&arm, ty)| (ty.clone(), self.take_units(body.match_arms[arm].body)))
+            .collect();
+        let units = self.join_units(parts, expected);
         // An unknown-FIELD in some arm's class pattern makes that arm's
         // matrix row a lie (the bad field dropped out), so usefulness
         // verdicts are noise - same suppression as an errored pattern.
-        any_pattern_error |= self.pending_diags[pending_before..]
+        any_pattern_error |= self.journals.pending_diags[pending_before..]
             .iter()
             .any(|pending| matches!(pending, super::PendingDiag::UnknownPatternField { .. }));
 
@@ -174,9 +202,37 @@ impl<'db> InferenceContext<'db> {
             return Ty::error();
         }
         let Ok(scrut_closed) = baml_type::interned::ClosedTy::try_from(&scrut_resolved) else {
-            // Open scrutinee: usefulness is undecidable; the sentinel
-            // suppresses (the pre-existing has_infer disposition).
-            return Ty::error();
+            if refused_open {
+                return Ty::error();
+            }
+            debug_assert!(
+                !needs_structure,
+                "an open scrutinee an arm needs the structure of was refused before its arms"
+            );
+            // Catch-all arms over a scrutinee still being inferred: the
+            // first unguarded one takes every value, so the match is
+            // exhaustive and every unguarded arm after it is unreachable.
+            // With every arm guarded, a value whose guards all fail reaches
+            // no arm, and nothing names a narrower witness than `_`.
+            let Some((_, later)) = matrix_arm_bodies.split_first() else {
+                self.report(super::PendingDiag::NonExhaustiveMatch {
+                    expr: match_expr,
+                    scrutinee: scrut_resolved.clone(),
+                    missing: vec!["_".to_string()],
+                });
+                self.result.non_exhaustive_matches.insert(match_expr);
+                return Ty::error();
+            };
+            for &arm_body in later {
+                self.report(super::PendingDiag::UnreachableArm {
+                    expr: arm_body,
+                    warning: false,
+                });
+            }
+            if !units.is_empty() {
+                self.unjudged_units.insert(match_expr, units);
+            }
+            return self.join(&arm_tys);
         };
         let col_ty = scrut_closed.to_plain();
         let ctx = HirPatCtx { infer: self };
@@ -188,7 +244,7 @@ impl<'db> InferenceContext<'db> {
                 break;
             }
             if let Some(&arm_body) = matrix_arm_bodies.get(arm.0) {
-                self.pending_diags.push(super::PendingDiag::UnreachableArm {
+                self.report(super::PendingDiag::UnreachableArm {
                     expr: arm_body,
                     warning: false,
                 });
@@ -202,14 +258,16 @@ impl<'db> InferenceContext<'db> {
                 .iter()
                 .map(|w| crate::exhaustiveness::render_witness_pat(self.db, &self.viewpoint(), w))
                 .collect();
-            self.pending_diags
-                .push(super::PendingDiag::NonExhaustiveMatch {
-                    expr: match_expr,
-                    scrutinee: scrut_resolved.clone(),
-                    missing,
-                });
+            self.report(super::PendingDiag::NonExhaustiveMatch {
+                expr: match_expr,
+                scrutinee: scrut_resolved.clone(),
+                missing,
+            });
             self.result.non_exhaustive_matches.insert(match_expr);
             return Ty::error();
+        }
+        if !units.is_empty() {
+            self.unjudged_units.insert(match_expr, units);
         }
         self.join(&arm_tys)
     }
@@ -230,18 +288,48 @@ impl<'db> InferenceContext<'db> {
 
     /// `expr is pattern`: the pattern lowers against the operand (no
     /// subtype gate - a never-matching test is legal and just false); the
-    /// result is always bool. S10b reads the outcome for narrowing.
-    pub(super) fn infer_is(&mut self, body: &ExprBody, scrutinee: ExprId, pattern: PatId) -> Ty {
+    /// result is always bool. A narrowable operand also yields the facts
+    /// of the test: the matched type when it holds and, for a pattern that
+    /// is refutable by type alone, the rest when it does not.
+    pub(super) fn infer_is(
+        &mut self,
+        body: &ExprBody,
+        scrutinee: ExprId,
+        pattern: PatId,
+        position: TestPosition,
+    ) -> (Ty, CondFacts) {
         let scrut_ty = self.infer_expr(body, scrutinee, &Expectation::None);
-        let scrut_resolved = self.scrutinee_demand(&scrut_ty);
+        let binding = self.narrowable_binding(body, scrutinee);
+        let scrut = match binding {
+            Some(binding) => self.binding_flow_ty(binding),
+            None => scrut_ty,
+        };
+        let scrut = self.scrutinee_demand(&scrut);
         // `is` is a runtime TYPE TEST: a pattern provably disjoint from
         // the scrutinee is a legal test that answers `false` (the corpus
         // pins `42 is string`), not the dead-pattern error a match arm
-        // gets - probe silently.
-        self.or_probe_depth += 1;
-        self.lower_pattern(body, pattern, &scrut_resolved);
-        self.or_probe_depth -= 1;
-        Ty::bool()
+        // gets - probe silently. A branch condition on a narrowable local
+        // is the exception: there the test is dead code, and it reports.
+        let silent = binding.is_none() || position == TestPosition::Value;
+        let outcome = if silent {
+            self.with_suppressed(Suppress::SilentTest, |this| {
+                this.lower_pattern(body, pattern, &scrut)
+            })
+        } else {
+            self.lower_pattern(body, pattern, &scrut)
+        };
+        let mut facts = CondFacts::default();
+        if let Some(binding) = binding {
+            // Subtraction only when the pattern is refutable by type
+            // alone (B-1069): a field- or length-constrained pattern
+            // failing tells us nothing type-shaped about the scrutinee.
+            if outcome.consumes_matched {
+                let complement = self.subtract_narrow(&scrut, &outcome.matched_ty);
+                facts.when_false.insert(binding, complement);
+            }
+            facts.when_true.insert(binding, outcome.matched_ty);
+        }
+        (Ty::bool(), facts)
     }
 
     /// Destructuring `let`: the initializer synthesizes (widened at the
@@ -296,7 +384,7 @@ impl<'db> InferenceContext<'db> {
             && !resolved.has_error()
             && !resolved.has_infer()
         {
-            self.pending_diags.push(super::PendingDiag::RefutableLet {
+            self.report(super::PendingDiag::RefutableLet {
                 pat: pattern,
                 context: crate::diagnostics::IrrefutableContextKind::Let,
             });
@@ -321,7 +409,11 @@ impl<'db> InferenceContext<'db> {
                     .iter()
                     .map(|s| baml_type::Name::new(s.as_str()))
                     .collect();
-                let def = self.lower.resolve_type_definition(&segments)?;
+                let head = self.lower.path_head(&segments);
+                if self.scoped_type_param_heads(head, &segments) {
+                    return None;
+                }
+                let def = self.lower.resolve_type_definition(head, &segments)?;
                 let baml_compiler2_hir::contributions::Definition::Class(class_loc) = def else {
                     return None;
                 };
@@ -416,7 +508,32 @@ impl<'db> InferenceContext<'db> {
         pat: PatId,
         scrut: &Ty,
     ) -> PatternOutcome {
-        let outcome = self.lower_pattern_inner(body, pat, scrut);
+        self.lower_pattern_reaching(body, pat, scrut, scrut)
+    }
+
+    /// [`Self::lower_pattern`] for a pattern that only part of the scrutinee
+    /// can reach: `reaching` is the scrutinee minus the members that earlier
+    /// `match` arms consumed. A pattern that writes no type of its own (`_`,
+    /// a bare `let name`, a chain of bare bindings) takes whatever reaches
+    /// it, so `reaching` is its type. Every other pattern is typed by what
+    /// it writes, against `scrut`.
+    pub(super) fn lower_pattern_reaching(
+        &mut self,
+        body: &ExprBody,
+        pat: PatId,
+        scrut: &Ty,
+        reaching: &Ty,
+    ) -> PatternOutcome {
+        debug_assert!(
+            reaching == scrut || {
+                let members = scrut_members(scrut);
+                scrut_members(reaching).into_iter().all(|member| {
+                    matches!(member.kind(), InferTy::Never) || members.contains(&member)
+                })
+            },
+            "`reaching` must be made of members of the scrutinee",
+        );
+        let outcome = self.lower_pattern_inner(body, pat, scrut, reaching);
         // Every pattern node records its type (TIR's pattern_types
         // single-write-point discipline); ascriptions record the WRITTEN
         // form (ruling 3) while narrowing keeps the refined one.
@@ -428,7 +545,13 @@ impl<'db> InferenceContext<'db> {
         outcome
     }
 
-    fn lower_pattern_inner(&mut self, body: &ExprBody, pat: PatId, scrut: &Ty) -> PatternOutcome {
+    fn lower_pattern_inner(
+        &mut self,
+        body: &ExprBody,
+        pat: PatId,
+        scrut: &Ty,
+        reaching: &Ty,
+    ) -> PatternOutcome {
         let mut written_refs = Vec::new();
         written_refs.extend(self.type_refs.pattern_types.get(&pat).copied());
         written_refs.extend(self.type_refs.array_ascriptions.get(&pat).copied());
@@ -449,19 +572,21 @@ impl<'db> InferenceContext<'db> {
                 .map(|(_, type_ref)| *type_ref),
         );
         match &body.patterns[pat] {
+            // A pattern that writes no type matches what reaches it. Its
+            // matrix row is still a wildcard over the whole column.
             Pattern::Wildcard => PatternOutcome {
                 dpat: DPat::wildcard(dpat_ty(scrut)),
-                matched_ty: scrut.clone(),
+                matched_ty: reaching.clone(),
                 recorded_ty: None,
                 covers_type: true,
                 consumes_matched: true,
             },
             Pattern::Bind { subpat, .. } => {
                 let inner = match subpat {
-                    Some(sub) => self.lower_pattern(body, *sub, scrut),
+                    Some(sub) => self.lower_pattern_reaching(body, *sub, scrut, reaching),
                     None => PatternOutcome {
                         dpat: DPat::wildcard(dpat_ty(scrut)),
-                        matched_ty: scrut.clone(),
+                        matched_ty: reaching.clone(),
                         recorded_ty: None,
                         covers_type: true,
                         consumes_matched: true,
@@ -506,14 +631,20 @@ impl<'db> InferenceContext<'db> {
                 let suffix = suffix.clone();
                 self.lower_array_pattern(body, pat, &prefix, rest.as_ref(), &suffix, scrut)
             }
+            Pattern::Tuple(elements) => {
+                let elements = elements.clone();
+                self.lower_tuple_pattern(body, pat, &elements, scrut)
+            }
             Pattern::Or(alts) => {
                 let alts = alts.clone();
-                self.or_probe_depth += 1;
-                let outcomes: Vec<PatternOutcome> = alts
-                    .iter()
-                    .map(|&alt| self.lower_pattern(body, alt, scrut))
-                    .collect();
-                self.or_probe_depth -= 1;
+                let outcomes: Vec<PatternOutcome> =
+                    self.with_suppressed(Suppress::OrPattern, |this| {
+                        alts.iter()
+                            // Every alternative is tried on the value that
+                            // reached the whole pattern.
+                            .map(|&alt| this.lower_pattern_reaching(body, alt, scrut, reaching))
+                            .collect()
+                    });
                 // The dead-pattern rule at the CHAIN level: one alt that
                 // can't match is just never taken, but a chain where no
                 // alternative overlaps the scrutinee is dead outright.
@@ -547,14 +678,12 @@ impl<'db> InferenceContext<'db> {
                                 }
                                 Some(existing) if *existing == ty => {}
                                 Some(existing) => {
-                                    self.pending_diags.push(
-                                        super::PendingDiag::OrBindingConflict {
-                                            pat,
-                                            name: name.clone(),
-                                            first: existing.clone(),
-                                            other: ty.clone(),
-                                        },
-                                    );
+                                    self.report(super::PendingDiag::OrBindingConflict {
+                                        pat,
+                                        name: name.clone(),
+                                        first: existing.clone(),
+                                        other: ty.clone(),
+                                    });
                                 }
                             }
                         }
@@ -627,7 +756,7 @@ impl<'db> InferenceContext<'db> {
         // realization the scrutinee carries, while a written pin
         // (`Source<Item = string> { value }`) constrains the head and
         // types its fields.
-        let adopted = scrut_members(scrut)
+        let existential = scrut_members(scrut)
             .into_iter()
             .find_map(|member| match member.kind() {
                 InferTy::Interface(member_qtn, args, pins)
@@ -643,32 +772,100 @@ impl<'db> InferenceContext<'db> {
                                     .zip(args.iter())
                                     .all(|(a, b)| self.cached_equivalent(a, b)))) =>
                 {
-                    Some((args.to_vec(), pins.to_vec()))
+                    Some(super::obligations::InterfaceInstantiation {
+                        args: args.to_vec(),
+                        pins: pins.to_vec(),
+                    })
                 }
                 _ => None,
             });
-        let (args, pins): (Vec<Ty>, Vec<(baml_type::Name, Ty)>) = {
-            let (adopted_args, adopted_pins) = adopted.unwrap_or_else(|| {
-                (
-                    (0..data.generic_params.len())
-                        .map(|_| Ty::error())
-                        .collect(),
-                    Vec::new(),
-                )
+        // Else the instantiation the scrutinee's implementors provide: the
+        // one at which every member that implements the interface does so (a
+        // class's impl, a type parameter's bound, another interface that
+        // requires it). Members that implement it at different arguments
+        // leave them undetermined.
+        let adopted = existential.or_else(|| {
+            if !written_args.is_empty() || scrut.has_error() {
+                return None;
+            }
+            let associated: Vec<baml_type::Name> = data
+                .associated_types
+                .iter()
+                .map(|assoc| assoc.name.clone())
+                .collect();
+            let mut provided: Option<super::obligations::InterfaceInstantiation> = None;
+            for member in scrut_members(scrut) {
+                let Some(instantiation) = self.implemented_instantiation(
+                    member,
+                    &qtn,
+                    data.generic_params.len(),
+                    &associated,
+                ) else {
+                    continue;
+                };
+                match &provided {
+                    Some(seen) if *seen != instantiation => return None,
+                    Some(_) => {}
+                    None => provided = Some(instantiation),
+                }
+            }
+            provided
+        });
+        let super::obligations::InterfaceInstantiation { args, pins } = {
+            // Nothing written and nothing to adopt: the interface's generics
+            // are undetermined, and the pattern says so (E0002 at the
+            // pattern) unless the scrutinee's own report already covers it:
+            // its error, or the open classes a `match` refused.
+            if adopted.is_none()
+                && written_args.is_empty()
+                && !scrut.has_error()
+                && !self.open_classes_owned(scrut)
+            {
+                for param in &data.generic_params {
+                    self.report(super::PendingDiag::UninferredPatternTypeParam {
+                        pat,
+                        name: param.name.clone(),
+                    });
+                }
+            }
+            let adopted = adopted.unwrap_or_else(|| super::obligations::InterfaceInstantiation {
+                args: (0..data.generic_params.len())
+                    .map(|_| Ty::error())
+                    .collect(),
+                pins: Vec::new(),
             });
-            (
-                if written_args.is_empty() {
-                    adopted_args
+            super::obligations::InterfaceInstantiation {
+                args: if written_args.is_empty() {
+                    adopted.args
                 } else {
                     written_args
                 },
-                if written_pins.is_empty() {
-                    adopted_pins
+                pins: if written_pins.is_empty() {
+                    adopted.pins
                 } else {
                     written_pins
                 },
-            )
+            }
         };
+        // The fields are read through this head, so every declared
+        // associated type is pinned on it: one the written or adopted
+        // instantiation leaves out is undetermined - reported, unless the
+        // scrutinee's own report covers it - and takes the sentinel, so a
+        // field typed by it (`value: Self.Item`) is the sentinel rather than
+        // a projection nothing can reduce.
+        let mut pins = pins;
+        for assoc in &data.associated_types {
+            if pins.iter().any(|(name, _)| *name == assoc.name) {
+                continue;
+            }
+            if !scrut.has_error() && !self.open_classes_owned(scrut) {
+                self.report(super::PendingDiag::UninferredPatternAssociatedType {
+                    pat,
+                    name: assoc.name.clone(),
+                });
+            }
+            pins.push((assoc.name.clone(), Ty::error()));
+        }
         let head = Ty::intern(InferTy::Interface(
             qtn.clone(),
             args.clone().into_boxed_slice(),
@@ -694,7 +891,7 @@ impl<'db> InferenceContext<'db> {
                 true,
             )
             .filter(|member| !member.is_method)
-            .map(|member| member.ty);
+            .map(|member| self.reduced_for_pattern(&member.ty));
             match field_ty {
                 Some(field_ty) => {
                     let index = declared.iter().position(|field| field == name);
@@ -725,7 +922,7 @@ impl<'db> InferenceContext<'db> {
                         name,
                         true,
                     )
-                    .map(|member| member.ty)
+                    .map(|member| self.reduced_for_pattern(&member.ty))
                     .unwrap_or_else(Ty::error);
                     DPat::wildcard(dpat_ty(&field_ty))
                 })
@@ -757,8 +954,16 @@ impl<'db> InferenceContext<'db> {
         };
         PatternOutcome {
             dpat,
-            matched_ty: if head_covers { scrut.clone() } else { head },
-            recorded_ty: None,
+            // A head the scrutinee provably inhabits narrows nothing; the
+            // pattern still records the interface it names, which its test
+            // and field views dispatch through whatever the scrutinee is (a
+            // class whose field links rename, a type parameter).
+            matched_ty: if head_covers {
+                scrut.clone()
+            } else {
+                head.clone()
+            },
+            recorded_ty: Some(head),
             covers_type: head_covers && field_covers,
             consumes_matched: field_covers,
         }
@@ -778,9 +983,46 @@ impl<'db> InferenceContext<'db> {
             outcome.recorded_ty = Some(pat_ty.clone());
         }
         if !outcome.covers_type {
-            self.check_pattern_type_overlap(pat, scrut, pat_ty);
+            if self.tuple_type_test_never_matches(scrut, pat_ty) {
+                // Quiet inside an or-pattern alternative (the chain judges
+                // itself; under a silent test the chain is quiet too) and a
+                // rejected rest, reported for a plain test, silent or not.
+                if !self.suppressed(Suppress::OrPattern) && !self.suppressed(Suppress::RestReject) {
+                    self.report(super::PendingDiag::TupleTypeTestNeverMatches {
+                        pat,
+                        scrutinee: scrut.clone(),
+                        tested: pat_ty.clone(),
+                    });
+                }
+            } else {
+                self.check_pattern_type_overlap(pat, scrut, pat_ty);
+            }
         }
         outcome
+    }
+
+    fn tuple_type_test_never_matches(&mut self, scrut: &Ty, pat_ty: &Ty) -> bool {
+        if !matches!(self.expand_alias_ty(pat_ty).kind(), InferTy::Tuple(_)) {
+            return false;
+        }
+        let expanded = self.expand_alias_ty(scrut);
+        let members = match expanded.kind() {
+            InferTy::Union(members) => members.to_vec(),
+            _ => vec![expanded.clone()],
+        };
+        members
+            .iter()
+            .any(|member| matches!(self.expand_alias_ty(member).kind(), InferTy::Tuple(_)))
+            && self.provably_disjoint(scrut, pat_ty)
+    }
+
+    /// Whether the dead-pattern rule is quiet here: inside an or-pattern
+    /// alternative, under a silent `is` test or in a rejected rest's
+    /// subtree.
+    fn dead_pattern_is_quiet(&self) -> bool {
+        self.suppressed(Suppress::OrPattern)
+            || self.suppressed(Suppress::SilentTest)
+            || self.suppressed(Suppress::RestReject)
     }
 
     /// The dead-pattern rule: a pattern TYPE provably sharing no value
@@ -789,19 +1031,31 @@ impl<'db> InferenceContext<'db> {
     /// ask the reachability oracle, whose `No` is trusted only when it
     /// can see every variable (the `all_typevars_within` obligation).
     fn check_pattern_type_overlap(&mut self, pat: PatId, scrut: &Ty, pat_ty: &Ty) {
-        if self.or_probe_depth > 0 || self.rest_reject_depth > 0 {
+        if self.dead_pattern_is_quiet() {
             return;
         }
+        if self.provably_disjoint(scrut, pat_ty) {
+            self.report(super::PendingDiag::PatternScrutMismatch {
+                pat,
+                expected: scrut.clone(),
+                found: pat_ty.clone(),
+            });
+        }
+    }
+
+    /// Whether a pattern of type `pat_ty` provably shares no value with a
+    /// scrutinee of type `scrut`: the one judgement the dead-arm report and
+    /// a union claim's candidate test read. An erroneous or still-open pair
+    /// is undecidable here, so never provably disjoint.
+    fn provably_disjoint(&self, scrut: &Ty, pat_ty: &Ty) -> bool {
         if pat_ty.has_error() || scrut.has_error() {
-            return;
+            return false;
         }
         let (Ok(pat_closed), Ok(scrut_closed)) = (
             baml_type::interned::ClosedTy::try_from(pat_ty),
             baml_type::interned::ClosedTy::try_from(scrut),
         ) else {
-            // Open pair: undecidable, defer (the pre-existing has_infer
-            // disposition).
-            return;
+            return false;
         };
         let pat_plain = pat_closed.to_plain();
         let scrut_plain = scrut_closed.to_plain();
@@ -822,18 +1076,10 @@ impl<'db> InferenceContext<'db> {
             && !scrut.has_typevar()
             && !pat_ty.has_projection()
             && !scrut.has_projection();
-        let mismatch = oracle_no
+        oracle_no
             || (ground
                 && !self.pattern_matchable(&pat_plain, &scrut_plain)
-                && !self.pattern_overlaps_scrut_member(&pat_plain, &scrut_plain));
-        if mismatch {
-            self.pending_diags
-                .push(super::PendingDiag::PatternScrutMismatch {
-                    pat,
-                    expected: scrut.clone(),
-                    found: pat_ty.clone(),
-                });
-        }
+                && !self.pattern_overlaps_scrut_member(&pat_plain, &scrut_plain))
     }
 
     /// Whether an arm with natural type `pat` is *plausible* against a
@@ -850,6 +1096,9 @@ impl<'db> InferenceContext<'db> {
         match (&pat, &scrut) {
             (P::Never, _) => true,
             (P::List(a), P::List(b)) => self.pattern_matchable(a, b),
+            (P::Tuple(_), P::Tuple(_)) => {
+                baml_type::normalize::equivalent(&pat, &scrut, &self.facts)
+            }
             (
                 P::Map {
                     key: ka, value: va, ..
@@ -971,7 +1220,7 @@ impl<'db> InferenceContext<'db> {
             }
             // Nothing provably claimed: possible-but-not-covering.
             return PatternOutcome {
-                dpat: DPat::single(dpat_ty(pat_ty), dpat_ty(scrut)),
+                dpat: DPat::type_test(dpat_ty(pat_ty), dpat_ty(scrut)),
                 matched_ty: pat_ty.clone(),
                 recorded_ty: None,
                 covers_type: false,
@@ -1019,13 +1268,13 @@ impl<'db> InferenceContext<'db> {
         }
         match pat_ty.kind() {
             InferTy::Literal(..) | InferTy::EnumVariant(..) | InferTy::Null => {
-                DPat::single(pat_plain, col_plain)
+                DPat::type_test(pat_plain, col_plain)
             }
             InferTy::Bool => DPat::or(
                 [true, false]
                     .into_iter()
                     .map(|value| {
-                        DPat::single(
+                        DPat::type_test(
                             baml_type::Ty::Literal(
                                 baml_base::Literal::Bool(value),
                                 Freshness::Regular,
@@ -1042,7 +1291,7 @@ impl<'db> InferenceContext<'db> {
                     variants
                         .into_iter()
                         .map(|variant| {
-                            DPat::single(
+                            DPat::type_test(
                                 baml_type::Ty::EnumVariant(qtn.clone(), variant),
                                 col_plain.clone(),
                             )
@@ -1070,6 +1319,7 @@ impl<'db> InferenceContext<'db> {
                     pat_plain,
                 )
             }
+            InferTy::Tuple(_) => DPat::type_test(pat_plain, col_plain),
             InferTy::TypeVar(..) => {
                 // Rigid: covers only a column of the SAME variable;
                 // otherwise possible-but-not-covering (never a blanket
@@ -1077,14 +1327,14 @@ impl<'db> InferenceContext<'db> {
                 if pat_ty == col {
                     DPat::wildcard(col_plain)
                 } else {
-                    DPat::single(pat_plain, col_plain)
+                    DPat::type_test(pat_plain, col_plain)
                 }
             }
             _ => {
                 if self.provable_subtype(col, pat_ty) {
                     DPat::wildcard(col_plain)
                 } else {
-                    DPat::single(pat_plain, col_plain)
+                    DPat::type_test(pat_plain, col_plain)
                 }
             }
         }
@@ -1118,7 +1368,12 @@ impl<'db> InferenceContext<'db> {
                 consumes_matched: false,
             };
         }
-        let definition = self.lower.resolve_type_definition(class_path);
+        // A type parameter or scoped `type` binding at the head shadows
+        // every item (as for a type pattern): no class is named.
+        let head = self.lower.path_head(class_path);
+        let definition = (!self.scoped_type_param_heads(head, class_path))
+            .then(|| self.lower.resolve_type_definition(head, class_path))
+            .flatten();
         // Destructure spelled with an INTERFACE name: the existential's
         // declared FIELDS destructure like a class's.
         if let Some(baml_compiler2_hir::contributions::Definition::Interface(interface)) =
@@ -1129,19 +1384,20 @@ impl<'db> InferenceContext<'db> {
         }
         let Some(baml_compiler2_hir::contributions::Definition::Class(class)) = definition else {
             // The destructured name resolves nowhere (or to a non-class):
-            // E0003 at the pattern, fields lower against the sentinel.
+            // E0002 at the pattern, as for a type pattern; fields lower
+            // against the sentinel.
             if definition.is_none() {
-                self.pending_diags
-                    .push(super::PendingDiag::UnresolvedPatternName {
-                        pat,
-                        name: baml_type::Name::new(
-                            class_path
-                                .iter()
-                                .map(baml_type::Name::as_str)
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        ),
-                    });
+                self.report(super::PendingDiag::UnresolvedPatternName {
+                    pat,
+                    name: baml_type::Name::new(
+                        class_path
+                            .iter()
+                            .map(baml_type::Name::as_str)
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    ),
+                    suggestions: self.lower.type_suggestions(class_path),
+                });
             }
             for &(_, field_pat) in field_pats {
                 self.lower_pattern(body, field_pat, &Ty::error());
@@ -1159,11 +1415,10 @@ impl<'db> InferenceContext<'db> {
         // A generic class destructure must WRITE its type arguments (the
         // ratified rule; inference from the scrutinee is not offered).
         if generic_count > 0 && !self.type_refs.pattern_class_args.contains_key(&pat) {
-            self.pending_diags
-                .push(super::PendingDiag::GenericDestructureNoArgs {
-                    pat,
-                    class_name: qtn.name().clone(),
-                });
+            self.report(super::PendingDiag::GenericDestructureNoArgs {
+                pat,
+                class_name: qtn.name().clone(),
+            });
         }
 
         let written: Vec<Ty> = self
@@ -1196,21 +1451,15 @@ impl<'db> InferenceContext<'db> {
         };
 
         let head = crate::lower::class_ty(self.lang(), qtn.clone(), args.clone());
-        let declared = if self.is_opaque_trace_type(&qtn) {
-            Vec::new()
-        } else {
-            crate::lower::class_field_types(self.db, class)
-        };
+        let declared = crate::lower::class_field_types(self.db, class);
         let mut field_covers = true;
         let mut sub_dpats: Vec<Option<DPat>> = vec![None; declared.len()];
         for (name, field_pat) in field_pats {
             let index = declared.iter().position(|(field, _)| field == name);
             match index {
                 Some(index) => {
-                    let field_ty = crate::lower::substitute_params(
-                        &crate::impls::interned_ty(&declared[index].1),
-                        &args,
-                    );
+                    let field_ty = self
+                        .pattern_field_ty(&crate::impls::interned_ty(&declared[index].1), &args);
                     let outcome = self.lower_pattern(body, *field_pat, &field_ty);
                     field_covers &= outcome.covers_type;
                     sub_dpats[index] = Some(outcome.dpat);
@@ -1218,13 +1467,12 @@ impl<'db> InferenceContext<'db> {
                 None => {
                     // Unknown field (E0007); sub-bindings still record
                     // (as Error).
-                    self.pending_diags
-                        .push(super::PendingDiag::UnknownPatternField {
-                            pat,
-                            class_name: qtn.clone(),
-                            field_name: name.clone(),
-                            declared: declared.iter().map(|(field, _)| field.clone()).collect(),
-                        });
+                    self.report(super::PendingDiag::UnknownPatternField {
+                        pat,
+                        class_name: qtn.clone(),
+                        field_name: name.clone(),
+                        declared: declared.iter().map(|(field, _)| field.clone()).collect(),
+                    });
                     self.lower_pattern(body, *field_pat, &Ty::error());
                 }
             }
@@ -1234,10 +1482,9 @@ impl<'db> InferenceContext<'db> {
             .zip(sub_dpats)
             .map(|((_, field_ty), sub)| {
                 sub.unwrap_or_else(|| {
-                    DPat::wildcard(dpat_ty(&crate::lower::substitute_params(
-                        &crate::impls::interned_ty(field_ty),
-                        &args,
-                    )))
+                    DPat::wildcard(dpat_ty(
+                        &self.pattern_field_ty(&crate::impls::interned_ty(field_ty), &args),
+                    ))
                 })
             })
             .collect();
@@ -1300,9 +1547,141 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    /// Array destructure: elements lower against the scrutinee's element
-    /// type (ascription intersects when written); a rest binding takes the
-    /// list type. A length-constrained shape never covers by type alone.
+    /// Tuple destructuring tests shape and slot values, preserving every
+    /// possible carried instantiation. Open holders may contain tuples of
+    /// any slot types; their bindings start at `unknown`.
+    fn lower_tuple_pattern(
+        &mut self,
+        body: &ExprBody,
+        pat: PatId,
+        elements: &[PatId],
+        scrut: &Ty,
+    ) -> PatternOutcome {
+        let arity = elements.len();
+        let structure = self.structurally_resolve(scrut);
+        let tuple_slots = |ty: &Ty| match ty.kind() {
+            InferTy::Tuple(slots) if slots.len() == arity => Some(slots.to_vec()),
+            // The bottom type is every tuple: the pattern covers it and
+            // binds nothing that exists.
+            InferTy::Never => Some(vec![Ty::never(); arity]),
+            _ if tuple_pattern_is_open(ty) => Some(vec![Ty::intern(InferTy::Unknown); arity]),
+            _ => None,
+        };
+        if let Some(slots) = tuple_slots(&structure) {
+            let mut outcome = self.lower_tuple_elements(body, elements, &slots, &structure);
+            if tuple_pattern_is_open(&structure) {
+                // Even irrefutable slot patterns do not consume an open
+                // holder: it can also contain non-tuples or other arities.
+                outcome.covers_type = false;
+                outcome.consumes_matched = false;
+            }
+            return outcome;
+        }
+        if let InferTy::Union(members) = structure.kind() {
+            let members: Vec<Ty> = members
+                .iter()
+                .map(|member| self.structurally_resolve(member))
+                .collect();
+            let mut claimed: Vec<(Ty, Vec<Ty>)> = Vec::new();
+            for member in &members {
+                if let Some(slots) = tuple_slots(member)
+                    && self.pattern_fits(body, pat, member)
+                {
+                    claimed.push((member.clone(), slots));
+                }
+            }
+            if !claimed.is_empty() {
+                let scrut_plain = dpat_ty(scrut);
+                let mut alts = Vec::new();
+                let mut matched = Vec::new();
+                let mut consumes = true;
+                let single = claimed.len() == 1;
+                for (member, slots) in &claimed {
+                    let outcome = if single {
+                        self.lower_tuple_elements(body, elements, slots, member)
+                    } else {
+                        self.with_suppressed(Suppress::OrPattern, |this| {
+                            this.lower_tuple_elements(body, elements, slots, member)
+                        })
+                    };
+                    consumes &= outcome.consumes_matched && !tuple_pattern_is_open(member);
+                    matched.push(outcome.matched_ty);
+                    alts.push(DPat::union_member(
+                        dpat_ty(member),
+                        outcome.dpat,
+                        scrut_plain.clone(),
+                    ));
+                }
+                if !single {
+                    let joined: Vec<Ty> = (0..arity)
+                        .map(|i| {
+                            let at_i: Vec<Ty> =
+                                claimed.iter().map(|(_, slots)| slots[i].clone()).collect();
+                            self.union_of(&at_i)
+                        })
+                        .collect();
+                    let joined_ty = Ty::tuple(joined.clone());
+                    self.lower_tuple_elements(body, elements, &joined, &joined_ty);
+                }
+                let dpat = if single {
+                    alts.pop().expect("one claim")
+                } else {
+                    DPat::or(alts, scrut_plain)
+                };
+                return PatternOutcome {
+                    dpat,
+                    matched_ty: self.union_of(&matched),
+                    recorded_ty: None,
+                    covers_type: false,
+                    consumes_matched: consumes,
+                };
+            }
+        }
+        let error_slots = vec![Ty::error(); arity];
+        self.with_suppressed(Suppress::OrPattern, |this| {
+            this.lower_tuple_elements(body, elements, &error_slots, &Ty::error());
+        });
+        if !self.dead_pattern_is_quiet() && !structure.has_error() && !structure.has_infer() {
+            self.report(super::PendingDiag::PatternScrutMismatch {
+                pat,
+                expected: scrut.clone(),
+                found: Ty::tuple(vec![Ty::intern(InferTy::Unknown); arity]),
+            });
+        }
+        PatternOutcome {
+            dpat: DPat::wildcard(dpat_ty(scrut)),
+            matched_ty: Ty::error(),
+            recorded_ty: None,
+            covers_type: false,
+            consumes_matched: false,
+        }
+    }
+
+    fn lower_tuple_elements(
+        &mut self,
+        body: &ExprBody,
+        elements: &[PatId],
+        slots: &[Ty],
+        tuple_ty: &Ty,
+    ) -> PatternOutcome {
+        let outcomes: Vec<PatternOutcome> = elements
+            .iter()
+            .zip(slots)
+            .map(|(&sub, slot)| self.lower_pattern(body, sub, slot))
+            .collect();
+        let covers = outcomes.iter().all(|outcome| outcome.covers_type);
+        PatternOutcome {
+            dpat: DPat::tuple(
+                outcomes.into_iter().map(|outcome| outcome.dpat).collect(),
+                dpat_ty(tuple_ty),
+            ),
+            matched_ty: tuple_ty.clone(),
+            recorded_ty: None,
+            covers_type: covers,
+            consumes_matched: covers,
+        }
+    }
+
     fn lower_array_pattern(
         &mut self,
         body: &ExprBody,
@@ -1334,56 +1713,92 @@ impl<'db> InferenceContext<'db> {
         // alias (or a reducible projection, or a bounded var) answers
         // as its structure.
         let effective = self.structurally_resolve(&effective);
-        // Union scrutinee: claim the list member the pattern
-        // DISCRIMINATES - the class arm's agreeing-instantiation rule
-        // applied to the list constructor. A single list member claims
-        // by constructor kind alone; among several, the pattern's own
-        // demands (ascriptions, nested structural shapes) filter, and
-        // only a UNIQUE fit claims - B-633's provable-overlap
-        // conservatism: "cannot tell" keeps the member, several
-        // survivors stay unclaimed.
-        // Keep the original scrutinee as the matrix column. The narrowed
-        // `effective` type belongs inside the UnionMember constructor; using
-        // it as the column loses the union discriminator and makes equal-shape
-        // slices cover one another regardless of their ascriptions.
+        // The lists the pattern can match are the list-holding members of
+        // the scrutinee: a list type holds lists of its own element, and a
+        // member whose values may be lists of ANY element (`unknown`, an
+        // interface existential, a type parameter) holds lists no one list
+        // type describes - generics are invariant, so an `int[]` is never an
+        // `unknown[]`. Among several holders the pattern claims the ones its
+        // own demands (ascriptions, nested structural shapes) fit, B-633's
+        // provable-overlap conservatism: "cannot tell" keeps the member. A
+        // pattern no holder fits is dead, and its sub-patterns report that
+        // against every holder's elements.
         let scrut_structure = self.structurally_resolve(scrut);
-        let claimed_union = match scrut_structure.kind() {
-            InferTy::Union(members) => {
-                let members = members.to_vec();
-                let mut lists: Vec<Ty> = Vec::new();
-                for member in &members {
-                    if matches!(member.kind(), InferTy::List(..)) {
-                        lists.push(member.clone());
-                    }
-                }
-                let claimed = match lists.as_slice() {
-                    [member] => Some(member.clone()),
-                    [] => None,
-                    _ => {
-                        let mut fitting: Vec<Ty> = Vec::new();
-                        for member in &lists {
-                            if self.pattern_fits(body, pat, member) {
-                                fitting.push(member.clone());
-                            }
-                        }
-                        match fitting.as_slice() {
-                            [member] => Some(member.clone()),
-                            _ => None,
-                        }
-                    }
+        let erroneous = effective.has_error();
+        let mut holders: Vec<(Ty, ListHolding)> = Vec::new();
+        let mut scrutinee_is_lists = !erroneous;
+        for member in scrut_members(&effective) {
+            scrutinee_is_lists &= self.collect_list_holders(member, &mut Vec::new(), &mut holders);
+        }
+        let holder_count = holders.len();
+        let claimed: Vec<(Ty, ListHolding)> = if holders.len() > 1 {
+            let mut fitting = Vec::new();
+            for (member, holding) in &holders {
+                let fits = match holding {
+                    ListHolding::Elements(_) => self.pattern_fits(body, pat, member),
+                    ListHolding::AnyElements => true,
                 };
-                claimed.map(|member| (scrut.clone(), member))
+                if fits {
+                    fitting.push((member.clone(), holding.clone()));
+                }
             }
-            _ => None,
+            if fitting.is_empty() { holders } else { fitting }
+        } else {
+            holders
         };
-        let effective = match &claimed_union {
-            Some((_, member)) => member.clone(),
-            None => effective,
+        let element = if erroneous {
+            // The scrutinee's own error was reported; its elements are
+            // that error too, never a type of their own.
+            Ty::error()
+        } else if claimed.is_empty() {
+            // A scrutinee that holds no list: the pattern is dead. It is
+            // reported where a type pattern's dead arm is - not from a
+            // silent probe (`is` written as a value, an or-alternative, a
+            // rejected rest), and not against `never`, which no arm matches
+            // - and a written ascription made the report above. Reported,
+            // the elements are the sentinel; unreported, they are what a
+            // dead binding holds, nothing.
+            let reported = ascribed.is_none()
+                && !self.dead_pattern_is_quiet()
+                && !matches!(effective.kind(), InferTy::Never);
+            if reported {
+                self.report(super::PendingDiag::ListPatternNeverMatches {
+                    pat,
+                    scrutinee: scrut.clone(),
+                });
+                Ty::error()
+            } else {
+                Ty::never()
+            }
+        } else if claimed
+            .iter()
+            .any(|(_, holding)| matches!(holding, ListHolding::AnyElements))
+        {
+            Ty::intern(InferTy::Unknown)
+        } else {
+            let elements: Vec<Ty> = claimed
+                .iter()
+                .filter_map(|(_, holding)| match holding {
+                    ListHolding::Elements(element) => Some(element.clone()),
+                    ListHolding::AnyElements => None,
+                })
+                .collect();
+            self.union_of(&elements)
         };
-        let element = match effective.kind() {
-            InferTy::List(element) => element.clone(),
-            _ => Ty::error(),
+        // What the pattern matches - the claimed holders - is what its test
+        // decides at run time: membership in that union where every claimed
+        // holder is a list type, the list head alone where one holds lists of
+        // any element.
+        let matched_ty = if claimed.is_empty() {
+            effective.clone()
+        } else {
+            let members: Vec<Ty> = claimed.iter().map(|(member, _)| member.clone()).collect();
+            self.union_of(&members)
         };
+        let claims_only_lists = !claimed.is_empty()
+            && claimed
+                .iter()
+                .all(|(_, holding)| matches!(holding, ListHolding::Elements(_)));
         let mut sub_dpats = Vec::new();
         for &sub in prefix {
             sub_dpats.push(self.lower_pattern(body, sub, &element).dpat);
@@ -1397,9 +1812,8 @@ impl<'db> InferenceContext<'db> {
             // have no sliced-middle semantics (E0001's rest-sub-pattern
             // rule) - including a bind CHAIN whose tail is structural.
             let shape_ok = rest_pattern_shape_ok(body, rest_pat);
-            if !shape_ok && self.rest_reject_depth == 0 {
-                self.pending_diags
-                    .push(super::PendingDiag::RestNotBinding { pat: rest_pat });
+            if !shape_ok && !self.suppressed(Suppress::RestReject) {
+                self.report(super::PendingDiag::RestNotBinding { pat: rest_pat });
             }
             // The rest binds the sliced middle: a list of the element.
             // A rejected subtree still lowers so its bindings record
@@ -1409,9 +1823,9 @@ impl<'db> InferenceContext<'db> {
             if shape_ok {
                 self.lower_pattern(body, rest_pat, &rest_ty);
             } else {
-                self.rest_reject_depth += 1;
-                self.lower_pattern(body, rest_pat, &rest_ty);
-                self.rest_reject_depth -= 1;
+                self.with_suppressed(Suppress::RestReject, |this| {
+                    this.lower_pattern(body, rest_pat, &rest_ty)
+                });
             }
         }
         for &sub in suffix {
@@ -1431,21 +1845,86 @@ impl<'db> InferenceContext<'db> {
                 suffix: 0
             }
         );
-        let slice_dpat = DPat::slice(shape, sub_dpats, dpat_ty(&effective));
-        let dpat = match &claimed_union {
-            Some((scrut_union, member)) => {
-                DPat::union_member(dpat_ty(member), slice_dpat, dpat_ty(scrut_union))
+        // A union column takes the claimed members as its branches, one
+        // `UnionMember` each; any other column (or a claim that is not made of
+        // the column's own members, after an ascription narrowed it) takes
+        // the slice directly.
+        let slice_dpat = |ty: &Ty| DPat::slice(shape.clone(), sub_dpats.clone(), dpat_ty(ty));
+        let dpat = match scrut_structure.kind() {
+            InferTy::Union(members)
+                if !claimed.is_empty()
+                    && claimed.iter().all(|(member, _)| members.contains(member)) =>
+            {
+                let mut branches: Vec<DPat> = claimed
+                    .iter()
+                    .map(|(member, _)| {
+                        DPat::union_member(dpat_ty(member), slice_dpat(member), dpat_ty(scrut))
+                    })
+                    .collect();
+                if branches.len() == 1 {
+                    branches.remove(0)
+                } else {
+                    DPat::or(branches, dpat_ty(scrut))
+                }
             }
-            None => slice_dpat,
+            _ => slice_dpat(&matched_ty),
         };
         PatternOutcome {
             dpat,
-            matched_ty: effective,
+            matched_ty,
             recorded_ty: None,
-            // A member-claiming pattern narrows; it never covers the
-            // whole union.
-            covers_type: covers && ascribed.is_none() && claimed_union.is_none(),
-            consumes_matched: covers,
+            // `[..]` accepts every value of a type made of lists only, and
+            // every value of the claimed list types; a member that may hold
+            // something other than a list (`unknown`, a type parameter) is
+            // never wholly accepted.
+            covers_type: covers
+                && ascribed.is_none()
+                && scrutinee_is_lists
+                && claimed.len() == holder_count,
+            consumes_matched: covers && claims_only_lists,
+        }
+    }
+
+    /// Appends the list-holding members `ty` unfolds to, through unions and
+    /// recursive aliases; returns whether every member is a list type. An
+    /// alias met again on its own unfolding is an unguarded recursive member,
+    /// which contributes nothing to its type (`TYPE_SYSTEM.md`, Productivity).
+    fn collect_list_holders(
+        &self,
+        ty: &Ty,
+        unfolding: &mut Vec<Ty>,
+        holders: &mut Vec<(Ty, ListHolding)>,
+    ) -> bool {
+        if let InferTy::TypeAlias(_) = ty.kind() {
+            if unfolding.contains(ty) {
+                return true;
+            }
+            let expanded = self.expand_alias_ty(ty);
+            if expanded != *ty {
+                unfolding.push(ty.clone());
+                let only_lists = self.collect_list_holders(&expanded, unfolding, holders);
+                unfolding.pop();
+                return only_lists;
+            }
+        }
+        if let InferTy::Union(members) = ty.kind() {
+            // Every member is visited: a non-list member must not hide the
+            // lists after it.
+            let mut only_lists = true;
+            for member in members {
+                only_lists &= self.collect_list_holders(member, unfolding, holders);
+            }
+            return only_lists;
+        }
+        match list_holding(ty) {
+            Some(holding) => {
+                let is_list = matches!(holding, ListHolding::Elements(_));
+                if !holders.iter().any(|(member, _)| member == ty) {
+                    holders.push((ty.clone(), holding));
+                }
+                is_list
+            }
+            None => false,
         }
     }
 
@@ -1458,6 +1937,22 @@ impl<'db> InferenceContext<'db> {
     /// only on a unique fit.
     fn pattern_fits(&mut self, body: &ExprBody, pat: PatId, ty: &Ty) -> bool {
         let expanded = self.expand_alias_ty(ty);
+        // A type whose values may be of any shape - or of any of several -
+        // is never a provable misfit as a whole.
+        match expanded.kind() {
+            InferTy::Unknown
+            | InferTy::TypeVar(_)
+            | InferTy::AssociatedTypeProjection { .. }
+            | InferTy::InferVar { .. }
+            | InferTy::Error => return true,
+            InferTy::Union(members) => {
+                let members = members.to_vec();
+                return members
+                    .iter()
+                    .any(|member| self.pattern_fits(body, pat, member));
+            }
+            _ => {}
+        }
         match &body.patterns[pat] {
             Pattern::Wildcard => true,
             Pattern::Bind { subpat, .. } => {
@@ -1465,8 +1960,7 @@ impl<'db> InferenceContext<'db> {
                     return true;
                 };
                 if let Some(ascribed) = self.pattern_ascription_ty(body, sub) {
-                    return self.provable_subtype(&ascribed, &expanded)
-                        || self.provable_subtype(&expanded, &ascribed);
+                    return !self.provably_disjoint(&expanded, &ascribed);
                 }
                 self.pattern_fits(body, sub, &expanded)
             }
@@ -1476,19 +1970,19 @@ impl<'db> InferenceContext<'db> {
                 suffix,
                 ..
             } => {
-                let InferTy::List(element) = expanded.kind() else {
-                    return false;
+                let element = match list_holding(&expanded) {
+                    Some(ListHolding::Elements(element)) => element,
+                    // Lists of any element may be among its values: cannot
+                    // tell.
+                    Some(ListHolding::AnyElements) => return true,
+                    None => return false,
                 };
                 if let Some(type_ref) = self.type_refs.array_ascriptions.get(&pat).copied() {
                     let ascribed = self.lower_body_annotation(type_ref);
-                    if !ascribed.has_error()
-                        && !self.provable_subtype(&ascribed, &expanded)
-                        && !self.provable_subtype(&expanded, &ascribed)
-                    {
+                    if self.provably_disjoint(&expanded, &ascribed) {
                         return false;
                     }
                 }
-                let element = element.clone();
                 let subs: Vec<PatId> = prefix.iter().chain(suffix.iter()).copied().collect();
                 let rest_pat = rest.as_ref().and_then(|rest| rest.pat);
                 subs.into_iter()
@@ -1497,11 +1991,22 @@ impl<'db> InferenceContext<'db> {
                         self.pattern_fits(body, rest, &Ty::list(element.clone()))
                     })
             }
-            Pattern::Class { class, .. } => match expanded.kind() {
-                // A class head demands the same class; interfaces and
-                // rigid vars could still adopt or implement - true.
-                InferTy::Class(qtn, ..) => class.last().is_none_or(|name| name == qtn.name()),
-                InferTy::Interface(..) | InferTy::TypeVar(..) => true,
+            Pattern::Class { class, .. } => {
+                let class = class.clone();
+                self.class_head_fits(&class, &expanded)
+            }
+            Pattern::Tuple(elements) => match expanded.kind() {
+                InferTy::Tuple(element_tys) if element_tys.len() == elements.len() => {
+                    let pairs: Vec<(PatId, Ty)> = elements
+                        .iter()
+                        .copied()
+                        .zip(element_tys.iter().cloned())
+                        .collect();
+                    pairs
+                        .into_iter()
+                        .all(|(sub, element_ty)| self.tuple_element_fits(body, sub, &element_ty))
+                }
+                InferTy::Unknown | InferTy::TypeVar(..) => true,
                 _ => false,
             },
             // Type patterns carry their own runtime test; the lowering
@@ -1516,6 +2021,56 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
+    fn tuple_element_fits(&mut self, body: &ExprBody, sub: PatId, slot: &Ty) -> bool {
+        match &body.patterns[sub] {
+            Pattern::Type(_) => match self.pattern_ascription_ty(body, sub) {
+                Some(tested) => !self.provably_disjoint(slot, &tested),
+                None => true,
+            },
+            Pattern::Or(alternatives) => {
+                let alternatives = alternatives.clone();
+                alternatives
+                    .into_iter()
+                    .any(|alternative| self.tuple_element_fits(body, alternative, slot))
+            }
+            _ => self.pattern_fits(body, sub, slot),
+        }
+    }
+
+    /// Whether a destructure spelled with `class_path` can fit a value of
+    /// `ty` (neither a union nor a type that may hold any shape): a class
+    /// head demands that class by identity; an interface head demands an
+    /// implementor, which an existential may be and any other type is
+    /// unless no implementation of the interface is visible from it. A
+    /// head that resolves to nothing fits - the lowering reports it.
+    fn class_head_fits(&mut self, class_path: &[baml_type::Name], ty: &Ty) -> bool {
+        use baml_compiler2_hir::contributions::Definition;
+        let head = self.lower.path_head(class_path);
+        let definition = (!self.scoped_type_param_heads(head, class_path))
+            .then(|| self.lower.resolve_type_definition(head, class_path))
+            .flatten();
+        match definition {
+            Some(Definition::Class(class)) => match ty.kind() {
+                InferTy::Class(qtn, ..) => {
+                    *qtn == crate::lower::class_qualified_name(self.db, class)
+                }
+                _ => false,
+            },
+            Some(Definition::Interface(interface)) => {
+                if matches!(ty.kind(), InferTy::Interface(..)) {
+                    return true;
+                }
+                let short = class_path.last().expect("type paths are never empty");
+                let qtn = self
+                    .lower
+                    .qualify_definition(Definition::Interface(interface), short);
+                crate::impls::structural_interface(self.db, &qtn).is_some()
+                    || !crate::impls::impl_candidates(self.db, ty, &qtn).is_empty()
+            }
+            Some(_) | None => true,
+        }
+    }
+
     fn class_pattern_field_types(&self, qtn: &baml_type::DeclName, args: &[Ty]) -> Vec<Ty> {
         if let Some(baml_compiler2_hir::contributions::Definition::Class(class)) =
             self.facts.definition_of(qtn)
@@ -1523,7 +2078,7 @@ impl<'db> InferenceContext<'db> {
             return crate::lower::class_field_types(self.db, class)
                 .iter()
                 .map(|(_, field_ty)| {
-                    crate::lower::substitute_params(&crate::impls::interned_ty(field_ty), args)
+                    self.pattern_field_ty(&crate::impls::interned_ty(field_ty), args)
                 })
                 .collect();
         }
@@ -1531,14 +2086,32 @@ impl<'db> InferenceContext<'db> {
         crate::extern_loc::mounted_class_loc(self.db, qtn)
             .map(|class| {
                 crate::extern_loc::extern_class_row(self.db, class)
-                    .fields
+                    .body
+                    .fields()
                     .iter()
-                    .map(|(_, field_ty, _)| {
-                        crate::lower::substitute_params(&Ty::from_plain(field_ty), args)
-                    })
+                    .map(|(_, field_ty, _)| self.pattern_field_ty(&Ty::from_plain(field_ty), args))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// A declared field's type at a pattern's class arguments, as the
+    /// sub-pattern judges it: overlap and coverage need the type the field
+    /// holds, so a projection the arguments make ground is reduced
+    /// (`T.Out` at `T = IntOut` IS `int`).
+    fn pattern_field_ty(&self, declared: &Ty, args: &[Ty]) -> Ty {
+        self.reduced_for_pattern(&crate::lower::substitute_params(declared, args))
+    }
+
+    /// `ty` with its ground projections reduced; one still waiting on an
+    /// inference variable stays, as it does in every relation.
+    fn reduced_for_pattern(&self, ty: &Ty) -> Ty {
+        match baml_type::interned::ClosedTy::try_from(ty) {
+            Ok(closed) if closed.has_projection() => self
+                .reduce_projections(&closed, super::PROJECTION_FINALIZE_FUEL)
+                .into_ty(),
+            Ok(_) | Err(baml_type::interned::OpenTy) => ty.clone(),
+        }
     }
 }
 
@@ -1553,7 +2126,7 @@ impl<'db> InferenceContext<'db> {
 /// holes — which the finalized plain `Ty` cannot represent. An open column
 /// poisons as `Ty::Error`, the same suppression `check_match` applies before
 /// usefulness (`has_infer()` gate) and the vocabulary the exhaustiveness
-/// machinery already keys on (`contains_error_recovery`): verdicts over an
+/// machinery already keys on (`contains_error`): verdicts over an
 /// open column are noise. Coarser than the retired lossy materialization
 /// (which kept the closed spine around per-node holes), in the conservative
 /// direction — fewer verdicts, never wrong ones. Recorded pattern FACTS are
@@ -1568,6 +2141,46 @@ fn dpat_ty(ty: &Ty) -> baml_type::Ty {
         // the sentinel reuse; today recovery-Error and open-Error want the
         // same suppression.)
         Err(baml_type::interned::OpenTy) => baml_type::Ty::Error,
+    }
+}
+
+/// Whether `pat` binds without writing a type or a shape: the wildcard, a
+/// bare binding, a chain of bare bindings, or an or-pattern of these. Such a
+/// pattern asks nothing of its scrutinee's structure and takes every value
+/// that reaches it (`TYPE_SYSTEM.md`, Pattern Matching: "a pattern that
+/// writes no type of its own").
+pub(super) fn binds_without_a_type(body: &ExprBody, pat: PatId) -> bool {
+    match &body.patterns[pat] {
+        Pattern::Wildcard => true,
+        Pattern::Bind { subpat: None, .. } => true,
+        Pattern::Bind {
+            subpat: Some(sub), ..
+        } => binds_without_a_type(body, *sub),
+        Pattern::Or(alternatives) => alternatives
+            .iter()
+            .all(|&alternative| binds_without_a_type(body, alternative)),
+        Pattern::Type(_) | Pattern::Class { .. } | Pattern::Array { .. } | Pattern::Tuple(_) => {
+            false
+        }
+    }
+}
+
+/// Whether `pat` takes every value that reaches it: a pattern that
+/// [`binds_without_a_type`], or an or-pattern one of whose alternatives
+/// does (`Panic | _`).
+pub(super) fn takes_every_value(body: &ExprBody, pat: PatId) -> bool {
+    match &body.patterns[pat] {
+        Pattern::Wildcard => true,
+        Pattern::Bind { subpat: None, .. } => true,
+        Pattern::Bind {
+            subpat: Some(sub), ..
+        } => takes_every_value(body, *sub),
+        Pattern::Or(alternatives) => alternatives
+            .iter()
+            .any(|&alternative| takes_every_value(body, alternative)),
+        Pattern::Type(_) | Pattern::Class { .. } | Pattern::Array { .. } | Pattern::Tuple(_) => {
+            false
+        }
     }
 }
 
@@ -1590,6 +2203,74 @@ fn scrut_members(scrut: &Ty) -> Vec<&Ty> {
     }
 }
 
+/// These types may hold tuples of any carried instantiation, as well as
+/// non-tuples. A shape test cannot give their slots concrete types or
+/// consume the entire holder during negative narrowing.
+fn tuple_pattern_is_open(ty: &Ty) -> bool {
+    matches!(
+        ty.kind(),
+        InferTy::Unknown
+            | InferTy::Interface(..)
+            | InferTy::TypeVar(_)
+            | InferTy::AssociatedTypeProjection { .. }
+            | InferTy::InferVar { .. }
+            | InferTy::TypeAlias(_)
+            | InferTy::Error
+    )
+}
+
+/// The lists a list pattern can match among one type's values.
+#[derive(Clone)]
+enum ListHolding {
+    /// Lists of exactly this element type.
+    Elements(Ty),
+    /// Lists of any element type, among other values: no one list type
+    /// describes them, and their elements are only known to be `unknown`.
+    AnyElements,
+}
+
+/// What a list pattern can match among the values of `ty`, a type that is
+/// neither a union nor an alias; `None` when no value of it is a list.
+fn list_holding(ty: &Ty) -> Option<ListHolding> {
+    match ty.kind() {
+        InferTy::List(element) => Some(ListHolding::Elements(element.clone())),
+        // Any value at all, an implementor of an interface, whatever a type
+        // parameter or projection is instantiated with, or a type that is
+        // still being inferred: each may be a list of any element.
+        InferTy::Unknown
+        | InferTy::Interface(..)
+        | InferTy::TypeVar(_)
+        | InferTy::AssociatedTypeProjection { .. }
+        | InferTy::InferVar { .. }
+        | InferTy::Error => Some(ListHolding::AnyElements),
+        // An alias that did not unfold: its shape is not known here.
+        InferTy::TypeAlias(_) => Some(ListHolding::AnyElements),
+        // A union an alias unfolded to: a caller that needs its members
+        // unfolds it first; one that does not cannot tell.
+        InferTy::Union(_) => Some(ListHolding::AnyElements),
+        InferTy::Int
+        | InferTy::Bigint
+        | InferTy::Float
+        | InferTy::String
+        | InferTy::Bool
+        | InferTy::Null
+        | InferTy::Uint8Array
+        | InferTy::Media(_)
+        | InferTy::Literal(..)
+        | InferTy::Class(..)
+        | InferTy::Enum(_)
+        | InferTy::EnumVariant(..)
+        | InferTy::Tuple(..)
+        | InferTy::Map { .. }
+        | InferTy::Function { .. }
+        | InferTy::Future(..)
+        | InferTy::Type
+        | InferTy::Resource
+        | InferTy::PromptAst
+        | InferTy::Never => None,
+    }
+}
+
 /// The `PatCtx` impl backing the usefulness matrix, over plain resolved
 /// types (TIR's impl transcribed; interface projections join with the I
 /// cluster).
@@ -1602,10 +2283,10 @@ impl PatCtx for HirPatCtx<'_, '_> {
         &self,
         iface_ty: &baml_type::Ty,
         class_qtn: &baml_type::DeclName,
-        _class_type_args: &[baml_type::Ty],
+        class_type_args: &[baml_type::Ty],
     ) -> Option<Vec<usize>> {
         use baml_compiler2_hir::contributions::Definition;
-        let baml_type::Ty::Interface(iface_qtn, ..) = iface_ty else {
+        let baml_type::Ty::Interface(iface_qtn, iface_args, iface_assoc) = iface_ty else {
             return None;
         };
         let db = self.infer.db;
@@ -1631,23 +2312,26 @@ impl PatCtx for HirPatCtx<'_, '_> {
                     .collect()
             }
         };
+        // The impl by which THIS realized class type implements THIS realized
+        // interface — selected like every other impl goal, so a class that
+        // implements one interface at several argument lists (`Foo<int>` and
+        // `Foo<string>`) gets the links of the matching block, not the first
+        // block of that name.
+        let concrete = crate::impls::try_interned_ty(&baml_type::Ty::Class(
+            class_qtn.clone(),
+            class_type_args.into(),
+        ))?;
+        let goal = baml_type::interned::InferInterface::from_constraint(
+            &baml_type::Interface::new(iface_qtn.clone(), iface_args.clone(), iface_assoc.clone()),
+        );
+        let resolved = crate::impls::resolve_impl(db, &concrete, &goal)?;
+        // Field links are source data (an interface with fields is implemented
+        // in-body, so the block is in this compilation).
+        let crate::impls::ResolvedImplFacts::Source { block, .. } = resolved.facts else {
+            return None;
+        };
+        let block = baml_compiler2_hir::item_data::impl_block_data(db, block);
         let class_data = baml_compiler2_hir::item_data::class_data(db, class);
-        let pkg = baml_compiler2_hir::file_package::file_package(db, class.file(db));
-        let pkg_items = baml_compiler2_hir::package::package_items(db, pkg.root);
-        // The class's block for that interface, matched by HEAD: the block's
-        // written target lowers to a name, which is the same whether the
-        // interface is declared in source or served from its rows.
-        let block = class_data.implements.iter().find(|block| {
-            crate::interfaces::resolve_ref_to_interface_name(
-                db,
-                &class_data.type_refs,
-                block.target,
-                pkg_items,
-                &pkg.namespace_path,
-            )
-            .as_ref()
-                == Some(iface_qtn)
-        })?;
         iface_fields
             .iter()
             .map(|field| {
@@ -1670,20 +2354,20 @@ impl PatCtx for HirPatCtx<'_, '_> {
         let ty = self.peel_aliases(ty.clone(), 8);
         match &ty {
             P::Bool => vec![
-                Ctor::Single(P::Literal(
+                Ctor::Type(P::Literal(
                     baml_base::Literal::Bool(true),
                     Freshness::Regular,
                 )),
-                Ctor::Single(P::Literal(
+                Ctor::Type(P::Literal(
                     baml_base::Literal::Bool(false),
                     Freshness::Regular,
                 )),
             ],
-            P::Null | P::Literal(..) | P::EnumVariant(..) => vec![Ctor::Single(ty.clone())],
+            P::Null | P::Literal(..) | P::EnumVariant(..) => vec![Ctor::Type(ty.clone())],
             P::Never => vec![],
             P::Union(members) => members
                 .iter()
-                .map(|member| Ctor::UnionMember(member.clone()))
+                .map(|member| Ctor::UnionMember(self.peel_aliases(member.clone(), 8)))
                 .collect(),
             P::Enum(qtn) => self
                 .infer
@@ -1691,7 +2375,7 @@ impl PatCtx for HirPatCtx<'_, '_> {
                 .enum_variants(qtn)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|variant| Ctor::Single(P::EnumVariant(qtn.clone(), variant)))
+                .map(|variant| Ctor::Type(P::EnumVariant(qtn.clone(), variant)))
                 .collect(),
             P::Class(qtn, args) => vec![Ctor::Class(qtn.clone(), args.clone())],
             // An existential column is a single-constructor STRUCT VIEW
@@ -1699,6 +2383,7 @@ impl PatCtx for HirPatCtx<'_, '_> {
             P::Interface(..) => vec![Ctor::Interface(ty.clone())],
             // Slice splitting owns list columns; empty defers to it.
             P::List(..) => vec![],
+            P::Tuple(elements) => vec![Ctor::Tuple(elements.len())],
             // Everything else is an infinite or open alphabet.
             _ => vec![Ctor::NonExhaustive],
         }
@@ -1792,6 +2477,14 @@ impl PatCtx for HirPatCtx<'_, '_> {
             .collect()
     }
 
+    fn is_subtype(&self, sub: &baml_type::Ty, sup: &baml_type::Ty) -> bool {
+        // Error is compatible with everything in the subtype relation; here
+        // it must prove nothing (the `dpat_ty` suppression discipline).
+        !baml_type::contains_error(sub)
+            && !baml_type::contains_error(sup)
+            && baml_type::normalize::is_subtype(sub, sup, &self.infer.facts)
+    }
+
     fn list_element_type(&self, ty: &baml_type::Ty) -> baml_type::Ty {
         match self.peel_aliases(ty.clone(), 8) {
             baml_type::Ty::List(element) => *element,
@@ -1852,11 +2545,11 @@ fn collect_bind_types(
                 collect_bind_types(ctx, body, rest_pat, out);
             }
         }
-        Pattern::Or(alts) => {
+        Pattern::Or(alts) | Pattern::Tuple(alts) => {
             for &alt in alts {
                 collect_bind_types(ctx, body, alt, out);
             }
         }
-        _ => {}
+        Pattern::Wildcard | Pattern::Type(_) => {}
     }
 }

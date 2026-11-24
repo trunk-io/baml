@@ -6,8 +6,8 @@
 // response field and every SSE event this client touches is a real BAML class.
 // `baml.json.json` shows up in exactly three places, all of them genuinely
 // open-ended: the `request_body` passthrough, a tool's `input_schema`, and the
-// `cache_control` directive (a beta-gated shape that arrives verbatim from
-// `ai.PromptMessage.metadata`).
+// `cache_control` directive (the `args` of a `${cache(args)}` in the prompt,
+// sent as written).
 //
 // Layering, so a future `vertex` package can reuse this: BODY construction
 // (`messages_request` / `messages_body`) is factored away
@@ -51,9 +51,9 @@ class AnthSource {
 class AnthTextBlock {
     type: string,
     text: string,
-    // Prompt-caching directive: {"type":"ephemeral"}, or under the extended-TTL
-    // beta {"type":"ephemeral","ttl":"1h"}. Deliberately untyped — the shape is
-    // beta-gated and arrives verbatim from ai.PromptMessage.metadata.
+    // Prompt-caching directive: {"type":"ephemeral"}, or with a lifetime
+    // {"type":"ephemeral","ttl":"1h"}. Deliberately untyped: it is the `args`
+    // of a `${cache(args)}` in the prompt, sent as written.
     cache_control: baml.json.json?,
 }
 
@@ -130,7 +130,7 @@ class MessagesRequest {
 // ---------------------------------------------------------------------------
 // Response envelope. from_string ignores unknown fields; only what the
 // client reads is typed, and EVERY field the API may omit is optional
-// (a required int here is a ParseFailed waiting to happen).
+// (a required int here is an InvalidResponse waiting to happen).
 
 class ContentBlock {
     type: string,
@@ -196,7 +196,7 @@ class Response {
 /// "Option::is_none"` in the Rust builders this replaces.
 ///
 /// Nulls INSIDE arrays are preserved (a JSON Schema `"enum": [null]` survives),
-/// and the two OPAQUE subtrees below are copied verbatim. The passthrough merge —
+/// and the three OPAQUE subtrees below are copied verbatim. The passthrough merge —
 /// where `null` means "delete this key" — still runs AFTER this, on the
 /// already-pruned base.
 ///
@@ -208,8 +208,11 @@ class Response {
 /// replayed tool_use, and the generated schema types optionals as
 /// `["string","null"]` and marks them required, so a null answer is the
 /// schema-conformant one.
+///
+/// `cache_control` is the `args` of a `${cache(args)}` in the prompt, which
+/// this client sends as written.
 function _anth_verbatim_subtree(key: string) -> bool {
-    key == "input" || key == "input_schema"
+    key == "input" || key == "input_schema" || key == "cache_control"
 }
 
 function _anth_drop_nulls(j: baml.json.json) -> baml.json.json {
@@ -262,11 +265,15 @@ class Prompt {
     messages: Message[],
 }
 
-/// (internal) Anthropic places a cache breakpoint on a CONTENT BLOCK, but the authored
-/// directive lives on a MESSAGE (`${ai.Role { name: "user", metadata:
-/// { "cache_control": ... } }}`). The engine's rule, ported: the directive
-/// attaches to that message's LAST content block, so everything up to and
-/// including it is the cached prefix.
+/// (internal) Anthropic places a cache breakpoint ON a content block, while a
+/// `${cache(args)}` in the prompt sits BETWEEN parts. The breakpoint goes on
+/// the last block lowered before the delimiter, so everything up to and
+/// including that block is the cached prefix, and `args` is the value of
+/// `cache_control`, as written.
+///
+/// Nothing is set when `blocks` is empty (there is no content before the
+/// delimiter in its message) or when `args` is null. A second delimiter with no
+/// block in between overwrites the first.
 function _anth_apply_cache_control(blocks: AnthBlock[], cache_control: baml.json.json?) -> void {
     match (cache_control) {
         null => null,
@@ -297,7 +304,7 @@ function _anth_apply_cache_control(blocks: AnthBlock[], cache_control: baml.json
 /// sys_llm's `send_url` default for this provider.
 /// The four image media types the Messages API accepts on a base64 source. It
 /// validates the declared `media_type` against the actual bytes, so anything
-/// else is a 400 — including `image/svg+xml` (which `ai.internal._media_mime_type`
+/// else is a 400 — including `image/svg+xml` (which `baml.media.Image.infer_mime_type`
 /// produces for an `.svg` source) and `image/png` guessed for an unknown
 /// extension. Checking here keeps the error client-side and specific; the check
 /// is per-provider because the allowed set is.
@@ -319,12 +326,17 @@ function _media_block(
     let source = if let url: string = resolved.url {
         // A URL source carries no media_type: Anthropic fetches and sniffs the
         // bytes itself, so the guessed mime never reaches the wire.
-        AnthSource { type: "url", media_type: null, data: null, url: url }
+        AnthSource {
+            type: "url",
+            media_type: null,
+            data: null,
+            url: url,
+        }
     } else {
         if (block_type == "image" && !_anth_supported_image_mime(resolved.mime_type)) {
             throw _reject(
                 `Anthropic does not accept ${resolved.mime_type} images: the Messages API supports image/jpeg, image/png, image/gif and image/webp`,
-            )
+            );
         }
         AnthSource {
             type: "base64",
@@ -333,7 +345,11 @@ function _media_block(
             url: null,
         }
     };
-    AnthMediaBlock { type: block_type, source: source, cache_control: null }
+    AnthMediaBlock {
+        type: block_type,
+        source: source,
+        cache_control: null,
+    }
 }
 
 /// One content block at `position` -> its wire block, or null when it lowers
@@ -361,7 +377,11 @@ function _lower_block(
             if (text.text.trim() == "") {
                 null
             } else {
-                AnthTextBlock { type: "text", text: text.text, cache_control: null }
+                AnthTextBlock {
+                    type: "text",
+                    text: text.text,
+                    cache_control: null,
+                }
             }
         },
         let media: ai.content.Media => {
@@ -371,16 +391,16 @@ function _lower_block(
                 let audio: baml.media.Audio => {
                     throw _reject(
                         "Anthropic does not support audio prompt input: the Messages API has no audio content block",
-                    )
+                    );
                 },
                 let video: baml.media.Video => {
-                    throw _reject("Anthropic does not support video prompt input")
+                    throw _reject("Anthropic does not support video prompt input");
                 },
             };
             if (position != "user" && position != "tool_result") {
                 throw _reject(
                     `Anthropic only supports ${media.kind()} input in user messages, found ${position}`,
-                )
+                );
             }
             _media_block(media.media, block_type, preview = preview)
         },
@@ -401,14 +421,57 @@ function _lower_blocks(
     out
 }
 
-function _lower_prompt(prompt: ai.Prompt, preview: bool = false) -> Prompt {
+/// (internal) One prompt message as Messages API blocks. Text and media lower
+/// exactly as they do for a journal turn; a `${cache(args)}` sets
+/// `cache_control` on the block before it (`_anth_apply_cache_control`), and
+/// the text on either side is trimmed where it faces the delimiter
+/// (`ai.wire.prompt_parts`). A `${cache()}` carries `default_cache_args`.
+function _prompt_blocks(
+    message: ai.PromptMessage,
+    position: string,
+    default_cache_args: baml.json.json,
+    preview: bool = false,
+) -> AnthBlock[] {
+    let blocks: AnthBlock[] = [];
+    for (let part in ai.wire.prompt_parts(message, default_cache_args = default_cache_args)) {
+        match (part) {
+            let text: string => {
+                let block = ai.content.Text { text: text };
+                if let lowered: AnthBlock = _lower_block(block, position, preview = preview) {
+                    blocks.push(lowered);
+                }
+                null
+            },
+            let delimiter: ai.CacheDelimiter => {
+                _anth_apply_cache_control(blocks, delimiter.args);
+                null
+            },
+            let media: ai.MediaPart => {
+                let block = ai.content.Media {
+                    media: media,
+                    provider_id: null,
+                    revised_prompt: null,
+                };
+                if let lowered: AnthBlock = _lower_block(block, position, preview = preview) {
+                    blocks.push(lowered);
+                }
+                null
+            },
+        };
+    }
+    blocks
+}
+
+function _lower_prompt(
+    prompt: ai.Prompt,
+    default_cache_args: baml.json.json,
+    preview: bool = false,
+) -> Prompt {
     let system: AnthBlock[] = [];
     let messages: Message[] = [];
     for (let message in prompt.messages()) {
-        let cache_control = message.metadata.get("cache_control");
         if (message.role == "system") {
-            let blocks = _lower_blocks(ai.wire.prompt_blocks(message), "system", preview = preview);
-            _anth_apply_cache_control(blocks, cache_control);
+            let blocks = _prompt_blocks(message, "system", default_cache_args, preview = preview);
             for (let block in blocks) {
                 system.push(block);
             }
@@ -419,17 +482,23 @@ function _lower_prompt(prompt: ai.Prompt, preview: bool = false) -> Prompt {
             } else {
                 "user"
             };
-            let blocks = _lower_blocks(ai.wire.prompt_blocks(message), role, preview = preview);
-            _anth_apply_cache_control(blocks, cache_control);
+            let blocks = _prompt_blocks(message, role, default_cache_args, preview = preview);
             // A message that lowered to nothing (all-whitespace text) is
             // dropped: `content: []` is a 400.
             if (blocks.length() > 0) {
-                messages.push(Message { role: role, tool_results: false, blocks: blocks });
+                messages.push(Message {
+                    role: role,
+                    tool_results: false,
+                    blocks: blocks,
+                });
             }
             null
         };
     }
-    Prompt { system: system, messages: messages }
+    Prompt {
+        system: system,
+        messages: messages,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,10 +539,18 @@ function _push_tool_result(
         if (m.tool_results) {
             m.blocks.push(block);
         } else {
-            msgs.push(Message { role: "user", tool_results: true, blocks: [block] });
+            msgs.push(Message {
+                role: "user",
+                tool_results: true,
+                blocks: [block],
+            });
         }
     } else {
-        msgs.push(Message { role: "user", tool_results: true, blocks: [block] });
+        msgs.push(Message {
+            role: "user",
+            tool_results: true,
+            blocks: [block],
+        });
     }
 }
 
@@ -485,9 +562,12 @@ function _lower_journal(j: ai.Journal, preview: bool = false) -> Message[] {
         match (e) {
             let m: ai.events.UserMessage => {
                 let blocks = _lower_blocks(m.content, "user", preview = preview);
-                _anth_apply_cache_control(blocks, m.metadata.get("cache_control"));
                 if (blocks.length() > 0) {
-                    msgs.push(Message { role: "user", tool_results: false, blocks: blocks });
+                    msgs.push(Message {
+                        role: "user",
+                        tool_results: false,
+                        blocks: blocks,
+                    });
                 }
                 null
             },
@@ -496,21 +576,23 @@ function _lower_journal(j: ai.Journal, preview: bool = false) -> Message[] {
                 for (let b in m.content) {
                     match (b) {
                         let content: ai.content.Block => {
-                            if let lowered: AnthBlock = _lower_block(content, "assistant", preview = preview) {
+                            if let lowered: AnthBlock = _lower_block(
+                                content,
+                                "assistant",
+                                preview = preview,
+                            ) {
                                 blocks.push(lowered);
                             }
                             null
                         },
                         let u: ai.content.ToolUse => {
-                            blocks.push(
-                                AnthToolUseBlock {
-                                    type: "tool_use",
-                                    id: u.id,
-                                    name: u.name,
-                                    input: baml.json.to_json(u.args),
-                                    cache_control: null,
-                                },
-                            );
+                            blocks.push(AnthToolUseBlock {
+                                type: "tool_use",
+                                id: u.id,
+                                name: u.name,
+                                input: baml.json.from(u.args),
+                                cache_control: null,
+                            });
                             null
                         },
                         // Dropped: replaying thinking without its signature is
@@ -525,7 +607,11 @@ function _lower_journal(j: ai.Journal, preview: bool = false) -> Message[] {
                 // the API 400). ai.wire.sanitize_for_client removes most of
                 // these upstream; this is the belt to its braces.
                 if (blocks.length() > 0) {
-                    msgs.push(Message { role: "assistant", tool_results: false, blocks: blocks });
+                    msgs.push(Message {
+                        role: "assistant",
+                        tool_results: false,
+                        blocks: blocks,
+                    });
                 }
                 null
             },
@@ -533,7 +619,9 @@ function _lower_journal(j: ai.Journal, preview: bool = false) -> Message[] {
                 _push_tool_result(
                     msgs,
                     c.id,
-                    _tool_result_content(_lower_blocks(c.content, "tool_result", preview = preview)),
+                    _tool_result_content(
+                        _lower_blocks(c.content, "tool_result", preview = preview),
+                    ),
                     false,
                 );
             },
@@ -568,7 +656,10 @@ function _render_messages(msgs: Message[]) -> AnthMessageParam[] {
                 continue;
             }
         }
-        out.push(AnthMessageParam { role: m.role, content: m.blocks.concat([]) });
+        out.push(AnthMessageParam {
+            role: m.role,
+            content: m.blocks.concat([]),
+        });
     }
     out
 }
@@ -589,8 +680,18 @@ class BodyParams {
     thinking: root.ThinkingConfig?,
     tool_choice: root.ToolChoice?,
     request_body: baml.json.json?,
-    // The id journal sanitization is performed against — `Client.id()`.
-    client_id: string,
+    // The provider journal sanitization compares against, with `model`.
+    provider: string,
+    // What a `${cache()}` in the prompt sends as `cache_control` — the host
+    // client's `default_cache_args()`.
+    default_cache_args: baml.json.json,
+}
+
+/// The `cache_control` a `${cache()}` sends on the Messages wire: an ephemeral
+/// breakpoint with the default 5-minute lifetime. Shared by every client that
+/// speaks that wire (`anthropic.Client`, Claude on `google.VertexClient`).
+function default_cache_control() -> baml.json.json throws never {
+    { "type": "ephemeral" }
 }
 
 function _body_params(c: root.Client) -> BodyParams {
@@ -604,21 +705,20 @@ function _body_params(c: root.Client) -> BodyParams {
         thinking: c.thinking,
         tool_choice: c.tool_choice,
         request_body: c.request_body,
-        client_id: c.id(),
+        provider: "anthropic",
+        default_cache_args: c.default_cache_args(),
     }
 }
 
 function _tool_params(toolbox: ai.tools.Toolbox) -> AnthToolParam[] {
     let out: AnthToolParam[] = [];
     for (let t in toolbox.list()) {
-        out.push(
-            AnthToolParam {
-                name: t.name,
-                description: t.description,
-                input_schema: baml.json.to_json(t.input_schema),
-                cache_control: null,
-            },
-        );
+        out.push(AnthToolParam {
+            name: t.name,
+            description: t.description,
+            input_schema: baml.json.from(t.input_schema),
+            cache_control: null,
+        });
     }
     out
 }
@@ -626,7 +726,11 @@ function _tool_params(toolbox: ai.tools.Toolbox) -> AnthToolParam[] {
 function _tool_choice_param(choice: root.ToolChoice?) -> AnthToolChoiceParam {
     match (choice) {
         // The API's own default, sent explicitly so the wire shape is stable.
-        null => AnthToolChoiceParam { type: "auto", name: null, disable_parallel_tool_use: null },
+        null => AnthToolChoiceParam {
+            type: "auto",
+            name: null,
+            disable_parallel_tool_use: null,
+        },
         let c: root.ToolChoice => {
             AnthToolChoiceParam {
                 type: c.type,
@@ -641,7 +745,10 @@ function _thinking_param(thinking: root.ThinkingConfig?) -> AnthThinkingParam? {
     match (thinking) {
         null => null,
         let t: root.ThinkingConfig => {
-            AnthThinkingParam { type: t.type, budget_tokens: t.budget_tokens }
+            AnthThinkingParam {
+                type: t.type,
+                budget_tokens: t.budget_tokens,
+            }
         },
     }
 }
@@ -654,15 +761,15 @@ function messages_request(
     stream: bool,
     preview: bool = false,
 ) -> MessagesRequest {
-    let prompt = input.prompt(ai.internal.build_output_format(input.output_type));
-    let lowered_prompt = _lower_prompt(prompt, preview = preview);
+    let prompt = (input.prompt)(ai.internal.build_output_format(input.output_type));
+    let lowered_prompt = _lower_prompt(prompt, params.default_cache_args, preview = preview);
     let system = lowered_prompt.system;
     let lowered = lowered_prompt.messages;
     // Sanitize BEFORE lowering: foreign-client reasoning, empty turns and
     // orphaned tool calls are repaired once, in ai.wire, for every provider.
     for (
         let message in _lower_journal(
-            ai.wire.sanitize_for_client(input.journal, params.client_id),
+            ai.wire.sanitize_for_client(input.journal, params.provider, params.model),
             preview = preview,
         )
     ) {
@@ -682,16 +789,29 @@ function messages_request(
     // request is a guaranteed 400.
     let synthesize_user = lowered.length() > 0 && first_role != "user" && system.length() == 0;
     let ordered: Message[] = if (promote_system) {
-        [Message { role: "user", tool_results: false, blocks: system }].concat(lowered)
+        [
+            Message {
+                role: "user",
+                tool_results: false,
+                blocks: system,
+            },
+        ]
+        .concat(lowered)
     } else if (synthesize_user) {
         [
             Message {
                 role: "user",
                 tool_results: false,
-                blocks: [AnthTextBlock { type: "text", text: "(continue)", cache_control: null }],
+                blocks: [
+                    AnthTextBlock {
+                        type: "text",
+                        text: "(continue)",
+                        cache_control: null,
+                    },
+                ],
             },
         ]
-            .concat(lowered)
+        .concat(lowered)
     } else {
         lowered
     };
@@ -702,7 +822,7 @@ function messages_request(
             status_code: null,
             detail: "the rendered prompt and journal produced no message content",
             raw_body: null,
-        }
+        };
     }
 
     // Promoted system blocks are already the first user message; sending them
@@ -723,11 +843,7 @@ function messages_request(
     } else {
         null
     };
-    let stream_flag: bool? = if (stream) {
-        true
-    } else {
-        null
-    };
+    let stream_flag: bool? = if (stream) { true } else { null };
     MessagesRequest {
         model: params.model,
         max_tokens: params.max_tokens,
@@ -753,7 +869,7 @@ function messages_body(
     preview: bool = false,
 ) -> string {
     let request = messages_request(params, input, stream, preview = preview);
-    let base = _anth_drop_nulls(baml.json.to_json(request));
+    let base = _anth_drop_nulls(baml.json.from(request));
     baml.json.stringify(ai.wire.merge_request_body(base, params.request_body))
 }
 
@@ -784,7 +900,10 @@ function _query_suffix(query_params: map<string, string>?) -> string {
 /// WASM playground needs) are reachable and `anthropic-version` is overridable;
 /// `x-api-key` is applied last so a stray header cannot break authentication.
 function _headers(c: root.Client, preview: bool = false) -> map<string, string> {
-    let headers: map<string, string> = { "anthropic-version": "2023-06-01", "content-type": "application/json" };
+    let headers: map<string, string> = {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    };
     if let extra: map<string, string> = c.headers {
         for (let key in extra.keys()) {
             let _ = headers.set(key.to_lower_case(), extra.get(key) ?? "");
@@ -818,8 +937,7 @@ function render(c: root.Client, input: ai.ModelTurnInput) -> baml.http.Request {
     _request(c, input, false, preview = false)
 }
 
-/// The request one `render` would send. URL media remains a URL reference;
-/// local files are rejected before any filesystem read.
+/// The request one `render` would send. URL media remains a URL reference.
 function preview(c: root.Client, input: ai.ModelTurnInput) -> baml.http.Request {
     _request(c, input, false, preview = true)
 }
@@ -841,7 +959,7 @@ function _stop_reason(s: string) -> ai.content.StopReason {
     }
 }
 
-/// One decoded response -> canonical content blocks, stop reason and usage.
+/// One decoded response -> canonical content blocks and stop reason.
 function parse(resp: Response) -> ai.ModelTurn {
     let content: ai.content.ModelBlock[] = [];
     for (let b in resp.content) {
@@ -851,18 +969,18 @@ function parse(resp: Response) -> ai.ModelTurn {
                 null
             },
             "thinking" => {
-                content.push(ai.content.Reasoning { summary: b.thinking ?? "" });
+                content.push(ai.content.Reasoning {
+                    summary: b.thinking ?? "",
+                });
                 null
             },
             "tool_use" => {
                 let empty_args: map<string, unknown> = {};
-                content.push(
-                    ai.content.ToolUse {
-                        id: b.id ?? "",
-                        name: b.name ?? "",
-                        args: b.input ?? empty_args,
-                    },
-                );
+                content.push(ai.content.ToolUse {
+                    id: b.id ?? "",
+                    name: b.name ?? "",
+                    args: b.input ?? empty_args,
+                });
                 null
             },
             // redacted_thinking and server-tool blocks: nothing canonical to
@@ -876,35 +994,73 @@ function parse(resp: Response) -> ai.ModelTurn {
         let s: string => _stop_reason(s),
     };
 
-    let usage: ai.events.Usage? = match (resp.usage) {
+    ai.ModelTurn {
+        calls: [],
+        child_turns: [],
+        content: content,
+        stop_reason: stop,
+    }
+}
+
+/// One decoded response's usage, null when it reported none.
+function usage(resp: Response) -> ai.events.Usage? {
+    match (resp.usage) {
         let u: Usage => {
-            ai.events.Usage {
-                input_tokens: u.input_tokens ?? 0,
-                output_tokens: u.output_tokens ?? 0,
-                // Cache READS are the cached-input tokens. Cache WRITES
-                // (cache_creation_input_tokens) are billed above the normal
-                // input rate, so folding them in here would misreport cost;
-                // ai.events.Usage needs its own slot for them.
-                cached_input_tokens: u.cache_read_input_tokens,
-                // Extended thinking: the reasoning share of output_tokens.
-                reasoning_tokens: u.output_tokens_details?.thinking_tokens,
-                cache_write_input_tokens: u.cache_creation_input_tokens,
-                // Anthropic's input_tokens already excludes both cache counts.
-                uncached_input_tokens: u.input_tokens,
-            }
+            _events_usage(
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+                u.output_tokens_details?.thinking_tokens,
+            )
         },
         null => null,
-    };
+    }
+}
 
-    ai.ModelTurn { calls: [], content: content, stop_reason: stop, usage: usage }
+/// (internal) Anthropic's counts, as a response or a stream event reports
+/// them, in `ai.events.Usage`'s terms.
+function _events_usage(
+    input: int?,
+    output: int?,
+    cache_read: int?,
+    cache_creation: int?,
+    thinking: int?,
+) -> ai.events.Usage {
+    ai.events.Usage {
+        // Anthropic's input_tokens excludes both cache counts.
+        input_tokens: ai.internal.total_input_tokens(input, cache_read, cache_creation),
+        output_tokens: output,
+        // Cache READS are the cached-input tokens. Cache WRITES
+        // (cache_creation_input_tokens) are billed above the normal input
+        // rate, so they have their own count.
+        cached_input_tokens: cache_read,
+        // Extended thinking: the reasoning share of output_tokens.
+        reasoning_tokens: thinking,
+        cache_write_input_tokens: cache_creation,
+        uncached_input_tokens: input,
+    }
 }
 
 /// The one internal entry point: render, send, normalize — one model turn.
 function invoke(c: root.Client, input: ai.ModelTurnInput) -> ai.ModelTurn {
-    let req = ai.LlmTimeoutOptions._resolve(c.timeout)._apply(_request(c, input, false, preview = false));
-    let sent = ai.wire.send_as_with_wire<Response>(req, "anthropic", c.id(), capture_wire = c.capture_wire);
-    let turn = parse(sent.value);
-    ai.ModelTurn { ...turn, calls: [sent.call], model: c.model }
+    let req =
+        ai.LlmTimeoutOptions._resolve(c.timeout)._apply(_request(c, input, false, preview = false));
+    let sent = ai.wire.send_as_with_wire<Response>(
+        req,
+        ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        capture_wire = c.capture_wire,
+    );
+    ai.internal.with_own_call(
+        parse(sent.value),
+        sent.call,
+        usage(sent.value),
+        c.model,
+        sent.value.model,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -928,20 +1084,28 @@ class AnthStreamUsage {
     output_tokens_details: AnthOutputTokensDetails?,
 }
 
-/// One event's usage, with the meanings a non-streamed turn's usage has.
+/// One event's usage, with the meanings a non-streamed turn's usage has, and
+/// the model it names.
 function _anth_stream_meta(
     stop: ai.content.StopReason?,
     usage: AnthStreamUsage?,
+    resolved_model: string? = null,
 ) -> ai.stream.TurnMeta {
     ai.stream.TurnMeta {
         stop_reason: stop,
-        input_tokens: usage?.input_tokens,
-        output_tokens: usage?.output_tokens,
-        cached_input_tokens: usage?.cache_read_input_tokens,
-        cache_write_input_tokens: usage?.cache_creation_input_tokens,
-        // Anthropic's input_tokens already excludes both cache counts.
-        uncached_input_tokens: usage?.input_tokens,
-        reasoning_tokens: usage?.output_tokens_details?.thinking_tokens,
+        resolved_model: resolved_model,
+        usage: match (usage) {
+            let u: AnthStreamUsage => {
+                _events_usage(
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_input_tokens,
+                    u.cache_creation_input_tokens,
+                    u.output_tokens_details?.thinking_tokens,
+                )
+            },
+            null => null,
+        },
     }
 }
 
@@ -1027,11 +1191,15 @@ class AnthStreamState {
             let args = if (call.args_json.trim() == "") {
                 empty
             } else {
-                baml.json.from_string<map<string, unknown>>(call.args_json) catch_all (e) {
+                baml.json.decode<map<string, unknown>>(call.args_json) catch_all (e) {
                     _ => empty,
                 }
             };
-            out.push(ai.content.ToolUse { id: call.id, name: call.name, args: args });
+            out.push(ai.content.ToolUse {
+                id: call.id,
+                name: call.name,
+                args: args,
+            });
         }
         out
     }
@@ -1047,40 +1215,24 @@ function _anth_stream_call_at(state: AnthStreamState, index: int?) -> AnthStream
     null
 }
 
-/// (internal) A mid-stream `error` event -> the precise failure. Same discipline as
-/// ai.errors.classify_http: only genuinely transient conditions get a
-/// retry-safe transport classification; a bad request stays a bad request so
-/// ai.clients.Retry does not replay it.
+/// (internal) Preserve a valid in-band provider error and its native type.
 function _anth_stream_failure(error: AnthStreamError?, raw: string) -> ai.errors.Failure {
-    let kind = error?.type ?? "";
-    let detail = error?.message ?? kind;
-    match (kind) {
-        "rate_limit_error" => {
-            ai.errors.RateLimited {
-                status_code: null,
-                provider: "anthropic",
-                retry_after_ms: null,
-                raw_body: raw,
-            }
-        },
-        "overloaded_error" | "api_error" | "timeout_error" => {
-            ai.errors.NetworkFailure {
-                status_code: null,
-                provider: "anthropic",
-                detail: `${kind}: ${detail}`,
-                raw_body: raw,
-            }
-        },
-        // authentication_error, permission_error, invalid_request_error,
-        // not_found_error, request_too_large, billing_error, and anything new.
-        _ => {
-            ai.errors.InvalidRequest {
-                provider: "anthropic",
-                status_code: null,
-                detail: `${kind}: ${detail}`,
-                raw_body: raw,
-            }
-        },
+    if let reported: AnthStreamError = error {
+        ai.errors.ProviderError {
+            provider: "anthropic",
+            message: reported.message ?? reported.type ?? "the Anthropic request failed",
+            error_type: reported.type,
+            error_code: null,
+            raw_body: raw,
+            status_code: null,
+        }
+    } else {
+        ai.errors.InvalidResponse {
+            provider: "anthropic",
+            message: "the error event contained no error object",
+            raw_body: raw,
+            status_code: null,
+        }
     }
 }
 
@@ -1090,20 +1242,34 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
     let out: ai.stream.Event[] = [];
     for (let raw in ai.stream.decode_sse_batch(batch)) {
         if let data: string = raw.data {
-            let ev: AnthStreamEvent? = baml.json.from_string<AnthStreamEvent>(data) catch_all (e) {
-                _ => null,
+            if (data.trim() == "") {
+                continue;
+            }
+            let ev = baml.json.decode<AnthStreamEvent>(data) catch_all (e) {
+                let parse => {
+                    throw ai.errors.InvalidResponse {
+                        provider: "anthropic",
+                        message: parse.to_string(),
+                        raw_body: data,
+                        status_code: null,
+                    };
+                },
             };
             if let event: AnthStreamEvent = ev {
                 let t = event.type ?? raw.event ?? "";
                 match (t) {
                     "error" => {
-                        throw _anth_stream_failure(event.error, data)
+                        throw _anth_stream_failure(event.error, data);
                     },
                     "message_start" => {
                         if let message: AnthStreamMessage = event.message {
                             state.model = message.model;
                         }
-                        out.push(_anth_stream_meta(null, event.message?.usage));
+                        out.push(_anth_stream_meta(
+                            null,
+                            event.message?.usage,
+                            resolved_model = event.message?.model,
+                        ));
                         null
                     },
                     "content_block_start" => {
@@ -1111,14 +1277,12 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                             let kind = block.type ?? "";
                             match (kind) {
                                 "tool_use" => {
-                                    state.tool_calls.push(
-                                        AnthStreamToolCall {
-                                            index: event.index ?? state.tool_calls.length(),
-                                            id: block.id ?? "",
-                                            name: block.name ?? "",
-                                            args_json: "",
-                                        },
-                                    );
+                                    state.tool_calls.push(AnthStreamToolCall {
+                                        index: event.index ?? state.tool_calls.length(),
+                                        id: block.id ?? "",
+                                        name: block.name ?? "",
+                                        args_json: "",
+                                    });
                                     null
                                 },
                                 "thinking" => {
@@ -1155,7 +1319,10 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                                     null
                                 },
                                 "input_json_delta" => {
-                                    if let call: AnthStreamToolCall = _anth_stream_call_at(state, event.index) {
+                                    if let call: AnthStreamToolCall = _anth_stream_call_at(
+                                        state,
+                                        event.index,
+                                    ) {
                                         call.args_json = `${call.args_json}${d.partial_json ?? ""}`;
                                     }
                                     // Tool input is content with no TextDelta.
@@ -1215,40 +1382,10 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
     out
 }
 
-/// (internal) `send_sse` fails a non-2xx status itself, throwing baml.errors.Io with the
-/// status and body in its message ("SSE request failed with status 401: …").
-/// Recover the status and route it through the SAME classifier the non-streaming
-/// path uses: a 400 or 401 must never come back as a retry-safe NetworkFailure,
-/// or ai.clients.Retry cheerfully replays a request that can never succeed.
-function _sse_failure(message: string) -> ai.errors.Failure {
-    let prefix = "SSE request failed with status ";
-    if (message.starts_with(prefix)) {
-        let rest = message.slice(prefix.length(), message.length());
-        if let separator: int = rest.index_of(":") {
-            let status = baml.Int.parse(rest.slice(0, separator)) catch_all (e) {
-                _ => 0,
-            };
-            if (status > 0) {
-                return ai.errors.classify_http(
-                    "anthropic",
-                    status,
-                    rest.slice(separator + 1, rest.length()).trim(),
-                );
-            }
-        }
-    }
-    ai.errors.NetworkFailure {
-        status_code: null,
-        provider: "anthropic",
-        detail: `transport failed before a response arrived: ${message}`,
-        raw_body: null,
-    }
-}
-
 function _stream_open_failure(error: baml.errors.Io | baml.errors.Timeout) -> never {
     match (error) {
         let timeout: baml.errors.Timeout => throw timeout,
-        let io: baml.errors.Io => throw _sse_failure(io.message),
+        let io: baml.errors.Io => throw ai.wire.sse_failure("anthropic", io),
     }
 }
 
@@ -1279,13 +1416,16 @@ function invoke_stream(c: root.Client, input: ai.ModelTurnInput) -> ai.stream.Tu
         timeout_options = limits,
         dispatched = started,
     );
-    let call = ai.events.LLMCall {
-        client_name: c.id(),
-        provider: "anthropic",
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: null,
-            ttft_ms: null,
+            start_time: started,
+            duration: null,
+            ttft: null,
         },
         http_request: if (c.capture_wire) {
             baml.http.Request {
@@ -1297,17 +1437,15 @@ function invoke_stream(c: root.Client, input: ai.ModelTurnInput) -> ai.stream.Tu
         } else {
             null
         },
-        http_response: ai.events.HttpResponse { status: sse.status_code, headers: sse.headers, body: null },
-        usage: null,
-        selected: true,
-        sse_responses: if (c.capture_wire) {
-            []
-        } else {
-            null
+        http_response: ai.events.HttpResponse {
+            status: sse.status_code,
+            headers: sse.headers,
+            body: null,
         },
+        sse_responses: if (c.capture_wire) { [] } else { null },
     };
-    stream._calls = [call];
     stream._wire_call = call;
+    stream._requested_model = c.model;
     stream._call_started = started;
     stream._ttft_from = baml.time.Instant.now();
     stream._capture_sse = c.capture_wire;

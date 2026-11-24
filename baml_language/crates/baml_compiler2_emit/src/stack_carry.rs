@@ -454,6 +454,9 @@ fn resolve_effective_use_location(
     }
 }
 
+/// Simulate a statement while validating a proposed stack-carried local.
+/// Return false when its stack effects cannot be modeled safely; the caller
+/// then rejects the candidate and retains slot-based storage for that local.
 fn simulate_statement_stack<'db>(
     kind: &StatementKind<'db>,
     sim: &mut StackCarrySim,
@@ -530,7 +533,24 @@ fn simulate_statement_stack<'db>(
                     classifications,
                     def_use,
                 };
-                pull_semantics::walk_projection_store(&mut sink, destination, value).is_ok()
+                pull_semantics::walk_projection_store(
+                    &mut sink,
+                    destination,
+                    value,
+                    |sink, value| {
+                        simulate_rvalue_pull_stack(
+                            value,
+                            sink.sim,
+                            carried_local,
+                            body,
+                            classifications,
+                            def_use,
+                        )
+                        .then_some(())
+                        .ok_or(())
+                    },
+                )
+                .is_ok()
             }
         },
         // Receiver, value and the interface type are pushed then all consumed by the
@@ -848,8 +868,7 @@ fn simulate_terminator_stack<'db>(
             // THROW consumes the thrown value from the stack when unwinding.
             sim.pop_n(1)
         }
-        Terminator::Rethrow { value, context }
-        | Terminator::ThrowIfPanic { value, context, .. } => {
+        Terminator::Rethrow { value, context } => {
             let mut sink = StackCarryPullSink {
                 sim,
                 carried_local,
@@ -861,8 +880,7 @@ fn simulate_terminator_stack<'db>(
             {
                 return false;
             }
-            // RETHROW consumes the value and its context when unwinding;
-            // THROW_IF_PANIC consumes both whether it throws or continues.
+            // RETHROW consumes the value and its context when unwinding.
             sim.pop_n(2)
         }
         Terminator::ShortCircuit { operand, .. } => {
@@ -977,9 +995,15 @@ fn simulate_rvalue_pull_stack<'db>(
         return true;
     }
 
-    // MakeBoundMethod: pops receiver (1 value), pushes bound_method (1 value).
-    // Net stack effect: 0 (receiver consumed, bound_method produced).
-    if let Rvalue::MakeBoundMethod { receiver, .. } = rvalue {
+    // MakeBoundMethod over the receiver's frame: pops receiver (1 value),
+    // pushes bound_method (1 value). Net stack effect: 0 (receiver consumed,
+    // bound_method produced).
+    if let Rvalue::MakeBoundMethod {
+        receiver,
+        frame: baml_compiler2_mir::BoundFrame::Receiver,
+        ..
+    } = rvalue
+    {
         let mut sink = StackCarryPullSink {
             sim,
             carried_local,
@@ -1004,7 +1028,10 @@ fn simulate_rvalue_pull_stack<'db>(
     // materialized correctly through `emit_rvalue_pull`.
     if matches!(
         rvalue,
-        Rvalue::MakeVirtualBoundMethod { .. }
+        Rvalue::MakeBoundMethod {
+            frame: baml_compiler2_mir::BoundFrame::Explicit(_),
+            ..
+        } | Rvalue::MakeVirtualBoundMethod { .. }
             | Rvalue::MakeVirtualFunction { .. }
             | Rvalue::VirtualFieldAccess { .. }
     ) {
@@ -1053,7 +1080,7 @@ fn simulate_operand_prefix_pull_stack(
                 def_use,
             ))
         }
-        Rvalue::Array(_, elements) => {
+        Rvalue::Array(_, elements) | Rvalue::ConcatStrings(elements) => {
             let values = elements.iter().collect::<Vec<_>>();
             Some(simulate_stack_consuming_aggregate(
                 AggregateStackShape {
@@ -1101,6 +1128,24 @@ fn simulate_operand_prefix_pull_stack(
                     trailing_operands: &[],
                     total_pops: fields.len(),
                     extra_pushes_before_alloc: 0,
+                },
+                sim,
+                carried_local,
+                classifications,
+                def_use,
+            ))
+        }
+        Rvalue::Aggregate {
+            kind: baml_compiler2_mir::AggregateKind::Tuple { .. },
+            fields,
+        } => {
+            let values = fields.iter().collect::<Vec<_>>();
+            Some(simulate_stack_consuming_aggregate(
+                AggregateStackShape {
+                    value_operands: &values,
+                    trailing_operands: &[],
+                    total_pops: fields.len() + 1,
+                    extra_pushes_before_alloc: 1,
                 },
                 sim,
                 carried_local,
@@ -1205,12 +1250,14 @@ fn simulate_stack_consuming_aggregate(
 #[cfg(test)]
 fn aggregate_value_operand_index<'db>(rvalue: &Rvalue<'db>, local: Local) -> Option<usize> {
     let operands: Vec<&Operand<'db>> = match rvalue {
-        Rvalue::Array(_, elements) => elements.iter().collect(),
+        Rvalue::Array(_, elements) | Rvalue::ConcatStrings(elements) => elements.iter().collect(),
         // See `simulate_operand_prefix_pull_stack`: only map values are
         // valid stack-carry prefix operands for the current VM stack layout.
         Rvalue::Map(_, _, entries) => entries.iter().map(|(_key, value)| value).collect(),
         Rvalue::Aggregate {
-            kind: baml_compiler2_mir::AggregateKind::Array,
+            kind:
+                baml_compiler2_mir::AggregateKind::Array
+                | baml_compiler2_mir::AggregateKind::Tuple { .. },
             fields,
         } => fields.iter().collect(),
         Rvalue::Aggregate {
@@ -1331,6 +1378,11 @@ struct StackCarryPullSink<'a> {
 impl<'a> PullSink<'a> for StackCarryPullSink<'a> {
     type Error = ();
 
+    fn trace_hook_settings(&mut self, _with_settings: bool) -> Result<(), Self::Error> {
+        self.sim.push();
+        Ok(())
+    }
+
     fn pull_constant(
         &mut self,
         _constant: &baml_compiler2_mir::Constant<'a>,
@@ -1401,7 +1453,7 @@ impl<'a> PullSink<'a> for StackCarryPullSink<'a> {
         }
     }
 
-    fn load_field(&mut self, _field: usize, _name: &str) -> Result<(), Self::Error> {
+    fn load_field(&mut self, _field: usize, _name: &str, _base: &Place) -> Result<(), Self::Error> {
         if !self.sim.pop_n(1) {
             return Err(());
         }
@@ -1409,8 +1461,20 @@ impl<'a> PullSink<'a> for StackCarryPullSink<'a> {
         Ok(())
     }
 
-    fn load_index(&mut self, _kind: baml_compiler2_mir::IndexKind) -> Result<(), Self::Error> {
-        if !self.sim.pop_n(2) {
+    fn load_index(
+        &mut self,
+        kind: baml_compiler2_mir::IndexKind,
+        _base: &Place,
+        _index: Local,
+    ) -> Result<(), Self::Error> {
+        if !self
+            .sim
+            .pop_n(if kind == baml_compiler2_mir::IndexKind::Tuple {
+                1
+            } else {
+                2
+            })
+        {
             return Err(());
         }
         self.sim.push();
@@ -1438,9 +1502,33 @@ impl<'a> PullSink<'a> for StackCarryPullSink<'a> {
         Ok(())
     }
 
+    fn null_test(&mut self, _negate: bool) -> Result<(), Self::Error> {
+        if !self.sim.pop_n(1) {
+            return Err(());
+        }
+        self.sim.push();
+        Ok(())
+    }
+
+    fn concat_strings(&mut self, len: usize) -> Result<(), Self::Error> {
+        if !self.sim.pop_n(len) {
+            return Err(());
+        }
+        self.sim.push();
+        Ok(())
+    }
+
     fn alloc_array(&mut self, _element_ty: &TyTemplate, len: usize) -> Result<(), Self::Error> {
         // `load_type` pushes the element type and `AllocArray` pops it again, so
         // the net stack effect (pop `len`, push the array) is unchanged.
+        if !self.sim.pop_n(len) {
+            return Err(());
+        }
+        self.sim.push();
+        Ok(())
+    }
+
+    fn alloc_tuple(&mut self, _tuple_ty: &TyTemplate, len: usize) -> Result<(), Self::Error> {
         if !self.sim.pop_n(len) {
             return Err(());
         }
@@ -1556,7 +1644,16 @@ impl<'a> PullSink<'a> for StackCarryPullSink<'a> {
         Ok(())
     }
 
-    fn load_current_package(&mut self, _package: &str) -> Result<(), Self::Error> {
+    fn load_current_package(&mut self) -> Result<(), Self::Error> {
+        self.sim.push();
+        Ok(())
+    }
+
+    fn satisfies_bound(&mut self) -> Result<(), Self::Error> {
+        // Consumes the type and the bound, pushes the bool.
+        if !self.sim.pop_n(2) {
+            return Err(());
+        }
         self.sim.push();
         Ok(())
     }
@@ -1632,7 +1729,12 @@ impl<'a> PullSink<'a> for StackCarryPullSink<'a> {
 }
 
 impl<'a> StackEffectSink<'a> for StackCarryPullSink<'a> {
-    fn store_field_value(&mut self, _field: usize, _name: &str) -> Result<(), Self::Error> {
+    fn store_field_value(
+        &mut self,
+        _field: usize,
+        _name: &str,
+        _base: &Place,
+    ) -> Result<(), Self::Error> {
         if !self.sim.pop_n(2) {
             return Err(());
         }
@@ -1642,6 +1744,7 @@ impl<'a> StackEffectSink<'a> for StackCarryPullSink<'a> {
     fn store_index_value(
         &mut self,
         _kind: baml_compiler2_mir::IndexKind,
+        _base: &Place,
     ) -> Result<(), Self::Error> {
         if !self.sim.pop_n(3) {
             return Err(());
@@ -1941,6 +2044,42 @@ mod tests {
 
         assert_eq!(ok, Some(true));
         assert!(sim.used);
+    }
+
+    #[test]
+    fn tuple_aggregate_stack_carry_accounts_for_trailing_load_type() {
+        let carried = Local(1);
+        let sibling = Local(2);
+        let classifications = stack_carried_classifications([sibling]);
+        let mut sim = StackCarrySim {
+            depth: Some(1),
+            used: false,
+        };
+
+        let ok = simulate_operand_prefix_pull_stack(
+            &Rvalue::Aggregate {
+                kind: AggregateKind::Tuple {
+                    element_templates: vec![
+                        TyTemplate::from(RealizedTy::int()),
+                        TyTemplate::from(RealizedTy::int()),
+                        TyTemplate::from(RealizedTy::int()),
+                    ],
+                },
+                fields: vec![
+                    Operand::copy_local(carried),
+                    Operand::copy_local(sibling),
+                    Operand::Constant(Constant::Int(1)),
+                ],
+            },
+            &mut sim,
+            carried,
+            &classifications,
+            &HashMap::new(),
+        );
+
+        assert_eq!(ok, Some(true));
+        assert!(sim.used);
+        assert_eq!(sim.depth, None);
     }
 
     #[test]

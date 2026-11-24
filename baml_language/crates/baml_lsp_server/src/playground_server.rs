@@ -2,10 +2,10 @@
 //!
 //! Two modes controlled by environment variables:
 //!
-//! **Dev mode** (`BAML_PLAYGROUND_DEV_PORT` is set):
+//! **Dev mode** (`DEV_BAML_PLAYGROUND_PORT` is set):
 //!   Reverse-proxies all non-API requests to a local Vite dev server.
 //!
-//! **Prod mode** (`BAML_PLAYGROUND_DIR` is set):
+//! **Prod mode** (`DEV_BAML_PLAYGROUND_DIR` is set):
 //!   Serves pre-built static assets with SPA fallback.
 
 use std::{
@@ -61,7 +61,7 @@ use crate::{
 };
 
 #[derive(Debug, thiserror::Error)]
-#[error("Playground server requires either BAML_PLAYGROUND_DEV_PORT or BAML_PLAYGROUND_DIR")]
+#[error("Playground server requires either DEV_BAML_PLAYGROUND_PORT or DEV_BAML_PLAYGROUND_DIR")]
 pub struct PlaygroundNotConfigured;
 
 fn to_ws_text(msg: &WsOutMessage) -> Option<AxumWsMsg> {
@@ -781,9 +781,7 @@ fn build_router(
         DEFAULT_NATIVE_LIVE_VALUE_CACHE_BYTES,
     )));
     let history_store = Arc::new(HistoryStore::new(workspace_roots.to_vec()));
-    let telemetry = Arc::new(crate::playground_btel::PlaygroundTelemetry::new(
-        Arc::clone(&workspace_roots),
-    ));
+    let telemetry = Arc::new(crate::playground_btel::PlaygroundTelemetry::default());
     let ws_state = WsState {
         seam,
         broadcast_tx,
@@ -813,13 +811,13 @@ fn build_router(
     let fallback = if let Some(dir) = playground_dir_override {
         tracing::info!("Playground: serving static files from {}", dir.display());
         static_router(dir.to_string_lossy().into_owned())
-    } else if let Ok(dev_port) = std::env::var("BAML_PLAYGROUND_DEV_PORT") {
+    } else if let Some(dev_port) = baml_env::raw_var("DEV_BAML_PLAYGROUND_PORT") {
         let dev_port: u16 = dev_port
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid BAML_PLAYGROUND_DEV_PORT: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Invalid DEV_BAML_PLAYGROUND_PORT: {e}"))?;
         tracing::info!("Playground: dev proxy -> http://localhost:{dev_port}");
         dev_proxy_router(format!("http://localhost:{dev_port}"))
-    } else if let Ok(dir) = std::env::var("BAML_PLAYGROUND_DIR") {
+    } else if let Some(dir) = baml_env::raw_var("DEV_BAML_PLAYGROUND_DIR") {
         tracing::info!("Playground: serving static files from {dir}");
         static_router(dir)
     } else {
@@ -1378,8 +1376,8 @@ async fn playground_ws_session(socket: WebSocket, state: WsState) {
 
     if let Some(hello) = to_ws_text(&WsOutMessage::Hello {
         toolchain_version: baml_version::CANONICAL_VERSION.to_string(),
-        playground_protocol: 2,
-        min_client_playground_protocol: 2,
+        playground_protocol: baml_lsp::PLAYGROUND_PROTOCOL,
+        min_client_playground_protocol: baml_lsp::MIN_SUPPORTED_CLIENT_PLAYGROUND_PROTOCOL,
         capabilities: vec![
             "playgroundWebSocket.v2".to_string(),
             "callFunction.v1".to_string(),
@@ -1414,7 +1412,7 @@ async fn playground_ws_session(socket: WebSocket, state: WsState) {
         // Only these keys are worth blocking a run to prompt for; everything
         // else resolves to unset without stalling. See `playground_env`.
         state.env_state.set_declared_keys(&names);
-        let vars = collect_referenced_env_vars(&names, |name| std::env::var(name).ok());
+        let vars = collect_referenced_env_vars(&names, baml_env::raw_var);
         if let Some(msg) = to_ws_text(&WsOutMessage::ProcessEnvVars { vars })
             && sink.send(msg).await.is_err()
         {
@@ -1479,41 +1477,11 @@ async fn handle_function_run(
     client: FunctionRunClient,
     project: String,
     target: FunctionRunTarget,
-    args_bytes: String,
+    args: String,
     call_id: sys_types::CallId,
     state: &WsState,
     sink: &mut futures::stream::SplitSink<WebSocket, AxumWsMsg>,
 ) {
-    let decoded = match base64::engine::general_purpose::STANDARD.decode(&args_bytes) {
-        Ok(d) => d,
-        Err(e) => {
-            send_ws(
-                sink,
-                &client.error("invalidBase64", format!("Invalid base64: {e}")),
-            )
-            .await;
-            return;
-        }
-    };
-
-    let kwargs = match bridge_ctypes::playground_run_args_to_bex_values(
-        decoded.as_slice(),
-        &bridge_ctypes::HANDLE_TABLE,
-    ) {
-        Ok(k) => k,
-        Err(e) => {
-            send_ws(
-                sink,
-                &client.error(
-                    "invalidArguments",
-                    format!("Failed to convert arguments: {e}"),
-                ),
-            )
-            .await;
-            return;
-        }
-    };
-
     let broadcast_tx = state.broadcast_tx.clone();
     // One coherent launch snapshot: engine + generation captured
     // in a single transaction, with the overlay control-flow graph pinned
@@ -1539,6 +1507,31 @@ async fn handle_function_run(
     };
     let project_generation = prepared.generation;
     let bex = prepared.engine;
+
+    // The arguments arrive as one JSON object; the engine hydrates each
+    // against the parameter type the function declares.
+    // Boxed: the hydration awaits engine calls, whose futures are large, and
+    // this handler is itself awaited inside the WebSocket loop's future.
+    let kwargs =
+        match Box::pin(
+            bex.json_arguments(&target.call_function_name, &args, |type_args| {
+                bex_project::FunctionCallContextBuilder::new(sys_types::CallId::next())
+                    .with_type_args(type_args)
+                    .build()
+            }),
+        )
+        .await
+        {
+            Ok(kwargs) => kwargs,
+            Err(e) => {
+                send_ws(
+                    sink,
+                    &client.error("invalidArguments", format!("Invalid arguments: {e}")),
+                )
+                .await;
+                return;
+            }
+        };
 
     let fs_path = bex_project::FsPath::from_str(project);
     let boundary_id = BoundaryId::new_random();
@@ -1742,13 +1735,13 @@ async fn handle_ws_in_message(
             request_id,
             project,
             function_name,
-            args_bytes,
+            args,
         } => {
             handle_function_run(
                 FunctionRunClient { request_id },
                 project,
                 FunctionRunTarget::function(function_name),
-                args_bytes,
+                args,
                 sys_types::CallId::next(),
                 state,
                 sink,
@@ -1762,13 +1755,13 @@ async fn handle_ws_in_message(
             parent_function_name,
             helper,
             function_name,
-            args_bytes,
+            args,
         } => {
             handle_function_run(
                 FunctionRunClient { request_id },
                 project,
                 FunctionRunTarget::preview(parent_function_name, helper, function_name),
-                args_bytes,
+                args,
                 sys_types::CallId::next(),
                 state,
                 sink,
@@ -1945,10 +1938,14 @@ async fn handle_ws_in_message(
             request_id,
             project,
         } => {
+            // Read only what the playground serves now: in an editor, the
+            // projects under the folders it announced.
+            let served = state.seam.workspace_roots().await;
             // SQLite and CAS reads block: keep them off the async executor.
             let telemetry = Arc::clone(&state.telemetry);
             let listed =
-                tokio::task::spawn_blocking(move || telemetry.list_executions(&project)).await;
+                tokio::task::spawn_blocking(move || telemetry.list_executions(&project, &served))
+                    .await;
             let message = match listed {
                 Ok(Ok((executions, store_missing))) => WsOutMessage::ExecutionList {
                     request_id,
@@ -1978,8 +1975,9 @@ async fn handle_ws_in_message(
             // Recorded locations are verified against what the playground
             // currently has built for this project, never assumed current.
             let current_source = state.seam.installed_source_snapshot(&project);
+            let served = state.seam.workspace_roots().await;
             let opened = tokio::task::spawn_blocking(move || {
-                telemetry.open_execution(&project, &id, current_source)
+                telemetry.open_execution(&project, &served, &id, current_source)
             })
             .await;
             let message = match opened {
@@ -2731,13 +2729,7 @@ mod tests {
     }
 
     impl RootHaver for EmptyRoots {
-        fn collect_roots(&self, _roots: &mut Vec<bex_vm_types::HeapPtr>) {}
-
-        fn forward_roots(
-            &mut self,
-            _forward: &std::collections::HashMap<bex_vm_types::HeapPtr, bex_vm_types::HeapPtr>,
-        ) {
-        }
+        fn visit_roots(&mut self, _visitor: &mut dyn bex_vm_types::RootVisitor) {}
     }
 
     impl TlabHolder for EmptyRoots {
@@ -3106,5 +3098,206 @@ mod tests {
         assert!(matches!(patch, WsOutMessage::RunPatch { .. }));
 
         let _ = std::fs::remove_dir_all(project);
+    }
+
+    type TestWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Send one playground request and return the reply that carries its id.
+    async fn ws_request(ws: &mut TestWs, request: serde_json::Value) -> serde_json::Value {
+        use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+        let request_id = request["requestId"].clone();
+        ws.send(TungMsg::text(request.to_string())).await.unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while let Some(frame) = ws.next().await {
+                if let TungMsg::Text(text) = frame.unwrap() {
+                    let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if reply["requestId"] == request_id {
+                        return Some(reply);
+                    }
+                }
+            }
+            None
+        });
+        reply
+            .await
+            .expect("the playground answers")
+            .expect("the socket stays open")
+    }
+
+    /// The editor starts `baml lsp` without `--workspace`, so the playground
+    /// has no folders of its own: only those the editor announces. Telemetry
+    /// reads the projects under them, and still refuses a directory the
+    /// playground does not serve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telemetry_reads_projects_under_folders_the_editor_announces() {
+        use baml_lsp::{GlobalState, discovery::NativeFs, executor::Executors};
+
+        use crate::{
+            lsp_ingress::TransportKind,
+            lsp_runtime::{LspRuntime, SinkDelivery, SubmitResult},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let temp_path = temp.path().canonicalize().unwrap();
+        let workspace = temp_path.join("workspace");
+        std::fs::create_dir_all(workspace.join("baml_src")).unwrap();
+        std::fs::write(
+            workspace.join("baml_src/main.baml"),
+            "class Point {\n    x int\n}\n",
+        )
+        .unwrap();
+        let outside = temp_path.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let assets = temp_path.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+
+        // The editor's session announces its folder in `initialize`.
+        let state = GlobalState::with_fs(Executors::native_default(), None, Arc::new(NativeFs));
+        let runtime = LspRuntime::new(state).unwrap();
+        let session = runtime
+            .open_session(
+                TransportKind::Stdio,
+                Arc::new(|_| SinkDelivery::Sent),
+                Arc::new(|| {}),
+                None,
+            )
+            .session_id;
+        let initialize = lsp_server::Message::Request(lsp_server::Request {
+            id: lsp_server::RequestId::from(1),
+            method: "initialize".into(),
+            params: serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "workspaceFolders": [{
+                    "uri": lsp_types::Url::from_file_path(&workspace).unwrap(),
+                    "name": "workspace",
+                }],
+            }),
+        });
+        let initialized = lsp_server::Message::Notification(lsp_server::Notification::new(
+            "initialized".into(),
+            serde_json::json!({}),
+        ));
+        for message in [initialize, initialized] {
+            assert!(matches!(
+                runtime.submit(session, message),
+                SubmitResult::Accepted
+            ));
+        }
+
+        // The playground host as `baml lsp` builds it.
+        let (broadcast_tx, _) = broadcast::channel(64);
+        let run_store = Arc::new(InMemoryRunStore::default());
+        let env_state = Arc::new(PlaygroundEnvState::new(
+            broadcast_tx.clone(),
+            run_store.clone(),
+            Arc::default(),
+        ));
+        let io_state = Arc::new(PlaygroundIoState::new(
+            broadcast_tx.clone(),
+            run_store.clone(),
+        ));
+        let platform = Arc::new(crate::PlaygroundPlatform::new(
+            broadcast_tx.clone(),
+            run_store.clone(),
+            env_state.clone(),
+            io_state.clone(),
+        ));
+        let (writer_tx, _writer_rx) = crossbeam_channel::bounded(16);
+        let lsp_sender = Arc::new(crate::native_lsp_sender::NativeLspSender::new(
+            &Arc::new(writer_tx),
+            &crate::OutboundBudget::new(),
+        ));
+        let current_open_target: crate::playground_sender::SharedOpenTarget = Arc::default();
+        let sender = Arc::new(crate::playground_sender::NativePlaygroundSender::new(
+            broadcast_tx.clone(),
+            lsp_sender,
+            0,
+            false,
+            current_open_target.clone(),
+        ));
+        let seam = PlaygroundSeam::new(
+            Arc::clone(&runtime),
+            Arc::default(),
+            sender,
+            env_state.clone(),
+            platform,
+        );
+
+        // The project the playground lists, as the UI picks it.
+        let project = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if let Some(project) = seam.workspace_roots().await.into_iter().next() {
+                    return project;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the announced folder's project is discovered");
+
+        let (lsp_out_tx, _) = broadcast::channel(16);
+        let app = build_router(
+            seam,
+            broadcast_tx,
+            env_state,
+            io_state,
+            run_store,
+            Some(assets),
+            lsp_out_tx,
+            runtime,
+            Arc::default(),
+            Arc::from(Vec::new()),
+            PlaygroundAccessGuard,
+            current_open_target,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/api/ws"))
+            .await
+            .unwrap();
+
+        let listed = ws_request(
+            &mut ws,
+            serde_json::json!({ "type": "listExecutions", "requestId": 1, "project": project }),
+        )
+        .await;
+        assert_eq!(listed["type"], "executionList", "{listed}");
+        assert_eq!(listed["storeMissing"], true, "{listed}");
+
+        let opened = ws_request(
+            &mut ws,
+            serde_json::json!({
+                "type": "openExecution",
+                "requestId": 2,
+                "project": project,
+                "executionId": "none",
+            }),
+        )
+        .await;
+        assert_eq!(
+            opened["message"], "no recordings in this project",
+            "{opened}"
+        );
+
+        let refused = ws_request(
+            &mut ws,
+            serde_json::json!({ "type": "listExecutions", "requestId": 3, "project": outside }),
+        )
+        .await;
+        assert_eq!(refused["type"], "commandError", "{refused}");
+        assert_eq!(
+            refused["message"],
+            format!(
+                "{} is not a workspace served by this playground",
+                outside.display()
+            ),
+            "{refused}"
+        );
     }
 }

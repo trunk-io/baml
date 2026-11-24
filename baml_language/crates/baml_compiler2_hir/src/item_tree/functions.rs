@@ -31,10 +31,13 @@ pub struct Function {
     pub metadata: ast::FunctionMetadata,
     /// Joined `///` doc-comment lines preceding this declaration.
     pub docstring: Option<String>,
+    /// The `//#` title directly above the declaration, for the visualizer.
+    pub header_title: Option<String>,
     /// BEP-049 §10: set when the fn def had a `//baml:tagged_string` marker.
     /// Mirrors `ast::FunctionDef::is_tagged_template_tag` so TIR can validate
     /// tagged-template tags without re-reading the CST.
     pub is_tagged_template_tag: bool,
+    pub trace_hook: Option<ast::TraceHookDirective>,
     /// Full source span of the function.
     pub span: TextRange,
 }

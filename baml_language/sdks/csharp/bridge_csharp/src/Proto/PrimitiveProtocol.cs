@@ -31,7 +31,13 @@ internal static class PrimitiveProtocol
     private const string StreamClassIdentity = "ai.stream.Stream";
     private const string StreamDoneIdentity = "ai.stream.Done";
 
-    internal static EncodedCallArguments EncodeOwnedValue(
+    /// <summary>
+    /// A host callback's returned or thrown value as its completion carries it,
+    /// measured against the wire, with the references its handles transfer: the
+    /// caller commits them once the completion is sent, or disposes them to
+    /// release every clone.
+    /// </summary>
+    internal static (InboundValue Value, EncodedCallArguments Ownership) EncodeOwnedResult(
         BamlGeneratedValue value,
         NativeApi api,
         ulong functionCallId)
@@ -41,14 +47,32 @@ internal static class PrimitiveProtocol
         var ownership = new EncodedCallArguments([]);
         try
         {
-            ownership.SetBytes(Encode(value, api, ownership, functionCallId).ToByteArray());
-            return ownership;
+            InboundValue encoded = Encode(value, api, ownership, functionCallId);
+            WireDepth.Require(encoded, WireDepth.Result, "$result");
+            return (encoded, ownership);
         }
         catch
         {
             ownership.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// One call argument, encoded and measured against the wire before anything
+    /// is sent: a value deeper than the wire carries is the caller's argument
+    /// error, and its handle clones are released with the call's ownership.
+    /// </summary>
+    private static InboundValue EncodeArgument(
+        string name,
+        BamlGeneratedValue value,
+        NativeApi? api,
+        EncodedCallArguments? ownership,
+        ulong callId)
+    {
+        InboundValue encoded = Encode(value, api, ownership, callId);
+        WireDepth.Require(encoded, WireDepth.Argument, $"$args.{name}");
+        return encoded;
     }
 
     internal static EncodedCallArguments EncodeOwnedCallArguments<TResult>(
@@ -68,7 +92,7 @@ internal static class PrimitiveProtocol
                 call.Kwargs.Add(new InboundMapEntry
                 {
                     StringKey = argument.WireIdentity,
-                    Value = Encode(value, api, ownership, callId),
+                    Value = EncodeArgument(argument.WireIdentity, value, api, ownership, callId),
                 });
             }
 
@@ -101,7 +125,7 @@ internal static class PrimitiveProtocol
                 call.Kwargs.Add(new InboundMapEntry
                 {
                     StringKey = name,
-                    Value = Encode(value, api, ownership, callId),
+                    Value = EncodeArgument(name, value, api, ownership, callId),
                 });
             }
 
@@ -132,7 +156,7 @@ internal static class PrimitiveProtocol
                 call.Kwargs.Add(new InboundMapEntry
                 {
                     StringKey = argument.WireIdentity,
-                    Value = Encode(value, api, ownership, callId),
+                    Value = EncodeArgument(argument.WireIdentity, value, api, ownership, callId),
                 });
             }
 
@@ -169,7 +193,7 @@ internal static class PrimitiveProtocol
             call.Kwargs.Add(new InboundMapEntry
             {
                 StringKey = argument.WireIdentity,
-                Value = Encode(value),
+                Value = EncodeArgument(argument.WireIdentity, value, api: null, ownership: null, callId),
             });
         }
 
@@ -222,7 +246,7 @@ internal static class PrimitiveProtocol
             call.Kwargs.Add(new InboundMapEntry
             {
                 StringKey = argument.WireIdentity,
-                Value = Encode(value),
+                Value = EncodeArgument(argument.WireIdentity, value, api: null, ownership: null, callId),
             });
         }
 
@@ -246,9 +270,6 @@ internal static class PrimitiveProtocol
         NativeApi? api = null)
     {
         BamlOutboundResult envelope = ParseCallResult(bytes, "BAML result");
-
-        HostCallableProtocol.ThrowIfHostCallbackError(envelope);
-
         using OutboundOwnershipScope ownership = OutboundOwnershipScope.Create(envelope, api);
         var budget = new BamlDecodeBudget();
         return envelope.ResultCase switch
@@ -503,6 +524,8 @@ internal static class PrimitiveProtocol
                 "BamlOutboundError.value was absent.");
         }
 
+        // Read while the scope still holds the exception's pin.
+        HostCallableProtocol.ThrowIfHostCallbackError(error);
         var thrownValue = new BamlValue(
             Decode(error.Value, "$error", ownership, api, budget, depth: 0));
         var trace = new BamlTrace(error.Trace);
@@ -552,7 +575,8 @@ internal static class PrimitiveProtocol
                 BamlCancellationOrigin.Engine,
                 BamlCancellationTokens.CreateEngineToken(),
                 bamlFunction,
-                trace);
+                trace,
+                value);
         }
 
         return new BamlPanicException(
@@ -565,7 +589,7 @@ internal static class PrimitiveProtocol
     internal static InboundValue Encode(BamlGeneratedValue value) =>
         Encode(value, api: null, ownership: null, functionCallId: 0);
 
-    private static InboundValue Encode(
+    internal static InboundValue Encode(
         BamlGeneratedValue value,
         NativeApi? api,
         EncodedCallArguments? ownership,
@@ -591,21 +615,19 @@ internal static class PrimitiveProtocol
                 BigintValue = FormatBigInt(value.ReadBigInt()),
             },
             PrimitiveCarrierKind.List => EncodeList(value, api, ownership, functionCallId),
+            PrimitiveCarrierKind.Tuple => EncodeTuple(value, api, ownership, functionCallId),
             PrimitiveCarrierKind.Map => EncodeMap(value, api, ownership, functionCallId),
             PrimitiveCarrierKind.Class => EncodeClass(value, api, ownership, functionCallId),
             PrimitiveCarrierKind.Enum => EncodeEnum(value),
             PrimitiveCarrierKind.Union => EncodeUnion(value, api, ownership, functionCallId),
-            PrimitiveCarrierKind.Media => MediaProtocol.Encode(
-                RequireNativeApi(api, value.Kind),
-                RequireOwnership(ownership, value.Kind),
-                value.ReadMedia()),
+            PrimitiveCarrierKind.Media => MediaProtocol.Encode(value.ReadMedia()),
             PrimitiveCarrierKind.Prompt => new InboundValue
             {
                 PromptAstValue = value.ReadPromptAst(),
             },
             PrimitiveCarrierKind.Type => new InboundValue
             {
-                TyDefValue = value.ReadType().WireCopy(),
+                TyValue = value.ReadType().Restate(ownership),
             },
             PrimitiveCarrierKind.Handle => EncodeHandle(
                 value.ReadHandle(),
@@ -632,6 +654,19 @@ internal static class PrimitiveProtocol
             new BamlDecodeBudget(),
             depth: 0);
     }
+
+    /// <summary>
+    /// Decode one host-callback argument, claiming the engine references it
+    /// keeps from <paramref name="ownership"/>, the invocation's argument
+    /// inventory.
+    /// </summary>
+    internal static BamlGeneratedValue DecodeHostArgument(
+        BamlOutboundValue value,
+        string path,
+        OutboundOwnershipScope ownership,
+        NativeApi api,
+        BamlDecodeBudget budget) =>
+        Decode(value, path, ownership, api, budget, depth: 0);
 
     private static BamlGeneratedValue Decode(
         BamlOutboundValue value,
@@ -667,6 +702,8 @@ internal static class PrimitiveProtocol
                 DecodeLiteral(value.LiteralValue, path),
             BamlOutboundValue.ValueOneofCase.ListValue =>
                 DecodeList(value.ListValue, path, ownership, api, budget, depth),
+            BamlOutboundValue.ValueOneofCase.TupleValue =>
+                DecodeTuple(value.TupleValue, path, ownership, api, budget, depth),
             BamlOutboundValue.ValueOneofCase.MapValue =>
                 DecodeMap(value.MapValue, path, ownership, api, budget, depth),
             BamlOutboundValue.ValueOneofCase.ClassValue =>
@@ -681,11 +718,7 @@ internal static class PrimitiveProtocol
                 BamlGeneratedValue.CreatePromptAst(value.PromptAstValue, path),
             BamlOutboundValue.ValueOneofCase.TyValue =>
                 BamlGeneratedValue.CreateType(
-                    new global::Baml.BamlType(value.TyValue),
-                    path),
-            BamlOutboundValue.ValueOneofCase.TyDefValue =>
-                BamlGeneratedValue.CreateType(
-                    new global::Baml.BamlType(value.TyDefValue),
+                    new global::Baml.BamlType(value.TyValue, ownership.ClaimRows(value.TyValue)),
                     path),
             BamlOutboundValue.ValueOneofCase.HandleValue =>
                 DecodeHandle(value.HandleValue, path, ownership, api, budget, depth),
@@ -707,19 +740,52 @@ internal static class PrimitiveProtocol
             list.Values.Add(Encode(item, api, ownership, functionCallId));
         }
 
-        var inbound = new InboundValue { ListValue = list };
-        if (value.ItemTypeMetadata is { Length: > 0 } itemTypeMetadata)
+        // Every list leaves with its type: the codec that built it stated the
+        // declared element type.
+        // BUG: a list the engine returned keeps the element type it was
+        // annotated with, and that annotation may label a runtime declaration
+        // by `anonymous_label` (a list of a runtime class's instances); sent
+        // back, the label goes out as a statement, which the decoder refuses.
+        // Maps and class type arguments carry the same annotation through.
+        return new InboundValue
         {
-            inbound.ValueType = new BamlTy
+            ListValue = list,
+            ValueType = new BamlTy
             {
                 List = new BamlTyList
                 {
-                    Item = ParseTypeMetadata(itemTypeMetadata, "list item"),
+                    Item = ParseTypeMetadata(value.ItemTypeMetadata, "list item"),
                 },
-            };
+            },
+        };
+    }
+
+    private static InboundValue EncodeTuple(
+        BamlGeneratedValue value,
+        NativeApi? api,
+        EncodedCallArguments? ownership,
+        ulong functionCallId)
+    {
+        if (value.TupleTypeMetadata is not { Length: > 0 } tupleType)
+        {
+            throw new BamlTypeMappingException(
+                typeof(global::Baml.BamlValue),
+                "tuple",
+                "$",
+                "A tuple whose BAML type was not carried cannot be sent back; state it through its generated tuple type first.");
         }
 
-        return inbound;
+        var list = new InboundListValue();
+        foreach (BamlGeneratedValue item in value.ReadTuple())
+        {
+            list.Values.Add(Encode(item, api, ownership, functionCallId));
+        }
+
+        return new InboundValue
+        {
+            ListValue = list,
+            ValueType = ParseTypeMetadata(tupleType, "tuple"),
+        };
     }
 
     private static InboundValue EncodeMap(
@@ -738,21 +804,20 @@ internal static class PrimitiveProtocol
             });
         }
 
-        var inbound = new InboundValue { MapValue = map };
-        if (value.KeyTypeMetadata is { Length: > 0 } keyTypeMetadata
-            && value.ValueTypeMetadata is { Length: > 0 } valueTypeMetadata)
+        // Every map leaves with its type: the codec that built it stated the
+        // declared key and value types.
+        return new InboundValue
         {
-            inbound.ValueType = new BamlTy
+            MapValue = map,
+            ValueType = new BamlTy
             {
                 Map = new BamlTyMap
                 {
-                    Key = ParseTypeMetadata(keyTypeMetadata, "map key"),
-                    Value = ParseTypeMetadata(valueTypeMetadata, "map value"),
+                    Key = ParseTypeMetadata(value.KeyTypeMetadata, "map key"),
+                    Value = ParseTypeMetadata(value.ValueTypeMetadata, "map value"),
                 },
-            };
-        }
-
-        return inbound;
+            },
+        };
     }
 
     private static InboundValue EncodeClass(
@@ -793,32 +858,16 @@ internal static class PrimitiveProtocol
             },
         };
 
+    /// <summary>
+    /// A union has no wire shape of its own: its payload leaves as the value
+    /// it is, which implies or states its own type.
+    /// </summary>
     private static InboundValue EncodeUnion(
         BamlGeneratedValue value,
         NativeApi? api,
         EncodedCallArguments? ownership,
-        ulong functionCallId)
-    {
-        InboundValue encoded =
-            Encode(value.ReadUnionPayload(), api, ownership, functionCallId);
-        if (encoded.ValueType is null
-            && value.UnionSelectedTypeMetadata is { Length: > 0 } selectedTypeMetadata)
-        {
-            BamlTy selectedType =
-                ParseTypeMetadata(selectedTypeMetadata, "selected union option");
-            if (selectedType.TyCase is BamlTy.TyOneofCase.Union
-                or BamlTy.TyOneofCase.Optional)
-            {
-                throw new BamlProtocolException(
-                    "A generated union codec selected a non-concrete inbound type.",
-                    "InboundValue.value_type must identify the selected value node, not a union or optional shell.");
-            }
-
-            encoded.ValueType = selectedType;
-        }
-
-        return encoded;
-    }
+        ulong functionCallId) =>
+        Encode(value.ReadUnionPayload(), api, ownership, functionCallId);
 
     private static InboundValue EncodeHandle(
         global::Baml.BamlHandle value,
@@ -879,6 +928,71 @@ internal static class PrimitiveProtocol
         return BamlGeneratedValue.CreateList(
             items.AsReadOnly(),
             Metadata(list.ItemType, path, "list item"),
+            path);
+    }
+
+    private static BamlGeneratedValue DecodeTuple(
+        BamlValueTuple tuple,
+        string path,
+        OutboundOwnershipScope ownership,
+        NativeApi? api,
+        BamlDecodeBudget budget,
+        int depth)
+    {
+        ArgumentNullException.ThrowIfNull(tuple);
+        BamlDecodeBudget.RequireCollection(tuple.Items.Count, path);
+        if (tuple.Items.Count == 0)
+        {
+            throw new BamlProtocolException(
+                "The native bridge returned an empty BAML tuple.",
+                $"A tuple at {path} had no slots.");
+        }
+
+        if (tuple.TupleType is { TyCase: BamlTy.TyOneofCase.Tuple } carried
+            && carried.Tuple.Items.Count != tuple.Items.Count)
+        {
+            throw new BamlProtocolException(
+                "The native bridge returned a tuple of the wrong arity for its type.",
+                $"A tuple at {path} carried {carried.Tuple.Items.Count} slot types for {tuple.Items.Count} slots.");
+        }
+
+        if (tuple.TupleType is { } stated
+            && stated.TyCase is not BamlTy.TyOneofCase.Tuple and not BamlTy.TyOneofCase.None)
+        {
+            throw new BamlProtocolException(
+                "The native bridge returned a tuple whose type is not a tuple.",
+                $"A tuple at {path} carried a {stated.TyCase} type.");
+        }
+
+        byte[] tupleType = Metadata(tuple.TupleType, path, "tuple");
+        var items = new List<BamlGeneratedValue>(tuple.Items.Count);
+        try
+        {
+            for (int index = 0; index < tuple.Items.Count; index++)
+            {
+                items.Add(Decode(
+                    tuple.Items[index],
+                    $"{path}[{index}]",
+                    ownership,
+                    api,
+                    budget,
+                    depth + 1));
+            }
+        }
+        catch
+        {
+            var disposed = new HashSet<global::Baml.BamlHandle>(ReferenceEqualityComparer.Instance);
+            foreach (BamlGeneratedValue item in items)
+            {
+                item.DisposeOwnedHandles(disposed);
+            }
+
+            throw;
+        }
+
+        return BamlGeneratedValue.CreateTuple(
+            items.AsReadOnly(),
+            tupleType,
             path);
     }
 
@@ -1038,14 +1152,32 @@ internal static class PrimitiveProtocol
                 path);
         }
 
+        if (wire.HandleType == BamlHandleType.AdtRuntimeValue
+            && ((wire.Ty?.TyCase == BamlTy.TyOneofCase.ClassTy
+                    && wire.Ty.ClassTy.HeadCase == BamlTyClass.HeadOneofCase.AnonymousLabel)
+                || (wire.Ty?.TyCase == BamlTy.TyOneofCase.Enum
+                    && wire.Ty.Enum.HeadCase == BamlTyEnum.HeadOneofCase.AnonymousLabel)))
+        {
+            // An instance of a runtime declaration: its type has no name, so
+            // the handle is held by its label and never matches a named type.
+            byte[] annotation = wire.Ty.ToByteArray();
+            return BamlGeneratedValue.CreateHandle(
+                new global::Baml.BamlHandle(
+                    ownership.Claim(wire),
+                    global::Baml.BamlTypeDescriptor.CreateUnnamedHandle(annotation),
+                    wire.HandleType,
+                    annotation),
+                sourcePath: path);
+        }
+
         string fqn = wire.HandleType switch
         {
             BamlHandleType.FunctionRef => "baml.internal.Function",
-            BamlHandleType.UntaggedRustData => "baml.internal.RustData",
             BamlHandleType.UntaggedBexHeap => "baml.internal.HeapValue",
             BamlHandleType.AdtPromptAst => "baml.llm.PromptAst",
             BamlHandleType.AdtFunctionSpec => "ai.FunctionSpec",
-            BamlHandleType.AdtTaggedHeapHandle => TaggedHandleIdentity(wire, path),
+            BamlHandleType.AdtTaggedHeapHandle or BamlHandleType.AdtRuntimeValue =>
+                TaggedHandleIdentity(wire, path),
             _ => throw new BamlProtocolException(
                 "The native bridge returned an unsupported BAML handle.",
                 $"Handle type {wire.HandleType} at {path} has no public managed projection."),
@@ -1056,7 +1188,8 @@ internal static class PrimitiveProtocol
         global::Baml.BamlTypeDescriptor descriptor =
             global::Baml.BamlTypeDescriptor.CreateHandle(fqn);
         if (wire.HandleType is BamlHandleType.AdtTaggedHeapHandle
-            or BamlHandleType.AdtFunctionSpec)
+            or BamlHandleType.AdtFunctionSpec
+            or BamlHandleType.AdtRuntimeValue)
         {
             global::Baml.BamlTypeDescriptor encodedType =
                 global::Baml.BamlTypeDescriptor.FromMetadata(metadata);
@@ -1336,7 +1469,7 @@ internal static class PrimitiveProtocol
         return type.ToByteArray();
     }
 
-    private static BamlTy ParseTypeMetadata(byte[]? metadata, string description)
+    internal static BamlTy ParseTypeMetadata(byte[]? metadata, string description)
     {
         if (metadata is null || metadata.Length == 0)
         {

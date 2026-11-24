@@ -5,8 +5,7 @@
 //! `record()` time (in the process that owns the event, so session id and
 //! metadata are correct); [`send_body`] POSTs one such body and runs only
 //! inside the detached flush child (see [`super::queue`]) — never on a
-//! user-visible code path. The `BAML_TELEMETRY_DEBUG=1` stderr dry-run
-//! lives in [`super::storage::Telemetry::record`].
+//! user-visible code path.
 
 use std::time::Duration;
 
@@ -115,16 +114,6 @@ pub(super) fn build_body(telemetry: &Telemetry, event: &TelemetryEvent) -> Optio
 
 fn host() -> &'static str {
     POSTHOG_HOST.trim_end_matches('/')
-}
-
-/// Crate-visible accessor for the PostHog key (used by `baml feedback`).
-pub(crate) fn posthog_api_key() -> &'static str {
-    POSTHOG_API_KEY
-}
-
-/// Crate-visible accessor for the PostHog host (used by `baml feedback`).
-pub(crate) fn posthog_host() -> &'static str {
-    POSTHOG_HOST
 }
 
 #[cfg(test)]

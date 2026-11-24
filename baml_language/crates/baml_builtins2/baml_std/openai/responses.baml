@@ -11,9 +11,9 @@
 ///     request as the LAST step, `null` deletes a key), `headers` and
 ///     `query_params`.
 ///
-/// Structured output stays SAP-based: the schema rides in the prompt text and
-/// `text.format` is deliberately never set. A caller who
-/// wants native JSON-schema output sets it through `request_body`.
+/// By default the output schema rides in the prompt text and the answer is
+/// parsed with SAP. `structured_output` sends OpenAI Structured Outputs
+/// instead (`text.format`), and reads the answer strictly.
 ///
 /// Deliberately not provided: the engine's `finish_reason_allow_list` and
 /// `finish_reason_deny_list`. There is no config surface for them here and
@@ -63,14 +63,34 @@ class ResponsesClient {
     headers: map<string, string>?,
     /// Extra URL query parameters, percent-encoded onto the endpoint.
     query_params: map<string, string>?,
-    // Record request/response bodies (and raw SSE events) on the LLMCall wire
+    // Record request/response bodies (and raw SSE events) on the ModelCall wire
     // records delivered through on_event. Status, headers, and timing are
     // always recorded; this flag only gates the bodies.
     capture_wire: bool,
+    /// Hold the model to the output type with OpenAI Structured Outputs: the
+    /// request carries a strict JSON Schema of the type as `text.format`, and
+    /// the answer is read strictly as JSON rather than parsed leniently.
+    ///
+    /// The model sees that schema, with every `@description` and `///` on the
+    /// type's classes, fields and enum variants, so the prompt need not
+    /// include `${ctx.output_format()}`. A prompt that keeps it sends the
+    /// schema twice, which is harmless but costs tokens.
+    ///
+    /// An output type strict mode cannot describe (a map, media, a type with
+    /// no JSON form) is rejected before the request is sent, and so is a call
+    /// that streams: streaming does not support it yet.
+    structured_output: bool,
 
     /// Creates a client. Construction reads no environment variable, so
     /// declaring one is always safe; credentials and endpoints resolve when a
     /// request is built.
+    ///
+    /// # Parameters
+    ///
+    /// - `structured_output`: send OpenAI Structured Outputs and read the
+    ///   answer strictly (see the field of the same name). The model sees
+    ///   the output type's schema, documentation included, so a prompt need
+    ///   not include `${ctx.output_format()}`.
     function new(
         model: string = "gpt-4o-mini",
         api_key: ai.Credential? = null,
@@ -88,6 +108,7 @@ class ResponsesClient {
         headers: map<string, string>? = null,
         query_params: map<string, string>? = null,
         capture_wire: bool = true,
+        structured_output: bool = false,
     ) -> ResponsesClient {
         ResponsesClient {
             model: model,
@@ -106,6 +127,7 @@ class ResponsesClient {
             headers: headers,
             query_params: query_params,
             capture_wire: capture_wire,
+            structured_output: structured_output,
         }
     }
 
@@ -126,7 +148,7 @@ class ResponsesClient {
             status_code: null,
             detail: `openai needs an API key: pass api_key (a literal or env.NAME), or set one of the variables it consulted — ${ai.wire.credential_sources(self.api_key, "OPENAI_API_KEY")}`,
             raw_body: null,
-        }
+        };
     }
 
     /// The request-time base URL, or null for the provider default.
@@ -135,12 +157,23 @@ class ResponsesClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `openai/${self.model}`
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "openai"
+        }
+
+        /// What a `${cache()}` sends as `prompt_cache_breakpoint` on the part
+        /// before it: `{"mode": "explicit"}`. Null for GPT-5.5 and earlier,
+        /// which reject the field; a `${cache()}` sends nothing there.
+        function default_cache_args(self) -> baml.json.json {
+            root.internal.default_cache_breakpoint(self.model)
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            openai.internal.preview(self, input) catch_all (e) {
+            root.internal.preview(self, input) catch_all (e) {
                 _ => throw ai.errors.normalize(e),
             }
         }

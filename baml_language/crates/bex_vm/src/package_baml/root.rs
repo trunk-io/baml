@@ -1,14 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use bex_heap::TlabHolder;
 use bex_vm_types::{
-    HeapPtr, ObjectType, ValueKind,
-    types::{Array, AtomicValueSlot, Instance, Map, Object, Value},
+    Field, HeapPtr, InstanceRef, ObjectType, RootHaver, RootVisitor, ValueKind,
+    types::{Array, Map, Object, Value},
 };
-use indexmap::IndexMap;
 
 use super::{
     BamlPackageBaml, Continuation, NativeCallResult, PackageBamlImpl,
@@ -108,26 +104,43 @@ impl BamlPackageBaml for PackageBamlImpl {
         render_to_string_honoring_overrides(vm, *value)
     }
 
-    /// `baml._to_json_default(value)` and `baml._to_json_shim(value)` both render
+    /// `baml._to_string_primitive(value)` renders an `int`, `float`, `bool` or
+    /// `null` exactly as `_to_string_default` does. The compiler calls it only
+    /// for those types; any other value still renders, structurally.
+    fn _to_string_primitive(vm: &BexVm, value: &Value) -> bex_str::BexStr {
+        if let Some(text) = primitive_text(vm, *value) {
+            return text;
+        }
+        let mut state = StringRenderState::with_overrides(&[], &[]);
+        let mut sink = StringRenderSink::default();
+        let Ok(()) = render_to_sink(vm, *value, false, 0, &mut state, &mut sink);
+        sink.0.into()
+    }
+
+    /// `baml._to_json_default(value)` renders
     /// `value` to a `json` value for `baml.json.from`, honoring `baml.ToJson`
-    /// overrides at every depth. The json analog of `_to_string_default`; both
-    /// delegate to the override-honoring walker in `json.rs`. Unlike the string
+    /// overrides at every depth. The json analog of `_to_string_default`;
+    /// delegates to the override-honoring walker in `json.rs`. Unlike the string
     /// renderer, this can throw `SerializationError` for values with no json
     /// representation.
     fn _to_json_default(vm: &mut BexVm, value: &Value) -> NativeCallResult {
         super::json::render_to_json_honoring_overrides(vm, *value)
     }
 
-    fn _to_json_shim(vm: &mut BexVm, value: &Value) -> NativeCallResult {
-        super::json::render_to_json_honoring_overrides(vm, *value)
+    fn _from_json_structural_default(vm: &mut BexVm, j: &Value) -> NativeCallResult {
+        super::json::json_to_structural_default(vm, *j)
     }
 
-    /// `baml._from_json_shim<T>(j)` backs `baml.json.to<T>`: decode `j` into the
-    /// target type `T` (read from the call's type-args), dispatching a user
-    /// `implements baml.FromJson` override on `T` and otherwise decoding
-    /// structurally. The deserialize analog of `_to_json_shim`.
-    fn _from_json_shim(vm: &mut BexVm, j: &Value) -> NativeCallResult {
-        super::json::json_to_shim(vm, *j)
+    fn _equals_structural_default(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
+        super::ops::equals_structural_default(vm, *a, *b)
+    }
+
+    fn _compare_structural_default(vm: &mut BexVm, a: &Value, b: &Value) -> NativeCallResult {
+        super::ops::compare_structural_default(vm, *a, *b)
+    }
+
+    fn _hash_structural_default(vm: &mut BexVm, value: &Value, state: &Value) -> NativeCallResult {
+        super::hashing::hash_structural_default(vm, *value, *state)
     }
 
     /// `baml._cleanup_begin(value)` — BEP-042 `cleanup` run-once guard.
@@ -139,16 +152,17 @@ impl BamlPackageBaml for PackageBamlImpl {
     /// the body is skipped. The latch is set on entry: a `cleanup` that throws
     /// is still considered cleaned and will not be retried.
     ///
-    /// A non-instance receiver returns `true` defensively; the guard is only
-    /// emitted for a class `cleanup(self)` method, whose `self` is an instance.
+    /// The guard is only emitted for a class's `cleanup(self)`, whose `self`
+    /// is an instance.
     fn _cleanup_begin(vm: &BexVm, value: &Value) -> bool {
-        match value.as_object_ptr() {
-            Some(ptr) => match vm.get_object(ptr) {
-                Object::Instance(inst) => inst.cleaned.begin(),
-                _ => true,
-            },
-            None => true,
-        }
+        let subject = value
+            .as_object_ptr()
+            .and_then(|ptr| vm.cleanup_subject(ptr));
+        debug_assert!(
+            subject.is_some(),
+            "the `cleanup` guard runs on an instance receiver"
+        );
+        subject.is_none_or(bex_vm_types::CleanupSubject::begin)
     }
 
     // ── Numeric-array reductions (formerly `baml.math.*`) ──────────────────────
@@ -239,7 +253,7 @@ fn has_to_string_override(
     value: Value,
 ) -> Result<bool, crate::errors::VmInternalError> {
     Ok(matches!(
-        super::shim_rule_method(vm, value, "ToString", "to_string")?,
+        super::shim_rule_method(vm, value, crate::lang_items::BAML_TO_STRING, "to_string")?,
         Some(resolved) if !resolved.is_default
     ))
 }
@@ -249,34 +263,57 @@ fn has_to_string_override(
 /// override node is recorded and *not* descended into — its `to_string` owns its
 /// whole subtree. Immutable and allocation-free so the garbage collector cannot
 /// move objects mid-walk. Matches the traversal order of [`render_to_sink`] so
-/// the two stay index-aligned. (Like the structural renderer, this does not
-/// guard against reference cycles — recursive *data* would already loop in the
-/// pre-existing walker; recursive *types* such as trees are acyclic.)
 pub(super) fn collect_to_string_overrides(
     vm: &BexVm,
     value: Value,
     out: &mut Vec<HeapPtr>,
 ) -> Result<(), crate::errors::VmInternalError> {
+    collect_to_string_overrides_within(vm, value, out, &mut HashSet::new())
+}
+
+fn collect_to_string_overrides_within(
+    vm: &BexVm,
+    value: Value,
+    out: &mut Vec<HeapPtr>,
+    active: &mut HashSet<HeapPtr>,
+) -> Result<(), crate::errors::VmInternalError> {
     let ValueKind::Object(ptr) = value.kind() else {
         return Ok(());
     };
+    if is_primitive_object(vm, ptr) {
+        return Ok(());
+    }
     if has_to_string_override(vm, value)? {
         out.push(ptr);
         return Ok(());
     }
+    if !active.insert(ptr) {
+        return Ok(());
+    }
     // Snapshot children (owned), dropping the heap borrow / container lock before
     // recursing - same discipline as `render_to_sink`'s `DisplaySnap`. The
-    // child order (array elements, then map values, then instance fields) matches
+    // child order (array elements, map key/value pairs, instance fields) matches
     // the renderer so the two stay index-aligned.
     let children: Vec<Value> = match vm.get_object(ptr) {
         Object::Array(values) => values.to_vec(),
-        Object::Map(map) => map.to_index_map().values().copied().collect(),
-        Object::Instance(inst) => inst.fields.iter().map(AtomicValueSlot::load).collect(),
+        Object::Tuple(tuple) => tuple.slot_values().collect(),
+        Object::Map(map) => map
+            .snapshot_entries()
+            .into_iter()
+            .flat_map(|(key, value)| [key, value])
+            .collect(),
+        Object::Instance => vm
+            .get_instance(ptr)
+            .into_iter()
+            .flat_map(InstanceRef::fields)
+            .filter_map(Field::as_value)
+            .collect(),
         _ => Vec::new(),
     };
     for v in children {
-        collect_to_string_overrides(vm, v, out)?;
+        collect_to_string_overrides_within(vm, v, out, active)?;
     }
+    active.remove(&ptr);
     Ok(())
 }
 
@@ -289,6 +326,17 @@ pub(crate) fn render_to_string_honoring_overrides(
     vm: &mut BexVm,
     value: Value,
 ) -> NativeCallResult {
+    // A top-level string renders as itself, and strings are immutable, so the
+    // value is its own rendering. A primitive needs neither the probe nor the
+    // walker: no package can override how it renders (E0139).
+    if let ValueKind::Object(ptr) = value.kind()
+        && matches!(vm.get_object(ptr), Object::String(_))
+    {
+        return NativeCallResult::Done(value);
+    }
+    if let Some(text) = primitive_text(vm, value) {
+        return NativeCallResult::Done(Value::object(vm.alloc_string(text)));
+    }
     let mut pending: Vec<HeapPtr> = Vec::new();
     if let Err(e) = collect_to_string_overrides(vm, value, &mut pending) {
         return NativeCallResult::Error(e.into());
@@ -329,7 +377,7 @@ fn render_done(
 ) -> NativeCallResult {
     let mut state = StringRenderState::with_overrides(pending, results);
     let mut sink = StringRenderSink::default();
-    render_to_sink(vm, root, false, 0, &mut state, &mut sink);
+    let Ok(()) = render_to_sink(vm, root, false, 0, &mut state, &mut sink);
     NativeCallResult::Done(Value::object(vm.alloc_string(sink.0)))
 }
 
@@ -344,6 +392,18 @@ struct ToStringWalkContinuation {
     pending: Vec<HeapPtr>,
     /// Override results so far, as plain Rust strings (no heap roots to track).
     results: Vec<String>,
+}
+
+impl RootHaver for ToStringWalkContinuation {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            root,
+            pending,
+            results: _,
+        } = self;
+        root.visit_roots(visitor);
+        pending.visit_roots(visitor);
+    }
 }
 
 impl Continuation for ToStringWalkContinuation {
@@ -376,26 +436,119 @@ impl Continuation for ToStringWalkContinuation {
         }
         render_done(vm, self.root, &self.pending, &self.results)
     }
+}
 
-    fn gc_roots(&self) -> Vec<HeapPtr> {
-        let mut roots = self.pending.clone();
-        if let Some(ptr) = self.root.as_object_ptr() {
-            roots.push(ptr);
-        }
-        roots
+/// `T[].join(separator)`: every element rendered as `string.from` renders it,
+/// with `separator` between them. One element at a time, as a loop of
+/// `string.from` calls would: collect the element's overrides, dispatch each,
+/// render it, then move to the next. A string is appended as is, and a
+/// primitive never reaches the override probe.
+pub(super) fn join_honoring_overrides(
+    vm: &mut BexVm,
+    elements: Vec<Value>,
+    separator: String,
+) -> NativeCallResult {
+    let mut join = Box::new(JoinContinuation {
+        elements,
+        separator,
+        index: 0,
+        out: String::new(),
+        pending: Vec::new(),
+        results: Vec::new(),
+    });
+    if let Some(&first) = join.elements.first()
+        && let Err(e) = collect_to_string_overrides(vm, first, &mut join.pending)
+    {
+        return NativeCallResult::Error(e.into());
     }
+    join.step(vm)
+}
 
-    fn apply_forwarding(&mut self, forwarding: &HashMap<HeapPtr, HeapPtr>) {
-        if let Some(ptr) = self.root.as_object_ptr() {
-            if let Some(&new_ptr) = forwarding.get(&ptr) {
-                self.root = Value::object(new_ptr);
+/// The state of a [`join_honoring_overrides`] between override calls.
+struct JoinContinuation {
+    /// The elements, snapshotted before the first override runs.
+    elements: Vec<Value>,
+    separator: String,
+    /// The element being rendered; every element before it is in `out`.
+    index: usize,
+    out: String,
+    /// The current element's override-bearing sub-values, in render order.
+    pending: Vec<HeapPtr>,
+    /// Their `to_string` results so far.
+    results: Vec<String>,
+}
+
+impl JoinContinuation {
+    /// Dispatch the current element's next override, or render the element
+    /// and move on; finish once every element is in `out`.
+    fn step(mut self: Box<Self>, vm: &mut BexVm) -> NativeCallResult {
+        while let Some(&element) = self.elements.get(self.index) {
+            if let Some(&next_ptr) = self.pending.get(self.results.len()) {
+                return match make_to_string_callee(vm, Value::object(next_ptr)) {
+                    Err(e) => NativeCallResult::Error(e.into()),
+                    Ok(Some(callee)) => NativeCallResult::YieldToCall {
+                        callee,
+                        args: vec![],
+                        type_args: vec![],
+                        continuation: self,
+                    },
+                    Ok(None) => NativeCallResult::Error(
+                        crate::errors::VmInternalError::OverrideWalkSkew {
+                            interface: "ToString",
+                        }
+                        .into(),
+                    ),
+                };
+            }
+            if self.index > 0 {
+                self.out.push_str(&self.separator);
+            }
+            match element.as_object_ptr().map(|ptr| vm.get_object(ptr)) {
+                Some(Object::String(s)) => self.out.push_str(s.as_str()),
+                _ => {
+                    let mut state = StringRenderState::with_overrides(&self.pending, &self.results);
+                    let mut sink = StringRenderSink(std::mem::take(&mut self.out));
+                    let Ok(()) = render_to_sink(vm, element, false, 0, &mut state, &mut sink);
+                    self.out = sink.0;
+                }
+            }
+            self.index += 1;
+            self.pending.clear();
+            self.results.clear();
+            if let Some(&next) = self.elements.get(self.index)
+                && let Err(e) = collect_to_string_overrides(vm, next, &mut self.pending)
+            {
+                return NativeCallResult::Error(e.into());
             }
         }
-        for ptr in &mut self.pending {
-            if let Some(&new_ptr) = forwarding.get(ptr) {
-                *ptr = new_ptr;
-            }
-        }
+        let out = std::mem::take(&mut self.out);
+        NativeCallResult::Done(Value::object(vm.alloc_string(out)))
+    }
+}
+
+impl RootHaver for JoinContinuation {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            elements,
+            separator: _,
+            index: _,
+            out: _,
+            pending,
+            results: _,
+        } = self;
+        elements.visit_roots(visitor);
+        pending.visit_roots(visitor);
+    }
+}
+
+impl Continuation for JoinContinuation {
+    fn call(mut self: Box<Self>, vm: &mut BexVm, value: Value) -> NativeCallResult {
+        self.results.push(
+            vm.as_string(&value)
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default(),
+        );
+        self.step(vm)
     }
 }
 
@@ -410,11 +563,11 @@ enum DisplaySnap {
     /// An array — elements rendered as `[a, b, c]`, with at most one trailing
     /// ellipsis when diagnostic limits omit further siblings.
     Seq(Vec<Value>, bool),
-    /// A map — entries rendered as `{"k": v, ...}` (keys are always strings, and
-    /// are quoted so keys containing `:`/`,` stay unambiguous).
-    Entries(Vec<(String, Value)>, bool),
+    Tuple(Vec<Value>, bool),
+    /// A map whose keys and values are rendered recursively.
+    Entries(Vec<(Value, Value)>, bool),
     /// A class instance — `ClassName { field: value, ... }`.
-    Instance(String, Vec<(String, Value)>, bool),
+    Instance(String, Vec<(String, Field)>, bool),
 }
 
 const DIAGNOSTIC_RENDER_MAX_DEPTH: usize = 32;
@@ -423,11 +576,6 @@ const TRUNCATED_RENDER: &str = "…";
 
 /// Mutable traversal state for structural string rendering.
 ///
-/// User-facing `ToString` rendering is unbounded to preserve its existing
-/// behavior and carries the precomputed override tables. Native diagnostic
-/// rendering has empty override tables and strict depth/node/cycle guards:
-/// an error-reporting path must degrade to an ellipsis rather than dispatch,
-/// throw, or recurse forever.
 pub(super) struct StringRenderState<'a> {
     pending: &'a [HeapPtr],
     results: &'a [String],
@@ -435,7 +583,7 @@ pub(super) struct StringRenderState<'a> {
     qualified_class_names: bool,
     remaining_nodes: Option<usize>,
     max_depth: Option<usize>,
-    active_objects: Option<HashSet<HeapPtr>>,
+    active_objects: HashSet<HeapPtr>,
 }
 
 impl<'a> StringRenderState<'a> {
@@ -447,7 +595,7 @@ impl<'a> StringRenderState<'a> {
             qualified_class_names: false,
             remaining_nodes: None,
             max_depth: None,
-            active_objects: None,
+            active_objects: HashSet::new(),
         }
     }
 
@@ -459,7 +607,7 @@ impl<'a> StringRenderState<'a> {
             qualified_class_names: true,
             remaining_nodes: Some(DIAGNOSTIC_RENDER_MAX_NODES),
             max_depth: Some(DIAGNOSTIC_RENDER_MAX_DEPTH),
-            active_objects: Some(HashSet::new()),
+            active_objects: HashSet::new(),
         }
     }
 
@@ -493,10 +641,15 @@ impl<'a> StringRenderState<'a> {
 }
 
 pub(super) trait StructuralRenderSink {
+    /// What rendering into this sink can fail with: nothing, for plain text.
+    type Error;
+
     fn push_text(&mut self, text: &str);
 
-    fn try_push_special(&mut self, _vm: &BexVm, _value: Value) -> bool {
-        false
+    /// Render `value` as this sink's own kind of part, if it is one; `false`
+    /// leaves it to the structural walk.
+    fn try_push_special(&mut self, _vm: &BexVm, _value: Value) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 }
 
@@ -504,8 +657,58 @@ pub(super) trait StructuralRenderSink {
 struct StringRenderSink(String);
 
 impl StructuralRenderSink for StringRenderSink {
+    type Error = std::convert::Infallible;
+
     fn push_text(&mut self, text: &str) {
         self.0.push_str(text);
+    }
+}
+
+/// The text of an `int`, `float`, `bool` or `null`, top-level or nested; `None`
+/// for any other value. The leaf rendering of [`render_to_sink`], and all of
+/// `string.from` for these types.
+///
+/// An `int`, `bool` or `null` is formatted on the stack: its text always fits
+/// in an inline string, so rendering one allocates nothing.
+fn primitive_text(vm: &BexVm, value: Value) -> Option<bex_str::BexStr> {
+    match value.kind() {
+        ValueKind::Null => Some(bex_str::BexStr::from("null")),
+        ValueKind::Int(i) => Some(bex_str::BexStr::from(itoa::Buffer::new().format(i))),
+        ValueKind::Bool(b) => Some(bex_str::BexStr::from(if b { "true" } else { "false" })),
+        ValueKind::Float(f) => Some(bex_vm_types::format_float(f).into()),
+        ValueKind::Object(ptr) => match vm.get_object(ptr) {
+            Object::Float(f) => Some(bex_vm_types::format_float(*f).into()),
+            _ => None,
+        },
+        ValueKind::OmittedArg => None,
+    }
+}
+
+/// Whether `ptr` is a string or a float, which no package can give a
+/// `baml.ToString` override (E0139).
+fn is_primitive_object(vm: &BexVm, ptr: HeapPtr) -> bool {
+    matches!(vm.get_object(ptr), Object::String(_) | Object::Float(_))
+}
+
+/// A field of an instance being rendered: a raw float renders as a float
+/// value would, against the same node budget.
+fn render_field<S: StructuralRenderSink>(
+    vm: &BexVm,
+    field: Field,
+    depth: usize,
+    state: &mut StringRenderState<'_>,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    match field {
+        Field::Value(value) => render_to_sink(vm, value, true, depth, state, sink),
+        Field::Float(_) if !state.consume_node(depth) => {
+            sink.push_text(TRUNCATED_RENDER);
+            Ok(())
+        }
+        Field::Float(float) => {
+            sink.push_text(&bex_vm_types::format_float(float));
+            Ok(())
+        }
     }
 }
 
@@ -518,34 +721,30 @@ impl StructuralRenderSink for StringRenderSink {
 /// `pending[state.counter]` is exactly the next override node — so the check is a
 /// pointer compare, not a per-node global lookup. With an empty `pending` this is
 /// a pure structural walk.
-pub(super) fn render_to_sink(
+pub(super) fn render_to_sink<S: StructuralRenderSink>(
     vm: &BexVm,
     value: Value,
     nested: bool,
     depth: usize,
     state: &mut StringRenderState<'_>,
-    sink: &mut impl StructuralRenderSink,
-) {
+    sink: &mut S,
+) -> Result<(), S::Error> {
     if !state.consume_node(depth) {
         sink.push_text(TRUNCATED_RENDER);
-        return;
+        return Ok(());
     }
 
+    if let Some(text) = primitive_text(vm, value) {
+        sink.push_text(&text);
+        return Ok(());
+    }
     let ptr = match value.kind() {
-        ValueKind::Null => {
-            sink.push_text("null");
-            return;
-        }
-        ValueKind::Int(i) => {
-            sink.push_text(&i.to_string());
-            return;
-        }
-        ValueKind::Bool(b) => {
-            sink.push_text(&b.to_string());
-            return;
-        }
-        ValueKind::OmittedArg => return,
         ValueKind::Object(ptr) => ptr,
+        ValueKind::Null
+        | ValueKind::Int(_)
+        | ValueKind::Bool(_)
+        | ValueKind::Float(_)
+        | ValueKind::OmittedArg => return Ok(()),
     };
 
     // Override node: splice its precomputed `to_string` result in bare.
@@ -557,27 +756,24 @@ pub(super) fn render_to_sink(
             .unwrap_or_default();
         state.counter += 1;
         sink.push_text(&rendered);
-        return;
+        return Ok(());
     }
 
-    if sink.try_push_special(vm, value) {
-        return;
+    if sink.try_push_special(vm, value)? {
+        return Ok(());
     }
 
     // Only an object currently on the recursion stack is a cycle. Shared DAG
     // children render normally after the first branch removes them on unwind.
-    if let Some(active_objects) = &mut state.active_objects
-        && !active_objects.insert(ptr)
-    {
+    if !state.active_objects.insert(ptr) {
         sink.push_text(TRUNCATED_RENDER);
-        return;
+        return Ok(());
     }
 
     // Capture an owned snapshot, dropping the heap borrow / container lock
     // before recursing.
     let snap = match vm.get_object(ptr) {
         Object::String(s) => DisplaySnap::Str(s.as_str().to_string()),
-        Object::Float(f) => DisplaySnap::Leaf(bex_vm_types::format_float(*f)),
         Object::Bigint(b) => DisplaySnap::Leaf(b.to_string()),
         Object::Array(values) => {
             let values = values.lock();
@@ -585,6 +781,13 @@ pub(super) fn render_to_sink(
             DisplaySnap::Seq(
                 values.iter().take(limit).copied().collect(),
                 values.len() > limit,
+            )
+        }
+        Object::Tuple(tuple) => {
+            let limit = state.snapshot_child_limit(tuple.len());
+            DisplaySnap::Tuple(
+                tuple.slot_values().take(limit).collect(),
+                tuple.len() > limit,
             )
         }
         Object::Uint8Array(bytes) => {
@@ -610,42 +813,41 @@ pub(super) fn render_to_sink(
             let map = map.lock();
             let limit = state.snapshot_child_limit(map.len());
             DisplaySnap::Entries(
-                map.iter()
-                    .take(limit)
-                    .map(|(k, v)| (k.as_str().to_string(), *v))
-                    .collect(),
+                map.iter().take(limit).map(|(k, v)| (*k, *v)).collect(),
                 map.len() > limit,
             )
         }
-        Object::Instance(inst) => {
-            let limit = state.snapshot_child_limit(inst.fields.len());
-            let (class_name, paired) = match vm.get_object(inst.class) {
-                Object::Class(class) => {
-                    let name = if state.qualified_class_names {
-                        class.name.to_string()
-                    } else {
-                        class.name.item_name().to_string()
-                    };
-                    let fields = inst
-                        .fields
-                        .iter()
-                        .take(limit)
-                        .map(AtomicValueSlot::load)
-                        .enumerate()
-                        .map(|(i, v)| {
-                            let field_name = class
-                                .fields
-                                .get(i)
-                                .map(|field| field.name.clone())
-                                .unwrap_or_else(|| i.to_string());
-                            (field_name, v)
-                        })
-                        .collect();
-                    (name, fields)
-                }
-                _ => (String::new(), Vec::new()),
+        Object::Instance => {
+            let inst = vm.get_instance(ptr).expect("an instance pointer");
+            let class = inst.class_object();
+            let limit = state.snapshot_child_limit(class.instance_fields().len());
+            let class_name = if state.qualified_class_names {
+                class.name().to_string()
+            } else {
+                class.path.name.to_string()
             };
-            DisplaySnap::Instance(class_name, paired, inst.fields.len() > limit)
+            let paired = class
+                .instance_fields()
+                .iter()
+                .zip(inst.fields())
+                .take(limit)
+                .map(|(field, value)| (field.name.clone(), value))
+                .collect();
+            DisplaySnap::Instance(class_name, paired, class.instance_fields().len() > limit)
+        }
+        // Its class, with nothing inside: the state is not BAML data.
+        Object::RustInstance(inst) => {
+            let class_name = match vm.get_object(inst.class) {
+                Object::Class(class) => {
+                    if state.qualified_class_names {
+                        class.name().to_string()
+                    } else {
+                        class.path.name.to_string()
+                    }
+                }
+                _ => String::new(),
+            };
+            DisplaySnap::Instance(class_name, Vec::new(), false)
         }
         Object::Variant(var) => {
             let name = match vm.get_object(var.enm) {
@@ -670,6 +872,30 @@ pub(super) fn render_to_sink(
                 sink.push_text(&s);
             }
         }
+        DisplaySnap::Tuple(values, mut truncated) => {
+            sink.push_text("(");
+            let mut rendered_count = 0;
+            for value in &values {
+                if !state.can_render_node(depth + 1) {
+                    truncated = true;
+                    break;
+                }
+                if rendered_count != 0 {
+                    sink.push_text(", ");
+                }
+                render_to_sink(vm, *value, true, depth + 1, state, sink)?;
+                rendered_count += 1;
+            }
+            if truncated {
+                if rendered_count != 0 {
+                    sink.push_text(", ");
+                }
+                sink.push_text(TRUNCATED_RENDER);
+            } else if rendered_count == 1 {
+                sink.push_text(",");
+            }
+            sink.push_text(")");
+        }
         DisplaySnap::Seq(values, mut truncated) => {
             sink.push_text("[");
             let mut rendered_count = 0;
@@ -681,7 +907,7 @@ pub(super) fn render_to_sink(
                 if rendered_count != 0 {
                     sink.push_text(", ");
                 }
-                render_to_sink(vm, *value, true, depth + 1, state, sink);
+                render_to_sink(vm, *value, true, depth + 1, state, sink)?;
                 rendered_count += 1;
             }
             if truncated {
@@ -703,8 +929,9 @@ pub(super) fn render_to_sink(
                 if rendered_count != 0 {
                     sink.push_text(", ");
                 }
-                sink.push_text(&format!("{key:?}: "));
-                render_to_sink(vm, *value, true, depth + 1, state, sink);
+                render_to_sink(vm, *key, true, depth + 1, state, sink)?;
+                sink.push_text(": ");
+                render_to_sink(vm, *value, true, depth + 1, state, sink)?;
                 rendered_count += 1;
             }
             if truncated {
@@ -736,7 +963,7 @@ pub(super) fn render_to_sink(
                     }
                     sink.push_text(name);
                     sink.push_text(": ");
-                    render_to_sink(vm, *value, true, depth + 1, state, sink);
+                    render_field(vm, *value, depth + 1, state, sink)?;
                     rendered_count += 1;
                 }
                 if truncated {
@@ -749,9 +976,8 @@ pub(super) fn render_to_sink(
             }
         }
     }
-    if let Some(active_objects) = &mut state.active_objects {
-        active_objects.remove(&ptr);
-    }
+    state.active_objects.remove(&ptr);
+    Ok(())
 }
 
 /// VM-heap-allocation-free structural rendering for diagnostics that already
@@ -761,7 +987,7 @@ pub(super) fn render_to_sink(
 pub(super) fn render_value_structural(vm: &BexVm, value: Value, nested: bool) -> String {
     let mut state = StringRenderState::diagnostic();
     let mut sink = StringRenderSink::default();
-    render_to_sink(vm, value, nested, 0, &mut state, &mut sink);
+    let Ok(()) = render_to_sink(vm, value, nested, 0, &mut state, &mut sink);
     sink.0
 }
 
@@ -771,7 +997,11 @@ fn deep_copy_value_recursive(
     copied_objects: &mut HashMap<HeapPtr, HeapPtr>,
 ) -> Result<Value, VmInternalError> {
     Ok(match value.kind() {
-        ValueKind::OmittedArg | ValueKind::Null | ValueKind::Int(_) | ValueKind::Bool(_) => value,
+        ValueKind::OmittedArg
+        | ValueKind::Null
+        | ValueKind::Int(_)
+        | ValueKind::Bool(_)
+        | ValueKind::Float(_) => value,
 
         ValueKind::Object(ptr) => {
             if let Some(&new_ptr) = copied_objects.get(&ptr) {
@@ -802,7 +1032,7 @@ fn deep_copy_value_recursive(
                     let element_ty = values.element_ty.as_ref().clone();
                     let placeholder_ptr = vm
                         .tlab
-                        .alloc(Object::Array(Array::new(element_ty.clone(), Vec::new())));
+                        .alloc(Object::Array(Array::new(element_ty, Vec::new())));
                     copied_objects.insert(ptr, placeholder_ptr);
 
                     // Snapshot under the source's lock; the recursive call
@@ -813,9 +1043,31 @@ fn deep_copy_value_recursive(
                         new_values.push(deep_copy_value_recursive(vm, value, copied_objects)?);
                     }
 
-                    // no GC write barrier because it is all in gen0
-                    *vm.get_object_mut(placeholder_ptr) =
-                        Object::Array(Array::new(element_ty, new_values));
+                    let Object::Array(array) = vm.get_object(placeholder_ptr) else {
+                        unreachable!("the placeholder was allocated as an array")
+                    };
+                    array.lock_mut(vm.tlab.alloc_debt()).extend(new_values);
+                    placeholder_ptr
+                }
+
+                Object::Tuple(tuple) => {
+                    let placeholder = bex_vm_types::Tuple::new(
+                        tuple.element_tys.clone(),
+                        std::iter::repeat_n(Value::NULL, tuple.len()),
+                    )
+                    .expect("one null per carried slot type");
+                    let placeholder_ptr = vm.tlab.alloc_tuple(placeholder);
+                    copied_objects.insert(ptr, placeholder_ptr);
+
+                    for (slot, element) in tuple.slot_values().enumerate() {
+                        let copied = deep_copy_value_recursive(vm, element, copied_objects)?;
+                        // SAFETY: the destination tuple is private until copying completes.
+                        #[allow(unsafe_code)]
+                        let Object::Tuple(copy) = (unsafe { placeholder_ptr.get_mut() }) else {
+                            unreachable!("the placeholder was allocated as a tuple")
+                        };
+                        copy.values_mut()[slot] = copied;
+                    }
                     placeholder_ptr
                 }
 
@@ -824,46 +1076,42 @@ fn deep_copy_value_recursive(
                     let key_ty = map.key_ty.as_ref().clone();
                     let value_ty = map.value_ty.as_ref().clone();
                     let placeholder_ptr = vm.tlab.alloc(Object::Map(Map::new(
-                        key_ty.clone(),
-                        value_ty.clone(),
-                        IndexMap::new(),
+                        key_ty,
+                        value_ty,
+                        bex_vm_types::MapData::new(),
                     )));
                     copied_objects.insert(ptr, placeholder_ptr);
 
-                    let snapshot = map.to_index_map();
-                    let mut new_map = IndexMap::new();
-                    for (key, value) in &snapshot {
-                        let new_value = deep_copy_value_recursive(vm, *value, copied_objects)?;
-                        new_map.insert(key.clone(), new_value);
+                    let snapshot: Vec<_> = map.lock().entries().map(|(_, entry)| *entry).collect();
+                    let mut new_map = bex_vm_types::MapData::new();
+                    for entry in snapshot {
+                        let new_key = deep_copy_value_recursive(vm, entry.key, copied_objects)?;
+                        let new_value = deep_copy_value_recursive(vm, entry.value, copied_objects)?;
+                        new_map.insert_hashed(entry.hash, new_key, new_value);
                     }
 
-                    // no GC write barrier because it is all in gen0
-                    *vm.get_object_mut(placeholder_ptr) =
-                        Object::Map(Map::new(key_ty, value_ty, new_map));
+                    let Object::Map(map) = vm.get_object(placeholder_ptr) else {
+                        unreachable!("the placeholder was allocated as a map")
+                    };
+                    let mut entries = map.lock_mut(vm.tlab.alloc_debt());
+                    **entries = new_map;
+                    drop(entries);
                     placeholder_ptr
                 }
 
-                Object::Instance(instance) => {
-                    let placeholder_ptr = vm.tlab.alloc(Object::Instance(Instance::new(
-                        instance.class,
-                        instance.class_type_args.to_vec().into_boxed_slice(),
-                        Vec::new(),
-                    )));
-                    copied_objects.insert(ptr, placeholder_ptr);
-
-                    let mut new_fields = Vec::with_capacity(instance.fields.len());
-                    for field in instance.field_values() {
-                        new_fields.push(deep_copy_value_recursive(vm, field, copied_objects)?);
+                Object::Instance => {
+                    let source = vm.get_instance(ptr).expect("an instance pointer");
+                    let copy = vm
+                        .tlab
+                        .alloc_instance_zeroed(source.class(), source.type_args().into());
+                    copied_objects.insert(ptr, vm.tlab.instance_ptr(copy));
+                    for field in 0..source.field_len() {
+                        let value = vm.load_field_value(source, field);
+                        let copied = deep_copy_value_recursive(vm, value, copied_objects)?;
+                        copy.store_relaxed(field, copied)
+                            .map_err(|mismatch| vm.slot_kind_error(mismatch))?;
                     }
-
-                    let new_instance = Instance::new(
-                        instance.class,
-                        instance.class_type_args.to_vec().into_boxed_slice(),
-                        new_fields,
-                    );
-                    // no GC write barrier because it is all in gen0
-                    *vm.get_object_mut(placeholder_ptr) = Object::Instance(new_instance);
-                    placeholder_ptr
+                    vm.tlab.instance_ptr(copy)
                 }
 
                 // Bigint is behind Arc — clone() is cheap (increments refcount).
@@ -879,7 +1127,18 @@ fn deep_copy_value_recursive(
                 Object::Enum(e) => vm.tlab.alloc(Object::Enum(e)),
                 Object::TypeAlias(a) => vm.tlab.alloc(Object::TypeAlias(a)),
                 Object::Variant(v) => vm.tlab.alloc(Object::Variant(v)),
-                Object::RustData(arc) => vm.tlab.alloc(Object::RustData(Arc::clone(&arc))),
+                Object::RustInstance(instance) => {
+                    // Cloning the object above cloned the payload, and a
+                    // payload's clone is its copy: the VM's own state is
+                    // copied, and shared or immutable state shares its `Arc`.
+                    let payload = instance.payload;
+                    vm.tlab
+                        .alloc(Object::RustInstance(bex_vm_types::RustInstance::new(
+                            instance.class,
+                            instance.class_type_args,
+                            payload,
+                        )))
+                }
                 // `Object::Future(_)` is short-circuited above; it can't
                 // reach this match arm.
                 Object::Future(_) => unreachable!("Future short-circuited above"),
@@ -896,6 +1155,7 @@ fn deep_copy_value_recursive(
                 // the closure semantics (shared handle).
                 Object::HostClosure(hc) => vm.tlab.alloc(Object::HostClosure(hc)),
                 Object::Cell(cell) => vm.tlab.alloc(Object::Cell(cell)),
+                Object::Tombstone => Object::tombstone_reached(),
                 #[cfg(feature = "heap_debug")]
                 Object::Sentinel(kind) => vm.tlab.alloc(Object::Sentinel(kind)),
             };
@@ -924,6 +1184,9 @@ fn value_type_name(vm: &BexVm, value: Value) -> String {
     if value.is_omitted() {
         return "omitted".to_string();
     }
+    if value.is_inline_float() {
+        return ObjectType::Float.to_string();
+    }
     if let Some(ptr) = value.as_object_ptr() {
         return ObjectType::of(vm.get_object(ptr)).to_string();
     }
@@ -932,22 +1195,15 @@ fn value_type_name(vm: &BexVm, value: Value) -> String {
 
 /// Extracts a float from a validated `float[]` element. The `FloatStats` /
 /// `Summable` methods are declared on `float[]`, so by the time execution reaches
-/// the native path each element is a boxed float; any other tag is an upstream
+/// the native path each element is a float; any other tag is an upstream
 /// invariant violation.
 fn expect_float(vm: &BexVm, value: Value, fn_name: &str, index: usize) -> f64 {
-    let Some(ptr) = value.as_object_ptr() else {
+    value.as_float().unwrap_or_else(|| {
         unreachable!(
             "{fn_name}: expected float at index {index}, got {}",
             value_type_name(vm, value)
-        );
-    };
-    match vm.get_object(ptr) {
-        Object::Float(float) => *float,
-        _ => unreachable!(
-            "{fn_name}: expected float at index {index}, got {}",
-            value_type_name(vm, value)
-        ),
-    }
+        )
+    })
 }
 
 /// Extracts an `i64` from a validated `int[]` element. Ints are unboxed tagged

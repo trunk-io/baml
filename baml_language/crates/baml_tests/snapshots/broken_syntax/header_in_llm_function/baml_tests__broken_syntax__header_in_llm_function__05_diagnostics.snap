@@ -19,52 +19,17 @@ source: crates/baml_tests/src/generated_tests.rs
   [parse] E0010
 
   × unexpected token
-   ╭─[test.baml:8:23]
- 8 │         model gemini-2.0-flash
-   ·                       ┬
-   ·                       ╰── expected `config key`, found `'.'`
-   ╰────
-
-  [parse] E0010
-
-  × unexpected token
-   ╭─[test.baml:8:24]
- 8 │         model gemini-2.0-flash
-   ·                        ┬
-   ·                        ╰── expected `config key`, found `integer`
-   ╰────
-
-  [parse] E0010
-
-  × unexpected token
-   ╭─[test.baml:8:25]
- 8 │         model gemini-2.0-flash
-   ·                         ┬
-   ·                         ╰── expected `config key`, found `'-'`
-   ╰────
-
-  [parse] E0010
-
-  × unexpected token
-   ╭─[test.baml:9:5]
- 9 │     }
-   ·     ┬
-   ·     ╰── expected `identifier`, found `'}'`
-   ╰────
-
-  [parse] E0010
-
-  × invalid syntax
-    ╭─[test.baml:13:5]
- 13 │     //# collect source material
-    ·     ─────────────┬─────────────
-    ·                  ╰── header comments (`//#`) are only allowed in expression functions
+    ╭─[test.baml:14:11]
+ 14 │     client: VertexGCP
+    ·           ┬
+    ·           ╰── expected `expression`, found `':'`
     ╰────
 
-  [type] E0003
+  [parse] E0010
 
-  × unresolved name: `VertexGCP`
-    ╭─[test.baml:14:13]
- 14 │     client: VertexGCP
-    ·             ─────────
+  × unexpected token
+    ╭─[test.baml:16:11]
+ 16 │     prompt: `
+    ·           ┬
+    ·           ╰── expected `expression`, found `':'`
     ╰────

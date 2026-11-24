@@ -37,7 +37,6 @@ const TABLES: &[(&str, &str)] = &[
     ("epoch_state", "rec, epoch_id"),
     ("aggregate", "rec, node"),
     ("sysop", "rec, call_path_id"),
-    ("model_usage", "rec, sequence, position"),
     ("call", "rec, call_id"),
     ("network_span", "rec, span_id"),
     ("network_event", "rec, span_id, seq"),
@@ -58,6 +57,8 @@ function Deferred(n: int) -> int throws Failure {
     Middle(n)
 }
 function main(n: int) -> int {
+    let span = trace.start_span(Pick<int>, inputs = { "x": n });
+    let closed = trace.start_span("closed");
     let a = Middle(n) catch (e) { Failure => 1 };
     let b = { Middle(n) catch (e) { Failure => { throw e } } } catch (outer) { Failure => 2 };
     let c = Recur(3) catch (e) { Failure => 3 };
@@ -65,6 +66,8 @@ function main(n: int) -> int {
     let child = spawn { Middle(n) };
     let e = (await child) catch (x) { Failure => 5 };
     let f = Pick(Box { value: n }).map((v) -> string { "v" }).value;
+    span.finish(n);
+    closed.close();
     a + b + c + d + e + Pick(f.length())
 }
 function crash(n: int) -> int { Middle(n) }
@@ -202,15 +205,44 @@ async fn fresh_and_incremental_indexes_are_identical() {
     let metrics = incremental.refresh().unwrap();
     assert_eq!(metrics.transactions, metrics.files_applied);
     let fresh = dump(&fresh);
-    // Pick<T> and Box<T>.map<U> recorded their type arguments.
+    // Two Pick<T> calls, Box<T>.map<U>, and the explicitly owned Pick<int>
+    // span each record type arguments on every main execution.
     let calls = &fresh.iter().find(|(table, _)| table == "call").unwrap().1;
     assert_eq!(
         calls.iter().filter(|row| row[9] != Value::Null).count(),
-        24 * 3,
+        24 * 4,
         "type_args_cas"
     );
+    // Futures that failed carry the error they ended with: `crash` (a root
+    // future) in both recordings, and the future each `main` of the second
+    // one spawns. No other future names an error.
+    let threads = &fresh.iter().find(|(table, _)| table == "thread").unwrap().1;
+    let failed = |spawned: bool| {
+        threads
+            .iter()
+            .filter(|row| {
+                row[THREAD_OUTCOME] == Value::Integer(2)
+                    && (row[THREAD_PARENT] != Value::Null) == spawned
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(failed(false).len(), 2, "one crash per recording");
+    assert_eq!(failed(true).len(), 24, "one failing spawn per main");
+    for row in threads {
+        assert_eq!(
+            row[THREAD_ERROR_CAS] != Value::Null,
+            row[THREAD_OUTCOME] == Value::Integer(2),
+            "{row:?}"
+        );
+    }
     assert_same(&fresh, &dump(&incremental));
 }
+
+/// Columns of `thread`, in table order.
+const THREAD_ID: usize = 1;
+const THREAD_PARENT: usize = 3;
+const THREAD_OUTCOME: usize = 10;
+const THREAD_ERROR_CAS: usize = 18;
 
 mod crafted {
     //! Evidence out of order and in conflict, written as recording files.
@@ -223,12 +255,15 @@ mod crafted {
     const EPOCH: u64 = 5;
     const CALLER: u64 = 21;
     const CALLEE: u64 = 22;
+    /// The thread that fails with an error, and that error's snapshot.
+    pub(super) const FAILED_THREAD: u64 = T3;
+    pub(super) const T3_ERROR: u64 = 66;
 
     pub(super) fn write(project: &std::path::Path, files: Vec<proto::RecordingFile>) {
         let id = [7_u8; 16];
         let dir = project
             .join(".baml/btel/recordings")
-            .join(btel_reader::discovery::hex(&id));
+            .join(btel_core::reader::discovery::hex(&id));
         std::fs::create_dir_all(&dir).unwrap();
         for (index, mut file) in files.into_iter().enumerate() {
             let sequence = index as u64 + 1;
@@ -243,6 +278,11 @@ mod crafted {
                 command: vec!["baml".into(), "run".into(), "main".into()],
                 process_started_at_unix_ns: Some(1_000),
                 source_cas_id: None,
+                initial_context_cas_id: None,
+                program_id: None,
+                build: None,
+                os: None,
+                arch: None,
             });
             file.sequence = sequence;
             std::fs::write(
@@ -357,8 +397,8 @@ mod crafted {
         }
     }
 
-    fn snapshot(n: u64) -> proto::SnapshotId {
-        proto::SnapshotId { low: n, high: 0 }
+    fn snapshot(n: u64) -> proto::CasId {
+        proto::CasId { low: n, high: 0 }
     }
 
     fn announce(id: u64, path: u32, method: &str, started: u64) -> Event {
@@ -392,16 +432,29 @@ mod crafted {
         })
     }
 
-    fn usage(node: u64, model: &str, input: u64) -> proto::ModelUsage {
+    fn usage(model: &str, input: u64) -> proto::ModelUsage {
         proto::ModelUsage {
-            node_id: node,
-            thread_id: T2,
+            provider: "openai".into(),
             model: Some(model.into()),
-            input_tokens: input,
-            output_tokens: 10,
+            calls: 1,
+            input_tokens: Some(input),
+            output_tokens: Some(10),
             cache_read_tokens: Some(5),
             cache_write_tokens: None,
             reasoning_tokens: None,
+        }
+    }
+
+    /// `completion`, carrying the model usage charged to its span.
+    fn charged(event: Event, usage: Vec<proto::ModelUsage>) -> Event {
+        match event {
+            Event::FunctionCompletion(completion) => {
+                Event::FunctionCompletion(proto::FunctionCompletion {
+                    usage,
+                    ..completion
+                })
+            }
+            _ => unreachable!("a function completion"),
         }
     }
 
@@ -419,7 +472,10 @@ mod crafted {
                         T2,
                         vec![
                             Event::ThreadAnnouncement(proto::ThreadAnnouncement {}),
-                            completion(100, T2, 2, 20),
+                            charged(
+                                completion(100, T2, 2, 20),
+                                vec![usage("claude-opus-5-5", 1000)],
+                            ),
                         ],
                     ),
                     // A request's events and completion before its announcement.
@@ -442,9 +498,6 @@ mod crafted {
                     sysops: 2,
                     total_ticks: 6,
                 }],
-            }),
-            usage: Some(proto::UsageBatch {
-                entries: vec![usage(100, "claude-opus-5-5", 1000)],
             }),
             ..Default::default()
         };
@@ -469,22 +522,31 @@ mod crafted {
                             Event::ThreadCompletion(proto::ThreadCompletion {
                                 completed_at_ticks: 90,
                                 outcome: 1,
+                                usage: vec![usage("unknown-model", 7)],
                                 ..Default::default()
                             }),
                             // Late: its completion was in the first file.
                             Event::FunctionAnnouncement(proto::FunctionAnnouncement {
+                                manual: false,
                                 id: 100,
                                 parent_id: T2,
                                 call_path_id: 2,
                                 entered_at_ticks: 21,
                                 inputs_cas_id: None,
-                                type_args_cas_id: Some(proto::SnapshotId { low: 3, high: 4 }),
+                                type_args_cas_id: Some(proto::CasId { low: 3, high: 4 }),
                             }),
                         ],
                     ),
                     section(
                         T3,
-                        vec![completion(101, T3, 4, 30), completion(101, T3, 4, 31)],
+                        // The later completion's usage replaces the first's.
+                        vec![
+                            charged(
+                                completion(101, T3, 4, 30),
+                                vec![usage("claude-opus-5-5", 3)],
+                            ),
+                            charged(completion(101, T3, 4, 31), vec![usage("jev-1.13.0", 50)]),
+                        ],
                     ),
                     section(
                         T2,
@@ -497,6 +559,18 @@ mod crafted {
                             network_done(202, 50, proto::InvocationOutcome::Unspecified),
                         ],
                     ),
+                    section(
+                        T3,
+                        vec![
+                            // Fails with an error, before its definition.
+                            Event::ThreadCompletion(proto::ThreadCompletion {
+                                completed_at_ticks: 70,
+                                outcome: 2,
+                                error_cas_id: Some(snapshot(T3_ERROR)),
+                                ..Default::default()
+                            }),
+                        ],
+                    ),
                 ],
             }),
             aggregates: Some(proto::AggregateBatch {
@@ -507,14 +581,17 @@ mod crafted {
                     total_ticks: 4,
                 }],
             }),
-            usage: Some(proto::UsageBatch {
-                entries: vec![usage(100, "jev-1.13.0", 50), usage(T2, "unpriced-model", 7)],
-            }),
             ..Default::default()
         };
         let third = proto::RecordingFile {
             definitions: Some(proto::Definitions {
-                functions: vec![metadata(CALLEE, "user.Callee", 7)],
+                functions: vec![{
+                    let mut callee = metadata(CALLEE, "user.Callee", 7);
+                    if let Some(Resolution::Metadata(metadata)) = &mut callee.resolution {
+                        metadata.model_invoke = true;
+                    }
+                    callee
+                }],
                 call_paths: vec![
                     path(1, 0, None, 0, CALLER, 1),
                     path(4, 1, Some(CALLER), 2, CALLEE, 1),
@@ -537,6 +614,9 @@ mod crafted {
                             completed_at_ticks: 95,
                             outcome: 2,
                             panicked: true,
+                            usage: Vec::new(),
+                            // The first completion is kept, without this error.
+                            error_cas_id: Some(snapshot(91)),
                         }),
                         announce(200, 4, "POST", 22),
                         network_event(200, "await", 41, None),
@@ -651,5 +731,31 @@ fn late_and_conflicting_evidence_indexes_identically() {
         })
         .collect();
     assert_eq!(type_args, vec![100]);
+    // A thread keeps the error of its first completion, whichever file
+    // defines the thread: the conflicting second completion's is dropped.
+    let errors: Vec<(i64, Value)> = fresh
+        .iter()
+        .find(|(table, _)| table == "thread")
+        .unwrap()
+        .1
+        .iter()
+        .map(|row| match &row[THREAD_ID] {
+            Value::Blob(id) => (
+                i64::from_be_bytes(id[..].try_into().unwrap()),
+                row[THREAD_ERROR_CAS].clone(),
+            ),
+            other => panic!("{other:?}"),
+        })
+        .filter(|(_, error)| *error != Value::Null)
+        .collect();
+    let mut expected = crafted::T3_ERROR.to_le_bytes().to_vec();
+    expected.extend([0; 8]);
+    assert_eq!(
+        errors,
+        vec![(
+            i64::try_from(crafted::FAILED_THREAD).unwrap(),
+            Value::Blob(expected)
+        )]
+    );
     assert_same(&fresh, &incremental);
 }

@@ -5,9 +5,9 @@
 //! `IoNamespaceFs` by delegating each operation to the corresponding JS method
 //! on the VFS object passed at runtime creation.
 //!
-//! File handle operations (`IoClassFsFile`) are not supported in WASM — they
-//! all return `Unsupported` because the native tokio file-handle model doesn't
-//! translate to the browser sandbox.
+//! `open` is not supported in WASM — the native tokio file-handle model
+//! doesn't translate to the browser sandbox — so no `baml.fs.File` exists
+//! here for its own operations to run on.
 
 use std::sync::Arc;
 
@@ -180,87 +180,74 @@ fn remove_dir_all_recursive(vfs: &WasmVfs, path: &str) -> Result<(), VmBamlError
 }
 
 // ============================================================================
-// IoClassFsFile — all File handle methods return Unsupported in WASM.
-// The native tokio file-handle model (open/read/write/seek/close) cannot be
-// mapped to the browser sandbox.
-// ============================================================================
-
-impl io::IoClassFsFile for WasmIoFs {
-    fn read(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: owned::fs::File,
-        _n: i64,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<Vec<u8>>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: owned::fs::File,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn seek_from(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: owned::fs::File,
-        _w: BexExternalValue,
-        _o: i64,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn write_some(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: owned::fs::File,
-        _d: Vec<u8>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn flush(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: owned::fs::File,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
-// ============================================================================
 // IoNamespaceFs — delegates to WasmVfs JS callbacks.
 // ============================================================================
 
 impl io::IoNamespaceFs for WasmIoFs {
+    fn metadata(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<io::owned::fs::Metadata> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "filesystem".into(),
+            message: "Native installation operations are not supported by this host".into(),
+        })
+    }
+    fn rename(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _source: String,
+        _destination: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "filesystem".into(),
+            message: "Native installation operations are not supported by this host".into(),
+        })
+    }
+    fn canonicalize(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "filesystem".into(),
+            message: "Native installation operations are not supported by this host".into(),
+        })
+    }
+    fn write_atomic(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _content: Vec<u8>,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "filesystem".into(),
+            message: "Native installation operations are not supported by this host".into(),
+        })
+    }
+    fn lock(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _timeout_ms: i64,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<io::owned::fs::Lock> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "filesystem".into(),
+            message: "Native installation operations are not supported by this host".into(),
+        })
+    }
+
     fn open(
         &self,
         _h: &Arc<BexHeap>,

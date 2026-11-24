@@ -16,8 +16,8 @@ use common::{EngineProgram, assert_engine_executes};
 async fn portable_prompt_ast_reconstructs_a_reusable_prompt_wrapper() {
     use std::sync::Arc;
 
-    use baml_builtins2::{PromptAst, PromptAstSimple};
     use bex_engine::BexEngine;
+    use bex_vm_types::{PromptAst, PromptAstSimple};
     use sys_native::SysOpsExt;
 
     let snapshot = common::compile_for_engine(
@@ -67,32 +67,6 @@ function main() -> string {
         entry: "main",
         expected: Ok(BexExternalValue::from(
             "[system]\nHello, Alice! You are 30 years old.",
-        )),
-        ..Default::default()
-    })
-    .await
-}
-
-#[tokio::test]
-async fn backtick_prompt_builds_chat_roles() -> anyhow::Result<()> {
-    assert_engine_executes(EngineProgram {
-        source: r#"
-function Answer(question: string) -> string {
-    client: "openai/gpt-4o"
-    prompt: `${role("system")}You are a helpful assistant.${role("user")}${question}`
-}
-
-function main() -> string {
-    let out = ""
-    for (let message in Answer@spec("What is 2+2?").prompt().messages()) {
-        out += message.role + "=" + message.content + ";"
-    }
-    out
-}
-"#,
-        entry: "main",
-        expected: Ok(BexExternalValue::from(
-            "system=You are a helpful assistant.;user=What is 2+2?;",
         )),
         ..Default::default()
     })

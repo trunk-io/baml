@@ -1,5 +1,5 @@
 // mcp — MCP servers as ordinary BAML tools. A library over public
-// primitives (baml.sys.start_process, root.raw_tool), not part of
+// primitives (baml.sys.subprocess, root.raw_tool), not part of
 // ai: the core namespace carries no protocol knowledge.
 //
 // One Connection is one server child process speaking JSON-RPC 2.0 over
@@ -18,15 +18,16 @@ function rpc_line(id: int?, method: string, params: map<string, unknown>?) -> st
     if let p: map<string, unknown> = params {
         let _ = m.set("params", p);
     }
-    baml.json.stringify(baml.json.to_json(m))
+    baml.json.stringify(m)
 }
 
 class Connection {
     server_name: string,
-    p: baml.sys.Process,
+    p: baml.sys.Subprocess,
     out: baml.sys.ReadPipeLines,
     timeout_ms: int,
     next_id: int,
+    _closed: bool,
 
     /// Spawn the server and perform the initialize handshake. The connection
     /// is live until close(); the caller owns the lifetime.
@@ -36,26 +37,37 @@ class Connection {
         args: string[],
         timeout_ms: int = 30000,
     ) -> Connection {
-        let p = baml.sys.start_process(
+        let p = baml.sys.subprocess(
             command,
-            args,
-            baml.sys.ProcessOptions { cwd: null, env: null, timeout_ms: timeout_ms, stdin: null },
+            args = args,
+            stdin = "pipe",
+            stdout = "pipe",
+            cwd = null,
+            input = null,
         ) catch_all (e) {
             _ => {
-                throw root.errors.NetworkFailure { status_code: null,
+                throw root.errors.NetworkFailure {
+                    status_code: null,
                     provider: `mcp/${name}`,
                     detail: `the MCP server could not start: ${e.to_string()}`,
                     raw_body: null,
-                }
+                };
             },
         };
         let conn = Connection {
             server_name: name,
             p: p,
-            out: p.stdout.lines(),
+            out: (p.stdout ?? baml.sys.panic("stdout is not piped")).lines(),
             timeout_ms: timeout_ms,
             next_id: 1,
+            _closed: false,
         };
+        let connected = false;
+        defer {
+            if (!connected) {
+                conn.close();
+            }
+        }
         let init: map<string, unknown> = {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
@@ -63,6 +75,7 @@ class Connection {
         };
         let _ = conn._request("initialize", init);
         conn._send(rpc_line(null, "notifications/initialized", null));
+        connected = true;
         conn
     }
 
@@ -71,13 +84,14 @@ class Connection {
         // lose the newline the protocol frames on; the newline is a quoted
         // string, appended before the single write.
         let framed = [line, "\n"].join("");
-        let _ = self.p.stdin.write(framed) catch_all (e) {
+        let _ = (self.p.stdin ?? baml.sys.panic("stdin is not piped")).write(framed) catch_all (e) {
             _ => {
-                throw root.errors.NetworkFailure { status_code: null,
+                throw root.errors.NetworkFailure {
+                    status_code: null,
                     provider: `mcp/${self.server_name}`,
                     detail: `writing to the MCP server failed: ${e.to_string()}`,
                     raw_body: null,
-                }
+                };
             },
         };
     }
@@ -88,61 +102,63 @@ class Connection {
         let id = self.next_id;
         self.next_id += 1;
         self._send(rpc_line(id, method, params));
-        baml.future.with_timeout(baml.time.Duration.from_milliseconds(self.timeout_ms), () -> {
-            while (true) {
-                let next = self.out.next() catch_all (e) {
-                    _ => {
-                        throw root.errors.NetworkFailure { status_code: null,
-                            provider: `mcp/${self.server_name}`,
-                            detail: `reading from the MCP server failed: ${e.to_string()}`,
-                            raw_body: null,
-                        }
-                    },
-                };
-                match (next) {
-                    let line: string => {
-                        let trimmed = line.trim();
-                        if (trimmed.length() > 0) {
-                            // stdout is protocol-only per the spec; tolerate stray lines
-                            let msg = baml.json.parse(trimmed) catch_all (e) {
-                                _ => null,
+        baml.future.with_timeout(
+            baml.time.Duration.from_milliseconds(self.timeout_ms),
+            () -> {
+                while (true) {
+                    let next = self.out.next() catch_all (e) {
+                        _ => {
+                            throw root.errors.NetworkFailure {
+                                status_code: null,
+                                provider: `mcp/${self.server_name}`,
+                                detail: `reading from the MCP server failed: ${e.to_string()}`,
+                                raw_body: null,
                             };
-                            if (baml.json.path_or<int>(msg, ".id", -1) == id) {
-                                let err = baml.json.path_or<json>(msg, ".error", null);
-                                if (err != null) {
-                                    throw root.errors.InvalidRequest {
-                                        provider: `mcp/${self.server_name}`,
-                                        status_code: baml.json.path_or<int?>(err, ".code", null),
-                                        detail: baml.json.path_or<string>(err, ".message", "MCP error"),
-                                        raw_body: baml.json.stringify(err),
+                        },
+                    };
+                    match (next) {
+                        let line: string => {
+                            let trimmed = line.trim();
+                            if (trimmed.length() > 0) {
+                                // stdout is protocol-only per the spec; tolerate stray lines
+                                let msg = baml.json.parse(trimmed) catch_all (e) {
+                                    _ => null,
+                                };
+                                if (baml.json.path_or<int>(msg, ".id", -1) == id) {
+                                    let err = baml.json.path_or<json>(msg, ".error", null);
+                                    if (err != null) {
+                                        throw root.errors.InvalidRequest {
+                                            provider: `mcp/${self.server_name}`,
+                                            status_code: baml.json
+                                                .path_or<int?>(err, ".code", null),
+                                            detail: baml.json
+                                                .path_or<string>(err, ".message", "MCP error"),
+                                            raw_body: baml.json.stringify(err),
+                                        };
                                     }
+                                    return baml.json.path_or<json>(msg, ".result", null);
                                 }
-                                return baml.json.path_or<json>(msg, ".result", null);
                             }
-                        }
-                    },
-                    _ => {
-                        throw root.errors.NetworkFailure { status_code: null,
-                            provider: `mcp/${self.server_name}`,
-                            detail: `the MCP server stream ended before answering ${method}`,
-                            raw_body: null,
-                        }
-                    },
-                };
-            }
-            // unreachable: the loop returns on a matching id or throws at EOF
-            throw root.errors.NetworkFailure { status_code: null,
-                provider: `mcp/${self.server_name}`,
-                detail: `no response for ${method}`,
-                raw_body: null,
-            }
-        }) catch (e) {
+                        },
+                        _ => {
+                            throw root.errors.NetworkFailure {
+                                status_code: null,
+                                provider: `mcp/${self.server_name}`,
+                                detail: `the MCP server stream ended before answering ${method}`,
+                                raw_body: null,
+                            };
+                        },
+                    };
+                }
+            },
+        ) catch (e) {
             baml.errors.Timeout => {
-                throw root.errors.NetworkFailure { status_code: null,
+                throw root.errors.NetworkFailure {
+                    status_code: null,
                     provider: `mcp/${self.server_name}`,
                     detail: `reading from the MCP server timed out after ${self.timeout_ms}ms`,
                     raw_body: null,
-                }
+                };
             },
         }
     }
@@ -155,7 +171,7 @@ class Connection {
         let out: root.tools.Tool[] = [];
         for (let t in baml.json.path_or<json[]>(result, ".tools", [])) {
             let tool_name = baml.json.path_or<string>(t, ".name", "");
-            let schema = baml.json.from_json<map<string, unknown>>(
+            let schema = baml.json.to<map<string, unknown>>(
                 baml.json.path_or<json>(t, ".inputSchema", {}),
             ) catch_all (e) {
                 _ => {
@@ -163,14 +179,12 @@ class Connection {
                     empty
                 },
             };
-            out.push(
-                root.tools.raw_tool(
-                    tool_name,
-                    baml.json.path_or<string>(t, ".description", ""),
-                    schema,
-                    root.internal._proxy(self, tool_name),
-                ),
-            );
+            out.push(root.tools.raw_tool(
+                tool_name,
+                baml.json.path_or<string>(t, ".description", ""),
+                schema,
+                root.internal._proxy(self, tool_name),
+            ));
         }
         out
     }
@@ -188,12 +202,32 @@ class Connection {
         }
         let joined = texts.join("\n");
         if (baml.json.path_or<bool>(result, ".isError", false)) {
-            throw baml.errors.InvalidArgument { message: `mcp tool ${name} failed: ${joined}` }
+            throw baml.errors.InvalidArgument {
+                message: `mcp tool ${name} failed: ${joined}`,
+            };
         }
         joined
     }
 
+    /// Terminate the server and release its independently owned pipes, even after a kill error.
     function close(self) -> void {
-        self.p.close();
+        if (self._closed) {
+            return;
+        }
+        self._closed = true;
+        defer {
+            self.p.close();
+        }
+        defer {
+            if let stdout: baml.sys.ReadPipe = self.p.stdout {
+                stdout.close();
+            }
+        }
+        defer {
+            if let stdin: baml.sys.WritePipe = self.p.stdin {
+                stdin.close();
+            }
+        }
+        self.p.kill();
     }
 }

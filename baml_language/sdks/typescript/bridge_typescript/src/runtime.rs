@@ -8,7 +8,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::{errors::bridge_error_to_napi, types::HostSpanManager};
+use crate::errors::bridge_error_to_napi;
 
 /// The main BAML runtime. A zero-sized handle (see module docs).
 #[napi]
@@ -54,21 +54,29 @@ impl BamlRuntime {
     }
 
     /// Call a BAML function synchronously (blocking).
+    ///
+    /// `args_proto` carries the call's control part (target, type arguments,
+    /// invocation options) with no `kwargs`; `kwargs` are the arguments by
+    /// declared parameter name as JavaScript values, encoded here against the
+    /// target's declared types, and `cancel` the `$baml.cancel` token. A value
+    /// that does not fit raises before anything is sent.
     #[napi]
-    pub fn call_function_sync(
+    pub fn call_function_sync<'env>(
         &self,
+        env: &'env Env,
         args_proto: Buffer,
-        ctx: Option<&HostSpanManager>,
+        kwargs: Option<Object<'env>>,
+        cancel: Option<Unknown<'env>>,
     ) -> napi::Result<Buffer> {
-        let prepared = (|| -> std::result::Result<_, bridge_cffi::BridgeError> {
-            let runtime = bridge_cffi::get_runtime()?;
-            let prepared = bridge_cffi::prepare_call(args_proto.as_ref())?;
+        let args_proto =
+            crate::encode::encode_request(env, args_proto.as_ref(), kwargs, cancel, true)?;
+        let request = (|| -> std::result::Result<_, bridge_cffi::BridgeError> {
+            let request = bridge_cffi::decode_invocation_request(&args_proto)?;
             let rt = bridge_cffi::get_tokio_runtime()?;
-            Ok((runtime, prepared, rt))
+            Ok((request, rt))
         })();
-        let _ = &ctx;
 
-        let (runtime, prepared, rt) = match prepared {
+        let (request, rt) = match request {
             Ok(v) => v,
             Err(e) => return Ok(Buffer::from(bridge_cffi::error_to_outbound(e))),
         };
@@ -77,33 +85,34 @@ impl BamlRuntime {
         // catch_unwind -> SdkPanic boundary and error/panic routing) lives in
         // bridge_cffi; we just return the encoded envelope bytes for the TS
         // decoder to surface.
-        let bytes = rt.block_on(bridge_cffi::invoke_prepared(runtime, prepared));
+        let _sync_call = crate::host_value::SyncCallGuard::new(request.host_call_id());
+        let bytes = rt.block_on(bridge_cffi::execute_invocation(request));
 
         Ok(Buffer::from(bytes))
     }
 
-    /// Call a BAML function asynchronously.
+    /// Call a BAML function asynchronously. Arguments as for
+    /// [`Self::call_function_sync`]; they are encoded on the JavaScript thread
+    /// before the future is spawned.
     #[napi(ts_return_type = "Promise<Buffer>")]
     pub fn call_function<'e>(
         &self,
         env: &'e Env,
         args_proto: Buffer,
-        ctx: Option<&HostSpanManager>,
+        kwargs: Option<Object<'e>>,
+        cancel: Option<Unknown<'e>>,
     ) -> napi::Result<PromiseRaw<'e, Buffer>> {
-        // `prepare_call` pins a handle target before the future is spawned,
+        let args_proto =
+            crate::encode::encode_request(env, args_proto.as_ref(), kwargs, cancel, false)?;
+        // `decode_invocation_request` pins a handle target before the future is spawned,
         // so a JS-side release of that handle cannot race the call.
-        let prepared = (|| -> std::result::Result<_, bridge_cffi::BridgeError> {
-            let runtime = bridge_cffi::get_runtime()?;
-            let prepared = bridge_cffi::prepare_call(args_proto.as_ref())?;
-            Ok((runtime, prepared))
-        })();
-        let _ = &ctx;
+        let request = bridge_cffi::decode_invocation_request(&args_proto);
 
-        // Same shared invoke_prepared as the sync + C-ABI paths — returns the
+        // Same shared execute_invocation as the sync + C-ABI paths — returns the
         // encoded BamlOutboundResult envelope bytes for the TS decoder.
         env.spawn_future(async move {
-            let bytes = match prepared {
-                Ok((runtime, prepared)) => bridge_cffi::invoke_prepared(runtime, prepared).await,
+            let bytes = match request {
+                Ok(request) => bridge_cffi::execute_invocation(request).await,
                 Err(e) => bridge_cffi::error_to_outbound(e),
             };
             Ok(Buffer::from(bytes))

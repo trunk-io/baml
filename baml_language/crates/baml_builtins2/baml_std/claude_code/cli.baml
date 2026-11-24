@@ -44,8 +44,12 @@ class ClaudeCodeClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `claude-code/${self.model}`
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "claude-code"
         }
 
         /// Claude Code is a process-backed client rather than an HTTP client;
@@ -55,7 +59,7 @@ class ClaudeCodeClient {
             throw ai.errors.PreviewUnsupported {
                 provider: "claude-code",
                 detail: "claude-code has no HTTP request representation",
-            }
+            };
         }
 
         function invoke(self, input: ai.ModelTurnInput) -> ai.ModelTurn {

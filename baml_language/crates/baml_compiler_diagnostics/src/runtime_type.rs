@@ -65,7 +65,7 @@ impl fmt::Display for InvalidIdentifierKind {
 
 /// Check a runtime-supplied name with the compiler lexer's identifier rules.
 pub fn is_baml_identifier(value: &str) -> bool {
-    baml_compiler_lexer::is_baml_identifier(value)
+    baml_syntax::lexer::is_identifier(value)
 }
 
 /// E0010 — a runtime-supplied declaration name is not a BAML identifier.
@@ -127,39 +127,49 @@ pub fn unspecialized_reflected_generic_call(name: &str) -> Diagnostic {
 }
 
 /// E0002 — a value name was written where a type argument belongs. A runtime
-/// type enters a type position only through a `type T = unreflect(value)`
-/// binding; the slot then names `T`.
-pub fn computed_generic_argument_requires_unreflect(name: &str) -> Diagnostic {
+/// type enters a type position only through a `let type T = value;` binding;
+/// the slot then names `T`.
+pub fn computed_generic_argument_requires_let_type(name: &str) -> Diagnostic {
     Diagnostic::error(
         DiagnosticId::UnknownType,
         format!(
             "`{name}` is a value, not a type; bind its runtime type first with \
-             `type T = unreflect({name});` and write `T` here"
+             `let type T = {name};` and write `T` here"
         ),
     )
 }
 
-/// E0168 — `unreflect(...)` written anywhere other than as the whole
-/// right-hand side of a body-level `type T = …;` binding. The binding is the
-/// one spelling that lifts a runtime type into a type position; every other
-/// position names the bound `T`.
-pub fn runtime_type_must_be_named() -> Diagnostic {
+/// E0111 — a bounded `let type T extends I = …;` has no `else` block. The
+/// bounds are checked when the statement runs, so like a refutable `let`
+/// pattern it must say what happens on a miss: `else { … }`, which diverges.
+pub fn bounded_let_type_requires_else(name: &str) -> Diagnostic {
     Diagnostic::error(
-        DiagnosticId::RuntimeTypeMustBeNamed,
-        "this runtime type must be given a name before it can be used here",
+        DiagnosticId::RefutablePatternInLet,
+        format!(
+            "`let type {name} extends …` checks its bounds when it runs, so it needs an \
+             `else` block for a type that misses them"
+        ),
     )
 }
 
-/// E0172 — a value typed by a body-scoped `type T = …` binding would be
+/// E0001 — a `let type` operand is a class builder's pending type
+/// (`reflect.class.Builder.type()`). It is not a type until the builder is
+/// built, so binding it could fail at run time; the operand is the built class
+/// instead.
+pub fn let_type_pending_operand() -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticId::TypeMismatch,
+        "`let type` cannot bind a class builder's pending type; call `build()` and bind the \
+         class it returns",
+    )
+}
+
+/// E0172 — a value typed by a body-scoped `let type T = …` binding would be
 /// observable outside the block that binds `T`. The binding re-executes on
 /// every pass through its block and may bind `T` to a different type each
 /// time, so a `T`-typed value that outlived the block could break the
 /// invariants of whatever it landed in. A value leaves a block only through
 /// a type that does not mention `T` (such as `unknown`).
-///
-/// "scoped type" rather than "scoped runtime type": the rule is the same for
-/// a static right-hand side (`type S = Wrapper<int>`), which binds no runtime
-/// value at all.
 pub fn scoped_type_escapes_block(name: &str) -> Diagnostic {
     Diagnostic::error(
         DiagnosticId::ScopedTypeEscapesBlock,
@@ -262,6 +272,27 @@ pub fn non_data_field_at_render(field: &str, ty: &str) -> Diagnostic {
     )
 }
 
+/// E0164 — a `@skip` field of an LLM output type has no empty value to hold.
+pub fn unfillable_skip_field_at_render(field: &str, ty: &str) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticId::NonDataTypeAtRender,
+        format!(
+            "the `@skip` field `{field}` has type `{ty}`, which has no empty value for it to hold, so its class cannot be rendered as an LLM output schema"
+        ),
+    )
+}
+
+/// E0164 — every value of an LLM output type is cyclic, and JSON holds only
+/// finite values.
+pub fn cyclic_type_at_render(ty: &str) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticId::NonDataTypeAtRender,
+        format!(
+            "every value of `{ty}` is cyclic, and JSON holds only finite values, so it cannot be rendered as an LLM output schema"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,9 +302,9 @@ mod tests {
         let cases = [
             (mismatched_types(), "E0001", "mismatched types"),
             (
-                expected_class_instance("reflect.class.get_field", "int"),
+                expected_class_instance("reflect.Class.get_field", "int"),
                 "E0001",
-                "reflect.class.get_field expected a class instance, got int",
+                "reflect.Class.get_field expected a class instance, got int",
             ),
             (
                 unspecialized_reflected_generic("root.Extract"),
@@ -286,9 +317,19 @@ mod tests {
                 "generic function `GenericList@render_prompt` cannot be invoked through reflection: its body needs type arguments",
             ),
             (
-                computed_generic_argument_requires_unreflect("runtime_t"),
+                computed_generic_argument_requires_let_type("runtime_t"),
                 "E0002",
-                "`runtime_t` is a value, not a type; bind its runtime type first with `type T = unreflect(runtime_t);` and write `T` here",
+                "`runtime_t` is a value, not a type; bind its runtime type first with `let type T = runtime_t;` and write `T` here",
+            ),
+            (
+                bounded_let_type_requires_else("V"),
+                "E0111",
+                "`let type V extends …` checks its bounds when it runs, so it needs an `else` block for a type that misses them",
+            ),
+            (
+                let_type_pending_operand(),
+                "E0001",
+                "`let type` cannot bind a class builder's pending type; call `build()` and bind the class it returns",
             ),
             (
                 scoped_type_escapes_block("Out"),
@@ -301,9 +342,9 @@ mod tests {
                 "duplicate field `Collision.wire`",
             ),
             (
-                cannot_construct_reflection_kind("reflect.class.Type"),
+                cannot_construct_reflection_kind("reflect.Class"),
                 "E0001",
-                "reflection kind `reflect.class.Type` cannot be constructed; obtain it from a type value",
+                "reflection kind `reflect.Class` cannot be constructed; obtain it from a type value",
             ),
             (
                 cannot_construct_builtin_companion("baml.Int", "int", "literals", true),
@@ -356,9 +397,14 @@ mod tests {
                 "field `Envelope.payload` has non-data type `unknown`, which cannot be rendered as an LLM output schema",
             ),
             (
-                runtime_type_must_be_named(),
-                "E0168",
-                "this runtime type must be given a name before it can be used here",
+                unfillable_skip_field_at_render("Envelope.raw", "reflect.Type"),
+                "E0164",
+                "the `@skip` field `Envelope.raw` has type `reflect.Type`, which has no empty value for it to hold, so its class cannot be rendered as an LLM output schema",
+            ),
+            (
+                cyclic_type_at_render("Loop"),
+                "E0164",
+                "every value of `Loop` is cyclic, and JSON holds only finite values, so it cannot be rendered as an LLM output schema",
             ),
         ];
 

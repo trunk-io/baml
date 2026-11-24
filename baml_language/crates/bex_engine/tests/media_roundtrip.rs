@@ -13,17 +13,17 @@ mod common;
 
 use std::sync::Arc;
 
-use baml_builtins2::{MediaContent, MediaValue};
-use baml_type::MediaKind;
+use baml_type::ConcreteMediaKind;
 use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder};
 use bex_external_types::BexExternalAdt;
+use bex_vm_types::{MediaContent, MediaValue};
 use common::compile_for_engine;
 use indexmap::IndexMap;
 use sys_native::SysOpsExt;
 
 fn pdf_media() -> Arc<MediaValue> {
     Arc::new(MediaValue::new(
-        MediaKind::Pdf,
+        ConcreteMediaKind::Pdf,
         MediaContent::Url {
             url: "https://example.test/sample.pdf".to_string(),
             base64_data: None,
@@ -32,17 +32,10 @@ fn pdf_media() -> Arc<MediaValue> {
     ))
 }
 
+/// A media value crosses the boundary as itself: the portable payload, not a
+/// shell of the standard library's wrapper class.
 fn pdf_instance(arc: Arc<MediaValue>) -> BexExternalValue {
-    let mut fields: IndexMap<String, BexExternalValue> = IndexMap::new();
-    fields.insert(
-        "_data".to_string(),
-        BexExternalValue::Adt(BexExternalAdt::Media(arc)),
-    );
-    BexExternalValue::Instance {
-        class_name: "baml.media.Pdf".to_string(),
-        type_args: vec![],
-        fields,
-    }
+    BexExternalValue::Adt(BexExternalAdt::Media(arc))
 }
 
 /// Identity round-trip — the simplest assertion that the engine
@@ -86,12 +79,14 @@ class Holder {
 
     match result {
         BexExternalValue::Adt(BexExternalAdt::Media(arc)) => {
-            assert_eq!(arc.kind, MediaKind::Pdf);
+            assert_eq!(arc.kind, ConcreteMediaKind::Pdf);
             arc.read_content(|content| match content {
                 MediaContent::Url { url, .. } => {
                     assert_eq!(url, "https://example.test/sample.pdf");
                 }
-                other => panic!("expected Url media content, got {other:?}"),
+                other @ MediaContent::Base64 { .. } => {
+                    panic!("expected Url media content, got {other:?}")
+                }
             });
         }
         other => panic!("expected canonical Adt(Media(_)) for unwrapped pdf, got {other:?}"),

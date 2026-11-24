@@ -188,8 +188,7 @@ type Value = null | bool | int | bigint | float | string;
 
 /// (internal) Marker: the reader needs more input bytes before it can make
 /// progress. Do not use directly.
-class _NeedData {
-}
+class _NeedData {}
 
 /// (internal) Marker: a record was skipped under `on_error = "skip"`.
 /// Do not use directly.
@@ -225,8 +224,6 @@ class _Headers {
 /// asymmetry: an empty cell read as `T = string` is `""`, not `null`, since an
 /// empty string is a perfectly good string and CSV cannot tell the two apart.
 class Record {
-    _handle: $rust_type,
-
     /// Converts the cell under header `column` to `T`.
     ///
     /// # Returns
@@ -323,6 +320,18 @@ class Record {
     function to_map(self) -> map<string, string> throws Error {
         $rust_function
     }
+
+    @@rust_type("CsvRecord")
+}
+
+/// (internal) A `Reader`'s state: its options, its input and its position.
+class _ReaderState {
+    @@rust_type("CsvReader")
+}
+
+/// (internal) A `Writer`'s state: its options, its counts and its buffer.
+class _WriterState {
+    @@rust_type("CsvWriter")
 }
 
 /// A streaming CSV reader. Create one with `baml.csv.open` or
@@ -349,7 +358,7 @@ class Record {
 /// before the throw, so a caller that swallows it gets `baml.iter.Done` rather
 /// than an infinite retry.
 class Reader {
-    _handle: $rust_type,
+    _state: _ReaderState,
     _file: root.fs.File?,
     _on_skip: ((Error) -> null throws never)?,
     _owns_file: bool,
@@ -363,7 +372,9 @@ class Reader {
         /// second traversal would resume mid-file rather than restart.
         function iter(
             self,
-        ) -> root.iter.Iterator<Item = Record, Error = root.csv.Error | root.errors.Io> throws never {
+        ) -> root.iter.Iterator<Item = Record, Error = root.csv.Error | root.errors.Io>
+            throws never
+        {
             self
         }
     }
@@ -399,7 +410,6 @@ class Reader {
                     },
                 }
             }
-            root.sys.panic("unreachable: Reader.next loop ended")
         }
     }
 
@@ -432,7 +442,6 @@ class Reader {
                 },
             }
         }
-        root.sys.panic("unreachable: Reader.headers loop ended")
     }
 
     /// A typed iterator over the remaining records, decoding each into `T`.
@@ -453,9 +462,9 @@ class Reader {
     /// - `Error { kind: Options }` if `T` is not a flat class of
     ///   cell-decodable fields.
     /// - Anything `headers()` throws, since it is called first.
-    function rows<T>(
-        self,
-    ) -> root.iter.Iterator<Item = T, Error = Error | root.errors.Io> throws Error | root.errors.Io {
+    function rows<T>(self) -> root.iter.Iterator<Item = T, Error = Error | root.errors.Io>
+        throws Error | root.errors.Io
+    {
         self.headers();
         _validate_columns<T>(self);
         Rows<T> { reader: self }
@@ -561,7 +570,7 @@ class Reader {
         let chunk = self._file?.read(65536) catch (e) {
             root.errors.Io => {
                 self._mark_exhausted();
-                throw e
+                throw e;
             },
         };
         match (chunk) {
@@ -591,9 +600,9 @@ class Rows<T> {
 
         /// Returns `self`, for the same one-cursor reason `Reader` is its own
         /// iterator.
-        function iter(
-            self,
-        ) -> root.iter.Iterator<Item = T, Error = root.csv.Error | root.errors.Io> throws never {
+        function iter(self) -> root.iter.Iterator<Item = T, Error = root.csv.Error | root.errors.Io>
+            throws never
+        {
             self
         }
     }
@@ -629,7 +638,6 @@ class Rows<T> {
                     },
                 }
             }
-            root.sys.panic("unreachable: Rows.next loop ended")
         }
     }
 }
@@ -646,7 +654,7 @@ class Rows<T> {
 /// `bool`, `null`, any enum (written as its variant name),
 /// `baml.time.Instant`, `baml.time.PlainDate`, and `baml.time.PlainDateTime`.
 /// A nested class or list is not a cell — serialize it yourself with
-/// `baml.json.to_string` and write the string.
+/// `baml.json.stringify` and write the string.
 ///
 /// Everything that emits output shares three failure modes. A cell that would
 /// need quoting under `quote_style: "never"`, or a non-finite float, throws
@@ -654,7 +662,7 @@ class Rows<T> {
 /// `baml.errors.Io`. A write after `close()` throws `Error { kind: Closed }`,
 /// while `records_written()` stays valid.
 class Writer {
-    _handle: $rust_type,
+    _state: _WriterState,
     _file: root.fs.File?,
     _owns_file: bool,
 
@@ -823,11 +831,10 @@ function reader(
 ///
 /// - `Error { kind: Options }` if `options` is invalid.
 /// - `baml.errors.Io` if `path` cannot be opened for reading.
-function open(
-    path: string,
-    options: ReaderOptions? = null,
-) -> Reader throws Error | root.errors.Io {
-    let f = baml.fs.open(path, "r") catch (_) {
+function open(path: string, options: ReaderOptions? = null) -> Reader
+    throws Error | root.errors.Io
+{
+    let f = root.fs.open(path, "r") catch (_) {
         root.errors.InvalidArgument { message } => throw root.errors.Io { message: message },
     };
     _reader(f, options, true)
@@ -844,10 +851,9 @@ function open(
 /// - `Error` for anything `open` and `Reader.rows<T>` throw, and for any
 ///   `Decode` failure not suppressed by `on_error = "skip"`.
 /// - `baml.errors.Io` if the file cannot be opened or read.
-function read<T>(
-    path: string,
-    options: ReaderOptions? = null,
-) -> T[] throws Error | root.errors.Io {
+function read<T>(path: string, options: ReaderOptions? = null) -> T[]
+    throws Error | root.errors.Io
+{
     let r = open(path, options = options);
     let result = r.rows<T>().collect();
     r.close();
@@ -866,10 +872,9 @@ function read<T>(
 /// - `Error` for a malformed record, unless `on_error = "skip"`. The reader is
 ///   not returned, so its errors are unreachable afterwards; pass `on_skip` if
 ///   you need to see them.
-function parse(
-    source: string | uint8array,
-    options: ReaderOptions? = null,
-) -> string[][] throws Error {
+function parse(source: string | uint8array, options: ReaderOptions? = null) -> string[][]
+    throws Error
+{
     {
         let r = reader(source, options = options);
         let out: string[][] = [];
@@ -902,13 +907,10 @@ function parse(
 ///
 /// - `Error` for anything `reader` and `Reader.rows<T>` throw, and for any
 ///   `Decode` failure not suppressed by `on_error = "skip"`.
-function decode<T>(
-    source: string | uint8array,
-    options: ReaderOptions? = null,
-) -> T[] throws Error {
-    {
-        reader(source, options = options).rows<T>().collect()
-    } catch (_) {
+function decode<T>(source: string | uint8array, options: ReaderOptions? = null) -> T[]
+    throws Error
+{
+    { reader(source, options = options).rows<T>().collect() } catch (_) {
         root.errors.Io { message } => {
             root.sys.panic("unreachable: in-memory CSV source raised Io: " + message)
         },
@@ -926,13 +928,15 @@ function decode<T>(
 /// - `Error { kind: TooManyRows }` if the input holds more than one data
 ///   record.
 /// - `Error` for anything `decode<T>` throws.
-function decode_optional<T>(
-    source: string | uint8array,
-    options: ReaderOptions? = null,
-) -> T? throws Error {
+function decode_optional<T>(source: string | uint8array, options: ReaderOptions? = null) -> T?
+    throws Error
+{
     let all = decode<T>(source, options = options);
     if (all.length() > 1) {
-        throw _error(ErrorKind.TooManyRows, "expected at most one data record, found " + root.json.stringify(all.length()));
+        throw _error(
+            ErrorKind.TooManyRows,
+            `expected at most one data record, found ${all.length()}`,
+        );
     }
     all.at(0)
 }
@@ -948,16 +952,21 @@ function decode_optional<T>(
 /// - `Error { kind: NotFound }` if the input holds no data record.
 /// - `Error { kind: TooManyRows }` if it holds more than one.
 /// - `Error` for anything `decode<T>` throws.
-function decode_one<T>(
-    source: string | uint8array,
-    options: ReaderOptions? = null,
-) -> T throws Error {
+function decode_one<T>(source: string | uint8array, options: ReaderOptions? = null) -> T
+    throws Error
+{
     let all = decode<T>(source, options = options);
     if (all.length() == 0) {
-        throw _error(ErrorKind.NotFound, "expected exactly one data record, found none");
+        throw _error(
+            ErrorKind.NotFound,
+            "expected exactly one data record, found none",
+        );
     }
     if (all.length() > 1) {
-        throw _error(ErrorKind.TooManyRows, "expected exactly one data record, found " + root.json.stringify(all.length()));
+        throw _error(
+            ErrorKind.TooManyRows,
+            `expected exactly one data record, found ${all.length()}`,
+        );
     }
     match (all.at(0)) {
         null => root.sys.panic("unreachable: decode_one lost its record"),
@@ -990,11 +999,10 @@ function writer(file: root.fs.File, options: WriterOptions? = null) -> Writer th
 ///
 /// - `Error { kind: Options }` if `options` is invalid.
 /// - `baml.errors.Io` if `path` cannot be opened for writing.
-function create(
-    path: string,
-    options: WriterOptions? = null,
-) -> Writer throws Error | root.errors.Io {
-    let f = baml.fs.open(path, "w") catch (_) {
+function create(path: string, options: WriterOptions? = null) -> Writer
+    throws Error | root.errors.Io
+{
+    let f = root.fs.open(path, "w") catch (_) {
         root.errors.InvalidArgument { message } => throw root.errors.Io { message: message },
     };
     _writer(f, options, true)
@@ -1026,11 +1034,9 @@ function buffer(options: WriterOptions? = null) -> Writer throws Error {
 ///
 /// - `Error` for anything `create` and `Writer.write_rows<T>` throw.
 /// - `baml.errors.Io` if the file cannot be opened, written, or closed.
-function write<T>(
-    path: string,
-    rows: T[],
-    options: WriterOptions? = null,
-) -> int throws Error | root.errors.Io {
+function write<T>(path: string, rows: T[], options: WriterOptions? = null) -> int
+    throws Error | root.errors.Io
+{
     let w = create(path, options = options);
     w.write_rows<T>(rows);
     w.close();
@@ -1069,10 +1075,9 @@ function stringify<T>(rows: T[], options: WriterOptions? = null) -> string throw
 /// # Throws
 ///
 /// - `Error` for anything `buffer` and `Writer.write_record` throw.
-function stringify_records(
-    records: Value[][],
-    options: WriterOptions? = null,
-) -> string throws Error {
+function stringify_records(records: Value[][], options: WriterOptions? = null) -> string
+    throws Error
+{
     {
         let w = buffer(options = options);
         for (let rec in records) {
@@ -1132,11 +1137,9 @@ function _reader(
 
 /// (internal) Construct a file-backed writer handle. Use `writer`.
 //baml:mut_vm
-function _writer(
-    file: root.fs.File,
-    options: WriterOptions?,
-    owns_file: bool,
-) -> Writer throws Error {
+function _writer(file: root.fs.File, options: WriterOptions?, owns_file: bool) -> Writer
+    throws Error
+{
     $rust_function
 }
 
@@ -1202,11 +1205,9 @@ function _to_markdown<T>(rows: T[], max_rows: int) -> string throws never {
 /// (internal) Render raw records as a Markdown table. Use
 /// `to_markdown_records`.
 //baml:mut_vm
-function _to_markdown_records(
-    records: string[][],
-    headers: string[]?,
-    max_rows: int,
-) -> string throws never {
+function _to_markdown_records(records: string[][], headers: string[]?, max_rows: int) -> string
+    throws never
+{
     $rust_function
 }
 

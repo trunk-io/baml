@@ -57,6 +57,63 @@ test "fs_open_and_read_bytes" {
 }
 
 // ============================================================================
+// File.bytes — everything that remains, in one read
+// ============================================================================
+
+function fs_file_bytes_reads_past_one_chunk_fn() -> string {
+    let path = fs_tmp("bytes_large.txt");
+    // Longer than the 64 KiB a single `read` returns.
+    baml.fs.write(path, "0123456789".repeat(20000));
+    let file = baml.fs.open(path, "r");
+    let direct = file.bytes();
+    file.close();
+    let again = baml.fs.open(path, "r");
+    let through_read = again.as<baml.io.Read>.bytes();
+    again.close();
+    baml.fs.remove(path);
+    `${direct.length()}|${through_read.length()}|${direct.to_base64() == through_read.to_base64()}`
+}
+
+test "fs_file_bytes_reads_past_one_chunk" {
+    assert.equal(fs_file_bytes_reads_past_one_chunk_fn(), "200000|200000|true")
+}
+
+function fs_file_bytes_reads_what_remains_fn() -> string {
+    let path = fs_tmp("bytes_remaining.txt");
+    baml.fs.write(path, "Hello from BAML!");
+    let file = baml.fs.open(path, "r");
+    let head = file.read(6) ?? b"";
+    let rest = file.bytes();
+    let after = file.bytes();
+    file.close();
+    baml.fs.remove(path);
+    `${head.length()}|${rest.length()}|${after.length()}`
+}
+
+test "fs_file_bytes_reads_what_remains" {
+    // 16 bytes: 6 by `read`, the other 10 by `bytes`, then nothing is left.
+    assert.equal(fs_file_bytes_reads_what_remains_fn(), "6|10|0")
+}
+
+function fs_file_bytes_on_a_closed_file_fn() -> string {
+    let path = fs_tmp("bytes_closed.txt");
+    baml.fs.write(path, "x");
+    let file = baml.fs.open(path, "r");
+    file.close();
+    baml.fs.remove(path);
+    {
+        file.bytes();
+        "read"
+    } catch (e) {
+        baml.errors.Io => "io"
+    }
+}
+
+test "fs_file_bytes_on_a_closed_file" {
+    assert.equal(fs_file_bytes_on_a_closed_file_fn(), "io")
+}
+
+// ============================================================================
 // write string — returns byte count
 // ============================================================================
 
@@ -779,4 +836,25 @@ function fs_symlink_onto_existing_path_errors_fn() -> bool {
 
 test "fs_symlink_onto_existing_path_errors" {
     assert.is_true(fs_symlink_onto_existing_path_errors_fn())
+}
+
+// ============================================================================
+// a file's state is the platform's: a copy shares it
+// ============================================================================
+
+function fs_deep_copy_shares_the_open_file_fn() -> string {
+    let path = fs_tmp("deep_copy.txt");
+    baml.fs.write(path, "Hello from BAML!");
+    let file = baml.fs.open(path, "r");
+    let copy = baml.deep_copy(file);
+    copy.seek_from("start", 6);
+    let through_original = file.text();
+    // Negative control: a second open has a cursor of its own.
+    let separate = baml.fs.open(path, "r").text();
+    baml.fs.remove(path);
+    `${through_original}|${separate}`
+}
+
+test "fs_deep_copy_shares_the_open_file" {
+    assert.equal(fs_deep_copy_shares_the_open_file_fn(), "from BAML!|Hello from BAML!")
 }

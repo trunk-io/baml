@@ -9,6 +9,7 @@
 
 (identifier) @variable
 (property_identifier) @property
+(tuple_index) @property
 
 ; ---------------------------------------------------------------------------
 ; Comments
@@ -33,6 +34,7 @@
 [
   (string)
   (byte_string)
+  (raw_quoted_string)
 ] @string
 
 (raw_string) @string
@@ -168,6 +170,7 @@
 (named_type_argument name: (identifier) @property)
 (destructure_pattern type: (identifier) @type)
 (generic_parameter name: (identifier) @type)
+(let_type_declaration name: (identifier) @type)
 (client_type kind: (identifier) @type.builtin)
 
 ((type_path
@@ -231,6 +234,7 @@
 (interface_declaration name: (identifier) @type)
 (type_alias_declaration name: (identifier) @type)
 (client_declaration name: (identifier) @type)
+(client_value_declaration name: (identifier) @constant)
 (generator_declaration name: (identifier) @constant)
 (retry_policy_declaration name: (identifier) @constant)
 (template_string_declaration name: (identifier) @function)
@@ -298,3 +302,6 @@
 (template_for_open "for" @keyword.control)
 (template_if_open "if" @keyword.control)
 (template_else_if "else" @keyword.control "if" @keyword.control)
+
+; `Extract@spec(...)`: a function's companion.
+(companion_expression companion: (property_identifier) @function.method)

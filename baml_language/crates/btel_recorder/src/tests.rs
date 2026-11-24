@@ -39,7 +39,7 @@ impl<F: FnMut(ConvertedBatch)> Publisher<Snapshot, Snapshot> for ProtobufPublish
     fn span(&mut self, t: TelemetryId, r: &mut SpanRecord<Snapshot, Snapshot>) {
         self.buffer
             .spans
-            .reserve(self.buffer.spans.len() + btel_settings::encoding::MAX_EVENT_BYTES);
+            .reserve(self.buffer.spans.len() + btel_core::recording::frame::MAX_EVENT_BYTES);
         self.buffer.span(t, r);
     }
     fn flush(&mut self) {
@@ -330,7 +330,7 @@ fn completion_variants_roundtrip_without_losing_wire_semantics() {
             _ => panic!("expected completion"),
         };
         let flags = CompletionFlags::from_wire(completion.completion_flags, is_late).unwrap();
-        assert_eq!(flags.outcome(), outcome);
+        assert_eq!(flags.outcome(), crate::flags::outcome(outcome));
         assert_eq!(completion.value_cas_id.is_some(), captured);
         assert_eq!(flags.requires_announcement(), dependency);
         assert_eq!(is_late, late);
@@ -363,7 +363,7 @@ fn completion_variants_roundtrip_without_losing_wire_semantics() {
             &[0x38, u8::try_from(completion.completion_flags).unwrap()]
         );
     }
-    for bits in [0, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, u32::MAX] {
+    for bits in [0, 4, 5, 6, 7, 8, 12, 13, 14, 15, 17, u32::MAX] {
         assert!(CompletionFlags::from_wire(bits, false).is_none());
     }
     for bits in [9, 10, 11, 13, 14, 15] {
@@ -380,6 +380,7 @@ fn converted_output_outlives_recycled_chunks_and_preserves_selector_context() {
         span_chunks: nz(1),
         max_producers: nz(1),
         preallocate: true,
+        overage_wait_base: btel_settings::transport::OVERAGE_WAIT_BASE_DURATION,
     })
     .unwrap();
     let mut processor = Processor::with_publisher(
@@ -822,7 +823,10 @@ fn outcome_merge_growth_and_spills_keep_exact_encoded_size() {
 }
 
 fn snapshot() -> btel_snapshot::Snapshot {
-    let pool = btel_snapshot::SnapshotPool::new(1, btel_snapshot::Limits::default());
+    let pool = btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default());
     let b = pool.try_acquire().unwrap();
-    b.finish_value(btel_snapshot::SnapshotValue::Int(42))
+    b.finish(
+        btel_snapshot::SnapshotValue::Int(42),
+        &mut btel_snapshot::Shaper::default(),
+    )
 }

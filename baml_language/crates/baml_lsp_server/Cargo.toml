@@ -30,11 +30,16 @@ ring-crypto = [
   "sys_native/ring-crypto",
 ]
 native-tls = [ "reqwest/native-tls", "sys_native/native-tls" ]
+# Logs parking_lot deadlocks, for debugging a hung LSP. Off by default: Cargo
+# unifies features per build, so `deadlock_detection` would add its bookkeeping
+# to every parking_lot lock in baml-cli, not just the LSP's.
+deadlock-watchdog = [ "parking_lot/deadlock_detection" ]
 
 [dependencies]
 baml_builtins2 = { workspace = true }
 baml_compiler2_visualization = { workspace = true }
 baml_db = { workspace = true }
+baml_env = { workspace = true }
 baml_ide = { workspace = true }
 baml_lsp = { workspace = true }
 baml_query_btel = { workspace = true }
@@ -59,11 +64,11 @@ lsp-server = { workspace = true }
 lsp-types = { workspace = true }
 notify = { workspace = true }
 num-bigint = { workspace = true }
-parking_lot = { workspace = true, features = [ "deadlock_detection" ] }
+parking_lot = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true, optional = true }
 serde = { workspace = true, features = [ "derive" ] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = [ "arbitrary_precision", "preserve_order" ] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [ "sync", "rt-multi-thread", "net", "time", "macros" ] }
 tokio-tungstenite = { workspace = true }
@@ -73,6 +78,7 @@ tracing-subscriber = { workspace = true }
 webbrowser = { workspace = true }
 
 [dev-dependencies]
+baml_test_support = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [ "macros", "rt-multi-thread" ] }
 

@@ -6,11 +6,12 @@
 //! B adds child threads and routes child completions through
 //! `settles_future`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use ::bex_heap::{Tlab, TlabHolder};
-use ::bex_vm_types::{HeapPtr, RootHaver, types::FutureId};
+use ::bex_vm_types::{HeapPtr, RootHaver, RootVisitor, types::FutureId};
 use bex_vm::BexVm;
+use bex_vm_types::cancellation::{CancellationObserver, CancellationSource};
 use tokio_util::sync::CancellationToken;
 
 /// What cancels a task: its own token, and every token linked into it.
@@ -25,33 +26,37 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct TaskCancel {
     own: CancellationToken,
-    linked: Arc<[CancellationToken]>,
+    linked: Arc<[CancellationSource]>,
+    deadline: Option<crate::invocation::InvocationDeadline>,
 }
 
 impl TaskCancel {
-    /// A root call's: cancelled through the host's token alone.
+    /// A root VM's private cancellation authority, before inputs are attached.
     pub fn root(own: CancellationToken) -> Self {
         Self {
             own,
             linked: Arc::from([]),
+            deadline: None,
         }
     }
 
     /// A task with no cancellation parent (a rooted spawn, or one started by
     /// cleanup code): a fresh token, and `linked`.
-    pub fn detached(linked: impl IntoIterator<Item = CancellationToken>) -> Self {
+    pub fn detached(linked: impl IntoIterator<Item = CancellationSource>) -> Self {
         Self {
             own: CancellationToken::new(),
             linked: linked.into_iter().collect(),
+            deadline: None,
         }
     }
 
     /// A child task's: cancelled with this task, and by `linked` too.
     #[must_use]
-    pub fn child(&self, linked: impl IntoIterator<Item = CancellationToken>) -> Self {
+    pub fn child(&self, linked: impl IntoIterator<Item = CancellationSource>) -> Self {
         Self {
             own: self.own.child_token(),
             linked: self.linked.iter().cloned().chain(linked).collect(),
+            deadline: self.deadline,
         }
     }
 
@@ -61,25 +66,62 @@ impl TaskCancel {
     }
 
     /// Every token whose firing cancels the task.
-    pub fn tokens(&self) -> impl Iterator<Item = &CancellationToken> {
-        std::iter::once(&self.own).chain(self.linked.iter())
+    pub fn sources(&self) -> impl Iterator<Item = CancellationSource> + '_ {
+        std::iter::once(self.own.clone().into()).chain(self.linked.iter().cloned())
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.tokens().any(CancellationToken::is_cancelled)
+        self.sources().any(|source| source.is_cancelled())
+            || self
+                .deadline
+                .is_some_and(crate::invocation::InvocationDeadline::is_expired)
+    }
+
+    pub(crate) fn with_deadline(
+        mut self,
+        deadline: Option<crate::invocation::InvocationDeadline>,
+    ) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    pub(crate) fn deadline(&self) -> Option<crate::invocation::InvocationDeadline> {
+        self.deadline
     }
 
     /// Completes once any token that cancels the task has fired.
     pub async fn cancelled(&self) {
-        if self.linked.is_empty() {
-            return self.own.cancelled().await;
+        let sources = async {
+            if self.linked.is_empty() {
+                self.own.cancelled().await;
+            } else {
+                futures::future::select_all(
+                    self.sources()
+                        .map(|source| Box::pin(async move { source.cancelled().await })),
+                )
+                .await;
+            }
+        };
+        match self.deadline {
+            Some(deadline) => {
+                tokio::select! { () = sources => {}, () = deadline.elapsed() => {} }
+            }
+            None => sources.await,
         }
-        futures::future::select_all(self.tokens().map(|token| Box::pin(token.cancelled()))).await;
     }
 
     /// Cancel the task and, through its own token, its descendants.
     pub fn cancel(&self) {
         self.own.cancel();
+    }
+}
+
+impl CancellationObserver for TaskCancel {
+    fn is_cancelled(&self) -> bool {
+        TaskCancel::is_cancelled(self)
+    }
+    fn cancelled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(TaskCancel::cancelled(self))
     }
 }
 
@@ -89,6 +131,8 @@ pub struct BexThread {
     pub vm: BexVm,
     pub name: Option<String>,
     pub cancel: TaskCancel,
+    pub(crate) host_environment: u64,
+    pub(crate) entry_reservation: Option<Arc<bex_vm_types::trace::ReservedSpanData>>,
     /// The token the thread's in-flight sys-op observes — never `cancel`
     /// itself: whether the thread is shielded is read only once `cancel`
     /// fires, and a shielded thread's cleanup runs its sys-ops to
@@ -101,6 +145,9 @@ pub struct BexThread {
     /// The network span the failing sys-op ends: closed with the thrown
     /// value once the engine has built it.
     pub(crate) network_close: Option<crate::telemetry_network::NetworkClose>,
+    /// Why the thread is parked, for the stuck-task report; `None` while it
+    /// runs.
+    pub(crate) parked: Option<crate::task_report::Parked>,
 }
 
 impl BexThread {
@@ -110,10 +157,13 @@ impl BexThread {
             vm,
             name: None,
             cancel,
+            host_environment: 0,
+            entry_reservation: None,
             sysop_cancel: CancellationToken::new(),
             settles_future: None,
             escaped_outcome: None,
             network_close: None,
+            parked: None,
         }
     }
 
@@ -128,10 +178,14 @@ impl BexThread {
             vm,
             name,
             cancel,
+            host_environment: 0,
+            entry_reservation: None,
             sysop_cancel: CancellationToken::new(),
             settles_future: Some(settles_future),
             escaped_outcome: None,
             network_close: None,
+            // Until it is admitted and starts running.
+            parked: Some(crate::task_report::Parked::Starting),
         }
     }
 
@@ -154,42 +208,22 @@ impl BexThread {
     }
 
     /// Whether the VM is inside a `defer` body, at any depth of the call
-    /// stack. Each bytecode frame's function carries the PC ranges of its
+    /// stack. Each frame's function carries the PC ranges of its
     /// `defer` bodies (`Bytecode::shield_table`); the innermost frame is
-    /// at `cur_pc`, and an outer frame is at its call instruction: the
-    /// saved instruction pointer is the end of that instruction, and the
-    /// block the call continues to may already lie outside the body
-    /// (`defer { f() }` continues after it), so the call itself decides.
+    /// at `cur_pc`, and an outer frame is at its call instruction (see
+    /// `BexVm::frame_pc`): the block the call continues to may already lie
+    /// outside the body (`defer { f() }` continues after it), so the call
+    /// itself decides.
     /// A callee is shielded through its caller, so unwinding needs no
     /// bookkeeping.
     pub fn vm_thread_is_shielded(&self) -> bool {
-        let innermost = self
-            .vm
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, bex_vm::Frame::Bytecode(_)));
-        self.vm
-            .frames
-            .iter()
-            .enumerate()
-            .rev()
-            .any(|(index, frame)| {
-                let bex_vm::Frame::Bytecode(frame) = frame else {
-                    return false;
-                };
-                let pc = if Some(index) == innermost {
-                    self.vm.cur_pc
-                } else {
-                    frame.instruction_ptr.checked_sub(1).unwrap_or_else(|| {
-                        unreachable!("an outer bytecode frame has executed its call instruction")
-                    })
-                };
-                let function = self.frame_function(frame.function);
-                match &function.bytecode.compact {
-                    Some(compact) => compact.pc_is_shielded(pc),
-                    None => function.bytecode.pc_is_shielded(pc),
-                }
-            })
+        self.vm.any_frame_position(|function, pc| {
+            let function = self.frame_function(function);
+            match &function.bytecode.compact {
+                Some(compact) => compact.pc_is_shielded(pc),
+                None => function.bytecode.pc_is_shielded(pc),
+            }
+        })
     }
 
     /// The function a bytecode frame runs, resolved as the VM resolves it: a
@@ -210,12 +244,28 @@ impl BexThread {
 }
 
 impl RootHaver for BexThread {
-    fn collect_roots(&self, roots: &mut Vec<HeapPtr>) {
-        self.vm.collect_roots(roots);
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            vm,
+            name: _,
+            cancel: _,
+            host_environment: _,
+            entry_reservation: _,
+            sysop_cancel: _,
+            settles_future: _,
+            escaped_outcome: _,
+            network_close: _,
+            parked: _,
+        } = self;
+        vm.visit_roots(visitor);
     }
 
-    fn forward_roots(&mut self, roots: &HashMap<HeapPtr, HeapPtr>) {
-        self.vm.forward_roots(roots);
+    fn relocated(&mut self) {
+        self.vm.relocated();
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 

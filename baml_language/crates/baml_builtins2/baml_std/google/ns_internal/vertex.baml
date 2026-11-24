@@ -25,49 +25,85 @@ function _vertex_scope() -> string {
     "https://www.googleapis.com/auth/cloud-platform"
 }
 
-/// (internal) `vercel env pull` and friends store a credential document as a JSON *string*
-/// (`"{\"type\": …}"`). Unwrap that one level so both spellings work; anything
-/// else is returned untouched.
-function _vertex_unwrap_json(document: string) -> string {
-    let trimmed = document.trim();
-    if (trimmed.starts_with("\"")) {
-        baml.json.from_string<string>(trimmed) catch_all (e) {
-            _ => document,
-        }
-    } else {
-        document
-    }
+/// (internal) The credential document a request authenticates with (null for
+/// Application Default Credentials), and a note naming the `env.NAME` options
+/// skipped on the way to it (see `ai.wire.unset_credentials_note`), for the
+/// error when it cannot be used.
+class VertexCredentials {
+    document: string?,
+    skipped: string,
 }
 
-/// (internal) The credential document to authenticate with, or null to run the Rust
-/// Application Default Credentials chain (GOOGLE_APPLICATION_CREDENTIALS, the
-/// well-known ADC file, the gcloud config file, the GCE metadata server).
+/// (internal) The credential to authenticate with, in the client's order:
+/// `credentials_json`, the file `credentials_file` names, the
+/// `GOOGLE_APPLICATION_CREDENTIALS_CONTENT` env var, else Application Default
+/// Credentials (a null `document`).
 ///
-/// An explicitly configured source is used AS-IS: a broken value raises rather
-/// than silently cascading to the next one.
-function _vertex_credentials(c: root.VertexClient) -> string? {
-    if let inline: string = c.credentials_json {
-        return _vertex_unwrap_json(inline);
+/// A configured source is used AS-IS: a broken value raises rather than
+/// silently cascading to the next one. A source whose `env.NAME` is unset or
+/// blank is not configured (see `ai.wire.resolve_credential`).
+function _vertex_credentials(c: root.VertexClient) -> VertexCredentials {
+    if let document: string = ai.wire.resolve_credential(c.credentials_json, null) {
+        return VertexCredentials {
+            document: document,
+            skipped: "",
+        };
     }
-    if let path: string = c.credentials_file {
+    let past_json = ai.wire.unset_credentials_note({ "credentials_json": c.credentials_json });
+    if let path: string = ai.wire.resolve_credential(c.credentials_file, null) {
         let contents = baml.fs.read(path) catch_all (e) {
             _ => {
+                let read_error = match (e) {
+                    let io: baml.errors.Io => io.message,
+                    let parse: baml.errors.ParseError => parse.message,
+                };
                 throw ai.errors.InvalidRequest {
                     provider: "vertex",
                     status_code: null,
-                    detail: `Vertex AI credentials file ${path} could not be read: ${e.to_string()}`,
+                    detail: `${ai.internal._describe_unreadable_credential_file("Vertex AI credentials_file", path, read_error, "credentials_json")}${past_json}`,
                     raw_body: null,
-                }
+                };
             },
         };
-        return _vertex_unwrap_json(contents);
+        return VertexCredentials {
+            document: contents,
+            skipped: past_json,
+        };
     }
+    let skipped = ai.wire.unset_credentials_note({
+        "credentials_json": c.credentials_json,
+        "credentials_file": c.credentials_file,
+    });
     if let from_env: string = baml.env.get("GOOGLE_APPLICATION_CREDENTIALS_CONTENT") {
         if (from_env.trim() != "") {
-            return _vertex_unwrap_json(from_env);
+            return VertexCredentials {
+                document: from_env,
+                skipped: skipped,
+            };
         }
     }
-    null
+    VertexCredentials {
+        document: null,
+        skipped: skipped,
+    }
+}
+
+/// (internal) The failure for a credential that could not be used, from the
+/// project lookup or the token mint alike.
+function _vertex_auth_failure(
+    error: baml.errors.Io | baml.errors.AccessError,
+    credentials: VertexCredentials,
+) -> ai.errors.InvalidRequest {
+    let message = match (error) {
+        let io: baml.errors.Io => io.message,
+        let access: baml.errors.AccessError => access.message,
+    };
+    ai.errors.InvalidRequest {
+        provider: "vertex",
+        status_code: null,
+        detail: `Vertex AI authentication failed: ${message}${credentials.skipped}`,
+        raw_body: null,
+    }
 }
 
 /// (internal) Express mode: a Vertex API key, which replaces the whole OAuth2 flow with a
@@ -160,7 +196,10 @@ function vertex_project_id(c: root.VertexClient, preview: bool = false) -> strin
         // Do not enter the ADC/credential-file chain during a request preview.
         "preview-project"
     } else {
-        root.internal.gcp_project_id(_vertex_credentials(c))
+        let credentials = _vertex_credentials(c);
+        root.internal.gcp_project_id(credentials.document) catch_all (e) {
+            _ => throw _vertex_auth_failure(e, credentials),
+        }
     }
 }
 
@@ -211,9 +250,9 @@ function _vertex_models_base(c: root.VertexClient, preview: bool = false) -> str
         throw ai.errors.InvalidRequest {
             provider: "vertex",
             status_code: null,
-            detail: "Could not resolve project_id for Vertex AI. Set the client's project_id option, the GOOGLE_CLOUD_PROJECT env var, or supply credentials that carry a project_id.",
+            detail: `Could not resolve project_id for Vertex AI. Set the client's project_id option, the GOOGLE_CLOUD_PROJECT env var, or supply credentials that carry a project_id.${ai.wire.unset_credentials_note({ "project_id": c.project_id, "credentials_json": c.credentials_json, "credentials_file": c.credentials_file })}`,
             raw_body: null,
-        }
+        };
     }
 }
 
@@ -276,7 +315,8 @@ function _vertex_anthropic_body(
         // The caller's request_body merges over the Vertex constants, so an
         // explicit anthropic_version wins.
         request_body: ai.wire.merge_request_body(vertex_fields, c.request_body),
-        client_id: c.id(),
+        provider: "vertex",
+        default_cache_args: c.default_cache_args(),
     };
     anthropic.internal.messages_body(params, input, stream, preview = preview)
 }
@@ -305,7 +345,8 @@ function _vertex_request(
     } else {
         root.internal.gemini_build_body(
             input,
-            c.id(),
+            "vertex",
+            c.model,
             root.internal._gm_generation_config(
                 c.temperature,
                 c.max_output_tokens,
@@ -337,28 +378,27 @@ function _vertex_request(
             }
         } else {
             let credentials = _vertex_credentials(c);
-            let token = root.internal.gcp_access_token(credentials, _vertex_scope()) catch_all (e) {
-                _ => {
-                    throw ai.errors.InvalidRequest {
-                        provider: "vertex",
-                        status_code: null,
-                        detail: `Vertex AI authentication failed: ${e.to_string()}`,
-                        raw_body: null,
-                    }
-                },
-            };
+            let token = root.internal
+                .gcp_access_token(credentials.document, _vertex_scope()) catch_all (e) {
+                    _ => throw _vertex_auth_failure(e, credentials),
+                };
             let _ = with_user.set("authorization", `Bearer ${token}`);
             // google-auth parity (`Credentials.apply`): bill quota to the
             // configured project, unless the caller set the header themselves.
             if (with_user.get("x-goog-user-project") == null) {
-                if let quota: string = root.internal.gcp_quota_project_id(credentials) {
+                if let quota: string = root.internal.gcp_quota_project_id(credentials.document) {
                     let _ = with_user.set("x-goog-user-project", quota);
                 }
             }
         }
         null
     };
-    baml.http.Request { method: "POST", url: url, headers: with_user, body: body }
+    baml.http.Request {
+        method: "POST",
+        url: url,
+        headers: with_user,
+        body: body,
+    }
 }
 
 /// The one internal entry point: render, send, normalize — one model turn.
@@ -368,22 +408,36 @@ function vertex_invoke(c: root.VertexClient, input: ai.ModelTurnInput) -> ai.Mod
     if (_vertex_publisher(c) == "anthropic") {
         let sent = ai.wire.send_as_with_wire<anthropic.internal.Response>(
             req,
-            "vertex",
-            c.id(),
+            ai.events.ModelKey {
+                provider: c.provider(),
+                model: c.model,
+            },
             capture_wire = c.capture_wire,
         );
-        let turn = anthropic.internal.parse(sent.value);
-        return ai.ModelTurn { ...turn, calls: [sent.call], model: c.model };
+        return ai.internal.with_own_call(
+            anthropic.internal.parse(sent.value),
+            sent.call,
+            anthropic.internal.usage(sent.value),
+            c.model,
+            sent.value.model,
+        );
     }
     let seq = input.journal.entries().length();
     let sent = ai.wire.send_as_with_wire<root.internal.GmResponse>(
         req,
-        "vertex",
-        c.id(),
+        ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
         capture_wire = c.capture_wire,
     );
-    let turn = root.internal.parse(sent.value, seq, provider = "vertex");
-    ai.ModelTurn { ...turn, calls: [sent.call], model: c.model }
+    ai.internal.with_own_call(
+        root.internal.parse(sent.value, seq, provider = "vertex"),
+        sent.call,
+        root.internal._gm_usage(sent.value.usageMetadata),
+        c.model,
+        sent.value.modelVersion,
+    )
 }
 
 function _vertex_decode_batch(batch: string) -> ai.stream.Event[] {
@@ -432,13 +486,16 @@ function vertex_invoke_stream(
             dispatched = started,
         )
     };
-    let call = ai.events.LLMCall {
-        client_name: c.id(),
-        provider: "vertex",
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: null,
-            ttft_ms: null,
+            start_time: started,
+            duration: null,
+            ttft: null,
         },
         http_request: if (c.capture_wire) {
             baml.http.Request {
@@ -451,17 +508,15 @@ function vertex_invoke_stream(
         } else {
             null
         },
-        http_response: ai.events.HttpResponse { status: sse.status_code, headers: sse.headers, body: null },
-        usage: null,
-        selected: true,
-        sse_responses: if (c.capture_wire) {
-            []
-        } else {
-            null
+        http_response: ai.events.HttpResponse {
+            status: sse.status_code,
+            headers: sse.headers,
+            body: null,
         },
+        sse_responses: if (c.capture_wire) { [] } else { null },
     };
-    stream._calls = [call];
     stream._wire_call = call;
+    stream._requested_model = c.model;
     stream._call_started = started;
     stream._ttft_from = baml.time.Instant.now();
     stream._capture_sse = c.capture_wire;

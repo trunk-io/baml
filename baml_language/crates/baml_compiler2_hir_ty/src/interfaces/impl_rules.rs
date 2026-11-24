@@ -48,29 +48,10 @@ pub struct ImplData<'db> {
     pub origin: InterfaceImplOrigin,
 }
 
-/// # Safety
-///
-/// `ImplData<'db>` holds Salsa interned locs with a db-tied lifetime, so it
-/// can't auto-derive `salsa::Update`; `maybe_update` uses `PartialEq` for
-/// proper early-cutoff.
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[allow(unsafe_code)]
-unsafe impl salsa::Update for ImplData<'_> {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        // SAFETY: `old_pointer` is valid, aligned, and Salsa-owned.
-        #[allow(unsafe_code)]
-        let old = unsafe { &*old_pointer };
-        if old == &new_value {
-            false
-        } else {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            true
-        }
-    }
-}
+unsafe impl salsa::SalsaValue for ImplData<'_> {}
 
 /// Where in an `implements` block a diagnostic originated. Span-free
 /// (Salsa-stable); check.rs maps it to a source range via [`impl_data_source_map`].
@@ -136,7 +117,7 @@ pub fn interface_loc_qtn<'db>(
 }
 
 /// Why [`impl_data`] could not produce an [`ImplData`].
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub enum ImplDataError {
     /// The implements target does not name an interface. The diagnostics
     /// lowered before the failure ride along so check.rs still surfaces them.
@@ -228,7 +209,7 @@ pub fn impl_data<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     impl_loc: baml_compiler2_hir::loc::ImplLoc<'db>,
 ) -> Result<ImplData<'db>, ImplDataError> {
-    use baml_compiler2_hir::item_data::{ImplSubjectData, function_data, impl_block_data};
+    use baml_compiler2_hir::item_data::{function_data, impl_block_data};
 
     let file = impl_loc.file(db);
     let block = impl_block_data(db, impl_loc);
@@ -237,117 +218,66 @@ pub fn impl_data<'db>(
     let pkg_items = baml_compiler2_hir::package::package_items(db, pkg_info.root);
     let ns = &pkg_info.namespace_path;
 
-    // Normalize in-body → free: an in-body impl's generics are the class's and
-    // its for-type is the class applied to its own params as type vars.
-    let (
-        generic_param_names,
-        for_ty_pattern,
-        generic_params,
-        for_target_diags,
-        bound_diags,
-        origin,
-    ) = match &block.subject {
-        ImplSubjectData::InClass { class, out_of_body } => {
-            let class_data = baml_compiler2_hir::item_data::class_data(db, *class);
-            let generic_param_names = crate::lower::class_generic_frame(db, *class);
-            let class_qtn = qualify_def(db, Definition::Class(*class), &class_data.name);
-            let for_ty = Ty::Class(
-                class_qtn.clone(),
-                generic_param_names
-                    .iter()
-                    .map(|p| Ty::TypeVar(p.clone()))
-                    .collect(),
-            );
-            // An in-body impl's generics ARE the class's; the class declaration
-            // owns its bounds' diagnostics, so they are lowered into a
-            // discarded sink here.
-            let mut class_bound_diags = Vec::new();
-            let generic_params: Vec<(ParamTy, Vec<baml_type::Interface>)> = generic_param_names
-                .iter()
-                .zip(class_data.generic_params.iter())
-                .map(|(name, declared)| {
-                    let ifaces = lower_generic_param_interface_bounds(
-                        db,
-                        &class_data.type_refs,
-                        &declared.bounds,
-                        pkg_items,
-                        ns,
-                        &generic_param_names,
-                        &mut class_bound_diags,
-                    );
-                    (name.clone(), ifaces)
-                })
-                .collect();
-            (
-                generic_param_names,
-                for_ty,
-                generic_params,
-                Vec::new(),
-                Vec::new(),
-                // A simple `implement I for C` is merged onto `C` (`InClass`
-                // subject) but written out-of-body — its origin stays `OutOfBody`.
-                if *out_of_body {
-                    InterfaceImplOrigin::OutOfBody
-                } else {
-                    InterfaceImplOrigin::InBodyClass { class_qtn }
-                },
-            )
+    // Both spellings arrive in one shape: an in-body block carries its class's
+    // generics and the class as its for-target. Provenance decides only the
+    // origin, which the out-of-body-only gates read.
+    let (for_target, generics) = (&block.for_target, &block.generics);
+    let names: Vec<Name> = generics.iter().map(|g| g.name.clone()).collect();
+    let generic_param_names = crate::lower::impl_frame(db, impl_loc);
+    let mut bound_diags = Vec::new();
+    // `implements<T, T> …` — a duplicate impl generic is a declaration error.
+    for (idx, name) in names.iter().enumerate() {
+        if names[..idx].contains(name) {
+            bound_diags.push(TirTypeError::DuplicateGenericParam { name: name.clone() });
         }
-        ImplSubjectData::Free {
-            for_target,
-            generics,
-        } => {
-            let names: Vec<Name> = generics.iter().map(|g| g.name.clone()).collect();
-            let generic_param_names = crate::lower::impl_frame(db, impl_loc);
-            let mut for_target_diags = Vec::new();
-            let for_ty = lower_ref_in(
-                &LowerScope {
-                    db,
-                    package_items: pkg_items,
-                    ns_context: ns,
-                    generic_params: &generic_param_names,
-                    bounds: &TypeVarBoundsMap::default(),
-                    self_ty: None,
-                },
+    }
+    let generic_params: Vec<_> = generics
+        .iter()
+        .zip(generic_param_names.iter())
+        .map(|(g, param)| {
+            let ifaces = lower_generic_param_interface_bounds(
+                db,
                 &block.type_refs,
-                *for_target,
-                &mut for_target_diags,
+                &g.bounds,
+                pkg_items,
+                ns,
+                &generic_param_names,
+                &mut bound_diags,
             );
-            let mut bound_diags = Vec::new();
-            // `implements<T, T> …` — a duplicate impl generic is a declaration error.
-            for (idx, name) in names.iter().enumerate() {
-                if names[..idx].contains(name) {
-                    bound_diags.push(TirTypeError::DuplicateGenericParam { name: name.clone() });
-                }
-            }
-            let generic_params = generics
-                .iter()
-                .zip(generic_param_names.iter())
-                .map(|(g, param)| {
-                    let ifaces = lower_generic_param_interface_bounds(
-                        db,
-                        &block.type_refs,
-                        &g.bounds,
-                        pkg_items,
-                        ns,
-                        &generic_param_names,
-                        &mut bound_diags,
-                    );
-                    (param.clone(), ifaces)
-                })
-                .collect();
-            (
-                generic_param_names,
-                for_ty,
-                generic_params,
-                for_target_diags,
-                bound_diags,
-                InterfaceImplOrigin::OutOfBody,
-            )
-        }
+            (param.clone(), ifaces)
+        })
+        .collect();
+    let bounds = generic_params.iter().cloned().collect();
+    let mut for_target_diags = Vec::new();
+    let for_ty = lower_ref_in(
+        &LowerScope {
+            db,
+            package_items: pkg_items,
+            ns_context: ns,
+            generic_params: &generic_param_names,
+            bounds: &bounds,
+            self_ty: None,
+        },
+        &block.type_refs,
+        *for_target,
+        &mut for_target_diags,
+    );
+    let origin = match block.origin {
+        baml_compiler2_ast::ImplOrigin::OutOfBody => InterfaceImplOrigin::OutOfBody,
+        baml_compiler2_ast::ImplOrigin::InBody => match &for_ty {
+            Ty::Class(class_qtn, _) => InterfaceImplOrigin::InBodyClass {
+                class_qtn: class_qtn.clone(),
+            },
+            // The class the block is written in did not resolve to a class
+            // type (its name is shadowed or malformed); nothing in-body
+            // applies.
+            _ => InterfaceImplOrigin::OutOfBody,
+        },
     };
+    let for_ty_pattern = for_ty;
 
     let mut interface_target_diags = Vec::new();
+    let bounds = generic_params.iter().cloned().collect();
     // The target is a constraint head: it pins only its written inline bindings.
     let lowered_interface = lower_ref_in_at(
         &LowerScope {
@@ -355,7 +285,7 @@ pub fn impl_data<'db>(
             package_items: pkg_items,
             ns_context: ns,
             generic_params: &generic_param_names,
-            bounds: &TypeVarBoundsMap::default(),
+            bounds: &bounds,
             self_ty: None,
         },
         &block.type_refs,
@@ -492,10 +422,10 @@ pub fn impl_data<'db>(
         }
         // Field-side conformance, in-body class impls only.
         if let InterfaceImplOrigin::InBodyClass { class_qtn } = &origin
-            && let ImplSubjectData::InClass { class, .. } = &block.subject
+            && let Some(class) = baml_compiler2_hir::item_data::impl_enclosing_class(db, impl_loc)
             && (!block.field_links.is_empty() || !iface_data.fields.is_empty())
         {
-            let class_fields = crate::lower::resolve_class_fields(db, *class);
+            let class_fields = crate::lower::resolve_class_fields(db, class);
             let is_iface_field =
                 |name: &Name| iface_data.fields.iter().any(|fld| fld.name == *name);
             let is_class_field = |name: &Name| class_fields.iter().any(|(n, _, _)| n == name);
@@ -691,7 +621,7 @@ pub fn impl_data_source_map<'db>(
     impl_loc: baml_compiler2_hir::loc::ImplLoc<'db>,
 ) -> ImplDataSourceMap {
     use baml_compiler2_hir::item_data::{
-        ImplSubjectData, function_data, function_source_map, impl_block_data, impl_block_source_map,
+        function_data, function_source_map, impl_block_data, impl_block_source_map,
     };
 
     let file_id = impl_loc.file(db).file_id(db);
@@ -699,12 +629,13 @@ pub fn impl_data_source_map<'db>(
     let spans = impl_block_source_map(db, impl_loc);
     let interface_target_range = spans.type_refs.span(block.interface_target);
     // In-body impls attribute to the interface-target span; out-of-body to the
-    // whole block span.
-    let (impl_range, for_target_span) = match &block.subject {
-        ImplSubjectData::InClass { .. } => (interface_target_range, None),
-        ImplSubjectData::Free { for_target, .. } => (
+    // whole block span (an in-body block's for-target is the class, written
+    // nowhere in the block).
+    let (impl_range, for_target_span) = match block.origin {
+        baml_compiler2_ast::ImplOrigin::InBody => (interface_target_range, None),
+        baml_compiler2_ast::ImplOrigin::OutOfBody => (
             spans.span,
-            Some(Span::new(file_id, spans.type_refs.span(*for_target))),
+            Some(Span::new(file_id, spans.type_refs.span(block.for_target))),
         ),
     };
     // Group all override spans by name so a same-named duplicate marks every occurrence.
@@ -866,7 +797,7 @@ impl<'db> InterfaceMethodSpec<'db> {
         // lower through the same road as written types.
         let mut scratch = baml_compiler2_hir::type_ref::TypeRefBuilder::new();
         let self_id = scratch.alloc_synthetic(baml_compiler2_hir::type_ref::TypeRefKind::Path {
-            segments: vec![Name::new("Self")],
+            path: baml_base::Path::bare(Name::new("Self")),
             generic_args: Box::new([]),
             associated_type_bindings: Box::new([]),
         });
@@ -1053,9 +984,7 @@ pub fn validate_impl_signatures<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
     impl_loc: baml_compiler2_hir::loc::ImplLoc<'db>,
 ) -> Vec<(TirTypeError, ImplDiagnosticLocation)> {
-    use baml_compiler2_hir::item_data::{
-        ImplSubjectData, function_data, impl_block_data, interface_data,
-    };
+    use baml_compiler2_hir::item_data::{function_data, impl_block_data, interface_data};
 
     let mut diags = Vec::new();
     let file = impl_loc.file(db);
@@ -1085,10 +1014,7 @@ pub fn validate_impl_signatures<'db>(
         Err(ImplDataError::InterfaceUnresolved { .. }) => {
             use crate::impls::ImplHeaderResolution;
 
-            let out_of_body = match &block.subject {
-                ImplSubjectData::InClass { out_of_body, .. } => *out_of_body,
-                ImplSubjectData::Free { .. } => true,
-            };
+            let out_of_body = block.origin == baml_compiler2_ast::ImplOrigin::OutOfBody;
 
             let (facts, for_ty, validate_requires) = match crate::impls::impl_facts(db, impl_loc) {
                 ImplHeaderResolution::Unresolved => return diags,
@@ -1180,7 +1106,7 @@ pub fn validate_impl_signatures<'db>(
                     crate::impls::REQUIRES_CLOSURE_FUEL,
                 ) {
                     let required_ty = baml_type::normalize::normalize(&required.to_ty(), &ctx);
-                    if baml_type_runtime::contains_error_recovery(&required_ty) {
+                    if baml_type::contains_error(&required_ty) {
                         continue;
                     }
                     let Some(required) = required_ty.as_interface() else {
@@ -1245,7 +1171,7 @@ pub fn validate_impl_signatures<'db>(
 
     // The canonical algebra context: hir_ty's fact oracle carrying the impl's
     // own param env (TIR's `GlobalTypeContext` role).
-    let res_ctx = crate::package_interface::package_resolution_context(db, pkg_id);
+    let pkg_items = baml_compiler2_hir::package::package_items(db, pkg_id);
     let aliases = super::package_resolved_aliases(db, pkg_id);
     let bounds: TypeVarBoundsMap = data.generic_params.iter().cloned().collect();
     let ctx = crate::facts::Facts::with_bounds(db, bounds.clone().into_iter().collect());
@@ -1260,9 +1186,9 @@ pub fn validate_impl_signatures<'db>(
     // ── E0116: field-type conformance (in-body impls). ──
     if !iface_data.fields.is_empty()
         && matches!(data.origin, InterfaceImplOrigin::InBodyClass { .. })
-        && let ImplSubjectData::InClass { class, .. } = &block.subject
+        && let Some(class) = baml_compiler2_hir::item_data::impl_enclosing_class(db, impl_loc)
     {
-        let class_fields = crate::lower::resolve_class_fields(db, *class);
+        let class_fields = crate::lower::resolve_class_fields(db, class);
         let iface_field_bounds = interface_declared_param_bounds(db, data.interface);
         // Realize the interface's declared field types at the impl's interface args.
         let iface_bindings =
@@ -1440,7 +1366,7 @@ pub fn validate_impl_signatures<'db>(
         let impl_method_params = &impl_scope_generics[impl_generic_names.len()..];
         let mut impl_fn = realize_with_symbolic_self(
             db,
-            &res_ctx.own_items,
+            pkg_items,
             &pkg_info.namespace_path,
             &impl_scope_generics,
             &iface_self_param,
@@ -1497,7 +1423,7 @@ pub fn validate_impl_signatures<'db>(
         // be entailed by the interface method's bound at the same position.
         let impl_bounds = method_generic_bound_interfaces(
             db,
-            &res_ctx.own_items,
+            pkg_items,
             &pkg_info.namespace_path,
             &impl_scope_generics,
             &impl_spec,
@@ -1578,10 +1504,10 @@ pub fn validate_impl_signatures<'db>(
             let Ty::Interface(qtn, generics, assoc) = &required else {
                 continue;
             };
-            // An ill-formed clause realizes to an obligation carrying a recovery
-            // sentinel — a cascade off an error already reported at the
+            // An ill-formed clause realizes to an obligation carrying the
+            // error sentinel — a cascade off an error already reported at the
             // interface declaration.
-            if baml_type_runtime::contains_error_recovery(&required) {
+            if baml_type::contains_error(&required) {
                 continue;
             }
             let required_iface = baml_type::Interface {
@@ -1771,7 +1697,7 @@ fn collect_ty_packages(ty: &Ty, out: &mut Vec<baml_base::SourceRoot>) {
             collect_ty_packages(key, out);
             collect_ty_packages(value, out);
         }
-        Ty::Union(members) => {
+        Ty::Union(members) | Ty::Tuple(members) => {
             for m in members {
                 collect_ty_packages(m, out);
             }
@@ -1805,11 +1731,9 @@ fn collect_ty_packages(ty: &Ty, out: &mut Vec<baml_base::SourceRoot>) {
         | Ty::Media(..)
         | Ty::Literal(..)
         | Ty::TypeVar(..)
-        | Ty::RustType
         | Ty::Type
         | Ty::Resource
         | Ty::PromptAst
-        | Ty::Void
         | Ty::Unknown
         | Ty::Never
         | Ty::Error => {}
@@ -1840,12 +1764,12 @@ pub fn implements_interface(
     aliases: &HashMap<DeclName, Ty>,
     mut is_subtype: impl FnMut(&Ty, &Ty) -> bool,
 ) -> bool {
-    // The blanket stdlib impl supplies AnyClass's default-method dispatch, but
-    // membership is compiler-derived and narrower. Reuse the normalizer's
-    // class-only rule so `requires AnyClass` cannot observe the blanket.
+    // Derived capabilities have no source impl block to find. The normalizer
+    // proves their membership using the caller's parameter environment.
     if interface
         .name
         .is_lang_root_type(lang_roots(db), baml_base::LangPackage::Reflect, "AnyClass")
+        || crate::impls::structural_interface(db, &interface.name).is_some()
     {
         return is_subtype(concrete, &interface.to_ty());
     }
@@ -1899,43 +1823,6 @@ pub fn type_implements_interface(
         }
     }
     false
-}
-
-/// Symbolic counterpart of [`get_implements_block`]: unlike membership, the
-/// caller reads the match's realized associated-type pins, so a UNIQUE
-/// matching block is required: several distinct matches return `None`.
-pub fn get_implements_block_symbolic<'db>(
-    db: &'db dyn baml_compiler2_hir::Db,
-    pkg_id: baml_base::SourceRoot,
-    concrete: &Ty,
-    interface: &baml_type::Interface,
-    aliases: &HashMap<DeclName, Ty>,
-    mut is_subtype: impl FnMut(&Ty, &Ty) -> bool,
-) -> Option<ResolvedImpl<'db>> {
-    let mut packages = vec![pkg_id];
-    packages.extend(baml_compiler2_hir::package::package_dependency_closure(
-        db, pkg_id,
-    ));
-    let mut found: Option<ResolvedImpl<'db>> = None;
-    for pkg in packages {
-        for &impl_loc in package_impl_locs(db, pkg) {
-            let Ok(data) = impl_data(db, impl_loc).as_ref() else {
-                continue;
-            };
-            let Some(bindings) = match_impl_head(db, data, concrete, interface, aliases) else {
-                continue;
-            };
-            if !impl_bounds_hold_symbolic(data, &bindings, &mut is_subtype) {
-                continue;
-            }
-            if found.is_some() {
-                // Coherence guarantees uniqueness only for realized inputs.
-                return None;
-            }
-            found = Some(ResolvedImpl { impl_loc, bindings });
-        }
-    }
-    found
 }
 
 /// [`get_implements_block`] with an explicit recursion budget.
@@ -2101,54 +1988,6 @@ fn impl_bounds_hold_symbolic(
     })
 }
 
-/// Every impl block in `pkg_id` + dependency closure that applies to `concrete`.
-/// Symbolic-capable: `concrete` may carry free vars.
-pub fn impls_for_type<'db>(
-    db: &'db dyn baml_compiler2_hir::Db,
-    pkg_id: baml_base::SourceRoot,
-    concrete: &Ty,
-    aliases: &HashMap<DeclName, Ty>,
-    mut is_subtype: impl FnMut(&Ty, &Ty) -> bool,
-) -> Vec<ResolvedImpl<'db>> {
-    let mut packages = vec![pkg_id];
-    packages.extend(baml_compiler2_hir::package::package_dependency_closure(
-        db, pkg_id,
-    ));
-    let mut out = Vec::new();
-    for pkg in packages {
-        for &impl_loc in package_impl_locs(db, pkg) {
-            let Ok(data) = impl_data(db, impl_loc).as_ref() else {
-                continue;
-            };
-            let param_names: Vec<ParamTy> = data
-                .generic_params
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect();
-            if let Ty::TypeVar(name) = &data.for_ty_pattern
-                && param_names.contains(name)
-                && !is_concrete_receiver(concrete)
-            {
-                continue;
-            }
-            let Some(bindings) = match_ty_patterns(
-                &[(&data.for_ty_pattern, concrete)],
-                &param_names,
-                &baml_type::unify::AliasEquivCtx {
-                    aliases,
-                    lang: lang_roots(db),
-                },
-            ) else {
-                continue;
-            };
-            if impl_bounds_hold_symbolic(data, &bindings, &mut is_subtype) {
-                out.push(ResolvedImpl { impl_loc, bindings });
-            }
-        }
-    }
-    out
-}
-
 /// When `concrete` *almost* implements the interface `requested` via some impl
 /// block — the implementor shape matches but a concrete generic bound fails —
 /// return the first failing `(param, required_bound_as_ty, actual_arg)`.
@@ -2219,32 +2058,6 @@ pub fn first_failing_impl_bound(
         }
     }
     None
-}
-
-impl<'db> ResolvedImpl<'db> {
-    /// The interface this impl provides at its resolved instantiation:
-    /// the declared interface with the impl's bindings substituted in.
-    pub fn implemented_interface(
-        &self,
-        db: &'db dyn baml_compiler2_hir::Db,
-    ) -> baml_type::Interface {
-        let data = impl_data(db, self.impl_loc)
-            .as_ref()
-            .unwrap_or_else(|_| unreachable!("a ResolvedImpl carries an impl_data-Ok impl"));
-        let name = interface_loc_qtn(db, data.interface)
-            .unwrap_or_else(|| unreachable!("an impl_data-Ok impl has a named interface target"));
-        let generics = data
-            .interface_args
-            .iter()
-            .map(|arg| substitute_ty(arg, &self.bindings))
-            .collect();
-        let associated_types = data
-            .associated_types
-            .iter()
-            .map(|(name, ty)| (name.clone(), substitute_ty(ty, &self.bindings)))
-            .collect();
-        baml_type::Interface::new(name, generics, associated_types)
-    }
 }
 
 #[cfg(test)]

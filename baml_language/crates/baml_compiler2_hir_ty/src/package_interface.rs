@@ -17,7 +17,7 @@ use baml_compiler2_hir::{
     file_package,
     loc::{ClassLoc, EnumLoc, FunctionLoc, InterfaceLoc, TypeAliasLoc},
     package::{
-        DependencyTable, PackageItems, accessible_package, edge_table, is_precompiled_stdlib,
+        DependencyTable, PackageItems, PathHead, edge_table, is_precompiled_stdlib,
         is_served_from_interface,
     },
 };
@@ -30,7 +30,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     callable::{ExternalCallTarget, ExternalLinkability},
-    extern_loc::{ExternFunctionLoc, extern_function_named},
+    extern_loc::{ExternFunctionLoc, ExternLetLoc, extern_function_named, mounted_let_named},
     lower::qualify_def,
     render::{Spell, Viewpoint},
 };
@@ -38,24 +38,17 @@ use crate::{
 /// Count of *honest* (non-seeded) `package_interface` derivations for stdlib
 /// packages, since process start. A warm compile that seeds the cached stdlib
 /// interface should leave this at zero; a cold compile bumps it up once per
-/// stdlib package. Exposed for the `BAML_CACHE_DEBUG` warm-run counter and the
-/// seeding tests — not part of any compile result.
+/// stdlib package. Exposed for the seeding tests — not part of any compile
+/// result.
 static STDLIB_HONEST_DERIVATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-
-/// Number of stdlib `package_interface`s derived honestly (from source, not
-/// from a seed) since process start. Zero on a warm run whose stdlib interface
-/// seed served every stdlib package; one per stdlib package on a cold run.
-pub fn stdlib_honest_derivations() -> usize {
-    STDLIB_HONEST_DERIVATIONS.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
 /// Fully-resolved typed interface for a package.
 /// Consumers never touch dependency `ItemTree` or raw `TypeExpr`.
 ///
-/// Serializes with Borsh so the six stdlib packages' interfaces can be cached
+/// Serializes with Borsh so the stdlib packages' interfaces can be cached
 /// once per compiler build (B-694 "export data") and seeded back into a fresh
 /// database, skipping the cold re-derivation. Every leaf (`Ty`,
 /// `DeclName`, `Name`, `FunctionParamTy`, `BuiltinKind`,
@@ -74,6 +67,10 @@ pub struct PackageInterface<N: Head = DeclName> {
     pub types: IndexMap<Vec<Name>, IndexMap<Name, ExportedType<N>>>,
     /// All exported free functions: namespace path -> name -> `ExportedFunction`
     pub functions: IndexMap<Vec<Name>, IndexMap<Name, ExportedFunction<N>>>,
+    /// All exported top-level bindings — global variables and clients:
+    /// namespace path -> name -> `ExportedValue`. A consumer reads one by the
+    /// slot its package's `$init` filled.
+    pub values: IndexMap<Vec<Name>, IndexMap<Name, ExportedValue<N>>>,
     /// Throw sets for all functions in this package (transitive, fully inferred).
     pub throw_sets: FunctionThrowSets<N>,
     /// Complete namespace set, including namespaces whose only declaration is
@@ -94,6 +91,9 @@ pub struct PackageInterface<N: Head = DeclName> {
     pub reexports: IndexMap<Vec<Name>, IndexMap<Name, ReExport<N>>>,
 }
 
+/// The version every interface this compiler exports is stamped with.
+pub const COMPILER_VERSION: &str = baml_version::CANONICAL_VERSION;
+
 /// A package interface as an artifact carries it: the rows, with every head
 /// addressed by a slot of the blob's own dependency table.
 ///
@@ -109,6 +109,13 @@ pub struct PackageInterface<N: Head = DeclName> {
 /// bytes mean the same declarations in every database and under every alias.
 #[derive(Debug, Clone, PartialEq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct WireInterface {
+    /// What the exporting package's manifest claims it is (BEP-085). Part of
+    /// the payload, so the interface digest covers it: the same rows under
+    /// another name or version are another interface.
+    pub claimed: baml_base::ClaimedIdentity,
+    /// The compiler that exported the interface ([`COMPILER_VERSION`]), in
+    /// the payload for the same reason.
+    pub compiler_version: String,
     pub dependencies: Vec<Locator>,
     pub rows: PackageInterface<WireName>,
 }
@@ -171,6 +178,19 @@ impl<N: Head> PackageInterface<N> {
                         items
                             .iter()
                             .map(|(name, function)| Ok((name.clone(), function.try_map_heads(f)?)))
+                            .collect::<Result<IndexMap<_, _>, E>>()?,
+                    ))
+                })
+                .collect::<Result<IndexMap<_, _>, E>>()?,
+            values: self
+                .values
+                .iter()
+                .map(|(ns, items)| {
+                    Ok((
+                        ns.clone(),
+                        items
+                            .iter()
+                            .map(|(name, value)| Ok((name.clone(), value.try_map_heads(f)?)))
                             .collect::<Result<IndexMap<_, _>, E>>()?,
                     ))
                 })
@@ -239,12 +259,44 @@ fn try_map_functions<N: Head, M: Head, E>(
         .collect()
 }
 
+/// What an exported class holds: its fields, or Rust-owned state in their
+/// place. A class has one or the other, never both.
+#[derive(Debug, Clone, PartialEq, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub enum ExportedClassBody<N: Head = DeclName> {
+    /// A plain class: its fields, in declaration order.
+    Fields(Vec<(Name, Ty<N>, ExportedFieldAttrs)>),
+    /// A `@@rust_type` class: its state lives in Rust, of this kind, and only
+    /// its own functions create an instance, so a dependent may not write a
+    /// literal of it.
+    RustType(baml_base::RustPayloadKind),
+}
+
+impl<N: Head> ExportedClassBody<N> {
+    /// The fields, of which a `@@rust_type` class has none.
+    pub fn fields(&self) -> &[(Name, Ty<N>, ExportedFieldAttrs)] {
+        match self {
+            Self::Fields(fields) => fields,
+            Self::RustType(_) => &[],
+        }
+    }
+
+    fn try_map_heads<M: Head, E>(
+        &self,
+        f: &mut impl FnMut(&N) -> Result<M, E>,
+    ) -> Result<ExportedClassBody<M>, E> {
+        Ok(match self {
+            Self::Fields(fields) => ExportedClassBody::Fields(try_map_fields(fields, f)?),
+            Self::RustType(kind) => ExportedClassBody::RustType(*kind),
+        })
+    }
+}
+
 /// A type exported from a package.
 #[derive(Debug, Clone, PartialEq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub enum ExportedType<N: Head = DeclName> {
     Class {
         qtn: N,
-        fields: Vec<(Name, Ty<N>, ExportedFieldAttrs)>,
+        body: ExportedClassBody<N>,
         methods: Vec<ExportedFunction<N>>,
         generic_params: Vec<ParamTy>,
         generic_param_bounds: Vec<Vec<baml_type::Interface<N>>>,
@@ -280,13 +332,13 @@ impl<N: Head> ExportedType<N> {
         Ok(match self {
             Self::Class {
                 qtn,
-                fields,
+                body,
                 methods,
                 generic_params,
                 generic_param_bounds,
             } => ExportedType::Class {
                 qtn: f(qtn)?,
-                fields: try_map_fields(fields, f)?,
+                body: body.try_map_heads(f)?,
                 methods: try_map_functions(methods, f)?,
                 generic_params: generic_params.clone(),
                 generic_param_bounds: try_map_bounds(generic_param_bounds, f)?,
@@ -412,6 +464,29 @@ pub enum ExportedImplOrigin<N: Head = DeclName> {
     OutOfBody,
 }
 
+/// A top-level binding exported from a package: a global variable or a
+/// client. Only its type crosses the boundary; its value lives in the slot the
+/// exporting package's `$init` fills, which a consumer imports by path.
+#[derive(Debug, Clone, PartialEq, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct ExportedValue<N: Head = DeclName> {
+    pub name: Name,
+    /// The type every reader sees: the annotation, or the initializer's
+    /// widened type.
+    pub ty: Ty<N>,
+}
+
+impl<N: Head> ExportedValue<N> {
+    fn try_map_heads<M: Head, E>(
+        &self,
+        f: &mut impl FnMut(&N) -> Result<M, E>,
+    ) -> Result<ExportedValue<M>, E> {
+        Ok(ExportedValue {
+            name: self.name.clone(),
+            ty: self.ty.try_map_heads(f)?,
+        })
+    }
+}
+
 /// A function exported from a package (free function or method).
 #[derive(Debug, Clone, PartialEq, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct ExportedFunction<N: Head = DeclName> {
@@ -465,6 +540,9 @@ pub struct FileInterfaceFragment {
     pub types: IndexMap<Name, ExportedType>,
     /// Free functions this file exports: name -> `ExportedFunction` (first wins).
     pub functions: IndexMap<Name, ExportedFunction>,
+    /// Top-level bindings this file exports: name -> `ExportedValue` (first
+    /// wins).
+    pub values: IndexMap<Name, ExportedValue>,
 }
 
 /// The only per-file interface data consumed across CLI process boundaries.
@@ -502,10 +580,12 @@ pub enum ResolvedSource {
 /// A value lookup never lies about source ownership: a source-backed result
 /// is its real definition; a served package's result is the identity of its
 /// exported row, whose facts every consumer reads through
-/// [`crate::extern_loc::extern_function_row`].
+/// [`crate::extern_loc::extern_function_row`] for a function and
+/// [`crate::extern_loc::extern_let_row`] for a top-level binding.
 pub enum ResolvedValue<'db> {
     Source(Definition<'db>),
     External(ExternFunctionLoc<'db>),
+    ExternalLet(ExternLetLoc<'db>),
 }
 
 /// Whether an exported function declares a `self` receiver, and is therefore
@@ -538,61 +618,12 @@ pub struct PackageResolutionContext<'db> {
     pub own: baml_base::SourceRoot,
 }
 
-// ── Salsa Update impls ─────────────────────────────────────────────────────
+// ── Salsa retention safety ─────────────────────────────────────────────────────
 
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[allow(unsafe_code)]
-unsafe impl<N: Head> salsa::Update for PackageInterface<N> {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        let old_ref = unsafe { &*old_pointer };
-        if *old_ref == new_value {
-            false
-        } else {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            true
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-unsafe impl salsa::Update for FileInterfaceFragment {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        let old_ref = unsafe { &*old_pointer };
-        if *old_ref == new_value {
-            false
-        } else {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            true
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-unsafe impl salsa::Update for PackageResolutionContext<'_> {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        let old_ref = unsafe { &*old_pointer };
-        if *old_ref == new_value {
-            false
-        } else {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            true
-        }
-    }
-}
+unsafe impl salsa::SalsaValue for PackageResolutionContext<'_> {}
 
 // ── PackageInterface lookup helpers ────────────────────────────────────────
 
@@ -607,6 +638,11 @@ impl<N: Head> PackageInterface<N> {
     /// Look up a function by explicit namespace and item name.
     pub fn lookup_function(&self, namespace: &[Name], item: &Name) -> Option<&ExportedFunction<N>> {
         self.functions.get(namespace)?.get(item)
+    }
+
+    /// Look up an exported top-level binding by explicit namespace and name.
+    pub fn lookup_value(&self, namespace: &[Name], item: &Name) -> Option<&ExportedValue<N>> {
+        self.values.get(namespace)?.get(item)
     }
 
     /// The re-export at `namespace.item`, if the package exports one there.
@@ -703,9 +739,9 @@ pub enum ImportError {
     /// A direct entry names a language package: the prelude carries no
     /// payload to bind against.
     PreludeAsDependency { edge: Name },
-    /// A prelude entry names an ordinary dependency, whose payload the
-    /// compile should have read.
-    DependencyAsPrelude { edge: Name },
+    /// A prelude entry names a language package this database has not
+    /// installed.
+    PreludeMissing { package: baml_base::LangPackage },
     /// The interface the blob was compiled against is not the interface the
     /// package bound to the edge serves or exports here (OCaml's
     /// "inconsistent assumptions over interface").
@@ -792,9 +828,10 @@ impl std::fmt::Display for ImportError {
                 "dependency `{edge}` is a language package but the interface records an interface \
                  digest for it"
             ),
-            Self::DependencyAsPrelude { edge } => write!(
+            Self::PreludeMissing { package } => write!(
                 f,
-                "dependency `{edge}` is not a language package but the interface records it as one"
+                "the interface depends on the language package `{}`, which is not installed",
+                package.manifest_name()
             ),
             Self::DependencyMismatch {
                 edge,
@@ -944,19 +981,34 @@ fn bind_locators(
                 via: via.0,
             });
         };
-        let Some((_, target)) = edge_table(db, parent)
-            .into_iter()
-            .find(|(edge, _)| edge == locator.edge())
+        // A prelude entry is bound by identity — the installed language
+        // package, whatever any edge table calls it; the other two locate an
+        // edge in the parent's table.
+        let edge_name = match locator {
+            Locator::Prelude(package) => {
+                let Some(target) = baml_compiler2_hir::package::lang_roots(db).get(*package) else {
+                    return Err(ImportError::PreludeMissing { package: *package });
+                };
+                bound.push(target);
+                continue;
+            }
+            Locator::Direct { edge, .. } | Locator::Transitive { edge, .. } => edge,
+        };
+        let Some(&(_, target)) = edge_table(db, parent)
+            .iter()
+            .find(|(edge, _)| edge == edge_name)
         else {
             return Err(ImportError::UnknownDependency {
                 slot: slot.0,
-                edge: locator.edge().clone(),
+                edge: edge_name.clone(),
             });
         };
-        let is_prelude = target.kind(db) == baml_base::SourceRootKind::Stdlib;
         match locator {
             Locator::Direct { edge, digest } => {
-                if is_prelude {
+                if baml_compiler2_hir::package::lang_roots(db)
+                    .package_of(target)
+                    .is_some()
+                {
                     return Err(ImportError::PreludeAsDependency { edge: edge.clone() });
                 }
                 let found = interface_digest(db, target);
@@ -968,11 +1020,7 @@ fn bind_locators(
                     });
                 }
             }
-            Locator::Prelude { edge } => {
-                if !is_prelude {
-                    return Err(ImportError::DependencyAsPrelude { edge: edge.clone() });
-                }
-            }
+            Locator::Prelude(_) => unreachable!("a prelude entry binds by identity above"),
             Locator::Transitive { .. } => {}
         }
         bound.push(target);
@@ -1109,11 +1157,11 @@ fn validate_row_identities(
             }
             listed(kind, namespace, &key)?;
             match row {
-                ExportedType::Class { fields, .. } => {
+                ExportedType::Class { body, .. } => {
                     unique_members(
                         "class field",
                         &key,
-                        &mut fields.iter().map(|(field, ..)| field),
+                        &mut body.fields().iter().map(|(field, ..)| field),
                     )?;
                 }
                 ExportedType::Enum { variants, .. } => {
@@ -1367,7 +1415,7 @@ pub fn export_interface(
     let mut table = DependencyTable::new(root);
     // Every direct non-prelude edge, in edge order, named by a row or not:
     // the digest of each is what makes this blob's digest cover its closure.
-    for (_, dependency) in edge_table(db, root) {
+    for &(_, dependency) in edge_table(db, root) {
         if dependency.kind(db) != baml_base::SourceRootKind::Stdlib {
             table.slot(db, dependency);
         }
@@ -1378,7 +1426,12 @@ pub fn export_interface(
         })
         .unwrap_or_else(|never| match never {});
     let dependencies = table.locators(db, |dependency| interface_digest(db, dependency));
-    WireInterface { dependencies, rows }
+    WireInterface {
+        claimed: root.claim(db),
+        compiler_version: COMPILER_VERSION.to_owned(),
+        dependencies,
+        rows,
+    }
 }
 
 /// The digest of the interface a dependent of `root` compiles against:
@@ -1393,7 +1446,7 @@ pub fn export_interface(
 /// closure: a change anywhere in it that alters what `root`'s dependents
 /// compile against changes this value, and a change that leaves it alone
 /// cannot change what they compile to.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn interface_digest(db: &dyn baml_compiler2_hir::Db, root: baml_base::SourceRoot) -> Digest {
     use sha2::Digest as _;
     if let Some(bytes) = root.interface(db) {
@@ -1562,6 +1615,7 @@ pub fn reduce_ground_projections(db: &dyn baml_compiler2_hir::Db, ty: &Ty, fuel:
         },
         Ty::Future(value, error) => Ty::Future(Box::new(recurse(value)), Box::new(recurse(error))),
         Ty::Union(members) => Ty::Union(members.iter().map(recurse).collect()),
+        Ty::Tuple(elements) => Ty::Tuple(elements.iter().map(recurse).collect()),
         Ty::Class(name, args) => Ty::Class(name.clone(), args.iter().map(recurse).collect()),
         Ty::Interface(name, args, pins) => Ty::Interface(
             name.clone(),
@@ -1674,23 +1728,21 @@ fn lower_class_export<'db>(
     let class_data = baml_compiler2_hir::item_data::class_data(db, class_loc);
     let class_frame = crate::lower::class_generic_frame(db, class_loc);
 
-    // Lower fields under the class frame and bounds so an associated-type
-    // projection `T.member` in a field type resolves `T`'s declaring
-    // interface.
-    let field_ctx = crate::lower::lower_ctx_for_file(db, class_loc.file(db))
-        .with_frame(class_frame.clone())
-        .with_bounds(crate::lower::class_generic_bounds(db, class_loc));
-    let mut fields = Vec::new();
-    for field in &class_data.fields {
-        let field_ty = crate::lower::reject_holes(
-            &field_ctx.lower_type_ref(&class_data.type_refs, field.type_ref),
-        );
-        fields.push((
-            field.name.clone(),
-            field_ty,
-            exported_field_attrs(&field.attrs, field.docstring.as_deref()),
-        ));
-    }
+    // The checker's own resolution of the fields (in the class's frame and
+    // bounds), so an exported row carries exactly the types the package
+    // checked against.
+    let fields = class_data
+        .fields
+        .iter()
+        .zip(crate::lower::resolve_class_fields(db, class_loc))
+        .map(|(field, (name, field_ty, _))| {
+            (
+                name.clone(),
+                field_ty.clone(),
+                exported_field_attrs(&field.attrs, field.docstring.as_deref()),
+            )
+        })
+        .collect();
 
     // Lower methods
     let mut methods = Vec::new();
@@ -1705,9 +1757,15 @@ fn lower_class_export<'db>(
     }
 
     let qtn = qualify_def(db, Definition::Class(class_loc), name);
+    // A `@@rust_type` class exports no fields: a field written on one is
+    // already an error, and its state lives in Rust.
+    let body = match class_data.attrs.rust_type {
+        Some(kind) => ExportedClassBody::RustType(kind),
+        None => ExportedClassBody::Fields(fields),
+    };
     ExportedType::Class {
         qtn,
-        fields,
+        body,
         methods,
         generic_params: class_frame,
         generic_param_bounds: plain_bounds(
@@ -1932,13 +1990,26 @@ pub fn file_interface_fragment(
     }
 
     let mut functions: IndexMap<Name, ExportedFunction> = IndexMap::new();
+    let mut values: IndexMap<Name, ExportedValue> = IndexMap::new();
     let mut claimed_values: FxHashSet<Name> = FxHashSet::default();
     for (name, contrib) in &contributions.values {
         if !claimed_values.insert(name.clone()) {
             continue;
         }
-        if let Definition::Function(func_loc) = contrib.definition {
-            functions.insert(name.clone(), lower_function_export(db, func_loc, name));
+        match contrib.definition {
+            Definition::Function(func_loc) => {
+                functions.insert(name.clone(), lower_function_export(db, func_loc, name));
+            }
+            Definition::Let(let_loc) => {
+                values.insert(
+                    name.clone(),
+                    ExportedValue {
+                        name: name.clone(),
+                        ty: crate::globals::global_value_type(db, let_loc).unwrap_or(Ty::Unknown),
+                    },
+                );
+            }
+            _ => {}
         }
     }
 
@@ -1946,6 +2017,7 @@ pub fn file_interface_fragment(
         ns_path,
         types,
         functions,
+        values,
     }
 }
 
@@ -1999,7 +2071,7 @@ pub fn package_interface(
     // boundary.
     if let Some(bytes) = pkg_id.interface(db) {
         let precompiled = is_precompiled_stdlib(db, pkg_id);
-        let spelled = baml_compiler2_hir::package::spelling(db).of(pkg_id).clone();
+        let spelled = crate::render::Viewpoint::canonical(db).display_label(pkg_id);
         let wire = if precompiled {
             borsh::from_slice::<WireInterface>(bytes).unwrap_or_else(|error| {
                 panic!("compiler-built package `{spelled}` has an invalid interface: {error}")
@@ -2092,8 +2164,6 @@ fn exported_impls(
     db: &dyn baml_compiler2_hir::Db,
     pkg_id: baml_base::SourceRoot,
 ) -> Vec<ExportedImpl> {
-    use baml_compiler2_hir::item_data::ImplSubjectData;
-
     let mut rows = Vec::new();
     for &block in crate::impls::package_impl_locs(db, pkg_id) {
         let Some(facts) = crate::impls::impl_facts(db, block).resolved() else {
@@ -2125,17 +2195,17 @@ fn exported_impls(
                 exported_function(db, method, &name, generic_params.len())
             })
             .collect();
-        let origin = match &data.subject {
-            ImplSubjectData::InClass {
-                class,
-                out_of_body: false,
-            } => ExportedImplOrigin::InBodyClass {
-                class_qtn: crate::lower::class_qualified_name(db, *class),
-            },
-            ImplSubjectData::InClass {
-                out_of_body: true, ..
+        let origin = match (
+            data.origin,
+            baml_compiler2_hir::item_data::impl_enclosing_class(db, block),
+        ) {
+            (baml_compiler2_ast::ImplOrigin::InBody, Some(class)) => {
+                ExportedImplOrigin::InBodyClass {
+                    class_qtn: crate::lower::class_qualified_name(db, class),
+                }
             }
-            | ImplSubjectData::Free { .. } => ExportedImplOrigin::OutOfBody,
+            (baml_compiler2_ast::ImplOrigin::InBody, None)
+            | (baml_compiler2_ast::ImplOrigin::OutOfBody, _) => ExportedImplOrigin::OutOfBody,
         };
         rows.push(ExportedImpl {
             interface: facts.interface.to_plain(),
@@ -2183,6 +2253,7 @@ fn fold_package_interface(
 
     let mut types: IndexMap<Vec<Name>, IndexMap<Name, ExportedType>> = IndexMap::new();
     let mut functions: IndexMap<Vec<Name>, IndexMap<Name, ExportedFunction>> = IndexMap::new();
+    let mut values: IndexMap<Vec<Name>, IndexMap<Name, ExportedValue>> = IndexMap::new();
 
     for (ns_path, ns_items) in &pkg_items.namespaces {
         for (name, def) in &ns_items.types {
@@ -2195,15 +2266,26 @@ fn fold_package_interface(
             }
         }
         for (name, def) in &ns_items.values {
-            let Definition::Function(func_loc) = def else {
-                continue;
-            };
-            let frag = file_interface_fragment(db, func_loc.file(db));
-            if let Some(exported) = frag.functions.get(name) {
-                functions
-                    .entry(ns_path.clone())
-                    .or_default()
-                    .insert(name.clone(), exported.clone());
+            match def {
+                Definition::Function(func_loc) => {
+                    let frag = file_interface_fragment(db, func_loc.file(db));
+                    if let Some(exported) = frag.functions.get(name) {
+                        functions
+                            .entry(ns_path.clone())
+                            .or_default()
+                            .insert(name.clone(), exported.clone());
+                    }
+                }
+                Definition::Let(let_loc) => {
+                    let frag = file_interface_fragment(db, let_loc.file(db));
+                    if let Some(exported) = frag.values.get(name) {
+                        values
+                            .entry(ns_path.clone())
+                            .or_default()
+                            .insert(name.clone(), exported.clone());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2212,6 +2294,7 @@ fn fold_package_interface(
     PackageInterface {
         types,
         functions,
+        values,
         throw_sets,
         namespaces: pkg_items.namespaces.keys().cloned().collect(),
         impls: exported_impls(db, pkg_id),
@@ -2270,26 +2353,6 @@ fn try_map_throw_sets<N: Head, M: Head, E>(
             ))
         })
         .collect()
-}
-
-// Safety: comparison-based replacement for Salsa early cutoff.
-#[allow(unsafe_code)]
-unsafe impl<N: Head> salsa::Update for FunctionThrowSets<N> {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        // SAFETY: pointer is Salsa-owned and valid for replacement.
-        #[allow(unsafe_code)]
-        let old = unsafe { &*old_pointer };
-        if old == &new_value {
-            false
-        } else {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            true
-        }
-    }
 }
 
 impl<N: Head> FunctionThrowSets<N> {
@@ -2355,36 +2418,33 @@ pub fn function_throw_sets(
             }
             let data = baml_compiler2_hir::item_data::function_data(db, *func_loc);
             let key = throw_set_key(ns_path, &data.name);
-            // The runtime boundary's shape: literals widen to their
-            // primitives, `void` drops, and error-recovery sentinels
-            // degrade to the top type (RuntimeTy has no Error).
-            let facts: BTreeSet<ThrowFact> = crate::throw_facts::flatten_declared_ty_to_facts(
-                &crate::callable::callable_throws(db, *func_loc).0,
-            )
-            .into_iter()
-            .filter_map(|fact| {
-                // A bare rigid var (a callback's synthetic effect param in
-                // `throws int | E`) has no runtime representation and
-                // DROPS from the runtime set - the SDK recovers the
-                // host-error arm through its untagged decode fallback
-                // (TIR's runtime sets never carried the var either).
-                // Tagging it as the top type instead would mis-tag the
-                // thrown value's wire envelope and break that fallback.
-                if matches!(fact, Ty::TypeVar(..)) {
-                    return None;
-                }
-                Some(if baml_type_runtime::contains_error_recovery(&fact) {
-                    Ty::Unknown
-                } else {
-                    fact
-                })
-            })
-            .collect();
+            let facts = runtime_throw_facts(db, *func_loc);
             sets.direct.insert(key.clone(), facts.clone());
             sets.transitive.insert(key, facts);
         }
     }
     sets
+}
+
+/// The types a function may throw, in the runtime boundary's shape: literals
+/// widen to their primitives and `void` drops. The same answer for a free
+/// function and a method.
+pub fn runtime_throw_facts(
+    db: &dyn baml_compiler2_hir::Db,
+    func_loc: baml_compiler2_hir::loc::FunctionLoc<'_>,
+) -> BTreeSet<ThrowFact> {
+    crate::throw_facts::flatten_declared_ty_to_facts(
+        &crate::callable::callable_throws(db, func_loc).0,
+    )
+    .into_iter()
+    // A bare rigid var (a callback's synthetic effect param in
+    // `throws int | E`) has no runtime representation and DROPS from the
+    // runtime set - the SDK recovers the host-error arm through its
+    // untagged decode fallback (TIR's runtime sets never carried the var
+    // either). Tagging it as the top type instead would mis-tag the
+    // thrown value's wire envelope and break that fallback.
+    .filter(|fact| !matches!(fact, Ty::TypeVar(..)))
+    .collect()
 }
 
 // ── package_resolution_context Salsa query ─────────────────────────────────
@@ -2413,159 +2473,90 @@ pub fn package_resolution_context(
 // ── PackageResolutionContext lookup methods ─────────────────────────────────
 
 impl<'db> PackageResolutionContext<'db> {
-    /// Get `PackageItems` for an accessible package (own or declared dependency).
-    ///
-    /// Returns `Some` for the own package and any declared dependency,
-    /// `None` for undeclared packages.
-    pub fn items_for_package(
-        &'db self,
-        db: &'db dyn baml_compiler2_hir::Db,
-        pkg_name: &Name,
-    ) -> Option<&'db PackageItems<'db>> {
-        let package = accessible_package(db, self.own, pkg_name)?;
-        if package == self.own {
-            return Some(&self.own_items);
-        }
-        // A served dependency has no semantic items for a consumer: it has
-        // no files; its rows are the answer.
-        (!is_served_from_interface(db, package))
-            .then(|| baml_compiler2_hir::package::package_items(db, package))
-    }
-
-    /// The items of the package `root`, when this package can see it: itself
-    /// or a declared dependency.
-    pub fn items_for_root(
-        &'db self,
-        db: &'db dyn baml_compiler2_hir::Db,
-        root: baml_base::SourceRoot,
-    ) -> Option<&'db PackageItems<'db>> {
-        if root == self.own {
-            return Some(&self.own_items);
-        }
-        (self.dep_interfaces.iter().any(|(_, dep, _)| *dep == root)
-            && !is_served_from_interface(db, root))
-        .then(|| baml_compiler2_hir::package::package_items(db, root))
-    }
-
-    /// Resolve a type by path. Own-package via `PackageItems`, then deps.
+    /// Resolve a type by path: a bare name in the namespace `ns_context`, or
+    /// a fully qualified path (`root.…` in this package, `<edge>.…` in a
+    /// dependency), read from the head HIR gives it
+    /// ([`baml_compiler2_hir::package::path_head`]). A qualified path is
+    /// never read relative to `ns_context`, and a bare name never falls
+    /// through into a dependency.
     pub fn resolve_type(
         &self,
         db: &'db dyn baml_compiler2_hir::Db,
         path: &[Name],
         ns_context: &[Name],
     ) -> Option<(ResolvedSource, Ty)> {
-        let item = path.last()?;
-        // Try namespace-qualified path first
-        if !ns_context.is_empty() {
-            let ns: Vec<_> = ns_context
-                .iter()
-                .chain(path[..path.len() - 1].iter())
-                .cloned()
-                .collect();
-            if let Some(result) = self.resolve_type_in_own_then_deps(db, &ns, item) {
-                return Some(result);
-            }
-        }
-
-        // When ns_context is empty, try unqualified path (same-namespace for root files)
-        if ns_context.is_empty() {
-            if let Some(result) =
-                self.resolve_type_in_own_then_deps(db, &path[..path.len() - 1], item)
-            {
-                return Some(result);
-            }
-        }
-        // No bare fallback from non-root namespaces: cross-namespace references
-        // in the same package must start with `root`.
-
-        // Try package-prefixed path (first segment is package name)
-        if path.len() >= 2 {
-            if path[0].as_str() == "root" {
-                if let Some(def) = self.own_items.lookup_type(&path[1..path.len() - 1], item) {
+        match baml_compiler2_hir::package::path_head(db, self.own, ns_context, path) {
+            PathHead::Package(package) | PathHead::Lang(package) => {
+                let (item, namespace) = path[1..].split_last()?;
+                if package == self.own {
+                    let def = self.own_items.lookup_type(namespace, item)?;
                     return def_to_ty(db, def).map(|ty| (ResolvedSource::Item, ty));
                 }
+                let dependency = self
+                    .dep_interfaces
+                    .iter()
+                    .any(|(_, dependency, _)| *dependency == package);
+                let exported = dependency
+                    .then(|| exported_type_row(db, package, namespace, item))
+                    .flatten()?;
+                Some((ResolvedSource::Builtin, exported.to_ty()))
             }
-            for (dep_name, dep_root, _) in &self.dep_interfaces {
-                if &path[0] == dep_name
-                    && let Some(exported) =
-                        exported_type_row(db, *dep_root, &path[1..path.len() - 1], item)
-                {
-                    return Some((ResolvedSource::Builtin, exported.to_ty()));
-                }
-            }
-        }
-
-        None
-    }
-
-    fn resolve_type_in_own_then_deps(
-        &self,
-        db: &'db dyn baml_compiler2_hir::Db,
-        namespace: &[Name],
-        item: &Name,
-    ) -> Option<(ResolvedSource, Ty)> {
-        if let Some(def) = self.own_items.lookup_type(namespace, item) {
-            return def_to_ty(db, def).map(|ty| (ResolvedSource::Item, ty));
-        }
-        for (_dep_name, dep_root, _) in &self.dep_interfaces {
-            if let Some(exported) = exported_type_row(db, *dep_root, namespace, item) {
-                return Some((ResolvedSource::Builtin, exported.to_ty()));
+            PathHead::Plain => {
+                let [item] = path else {
+                    return None;
+                };
+                let def = self.own_items.lookup_type(ns_context, item)?;
+                def_to_ty(db, def).map(|ty| (ResolvedSource::Item, ty))
             }
         }
-        None
     }
 
     /// Resolve a function/value by path, preserving source versus source-less
-    /// ownership in the result.
+    /// ownership in the result: a bare name in the namespace `ns_context`,
+    /// or a fully qualified path, as in [`Self::resolve_type`].
     pub fn resolve_value(
         &self,
         db: &'db dyn baml_compiler2_hir::Db,
         path: &[Name],
         ns_context: &[Name],
     ) -> Option<ResolvedValue<'db>> {
-        let item = path.last()?;
-        if !ns_context.is_empty() {
-            let ns: Vec<_> = ns_context
-                .iter()
-                .chain(path[..path.len() - 1].iter())
-                .cloned()
-                .collect();
-            if let Some(definition) = self.own_items.lookup_value(&ns, item) {
-                return Some(ResolvedValue::Source(definition));
-            }
-        }
-        // When ns_context is empty, try unqualified path (same-namespace for root files)
-        if ns_context.is_empty() {
-            if let Some(definition) = self.own_items.lookup_value(&path[..path.len() - 1], item) {
-                return Some(ResolvedValue::Source(definition));
-            }
-        }
-        // No bare fallback from non-root namespaces — cross-namespace requires explicit qualification
-        // root.* prefix handling (parity with resolve_type)
-        if path.len() >= 2 {
-            if path[0].as_str() == "root" {
-                if let Some(def) = self.own_items.lookup_value(&path[1..path.len() - 1], item) {
-                    return Some(ResolvedValue::Source(def));
+        match baml_compiler2_hir::package::path_head(db, self.own, ns_context, path) {
+            PathHead::Package(package) | PathHead::Lang(package) => {
+                let (item, namespace) = path[1..].split_last()?;
+                if package == self.own {
+                    return self
+                        .own_items
+                        .lookup_value(namespace, item)
+                        .map(ResolvedValue::Source);
                 }
-            }
-            for (dep_name, dep_root, _) in &self.dep_interfaces {
-                if &path[0] == dep_name {
-                    if is_served_from_interface(db, *dep_root) {
-                        return Some(ResolvedValue::External(extern_function_named(
-                            db,
-                            *dep_root,
-                            &path[1..path.len() - 1],
-                            item,
-                        )?));
-                    }
-                    let dep_items = baml_compiler2_hir::package::package_items(db, *dep_root);
-                    if let Some(def) = dep_items.lookup_value(&path[1..path.len() - 1], item) {
-                        return Some(ResolvedValue::Source(def));
-                    }
+                if !self
+                    .dep_interfaces
+                    .iter()
+                    .any(|(_, dependency, _)| *dependency == package)
+                {
+                    return None;
                 }
+                if is_served_from_interface(db, package) {
+                    return extern_function_named(db, package, namespace, item)
+                        .map(ResolvedValue::External)
+                        .or_else(|| {
+                            mounted_let_named(db, package, namespace, item)
+                                .map(ResolvedValue::ExternalLet)
+                        });
+                }
+                baml_compiler2_hir::package::package_items(db, package)
+                    .lookup_value(namespace, item)
+                    .map(ResolvedValue::Source)
+            }
+            PathHead::Plain => {
+                let [item] = path else {
+                    return None;
+                };
+                self.own_items
+                    .lookup_value(ns_context, item)
+                    .map(ResolvedValue::Source)
             }
         }
-        None
     }
 }
 

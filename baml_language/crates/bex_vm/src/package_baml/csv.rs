@@ -2,12 +2,12 @@
 //!
 //! Architecture: the streaming reader is the only parser. All tokenization,
 //! typed decoding, and encoding happens here, synchronously, against an
-//! in-memory byte buffer held in the handle's `RustData` state. File IO is
+//! in-memory byte buffer held in the reader's `@@rust_type` state. File IO is
 //! *not* done here: the BAML-level method bodies in `ns_csv/csv.baml` pump
 //! chunks from a `baml.fs.File` into `_feed` / `_feed_eof` whenever a native
 //! poll returns the `_NeedData` marker. That keeps every heap `Value` (the
 //! `File` handle, the `on_skip` closure) in regular GC-traced instance
-//! fields — the `RustData` state holds plain Rust data only.
+//! fields — the `@@rust_type` state holds plain Rust data only.
 //!
 //! Error values are `baml.csv.Error` instances built from plain-Rust
 //! [`ErrInfo`] records; skip diagnostics are retained as `ErrInfo` and
@@ -20,9 +20,9 @@
 //   count bounded far below 2^62 (BAML int range checks would fail first).
 // - `result_large_err`: error values are cold-path BAML exception payloads;
 //   boxing them would only add noise on the hot Ok path.
-// - `used_underscore_items`: the codegen names `$rust_type` accessors and
-//   internal stdlib methods with a leading underscore (`_handle`, `_poll`);
-//   calling them is the entire point of this module.
+// - `used_underscore_items`: internal stdlib methods carry a leading
+//   underscore (`_poll`, `_feed`); calling them is the entire point of this
+//   module.
 #![allow(
     clippy::struct_excessive_bools,
     clippy::cast_possible_wrap,
@@ -30,16 +30,15 @@
     clippy::used_underscore_items
 )]
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Write as _,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::{fmt::Write as _, sync::Arc};
 
 use bex_heap::TlabHolder;
 use bex_vm_types::{
-    ValueKind,
-    types::{Instance, Object, Value},
+    CsvCell, CsvHeader, CsvRecord, Field, InstanceRef, MeteredGuard, MeteredMutex,
+    RetainedFootprint, RustPayload, ValueKind,
+    csv::{ErrInfo, Kind, QuoteStyle, Ragged, ReaderOpts, ReaderState, WriterOpts, WriterState},
+    payload,
+    types::{Object, Value},
 };
 use indexmap::IndexMap;
 use time::{
@@ -57,85 +56,19 @@ use crate::{
     package_load::{StdlibHeads, TimeClass},
 };
 
-const CSV_ERROR_KIND_FQN: &str = "baml.csv.ErrorKind";
-const ITER_DONE_FQN: &str = "baml.iter.Done";
+const CSV_ERROR_KIND: baml_base::LangItem = crate::lang_items::BAML_CSV_ERROR_KIND;
+const ITER_DONE: baml_base::LangItem = crate::lang_items::BAML_ITER_DONE;
 
 // =============================================================================
 // Error plumbing
 // =============================================================================
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Options,
-    Quote,
-    FieldCount,
-    Encoding,
-    Header,
-    Decode,
-    Encode,
-    Closed,
-}
-
-impl Kind {
-    fn variant_name(self) -> &'static str {
-        match self {
-            Kind::Options => "Options",
-            Kind::Quote => "Quote",
-            Kind::FieldCount => "FieldCount",
-            Kind::Encoding => "Encoding",
-            Kind::Header => "Header",
-            Kind::Decode => "Decode",
-            Kind::Encode => "Encode",
-            Kind::Closed => "Closed",
-        }
-    }
-}
-
-/// Plain-Rust mirror of `baml.csv.Error`, safe to retain inside `RustData`
-/// state (no heap `Value`s). Materialized via [`error_value`].
-#[derive(Clone, Debug)]
-struct ErrInfo {
-    kind: Kind,
-    message: String,
-    line: Option<i64>,
-    record: Option<i64>,
-    field: Option<i64>,
-    column: Option<String>,
-    expected: Option<i64>,
-    found: Option<i64>,
-}
-
-impl ErrInfo {
-    fn new(kind: Kind, message: impl Into<String>) -> Self {
-        ErrInfo {
-            kind,
-            message: message.into(),
-            line: None,
-            record: None,
-            field: None,
-            column: None,
-            expected: None,
-            found: None,
-        }
-    }
-
-    fn at(mut self, line: i64, record: i64) -> Self {
-        self.line = Some(line);
-        self.record = Some(record);
-        self
-    }
-}
 
 fn opt_int_value(o: Option<i64>) -> Value {
     o.and_then(Value::try_int).unwrap_or(Value::NULL)
 }
 
 fn error_value(vm: &mut BexVm, e: &ErrInfo) -> Result<Value, VmRustFnError> {
-    let enm_ptr = vm.lookup_type_by_fqn(CSV_ERROR_KIND_FQN).ok_or_else(|| {
-        VmInternalError::MissingNativeFunction {
-            name: CSV_ERROR_KIND_FQN.to_string(),
-        }
-    })?;
+    let enm_ptr = vm.lang_object(CSV_ERROR_KIND);
     let idx = match vm.get_object(enm_ptr) {
         Object::Enum(en) => en
             .variants
@@ -144,7 +77,7 @@ fn error_value(vm: &mut BexVm, e: &ErrInfo) -> Result<Value, VmRustFnError> {
         _ => None,
     }
     .ok_or_else(|| VmInternalError::MissingNativeFunction {
-        name: format!("{CSV_ERROR_KIND_FQN}.{}", e.kind.variant_name()),
+        name: format!("{CSV_ERROR_KIND}.{}", e.kind.variant_name()),
     })?;
     let kind = Value::object(vm.alloc_variant(enm_ptr, idx));
     let message = Value::object(vm.alloc_string(e.message.clone()));
@@ -173,149 +106,68 @@ fn throw_err(vm: &mut BexVm, e: &ErrInfo) -> VmRustFnError {
 }
 
 fn need_data_value(vm: &mut BexVm) -> Value {
-    let class_ptr = vm.resolve_class("baml.csv._NeedData");
+    let class_ptr = vm.lang_object(crate::lang_items::BAML_CSV_NEED_DATA);
     Value::object(vm.alloc_instance(class_ptr, vec![]))
 }
 
-fn done_value(vm: &mut BexVm) -> Result<Value, VmRustFnError> {
-    let class_ptr = vm.lookup_type_by_fqn(ITER_DONE_FQN).ok_or_else(|| {
-        VmInternalError::MissingNativeFunction {
-            name: ITER_DONE_FQN.to_string(),
-        }
-    })?;
-    Ok(Value::object(vm.alloc_instance(class_ptr, vec![])))
+fn done_value(vm: &mut BexVm) -> Value {
+    let class_ptr = vm.lang_object(ITER_DONE);
+    Value::object(vm.alloc_instance(class_ptr, vec![]))
 }
 
 // =============================================================================
 // Handle-state access
 // =============================================================================
 
-/// Clone the `Arc` out of a `$rust_type` field so the caller can lock it while
-/// still holding `&mut BexVm` for allocation.
-fn state_arc<T: Send + Sync + 'static>(
-    vm: &BexVm,
-    holder: Value,
-    field_idx: usize,
-) -> Result<Arc<T>, VmRustFnError> {
-    let inst = vm.as_instance(&holder)?;
-    let handle = inst.load_field(field_idx);
-    let ptr = handle
-        .as_object_ptr()
-        .ok_or_else(|| VmInternalError::MissingNativeFunction {
-            name: "csv handle field is not an object".to_string(),
-        })?;
-    match vm.get_object(ptr) {
-        Object::RustData(arc) => arc.clone().downcast::<T>().map_err(|_| {
-            VmRustFnError::InternalError(VmInternalError::MissingNativeFunction {
-                name: "csv handle holds an unexpected Rust type".to_string(),
-            })
-        }),
-        _ => Err(VmRustFnError::InternalError(
-            VmInternalError::MissingNativeFunction {
-                name: "csv handle field is not RustData".to_string(),
-            },
-        )),
+/// The state a reader's `_state` instance holds.
+fn reader_state_in(vm: &BexVm, state: Value) -> payload::CsvReader {
+    match vm
+        .as_rust_instance(&state)
+        .map(|instance| &instance.payload)
+    {
+        Ok(RustPayload::CsvReader(state)) => Arc::clone(state),
+        _ => unreachable!("a `baml.csv.Reader`'s `_state` is a `_ReaderState`"),
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The state of the reader `reader`.
+fn reader_state_of(vm: &BexVm, reader: Value) -> Result<payload::CsvReader, VmInternalError> {
+    Ok(reader_state_in(vm, vm.as_instance(&reader)?.load_value(0)))
+}
+
+/// The state a writer's `_state` instance holds.
+fn writer_state_in(vm: &BexVm, state: Value) -> payload::CsvWriter {
+    match vm
+        .as_rust_instance(&state)
+        .map(|instance| &instance.payload)
+    {
+        Ok(RustPayload::CsvWriter(state)) => Arc::clone(state),
+        _ => unreachable!("a `baml.csv.Writer`'s `_state` is a `_WriterState`"),
+    }
+}
+
+/// The state of the writer `writer`.
+fn writer_state_of(vm: &BexVm, writer: Value) -> Result<payload::CsvWriter, VmInternalError> {
+    Ok(writer_state_in(vm, vm.as_instance(&writer)?.load_value(0)))
+}
+
+/// A writer's `_state` instance, holding `state`.
+fn new_writer_state(vm: &mut BexVm, state: WriterState) -> Value {
+    copy::csv::WriterState {
+        payload: Arc::new(MeteredMutex::new(state)),
+    }
+    .to_value(vm)
+}
+
+/// Lock a reader's or writer's state, charging what it grew by since the
+/// last call to the VM's allocation account.
+fn lock<'a, T: RetainedFootprint>(m: &'a MeteredMutex<T>, vm: &BexVm) -> MeteredGuard<'a, T> {
+    m.lock(vm.tlab.alloc_debt())
 }
 
 // =============================================================================
 // Options
 // =============================================================================
-
-#[derive(Clone, Copy, PartialEq)]
-enum Ragged {
-    Strict,
-    Pad,
-    Truncate,
-}
-
-#[derive(Clone)]
-struct ReaderOpts {
-    delimiter: u8,
-    quote: u8,
-    quoting: bool,
-    escape: Option<u8>,
-    has_header: bool,
-    headers_override: Option<Vec<String>>,
-    comment: Option<u8>,
-    trim_headers: bool,
-    trim_fields: bool,
-    skip_lines: i64,
-    skip_blank: bool,
-    ragged: Ragged,
-    null_values: Arc<[String]>,
-    lossy: bool,
-    strip_bom: bool,
-    skip_on_error: bool,
-    max_skipped: usize,
-    limit: Option<i64>,
-}
-
-impl Default for ReaderOpts {
-    fn default() -> Self {
-        ReaderOpts {
-            delimiter: b',',
-            quote: b'"',
-            quoting: true,
-            escape: None,
-            has_header: true,
-            headers_override: None,
-            comment: None,
-            trim_headers: false,
-            trim_fields: false,
-            skip_lines: 0,
-            skip_blank: true,
-            ragged: Ragged::Strict,
-            null_values: Arc::from(Vec::new()),
-            lossy: false,
-            strip_bom: true,
-            skip_on_error: false,
-            max_skipped: 1000,
-            limit: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum QuoteStyle {
-    Minimal,
-    All,
-    Never,
-}
-
-struct WriterOpts {
-    delimiter: u8,
-    quote: u8,
-    style: QuoteStyle,
-    escape: Option<u8>,
-    crlf: bool,
-    auto_header: bool,
-    headers_override: Option<Vec<String>>,
-    null_value: String,
-    bom: bool,
-    sanitize: bool,
-}
-
-impl Default for WriterOpts {
-    fn default() -> Self {
-        WriterOpts {
-            delimiter: b',',
-            quote: b'"',
-            style: QuoteStyle::Minimal,
-            escape: None,
-            crlf: false,
-            auto_header: true,
-            headers_override: None,
-            null_value: String::new(),
-            bom: false,
-            sanitize: false,
-        }
-    }
-}
 
 fn options_err(vm: &mut BexVm, message: impl Into<String>) -> VmRustFnError {
     throw_err(vm, &ErrInfo::new(Kind::Options, message))
@@ -325,15 +177,15 @@ fn options_err(vm: &mut BexVm, message: impl Into<String>) -> VmRustFnError {
 /// declaration provides the name → index mapping).
 fn field_by_name(vm: &BexVm, inst_val: Value, name: &str) -> Result<Value, VmRustFnError> {
     let inst = vm.as_instance(&inst_val)?;
-    let class_ptr = inst.class;
-    let idx = match vm.get_object(class_ptr) {
-        Object::Class(c) => c.fields.iter().position(|f| f.name == name),
-        _ => None,
-    }
-    .ok_or_else(|| VmInternalError::MissingNativeFunction {
-        name: format!("csv options field `{name}` not found"),
-    })?;
-    Ok(inst.load_field(idx))
+    let idx = inst
+        .class_object()
+        .instance_fields()
+        .iter()
+        .position(|f| f.name == name)
+        .ok_or_else(|| VmInternalError::MissingNativeFunction {
+            name: format!("csv options field `{name}` not found"),
+        })?;
+    Ok(inst.load_value(idx))
 }
 
 fn opt_string(vm: &BexVm, v: Value) -> Result<Option<String>, VmRustFnError> {
@@ -597,111 +449,6 @@ fn parse_writer_options(
 // =============================================================================
 // Reader state and tokenizer
 // =============================================================================
-
-struct Header {
-    names: Vec<String>,
-    /// First index per name.
-    index: HashMap<String, usize>,
-    /// Names appearing more than once.
-    dup: HashSet<String>,
-}
-
-impl Header {
-    fn new(names: Vec<String>) -> Self {
-        let mut index = HashMap::new();
-        let mut dup = HashSet::new();
-        for (i, n) in names.iter().enumerate() {
-            if index.contains_key(n) {
-                dup.insert(n.clone());
-            } else {
-                index.insert(n.clone(), i);
-            }
-        }
-        Header { names, index, dup }
-    }
-}
-
-struct CellData {
-    text: String,
-    quoted: bool,
-}
-
-/// Snapshot of one parsed record. Plain Rust only — safe in `RustData`.
-struct RecordData {
-    cells: Vec<CellData>,
-    header: Option<Arc<Header>>,
-    null_values: Arc<[String]>,
-    byte: i64,
-    line: i64,
-    record: i64,
-}
-
-struct ReaderState {
-    opts: ReaderOpts,
-    buf: Vec<u8>,
-    pos: usize,
-    eof: bool,
-    bom_done: bool,
-    lines_to_skip: i64,
-    header: Option<Arc<Header>>,
-    header_done: bool,
-    header_error: Option<ErrInfo>,
-    expected_width: Option<usize>,
-    /// Position of the next unread byte/record.
-    byte: i64,
-    line: i64,
-    record: i64,
-    yielded: i64,
-    skipped: Vec<ErrInfo>,
-    skipped_count: i64,
-    closed: bool,
-    finished: bool,
-}
-
-impl ReaderState {
-    fn new(opts: ReaderOpts, initial: Vec<u8>, eof: bool) -> Self {
-        let lines_to_skip = opts.skip_lines;
-        ReaderState {
-            opts,
-            buf: initial,
-            pos: 0,
-            eof,
-            bom_done: false,
-            lines_to_skip,
-            header: None,
-            header_done: false,
-            header_error: None,
-            expected_width: None,
-            byte: 0,
-            line: 1,
-            record: 0,
-            yielded: 0,
-            skipped: Vec::new(),
-            skipped_count: 0,
-            closed: false,
-            finished: false,
-        }
-    }
-
-    fn register_skip(&mut self, info: &ErrInfo) {
-        self.skipped_count += 1;
-        if self.skipped.len() < self.opts.max_skipped {
-            self.skipped.push(info.clone());
-        }
-    }
-
-    /// Consume `n` bytes (with `nl` line terminators among them) and drop the
-    /// consumed prefix once it grows large.
-    fn consume(&mut self, n: usize, nl: i64) {
-        self.pos += n;
-        self.byte += n as i64;
-        self.line += nl;
-        if self.pos > 64 * 1024 && self.pos * 2 > self.buf.len() {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-    }
-}
 
 struct RawCell {
     bytes: Vec<u8>,
@@ -993,7 +740,7 @@ fn scan_record(buf: &[u8], start: usize, eof: bool, o: &ReaderOpts, trim: bool) 
     }
 }
 
-fn cells_to_text(cells: Vec<RawCell>, lossy: bool) -> Result<Vec<CellData>, (usize, String)> {
+fn cells_to_text(cells: Vec<RawCell>, lossy: bool) -> Result<Vec<CsvCell>, (usize, String)> {
     let mut out = Vec::with_capacity(cells.len());
     for (i, c) in cells.into_iter().enumerate() {
         let text = if lossy {
@@ -1002,7 +749,7 @@ fn cells_to_text(cells: Vec<RawCell>, lossy: bool) -> Result<Vec<CellData>, (usi
             String::from_utf8(c.bytes)
                 .map_err(|e| (i, format!("invalid UTF-8 in field {i}: {e}")))?
         };
-        out.push(CellData {
+        out.push(CsvCell {
             text,
             quoted: c.quoted,
         });
@@ -1014,7 +761,7 @@ enum Polled {
     NeedData,
     Done,
     Skipped(ErrInfo),
-    Rec(RecordData),
+    Rec(CsvRecord),
 }
 
 enum HeadersPolled {
@@ -1069,7 +816,7 @@ fn ensure_header(s: &mut ReaderState) -> Result<Option<()>, ErrInfo> {
             .opts
             .headers_override
             .clone()
-            .map(|names| Arc::new(Header::new(names)));
+            .map(|names| Arc::new(CsvHeader::new(names)));
         if let Some(h) = &s.header {
             s.expected_width = Some(h.names.len());
         }
@@ -1086,7 +833,7 @@ fn ensure_header(s: &mut ReaderState) -> Result<Option<()>, ErrInfo> {
                     .opts
                     .headers_override
                     .clone()
-                    .map(|names| Arc::new(Header::new(names)));
+                    .map(|names| Arc::new(CsvHeader::new(names)));
                 s.header_done = true;
                 return Ok(Some(()));
             }
@@ -1137,7 +884,7 @@ fn ensure_header(s: &mut ReaderState) -> Result<Option<()>, ErrInfo> {
                     Some(over) => over.clone(),
                     None => cells.into_iter().map(|c| c.text).collect(),
                 };
-                s.header = Some(Arc::new(Header::new(names)));
+                s.header = Some(Arc::new(CsvHeader::new(names)));
                 s.header_done = true;
                 return Ok(Some(()));
             }
@@ -1225,7 +972,7 @@ fn poll_record(s: &mut ReaderState) -> Result<Polled, ErrInfo> {
                         Ragged::Pad => {
                             if cells.len() < expected {
                                 while cells.len() < expected {
-                                    cells.push(CellData {
+                                    cells.push(CsvCell {
                                         text: String::new(),
                                         quoted: false,
                                     });
@@ -1261,7 +1008,7 @@ fn poll_record(s: &mut ReaderState) -> Result<Polled, ErrInfo> {
                 }
 
                 s.yielded += 1;
-                return Ok(Polled::Rec(RecordData {
+                return Ok(Polled::Rec(CsvRecord {
                     cells,
                     header: s.header.clone(),
                     null_values: Arc::clone(&s.opts.null_values),
@@ -1391,7 +1138,7 @@ fn convert_cell(vm: &mut BexVm, text: &str, target: &Target) -> Result<Conv, VmR
                 return Ok(Conv::Bad(format!("cannot convert {text:?} to float")));
             }
             match text.parse::<f64>() {
-                Ok(f) if f.is_finite() => Conv::Ok(Value::object(vm.alloc_float(f))),
+                Ok(f) if f.is_finite() => Conv::Ok(vm.float_value(f)),
                 _ => Conv::Bad(format!("cannot convert {text:?} to float")),
             }
         }
@@ -1459,7 +1206,7 @@ fn convert_cell(vm: &mut BexVm, text: &str, target: &Target) -> Result<Conv, VmR
 
 /// Null-cell classification per BEP-060: an empty unquoted cell, or an
 /// unquoted cell matching `null_values`.
-fn null_cell_state(cell: &CellData, null_values: &[String]) -> NullState {
+fn null_cell_state(cell: &CsvCell, null_values: &[String]) -> NullState {
     if cell.quoted {
         return NullState::Data;
     }
@@ -1489,14 +1236,20 @@ impl From<VmRustFnError> for DecodeFail {
     }
 }
 
-fn record_arc(vm: &BexVm, rec: Value) -> Result<Arc<RecordData>, VmRustFnError> {
-    state_arc::<RecordData>(vm, rec, 0)
+fn record_arc(vm: &BexVm, rec: Value) -> Result<Arc<CsvRecord>, VmRustFnError> {
+    let instance = vm.as_rust_instance(&rec)?;
+    Ok(Arc::clone(view::csv::Record { instance }.payload()))
+}
+
+/// The error for a decode target only the runtime builds.
+fn runtime_owned_target(key: &str) -> String {
+    format!("`{key}` is built only by the runtime; CSV decodes into flat classes")
 }
 
 /// Decode a whole record into an instance of class `ty`.
 fn decode_record_to_instance(
     vm: &mut BexVm,
-    rd: &RecordData,
+    rd: &CsvRecord,
     ty: &bex_vm_types::RealizedTy,
 ) -> Result<Value, DecodeFail> {
     use bex_vm_types::RealizedTy;
@@ -1508,21 +1261,16 @@ fn decode_record_to_instance(
     };
     let key = head_key(head);
     let class_ptr = head.ptr();
-    let Object::Class(_) = vm.get_object(class_ptr) else {
+    let Object::Class(class) = vm.get_object(class_ptr) else {
         return Err(DecodeFail::Info(ErrInfo::new(
             Kind::Options,
             format!("class `{key}` not found"),
         )));
     };
-    let class_fields = match vm.get_object(class_ptr) {
-        Object::Class(c) => c.fields.clone(),
-        _ => {
-            return Err(DecodeFail::Info(ErrInfo::new(
-                Kind::Options,
-                format!("`{key}` is not a class"),
-            )));
-        }
-    };
+    let class_fields = class
+        .buildable_fields()
+        .map_err(|_| DecodeFail::Info(ErrInfo::new(Kind::Options, runtime_owned_target(&key))))?
+        .to_vec();
 
     let mut field_values = Vec::with_capacity(class_fields.len());
     for (fi, cf) in class_fields.iter().enumerate() {
@@ -1628,9 +1376,11 @@ fn decode_record_to_instance(
         }
     }
 
-    Ok(Value::object(vm.tlab.alloc(Object::Instance(
-        Instance::new(class_ptr, type_args.clone(), field_values),
-    ))))
+    Ok(Value::object(vm.tlab.alloc_instance_with_type_args(
+        class_ptr,
+        type_args.clone(),
+        field_values,
+    )))
 }
 
 fn current_type_arg(vm: &mut BexVm, who: &str) -> Result<bex_vm_types::RealizedTy, VmRustFnError> {
@@ -1649,7 +1399,7 @@ fn current_type_arg(vm: &mut BexVm, who: &str) -> Result<bex_vm_types::RealizedT
 /// Convert one cell to `T?` per the `get<T>` / `get_at<T>` rules.
 fn cell_to_optional(
     vm: &mut BexVm,
-    rd: &RecordData,
+    rd: &CsvRecord,
     col: Option<usize>,
     ty: &bex_vm_types::RealizedTy,
 ) -> Result<Option<Value>, VmRustFnError> {
@@ -1691,32 +1441,6 @@ fn cell_to_optional(
 // =============================================================================
 // Writer state and encoding
 // =============================================================================
-
-struct WriterState {
-    opts: WriterOpts,
-    header_written: bool,
-    records_written: i64,
-    bytes_written: i64,
-    /// `Some` for buffer writers; file writers stream through `_emit`.
-    buffer: Option<String>,
-    bom_pending: bool,
-    closed: bool,
-}
-
-impl WriterState {
-    fn new(opts: WriterOpts, buffered: bool) -> Self {
-        let bom_pending = opts.bom;
-        WriterState {
-            opts,
-            header_written: false,
-            records_written: 0,
-            bytes_written: 0,
-            buffer: buffered.then(String::new),
-            bom_pending,
-            closed: false,
-        }
-    }
-}
 
 const FORMULA_TRIGGERS: [char; 10] = ['=', '+', '-', '@', '\t', '\r', '\n', '＝', '＋', '－'];
 
@@ -1860,8 +1584,8 @@ fn format_float(f: f64) -> String {
     }
 }
 
-fn plaindate_cell_text(inst: &Instance) -> Result<String, CellTextErr> {
-    let days = view::time::PlainDate { instance: inst }._days();
+fn plaindate_cell_text(inst: InstanceRef) -> Result<String, CellTextErr> {
+    let days = view::time::PlainDate { instance: &inst }._days();
     let date = super::time::date_for_days(days, "csv cell")
         .map_err(|_| CellTextErr::Unsupported("PlainDate out of range".to_string()))?;
     let mut out = String::new();
@@ -1869,8 +1593,8 @@ fn plaindate_cell_text(inst: &Instance) -> Result<String, CellTextErr> {
     Ok(out)
 }
 
-fn plaindatetime_cell_text(inst: &Instance) -> Result<String, CellTextErr> {
-    let nanos = view::time::PlainDateTime { instance: inst }._nanoseconds();
+fn plaindatetime_cell_text(inst: InstanceRef) -> Result<String, CellTextErr> {
+    let nanos = view::time::PlainDateTime { instance: &inst }._nanoseconds();
     let dt = super::time::civil_datetime(&nanos, "csv cell")
         .map_err(|_| CellTextErr::Unsupported("PlainDateTime out of range".to_string()))?;
     let mut out = String::new();
@@ -1886,8 +1610,8 @@ fn plaindatetime_cell_text(inst: &Instance) -> Result<String, CellTextErr> {
     Ok(out)
 }
 
-fn instant_cell_text(inst: &Instance) -> Result<String, CellTextErr> {
-    let nanos = view::time::Instant { instance: inst }._nanoseconds();
+fn instant_cell_text(inst: InstanceRef) -> Result<String, CellTextErr> {
+    let nanos = view::time::Instant { instance: &inst }._nanoseconds();
     let nanos = i128::try_from(&*nanos)
         .map_err(|_| CellTextErr::Unsupported("Instant out of range".to_string()))?;
     let dt = OffsetDateTime::from_unix_timestamp_nanos(nanos)
@@ -1902,6 +1626,7 @@ fn value_cell_text(vm: &BexVm, v: Value, null_value: &str) -> Result<String, Cel
         ValueKind::Null => null_value.to_string(),
         ValueKind::Bool(b) => if b { "true" } else { "false" }.to_string(),
         ValueKind::Int(i) => i.to_string(),
+        ValueKind::Float(f) => float_cell_text(f)?,
         ValueKind::OmittedArg => {
             return Err(CellTextErr::Unsupported("omitted argument".to_string()));
         }
@@ -1918,25 +1643,19 @@ fn value_cell_text(vm: &BexVm, v: Value, null_value: &str) -> Result<String, Cel
                     CellTextErr::Unsupported("unresolvable enum variant".to_string())
                 })?
             }
-            Object::Instance(inst) => {
+            Object::Instance => {
+                let inst = vm.get_instance(ptr).expect("an instance pointer");
                 // Match the instance's class against the stdlib time classes
                 // by head — an integer compare per cell, with no name rendered
                 // and no package-index lookup.
-                let class_head = match vm.get_object(inst.class) {
-                    Object::Class(class) => bex_vm_types::TypeHead::new(inst.class, class.type_tag),
-                    _ => {
-                        return Err(CellTextErr::Unsupported(
-                            "value is not representable as a CSV cell".to_string(),
-                        ));
-                    }
-                };
+                let class_head = inst.head();
                 match vm.stdlib_heads().time_class(class_head) {
                     Some(TimeClass::Instant) => instant_cell_text(inst)?,
                     Some(TimeClass::PlainDate) => plaindate_cell_text(inst)?,
                     Some(TimeClass::PlainDateTime) => plaindatetime_cell_text(inst)?,
                     None => {
                         return Err(CellTextErr::Unsupported(
-                            "nested class values are not CSV cells; serialize explicitly (e.g. baml.json.to_string)".to_string(),
+                            "nested class values are not CSV cells; serialize explicitly (e.g. baml.json.stringify)".to_string(),
                         ));
                     }
                 }
@@ -1961,24 +1680,35 @@ fn cell_text_err_info(e: CellTextErr, context: &str) -> ErrInfo {
 }
 
 /// Field names and per-row field values for a typed row instance.
-fn row_fields(vm: &BexVm, row: Value) -> Result<(Vec<String>, Vec<Value>), ErrInfo> {
+fn row_fields(vm: &BexVm, row: Value) -> Result<(Vec<String>, Vec<Field>), ErrInfo> {
+    // A `@@rust_type` class instance holds native state, not fields.
+    if let Some(ptr) = row.as_object_ptr()
+        && let Object::RustInstance(inst) = vm.get_object(ptr)
+    {
+        let Object::Class(class) = vm.get_object(inst.class) else {
+            unreachable!("RustInstance.class must point to Object::Class")
+        };
+        return Err(ErrInfo::new(
+            Kind::Options,
+            format!(
+                "write_row target `{}` has no fields; CSV writes flat classes",
+                class.name().display_name()
+            ),
+        ));
+    }
     let inst = vm.as_instance(&row).map_err(|_| {
         ErrInfo::new(
             Kind::Options,
             "write_row target is not a class instance; CSV writes flat classes",
         )
     })?;
-    let names = match vm.get_object(inst.class) {
-        Object::Class(c) => c.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
-        _ => {
-            return Err(ErrInfo::new(
-                Kind::Options,
-                "write_row target is not a class instance",
-            ));
-        }
-    };
-    let values = (0..names.len()).map(|i| inst.load_field(i)).collect();
-    Ok((names, values))
+    let names = inst
+        .class_object()
+        .instance_fields()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    Ok((names, inst.fields().collect()))
 }
 
 /// Encode one typed row (plus the auto-header when `header_pending`), into
@@ -1998,9 +1728,12 @@ fn encode_typed_row(
         *header_pending = false;
     }
     let mut cells = Vec::with_capacity(values.len());
-    for (name, v) in names.iter().zip(&values) {
-        let text = value_cell_text(vm, *v, &o.null_value)
-            .map_err(|e| cell_text_err_info(e, &format!("field `{name}`")))?;
+    for (name, field) in names.iter().zip(values) {
+        let text = match field {
+            Field::Value(v) => value_cell_text(vm, v, &o.null_value),
+            Field::Float(f) => float_cell_text(f),
+        }
+        .map_err(|e| cell_text_err_info(e, &format!("field `{name}`")))?;
         cells.push(text);
     }
     out.push_str(&encode_line(o, &cells)?);
@@ -2023,19 +1756,17 @@ fn md_escape(text: &str) -> String {
     out
 }
 
-fn md_value_text(vm: &mut BexVm, v: Value, field_ty: Option<&bex_vm_types::RealizedTy>) -> String {
+fn md_value_text(vm: &mut BexVm, v: Value, json_fallback: bool) -> String {
     // Prompt text is not meant to round-trip: non-finite floats render as-is.
-    if let ValueKind::Object(ptr) = v.kind() {
-        if let Object::Float(f) = vm.get_object(ptr) {
-            return format_float_md(*f);
-        }
+    if let Some(f) = v.as_float() {
+        return format_float_md(f);
     }
     match value_cell_text(vm, v, "") {
         Ok(t) => t,
         Err(_) => {
-            // Nested values: fall back to JSON when the field type is known.
-            if let Some(ty) = field_ty {
-                if let Ok(json) = super::json::json_to_string_typed(vm, v, ty) {
+            // Nested values in a class row's fields: fall back to JSON.
+            if json_fallback {
+                if let Ok(json) = super::json::structural_json_text(vm, v) {
                     return json;
                 }
             }
@@ -2088,10 +1819,10 @@ fn render_markdown(headers: &[String], rows: &[Vec<String>], total_rows: usize) 
 
 impl BamlClassCsvReader for PackageBamlImpl {
     fn skipped(vm: &mut BexVm, csvreader: &Value) -> Vec<Value> {
-        let Ok(st) = state_arc::<Mutex<ReaderState>>(vm, *csvreader, 0) else {
+        let Ok(st) = reader_state_of(vm, *csvreader) else {
             return Vec::new();
         };
-        let infos: Vec<ErrInfo> = lock(&st).skipped.clone();
+        let infos: Vec<ErrInfo> = lock(&st, vm).skipped.clone();
         infos
             .iter()
             .filter_map(|info| error_value(vm, info).ok())
@@ -2099,14 +1830,14 @@ impl BamlClassCsvReader for PackageBamlImpl {
     }
 
     fn skipped_count(vm: &BexVm, csvreader: &view::csv::Reader<'_>) -> i64 {
-        lock(csvreader._handle::<Mutex<ReaderState>>(vm)).skipped_count
+        lock(&reader_state_in(vm, csvreader._state()), vm).skipped_count
     }
 
     fn position(vm: &mut BexVm, csvreader: &Value) -> Value {
-        match state_arc::<Mutex<ReaderState>>(vm, *csvreader, 0) {
+        match reader_state_of(vm, *csvreader) {
             Ok(st) => {
                 let (byte, line, record) = {
-                    let s = lock(&st);
+                    let s = lock(&st, vm);
                     (s.byte, s.line, s.record)
                 };
                 copy::csv::Position { byte, line, record }.to_value(vm)
@@ -2121,20 +1852,20 @@ impl BamlClassCsvReader for PackageBamlImpl {
     }
 
     fn _poll(vm: &mut BexVm, csvreader: &Value) -> Result<Value, VmRustFnError> {
-        let st = state_arc::<Mutex<ReaderState>>(vm, *csvreader, 0)?;
+        let st = reader_state_of(vm, *csvreader)?;
         let polled = {
-            let mut s = lock(&st);
+            let mut s = lock(&st, vm);
             poll_record(&mut s)
         };
         match polled {
             Ok(Polled::NeedData) => Ok(need_data_value(vm)),
-            Ok(Polled::Done) => done_value(vm),
+            Ok(Polled::Done) => Ok(done_value(vm)),
             Ok(Polled::Skipped(info)) => {
                 let error = error_value(vm, &info)?;
                 Ok(copy::csv::Skip { error }.to_value(vm))
             }
             Ok(Polled::Rec(rd)) => Ok(copy::csv::Record {
-                _handle: Arc::new(rd),
+                payload: Arc::new(rd),
             }
             .to_value(vm)),
             Err(info) => Err(throw_err(vm, &info)),
@@ -2142,9 +1873,9 @@ impl BamlClassCsvReader for PackageBamlImpl {
     }
 
     fn _poll_headers(vm: &mut BexVm, csvreader: &Value) -> Result<Value, VmRustFnError> {
-        let st = state_arc::<Mutex<ReaderState>>(vm, *csvreader, 0)?;
+        let st = reader_state_of(vm, *csvreader)?;
         let polled = {
-            let mut s = lock(&st);
+            let mut s = lock(&st, vm);
             poll_headers(&mut s)
         };
         match polled {
@@ -2168,20 +1899,20 @@ impl BamlClassCsvReader for PackageBamlImpl {
     }
 
     fn _feed(vm: &BexVm, csvreader: &view::csv::Reader<'_>, chunk: &[u8]) {
-        let mut s = lock(csvreader._handle::<Mutex<ReaderState>>(vm));
-        s.buf.extend_from_slice(chunk);
+        let state = reader_state_in(vm, csvreader._state());
+        lock(&state, vm).buf.extend_from_slice(chunk);
     }
 
     fn _feed_eof(vm: &BexVm, csvreader: &view::csv::Reader<'_>) {
-        lock(csvreader._handle::<Mutex<ReaderState>>(vm)).eof = true;
+        lock(&reader_state_in(vm, csvreader._state()), vm).eof = true;
     }
 
     fn _mark_closed(vm: &BexVm, csvreader: &view::csv::Reader<'_>) {
-        lock(csvreader._handle::<Mutex<ReaderState>>(vm)).closed = true;
+        lock(&reader_state_in(vm, csvreader._state()), vm).closed = true;
     }
 
     fn _mark_exhausted(vm: &BexVm, csvreader: &view::csv::Reader<'_>) {
-        lock(csvreader._handle::<Mutex<ReaderState>>(vm)).finished = true;
+        lock(&reader_state_in(vm, csvreader._state()), vm).finished = true;
     }
 }
 
@@ -2197,8 +1928,8 @@ impl BamlClassCsvRecord for PackageBamlImpl {
         }
     }
 
-    fn length(vm: &BexVm, csvrecord: &view::csv::Record<'_>) -> i64 {
-        csvrecord._handle::<RecordData>(vm).cells.len() as i64
+    fn length(_vm: &BexVm, csvrecord: &view::csv::Record<'_>) -> i64 {
+        csvrecord.payload().cells.len() as i64
     }
 
     fn position(vm: &mut BexVm, csvrecord: &Value) -> Value {
@@ -2253,13 +1984,13 @@ impl BamlClassCsvRecord for PackageBamlImpl {
 
 impl BamlClassCsvWriter for PackageBamlImpl {
     fn records_written(vm: &BexVm, csvwriter: &view::csv::Writer<'_>) -> i64 {
-        lock(csvwriter._handle::<Mutex<WriterState>>(vm)).records_written
+        lock(&writer_state_in(vm, csvwriter._state()), vm).records_written
     }
 
     fn text(vm: &mut BexVm, csvwriter: &Value) -> Result<bex_str::BexStr, VmRustFnError> {
-        let st = state_arc::<Mutex<WriterState>>(vm, *csvwriter, 0)?;
+        let st = writer_state_of(vm, *csvwriter)?;
         let text = {
-            let s = lock(&st);
+            let s = lock(&st, vm);
             s.buffer.clone()
         };
         match text {
@@ -2279,8 +2010,8 @@ impl BamlClassCsvWriter for PackageBamlImpl {
         csvwriter: &Value,
         record: &[Value],
     ) -> Result<bex_str::BexStr, VmRustFnError> {
-        let st = state_arc::<Mutex<WriterState>>(vm, *csvwriter, 0)?;
-        let mut s = lock(&st);
+        let st = writer_state_of(vm, *csvwriter)?;
+        let mut s = lock(&st, vm);
         if s.closed {
             drop(s);
             let info = ErrInfo::new(Kind::Closed, "writer is closed");
@@ -2314,8 +2045,8 @@ impl BamlClassCsvWriter for PackageBamlImpl {
         csvwriter: &Value,
         names: &[Value],
     ) -> Result<bex_str::BexStr, VmRustFnError> {
-        let st = state_arc::<Mutex<WriterState>>(vm, *csvwriter, 0)?;
-        let mut s = lock(&st);
+        let st = writer_state_of(vm, *csvwriter)?;
+        let mut s = lock(&st, vm);
         if s.closed {
             drop(s);
             let info = ErrInfo::new(Kind::Closed, "writer is closed");
@@ -2343,11 +2074,11 @@ impl BamlClassCsvWriter for PackageBamlImpl {
     }
 
     fn _bytes_written(vm: &BexVm, csvwriter: &view::csv::Writer<'_>) -> i64 {
-        lock(csvwriter._handle::<Mutex<WriterState>>(vm)).bytes_written
+        lock(&writer_state_in(vm, csvwriter._state()), vm).bytes_written
     }
 
     fn _mark_closed(vm: &BexVm, csvwriter: &view::csv::Writer<'_>) {
-        lock(csvwriter._handle::<Mutex<WriterState>>(vm)).closed = true;
+        lock(&writer_state_in(vm, csvwriter._state()), vm).closed = true;
     }
 }
 
@@ -2369,7 +2100,10 @@ impl BamlNamespaceCsv for PackageBamlImpl {
         } else if let Ok(bytes) = vm.as_uint8array(source) {
             let initial = bytes.to_vec();
             (initial, true, Value::NULL)
-        } else if vm.as_instance(source).is_ok() {
+        } else if vm
+            .as_rust_instance(source)
+            .is_ok_and(|instance| matches!(instance.payload, bex_vm_types::RustPayload::File(_)))
+        {
             (Vec::new(), false, *source)
         } else {
             return Err(options_err(
@@ -2380,7 +2114,10 @@ impl BamlNamespaceCsv for PackageBamlImpl {
 
         let state = ReaderState::new(opts, initial, eof);
         Ok(copy::csv::Reader {
-            _handle: Arc::new(Mutex::new(state)),
+            _state: copy::csv::ReaderState {
+                payload: Arc::new(MeteredMutex::new(state)),
+            }
+            .to_value(vm),
             _file: file,
             _on_skip: on_skip,
             _owns_file: owns_file && !file.is_null(),
@@ -2396,7 +2133,7 @@ impl BamlNamespaceCsv for PackageBamlImpl {
     ) -> Result<Value, VmRustFnError> {
         let opts = parse_writer_options(vm, options)?;
         Ok(copy::csv::Writer {
-            _handle: Arc::new(Mutex::new(WriterState::new(opts, false))),
+            _state: new_writer_state(vm, WriterState::new(opts, false)),
             _file: *file,
             _owns_file: owns_file,
         }
@@ -2406,7 +2143,7 @@ impl BamlNamespaceCsv for PackageBamlImpl {
     fn _buffer(vm: &mut BexVm, options: Option<&Value>) -> Result<Value, VmRustFnError> {
         let opts = parse_writer_options(vm, options)?;
         Ok(copy::csv::Writer {
-            _handle: Arc::new(Mutex::new(WriterState::new(opts, true))),
+            _state: new_writer_state(vm, WriterState::new(opts, true)),
             _file: Value::NULL,
             _owns_file: false,
         }
@@ -2425,15 +2162,21 @@ impl BamlNamespaceCsv for PackageBamlImpl {
         };
         let key = head_key(head);
         let class_fields = match vm.get_object(head.ptr()) {
-            Object::Class(c) => c.fields.clone(),
+            Object::Class(c) => match c.buildable_fields() {
+                Ok(fields) => fields.to_vec(),
+                Err(_) => {
+                    let info = ErrInfo::new(Kind::Options, runtime_owned_target(&key));
+                    return Err(throw_err(vm, &info));
+                }
+            },
             _ => {
                 let info = ErrInfo::new(Kind::Options, format!("`{key}` is not a class"));
                 return Err(throw_err(vm, &info));
             }
         };
 
-        let st = state_arc::<Mutex<ReaderState>>(vm, *r, 0)?;
-        let header = lock(&st).header.clone();
+        let st = reader_state_of(vm, *r)?;
+        let header = lock(&st, vm).header.clone();
 
         for cf in &class_fields {
             let field_ty = vm.realize_field_ty(&cf.field_template, type_args);
@@ -2480,8 +2223,8 @@ impl BamlNamespaceCsv for PackageBamlImpl {
             Err(DecodeFail::Fatal(e)) => Err(e),
             Err(DecodeFail::Info(info)) => {
                 let skip = info.kind == Kind::Decode && {
-                    let st = state_arc::<Mutex<ReaderState>>(vm, *r, 0)?;
-                    let mut s = lock(&st);
+                    let st = reader_state_of(vm, *r)?;
+                    let mut s = lock(&st, vm);
                     if s.opts.skip_on_error {
                         s.register_skip(&info);
                         true
@@ -2557,8 +2300,8 @@ impl BamlNamespaceCsv for PackageBamlImpl {
         w: &Value,
         row: &Value,
     ) -> Result<bex_str::BexStr, VmRustFnError> {
-        let st = state_arc::<Mutex<WriterState>>(vm, *w, 0)?;
-        let mut s = lock(&st);
+        let st = writer_state_of(vm, *w)?;
+        let mut s = lock(&st, vm);
         if s.closed {
             drop(s);
             let info = ErrInfo::new(Kind::Closed, "writer is closed");
@@ -2584,8 +2327,8 @@ impl BamlNamespaceCsv for PackageBamlImpl {
         w: &Value,
         rows: &[Value],
     ) -> Result<bex_str::BexStr, VmRustFnError> {
-        let st = state_arc::<Mutex<WriterState>>(vm, *w, 0)?;
-        let mut s = lock(&st);
+        let st = writer_state_of(vm, *w)?;
+        let mut s = lock(&st, vm);
         if s.closed {
             drop(s);
             let info = ErrInfo::new(Kind::Closed, "writer is closed");
@@ -2614,44 +2357,33 @@ impl BamlNamespaceCsv for PackageBamlImpl {
         let ty = vm.current_call_type_args().first().cloned();
         let max = usize::try_from(max_rows).unwrap_or(0);
 
-        // Header names + field types from T (or the first row's class).
+        // CsvHeader names from T's fields.
         let class_info = match &ty {
-            Some(RealizedTy::Class(head, type_args)) => {
-                Some(head.ptr()).and_then(|ptr| match vm.get_object(ptr) {
-                    Object::Class(c) => Some(
-                        c.fields
-                            .iter()
-                            .map(|f| {
-                                (
-                                    f.name.clone(),
-                                    vm.realize_field_ty(&f.field_template, type_args),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                    _ => None,
-                })
-            }
+            Some(RealizedTy::Class(head, _)) => match vm.get_object(head.ptr()) {
+                Object::Class(c) => Some(
+                    c.declared_fields()
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            },
             _ => None,
         };
 
         let (headers, row_cells): (Vec<String>, Vec<Vec<String>>) = match class_info {
-            Some(fields) => {
-                let headers = fields.iter().map(|(n, _)| n.clone()).collect();
+            Some(headers) => {
                 let cells = rows
                     .iter()
                     .take(max)
                     .map(|row| match vm.as_instance(row) {
                         Ok(inst) => {
-                            let values: Vec<Value> =
-                                (0..fields.len()).map(|i| inst.load_field(i)).collect();
-                            values
-                                .iter()
-                                .zip(&fields)
-                                .map(|(v, (_, fty))| md_value_text(vm, *v, Some(fty)))
-                                .collect()
+                            let values: Vec<Value> = (0..headers.len())
+                                .map(|i| vm.load_field_value(inst, i))
+                                .collect();
+                            values.iter().map(|v| md_value_text(vm, *v, true)).collect()
                         }
-                        Err(_) => vec!["<unrepresentable>".to_string(); fields.len()],
+                        Err(_) => vec!["<unrepresentable>".to_string(); headers.len()],
                     })
                     .collect();
                 (headers, cells)
@@ -2660,7 +2392,7 @@ impl BamlNamespaceCsv for PackageBamlImpl {
                 vec!["value".to_string()],
                 rows.iter()
                     .take(max)
-                    .map(|v| vec![md_value_text(vm, *v, None)])
+                    .map(|v| vec![md_value_text(vm, *v, false)])
                     .collect(),
             ),
         };
@@ -2708,5 +2440,21 @@ impl BamlNamespaceCsv for PackageBamlImpl {
             return bex_str::BexStr::from("");
         }
         bex_str::BexStr::from(render_markdown(&header_names, &rows, records.len()).as_str())
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn reader_publishes_retained_error_messages() {
+        let handle = MeteredMutex::new(ReaderState::new(ReaderOpts::default(), Vec::new(), true));
+        let before = handle.retained_bytes();
+        {
+            let mut state = handle.lock_uncharged();
+            state.register_skip(&ErrInfo::new(Kind::Decode, "e".repeat(50_000)));
+        }
+        assert!(handle.retained_bytes() >= before + 50_000);
     }
 }

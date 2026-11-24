@@ -41,7 +41,7 @@
 //! ## Suppression
 //!
 //! We suppress type hints for:
-//! - Unknown / error types (noise)
+//! - Error types (noise) and `never` (unreachable code)
 //! - Bindings named `_` (discard patterns)
 //! - Constructor or primitive-literal initializers (including homogeneous
 //!   arrays of them), and bindings named like their inferred type
@@ -56,13 +56,17 @@
 //! LLM declarative functions are skipped entirely (and never recursed into), so
 //! their synthetic `client` / `function_name` / `args` calls produce no hints.
 
-use baml_base::{SourceFile, SourceRootKind};
+use baml_base::{LangPackage, SourceFile};
 use baml_compiler2_ast::{
     Expr, ExprId, Stmt,
     ast::{AstSourceMap, ExprBody, FunctionOrigin},
 };
 use baml_compiler2_hir::{
-    body::FunctionBody, contributions::Definition, item_data, loc::DeclRef, package::package_items,
+    body::FunctionBody,
+    contributions::Definition,
+    item_data,
+    loc::DeclRef,
+    package::{lang_roots, package_items},
     scope::FileScopeId,
 };
 use baml_compiler2_hir_ty::ide::infer_for_scope;
@@ -85,7 +89,7 @@ pub enum AnnotationKind {
 }
 
 /// A single inline annotation (inlay hint) to display in the editor.
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub struct InlineAnnotation {
     /// Byte offset in the file where the hint is inserted.
     pub offset: TextSize,
@@ -163,6 +167,55 @@ pub fn file_annotations(
                     baml_compiler2_hir::item_data::function_source_map(db, func_loc).span;
                 index.scope_at_offset(func_span.start(), Some(&func_data.name))
             });
+        process_body(
+            db,
+            file,
+            index,
+            owner_scope,
+            expr_body,
+            &source_map,
+            &mut out,
+        );
+    }
+
+    // Global variables: an unannotated global's type, as an unannotated local
+    // `let` gets one, and the hints inside its initializer — a body like a
+    // function's. A `client` declaration's type is its constructor's, so it
+    // gets the initializer's hints only.
+    for &let_loc in item_data::file_lets(db, file) {
+        let body = baml_compiler2_hir::body::let_body(db, let_loc);
+        let baml_compiler2_hir::body::LetBody::Expr(expr_body) = body.as_ref() else {
+            continue;
+        };
+        let Some(source_map) = baml_compiler2_hir::body::let_body_source_map(db, let_loc) else {
+            continue;
+        };
+        let Some(owner_scope) =
+            item_data::let_scope(db, let_loc).map(|scope| scope.file_scope_id(db))
+        else {
+            continue;
+        };
+        let data = item_data::let_data(db, let_loc);
+        let annotatable = matches!(data.origin, baml_compiler2_ast::LetOrigin::Source);
+        if annotatable
+            && data.annotation.is_none()
+            && !expr_body
+                .root_expr
+                .is_some_and(|root| initializer_makes_type_obvious(expr_body, root))
+            && let Some(ty) = baml_compiler2_hir_ty::globals::global_value_type(db, let_loc)
+            && !should_suppress_type(&ty)
+            && !type_repeats_binding_name(data.name.as_str(), &ty)
+        {
+            let name_span = item_data::let_source_map(db, let_loc).name_span;
+            out.push(InlineAnnotation {
+                offset: name_span.end(),
+                label: format!(": {}", display_ty_for_file(db, file, &ty)),
+                kind: AnnotationKind::Type,
+                padding_left: false,
+                padding_right: true,
+                target: type_definition(db, &ty),
+            });
+        }
         process_body(
             db,
             file,
@@ -361,11 +414,13 @@ fn process_body(
 /// Returns `true` for types that would produce noisy or unhelpful hints.
 ///
 /// We suppress:
-/// - `Ty::Error` — type-check error, nothing useful to show
-/// - `Ty::Unknown` — no useful info
-/// - `Ty::Never` — unreachable / error types
+/// - any type carrying `Ty::Error` — a type-check error, nothing useful to show
+/// - `Ty::Never` — unreachable code
+///
+/// `unknown` shows: it is the top type a binding really holds, never a
+/// stand-in for a failure.
 fn should_suppress_type(ty: &Ty) -> bool {
-    baml_type::contains_error_recovery(ty) || matches!(ty, Ty::Unknown | Ty::Never)
+    baml_type::contains_error(ty) || matches!(ty, Ty::Never)
 }
 
 fn initializer_makes_type_obvious(body: &ExprBody, expr: ExprId) -> bool {
@@ -526,10 +581,7 @@ fn is_assert_without_hints(
         return false;
     };
     let root = function.file(db).source_root(db);
-    root.kind(db) == SourceRootKind::Stdlib
-        && root
-            .self_name(db)
-            .is_some_and(|name| name.as_str() == "assert")
+    lang_roots(db).get(LangPackage::Assert) == Some(root)
 }
 
 fn parameter_definition(
@@ -670,6 +722,41 @@ function unresolved() -> int {
         );
         assert!(type_hints_at(binding_offset("unresolved_lambda")).is_empty());
         assert!(hints.iter().all(|hint| !hint.label.contains("!error")));
+    }
+
+    /// `unknown` is the top type a binding really holds, so it is shown; an
+    /// erroneous type is not.
+    #[test]
+    fn a_binding_of_the_top_type_shows_its_type() {
+        const SOURCE: &str = r#"
+function any() -> unknown {
+    1
+}
+
+function main() -> int {
+    let anything = any()
+    let broken = missing_value
+    0
+}
+"#;
+
+        let mut builder = ProjectTest::builder();
+        builder.source("main.baml", SOURCE);
+        let project = builder.build();
+        let hints = file_annotations(&project.db, project.files[0]);
+        let type_hints_after = |name: &str| {
+            let start = SOURCE.find(name).expect("binding should exist");
+            let offset = TextSize::try_from(start + name.len())
+                .expect("binding offset should fit in TextSize");
+            hints
+                .iter()
+                .filter(|hint| hint.kind == AnnotationKind::Type && hint.offset == offset)
+                .map(|hint| hint.label.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(type_hints_after("anything"), vec![": unknown"]);
+        assert!(type_hints_after("broken").is_empty());
     }
 
     #[test]
@@ -1003,7 +1090,7 @@ function is_true(condition: bool) -> bool { condition }
             r#"
 
 function demo() -> bool {
-    assert.equal(1, 2) && assert.is_true(true)
+    root.assert.equal(1, 2) && root.assert.is_true(true)
 }
 "#,
         );

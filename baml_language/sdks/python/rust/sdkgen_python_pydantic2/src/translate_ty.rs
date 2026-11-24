@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use baml_base::{Literal, MediaKind, qualified_name::AI_STREAM_STREAM};
-use baml_sdkgen_types::{Name, Ty};
+use baml_sdkgen_types::{ClassCrossing, Name, Ty};
 use indexmap::IndexMap;
 
 use crate::{
@@ -41,6 +41,10 @@ pub(crate) struct TranslateCtx {
     /// runtime `.py` path, where callable types fall back to
     /// `typing.Callable[..., R]` (Protocol classes are stub-only).
     pub(crate) callback_protocols: Option<std::rc::Rc<IndexMap<Ty, String>>>,
+    /// `.pyi`-only: maps each `Ty::Function` in the leaf whose values BAML
+    /// makes to the name of the `typing.Protocol` emitted for it, which has
+    /// the handle and the async entry path of a BAML closure.
+    pub(crate) returned_protocols: Option<std::rc::Rc<IndexMap<Ty, String>>>,
     /// Rewrite source `ai.stream.Stream<T>` to the underlying host
     /// `_BamlStream` type. `Stream` is a host re-export rather than a normal
     /// generated class, so retaining the source spelling in annotations is
@@ -63,7 +67,65 @@ pub(crate) struct SelfRef {
     pub(crate) bare_name: String,
 }
 
+/// Which side makes the function values of a type. It decides the Python
+/// type of a callable: what it returns, and which Protocol names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallableSide {
+    /// The host may have made the callable: a function argument, a class
+    /// field, a type alias. It may be an `async def`: the bridge runs the
+    /// coroutine it returns to completion (`baml_bridge._dispatch`), so the
+    /// return type admits that coroutine too.
+    ///
+    /// A position that either side fills (a field of a class that the host
+    /// builds and that BAML returns) is on this side as well. A callable that
+    /// BAML made is also a value of the host's type: it returns a coroutine
+    /// of the value, and it takes every callback a host callable is given. So the host's
+    /// type is the one that every value of the position has.
+    Host,
+    /// Only BAML makes the callable: a returned function, an argument of a
+    /// host callback. Calling it is async, as for generated functions: the
+    /// call returns a coroutine of the value (`call_sync` blocks instead).
+    Baml,
+}
+
+impl CallableSide {
+    /// The side that makes the parameters of a function this side makes.
+    pub(crate) fn of_params(self) -> Self {
+        match self {
+            Self::Host => Self::Baml,
+            Self::Baml => Self::Host,
+        }
+    }
+
+    /// The Python return type of a callable this side makes, for a BAML
+    /// return type rendered as `ret`.
+    fn return_ty(self, ret: &str) -> String {
+        match self {
+            Self::Host => host_callback_return_ty(ret),
+            Self::Baml => format!("typing.Coroutine[typing.Any, typing.Any, {ret}]"),
+        }
+    }
+}
+
+/// What a host callback may return for a BAML return type rendered as `ret`:
+/// the value, or the coroutine of an `async def` callback. Spelled with
+/// `typing.Union` so the annotation also evaluates where `X | Y` does not.
+pub(crate) fn host_callback_return_ty(ret: &str) -> String {
+    format!("typing.Union[{ret}, typing.Coroutine[typing.Any, typing.Any, {ret}]]")
+}
+
+/// The Python type of `ty` where the host supplies the value: a function
+/// argument, a class field, a type alias.
 pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
+    translate_ty_from(ty, ctx, CallableSide::Host)
+}
+
+/// The Python type of a parameter of a host callback: BAML supplies the value.
+pub(crate) fn translate_callback_param_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
+    translate_ty_from(ty, ctx, CallableSide::Baml)
+}
+
+fn translate_ty_from(ty: &Ty, ctx: &TranslateCtx, side: CallableSide) -> String {
     match ty {
         Ty::Int => "int".to_string(),
         Ty::Bigint => "int".to_string(),
@@ -87,12 +149,16 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
         Ty::Media(MediaKind::Pdf) => media_ref("Pdf", ctx),
         Ty::Media(MediaKind::Generic) => "typing.Any".to_string(),
         Ty::Class(name, args) => {
+            if is_host_value(name, ctx.names.as_deref()) {
+                debug_assert!(args.is_empty(), "`{name}` takes no type arguments");
+                return "_BamlPyHandle".to_string();
+            }
             if ctx.type_stream_accessors
                 && is_ai_stream_type(name)
                 && let [value] = &**args
             {
-                let stream_type = translate_ty(value, ctx);
-                let yield_type = translate_stream_yield_ty(value, ctx);
+                let stream_type = translate_ty_from(value, ctx, side);
+                let yield_type = translate_stream_yield_ty(value, ctx, side);
                 let next_type = if ctx.include_stream_done {
                     let done = if ctx.current_leaf.segments == ["ai", "stream"] {
                         "Done"
@@ -107,10 +173,13 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
                     "_BamlStream[{}, {}, {}]",
                     next_type,
                     yield_type,
-                    translate_ty(value, ctx),
+                    translate_ty_from(value, ctx, side),
                 );
             }
-            let arg_strs: Vec<String> = args.iter().map(|a| translate_ty(a, ctx)).collect();
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|a| translate_ty_from(a, ctx, side))
+                .collect();
             render_name_ref_or_self_ref(name, ctx, &arg_strs.join(", "))
         }
         Ty::TypeAlias(name) => render_name_ref_or_self_ref(name, ctx, ""),
@@ -127,27 +196,38 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
             .get(name.as_str())
             .cloned()
             .unwrap_or_else(|| name.as_str().to_string()),
-        Ty::List(inner) => format!("typing.List[{}]", translate_ty(inner, ctx)),
+        Ty::List(inner) => format!("typing.List[{}]", translate_ty_from(inner, ctx, side)),
         Ty::Map { key, value, .. } => {
             format!(
                 "typing.Dict[{}, {}]",
-                translate_ty(key, ctx),
-                translate_ty(value, ctx)
+                translate_ty_from(key, ctx, side),
+                translate_ty_from(value, ctx, side)
             )
         }
+        Ty::Tuple(items) => format!(
+            "typing.Tuple[{}]",
+            items
+                .iter()
+                .map(|item| translate_ty_from(item, ctx, side))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Ty::Union(items) => {
             // `T | null` (a single non-null member plus null) is optionality —
             // emit idiomatic `typing.Optional[T]`. Multi-member nullable unions
             // fall through to `typing.Union[A, B, None]` (Null → "None").
             let non_null: Vec<&Ty> = items.iter().filter(|t| !matches!(t, Ty::Null)).collect();
             if non_null.len() == 1 && non_null.len() < items.len() {
-                format!("typing.Optional[{}]", translate_ty(non_null[0], ctx))
+                format!(
+                    "typing.Optional[{}]",
+                    translate_ty_from(non_null[0], ctx, side)
+                )
             } else {
                 format!(
                     "typing.Union[{}]",
                     items
                         .iter()
-                        .map(|item| translate_ty(item, ctx))
+                        .map(|item| translate_ty_from(item, ctx, side))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -160,47 +240,66 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
         | Ty::PromptAst
         | Ty::Future(..) => "typing.Any".to_string(),
         Ty::Function { params, ret, .. } => {
+            // A callable that `typing.Callable` cannot describe is emitted as
+            // a named `typing.Protocol`, and the type expression here is that
+            // Protocol's name: a host callback with optional params, and
+            // every callable that BAML makes.
+            let protocols = match side {
+                CallableSide::Host => &ctx.callback_protocols,
+                CallableSide::Baml => &ctx.returned_protocols,
+            };
+            if let Some(name) = protocols.as_ref().and_then(|map| map.get(ty)) {
+                return name.clone();
+            }
             let has_optional = params
                 .iter()
                 .any(|param| param.mode == baml_sdkgen_types::CodegenFunctionParamMode::Optional);
             if has_optional {
-                // A callback with optional params is emitted as a named
-                // `typing.Protocol` (see `TranslateCtx::callback_protocols`):
-                // the type expression here is just that Protocol's name.
-                if let Some(name) = ctx.callback_protocols.as_ref().and_then(|map| map.get(ty)) {
-                    return name.clone();
-                }
                 // Runtime `.py` path (no Protocol map): `typing.Callable` can't
                 // express per-param optionality, so widen the arg list.
-                format!("typing.Callable[..., {}]", translate_ty(ret, ctx))
+                format!(
+                    "typing.Callable[..., {}]",
+                    side.return_ty(&translate_ty_from(ret, ctx, side))
+                )
             } else {
                 format!(
                     "typing.Callable[[{}], {}]",
                     params
                         .iter()
-                        .map(|param| translate_ty(&param.ty, ctx))
+                        .map(|param| translate_ty_from(&param.ty, ctx, side.of_params()))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    translate_ty(ret, ctx)
+                    side.return_ty(&translate_ty_from(ret, ctx, side))
                 )
             }
         }
-        Ty::Void | Ty::Never => "None".to_string(),
-        // `$rust_type` fields in stdlib stubs (Response._body, SseStream._handle, …).
-        // The host-language opaque-handle wrapper is `BamlPyHandle` from the
-        // bridge runtime, imported as `_BamlPyHandle` to keep `baml` (the
-        // local relative module) from shadowing it. The single-underscore
-        // field name still triggers Pydantic v2's private-attribute handling
-        // regardless of the annotation; `_decode_class` injects the value
-        // into `__pydantic_private__` post-construction.
-        Ty::RustType => "_BamlPyHandle".to_string(),
+        Ty::Never => "None".to_string(),
+    }
+}
+
+/// Whether the class `name` is a host's own value, which crosses as the
+/// host's handle to it and so renders as the runtime's `_BamlPyHandle`.
+/// Without the declaration projection (translator-only unit tests) no class
+/// is.
+pub(crate) fn is_host_value(name: &Name, names: Option<&PythonNames>) -> bool {
+    match names.and_then(|names| names.crossing(name)) {
+        Some(ClassCrossing::HostValue) => true,
+        Some(
+            ClassCrossing::Fields
+            | ClassCrossing::Opaque
+            | ClassCrossing::Stream
+            | ClassCrossing::FunctionSpec
+            | ClassCrossing::Media(_)
+            | ClassCrossing::Prompt,
+        )
+        | None => false,
     }
 }
 
 /// Async iteration consumes the raw `next()` protocol: `Done` terminates the
 /// iterator and top-level null partials are skipped. Render the value that can
 /// actually reach the loop body rather than reusing the broader next type.
-fn translate_stream_yield_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
+fn translate_stream_yield_ty(ty: &Ty, ctx: &TranslateCtx, side: CallableSide) -> String {
     match ty {
         Ty::Null => "typing_extensions.Never".to_string(),
         Ty::Union(items) => {
@@ -210,17 +309,17 @@ fn translate_stream_yield_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
                 .collect::<Vec<_>>();
             match non_null.as_slice() {
                 [] => "typing_extensions.Never".to_string(),
-                [only] => translate_ty(only, ctx),
+                [only] => translate_ty_from(only, ctx, side),
                 many => format!(
                     "typing.Union[{}]",
                     many.iter()
-                        .map(|item| translate_ty(item, ctx))
+                        .map(|item| translate_ty_from(item, ctx, side))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
             }
         }
-        _ => translate_ty(ty, ctx),
+        _ => translate_ty_from(ty, ctx, side),
     }
 }
 
@@ -302,6 +401,13 @@ fn projected_bare_name(name: &Name, ctx: &TranslateCtx) -> String {
     )
 }
 
+/// The Python type of `ty` where BAML supplies the value: what a function
+/// returns. Function values returned by BAML expose controls and an async
+/// entry path.
+pub(crate) fn translate_return_ty(ty: &Ty, ctx: &TranslateCtx) -> String {
+    translate_ty_from(ty, ctx, CallableSide::Baml)
+}
+
 #[cfg(test)]
 mod tests {
     use baml_base::Name as BaseName;
@@ -328,6 +434,7 @@ mod tests {
             self_ref: None,
             defer_name_refs: false,
             callback_protocols: None,
+            returned_protocols: None,
             type_stream_accessors: false,
             include_stream_done: false,
             names: None,
@@ -344,6 +451,7 @@ mod tests {
             current_leaf: leaf(current_segments),
             defer_name_refs: false,
             callback_protocols: None,
+            returned_protocols: None,
             type_stream_accessors: false,
             include_stream_done: false,
             self_ref: Some(SelfRef {
@@ -367,6 +475,7 @@ mod tests {
             current_leaf: leaf(current_segments),
             defer_name_refs: true,
             callback_protocols: None,
+            returned_protocols: None,
             type_stream_accessors: false,
             include_stream_done: false,
             self_ref: Some(SelfRef {
@@ -469,16 +578,83 @@ mod tests {
             | Ty::List(..)
             | Ty::Map { .. }
             | Ty::Union(..)
+            | Ty::Tuple(..)
             | Ty::Unknown
             | Ty::Function { .. }
             | Ty::Future(..)
-            | Ty::Void
             | Ty::Never
-            | Ty::RustType
             | Ty::Type
             | Ty::Resource
             | Ty::PromptAst => {}
         }
+    }
+
+    /// A function that BAML returns is BAML-made: a call returns a coroutine
+    /// of the value. The callbacks the host passes into it are host-made.
+    #[test]
+    fn returned_callable_returns_its_value_and_takes_host_callbacks() {
+        let returned = callable(
+            vec![callable_param(callable(
+                vec![callable_param(Ty::Int)],
+                Box::new(Ty::String),
+            ))],
+            Box::new(Ty::Bool),
+        );
+        assert_eq!(
+            translate_return_ty(&returned, &ctx(&["lorem"])),
+            "typing.Callable[[typing.Callable[[int], typing.Union[str, typing.Coroutine[typing.Any, typing.Any, str]]]], typing.Coroutine[typing.Any, typing.Any, bool]]",
+        );
+        assert_eq!(
+            translate_callback_param_ty(&returned, &ctx(&["lorem"])),
+            "typing.Callable[[typing.Callable[[int], typing.Union[str, typing.Coroutine[typing.Any, typing.Any, str]]]], typing.Coroutine[typing.Any, typing.Any, bool]]",
+        );
+    }
+
+    /// A callable is named by the Protocol of the side that makes it, at
+    /// every depth: the same function type is a different Python type as a
+    /// host callback and as a BAML closure.
+    #[test]
+    fn callable_takes_the_protocol_of_the_side_that_makes_it() {
+        let optional = callable(
+            vec![
+                callable_param(Ty::Int),
+                optional_callable_param("limit", Ty::Int),
+            ],
+            Box::new(Ty::String),
+        );
+        let mut ctx = ctx(&["lorem"]);
+        ctx.callback_protocols = Some(std::rc::Rc::new(IndexMap::from([(
+            optional.clone(),
+            "_HostCallback".to_string(),
+        )])));
+        ctx.returned_protocols = Some(std::rc::Rc::new(IndexMap::from([(
+            optional.clone(),
+            "_BamlReturned1".to_string(),
+        )])));
+
+        assert_eq!(translate_ty(&optional, &ctx), "_HostCallback");
+        assert_eq!(translate_return_ty(&optional, &ctx), "_BamlReturned1");
+        assert_eq!(
+            translate_callback_param_ty(&optional, &ctx),
+            "_BamlReturned1"
+        );
+
+        // A host callback is handed a BAML closure, and returns a host one.
+        let takes = callable(vec![callable_param(optional.clone())], Box::new(Ty::Bool));
+        assert_eq!(
+            translate_ty(&takes, &ctx),
+            "typing.Callable[[_BamlReturned1], typing.Union[bool, typing.Coroutine[typing.Any, typing.Any, bool]]]",
+        );
+        let gives = callable(vec![], Box::new(optional.clone()));
+        assert_eq!(
+            translate_ty(&gives, &ctx),
+            "typing.Callable[[], typing.Union[_HostCallback, typing.Coroutine[typing.Any, typing.Any, _HostCallback]]]",
+        );
+        // A list keeps the side of the value that holds it.
+        assert_eq!(
+            translate_return_ty(&list(Box::new(optional)), &ctx),
+            "typing.List[_BamlReturned1]",
+        );
     }
 
     #[test]
@@ -525,12 +701,6 @@ mod tests {
                 ty: Ty::Unknown,
                 ctx: ctx(&["lorem"]),
                 expected: "typing.Any",
-            },
-            Case {
-                label: "unit",
-                ty: Ty::Void,
-                ctx: ctx(&["lorem"]),
-                expected: "None",
             },
             Case {
                 label: "baml options",
@@ -743,6 +913,26 @@ mod tests {
                 expected: "typing.Optional[typing.List[Resume]]",
             },
             Case {
+                label: "tuple int string",
+                ty: Ty::Tuple(vec![Ty::Int, Ty::String].into()),
+                ctx: ctx(&["lorem"]),
+                expected: "typing.Tuple[int, str]",
+            },
+            Case {
+                label: "one-tuple",
+                ty: Ty::Tuple(vec![Ty::Bool].into()),
+                ctx: ctx(&["lorem"]),
+                expected: "typing.Tuple[bool]",
+            },
+            Case {
+                label: "list of tuple with optional",
+                ty: list(Box::new(Ty::Tuple(
+                    vec![union(vec![Ty::String, Ty::Null]), list(Box::new(Ty::Int))].into(),
+                ))),
+                ctx: ctx(&["lorem"]),
+                expected: "typing.List[typing.Tuple[typing.Optional[str], typing.List[int]]]",
+            },
+            Case {
                 label: "list optional string",
                 ty: list(Box::new(union(vec![Ty::String, Ty::Null]))),
                 ctx: ctx(&["lorem"]),
@@ -767,13 +957,13 @@ mod tests {
                     Box::new(Ty::Bool),
                 ),
                 ctx: ctx(&["lorem"]),
-                expected: "typing.Callable[[int, str], bool]",
+                expected: "typing.Callable[[int, str], typing.Union[bool, typing.Coroutine[typing.Any, typing.Any, bool]]]",
             },
             Case {
                 label: "callable no params",
-                ty: callable(vec![], Box::new(Ty::Void)),
+                ty: callable(vec![], Box::new(Ty::Null)),
                 ctx: ctx(&["lorem"]),
-                expected: "typing.Callable[[], None]",
+                expected: "typing.Callable[[], typing.Union[None, typing.Coroutine[typing.Any, typing.Any, None]]]",
             },
             Case {
                 label: "callable nested params",
@@ -782,7 +972,7 @@ mod tests {
                     Box::new(union(vec![Ty::String, Ty::Null])),
                 ),
                 ctx: ctx(&["lorem"]),
-                expected: "typing.Callable[[typing.List[int]], typing.Optional[str]]",
+                expected: "typing.Callable[[typing.List[int]], typing.Union[typing.Optional[str], typing.Coroutine[typing.Any, typing.Any, typing.Optional[str]]]]",
             },
             Case {
                 label: "callable optional params",
@@ -794,7 +984,42 @@ mod tests {
                     Box::new(Ty::Bool),
                 ),
                 ctx: ctx(&["lorem"]),
-                expected: "typing.Callable[..., bool]",
+                expected: "typing.Callable[..., typing.Union[bool, typing.Coroutine[typing.Any, typing.Any, bool]]]",
+            },
+            // A callable that BAML hands to a host callback returns its value.
+            Case {
+                label: "callable that takes a callable",
+                ty: callable(
+                    vec![callable_param(callable(
+                        vec![callable_param(Ty::Int)],
+                        Box::new(Ty::String),
+                    ))],
+                    Box::new(Ty::Bool),
+                ),
+                ctx: ctx(&["lorem"]),
+                expected: "typing.Callable[[typing.Callable[[int], typing.Coroutine[typing.Any, typing.Any, str]]], typing.Union[bool, typing.Coroutine[typing.Any, typing.Any, bool]]]",
+            },
+            // A callable that a host callback returns is host-made too.
+            Case {
+                label: "callable that returns a callable",
+                ty: callable(
+                    vec![],
+                    Box::new(callable(
+                        vec![callable_param(Ty::Int)],
+                        Box::new(Ty::String),
+                    )),
+                ),
+                ctx: ctx(&["lorem"]),
+                expected: "typing.Callable[[], typing.Union[typing.Callable[[int], typing.Union[str, typing.Coroutine[typing.Any, typing.Any, str]]], typing.Coroutine[typing.Any, typing.Any, typing.Callable[[int], typing.Union[str, typing.Coroutine[typing.Any, typing.Any, str]]]]]]",
+            },
+            Case {
+                label: "list of callables",
+                ty: list(Box::new(callable(
+                    vec![callable_param(Ty::Int)],
+                    Box::new(Ty::String),
+                ))),
+                ctx: ctx(&["lorem"]),
+                expected: "typing.List[typing.Callable[[int], typing.Union[str, typing.Coroutine[typing.Any, typing.Any, str]]]]",
             },
             Case {
                 label: "optional media",

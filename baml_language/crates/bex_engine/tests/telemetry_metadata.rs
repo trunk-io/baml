@@ -34,36 +34,40 @@ function main() -> int {
 }
 "#;
 
-/// `FunctionArgs` root parameter count from a current-format blob header.
-fn captured_slots(root: &std::path::Path, id: proto::SnapshotId) -> u64 {
+/// `FunctionArgs` root parameter count of a captured blob.
+fn captured_slots(root: &std::path::Path, id: proto::CasId) -> u64 {
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&id.low.to_le_bytes());
     bytes[8..].copy_from_slice(&id.high.to_le_bytes());
-    let path = btel_file::cas_path(
+    let path = btel_core::cas::cas_path(
         &root.join(".baml/btel/cas"),
-        btel_snapshot::SnapshotId::from_bytes(bytes),
+        btel_snapshot::CasId::from_bytes(bytes),
     );
     let blob = std::fs::read(path).unwrap();
-    // magic(8) version(4) id(16) limited(1) objects(4) root tag(1) count(8)
-    assert_eq!(blob[33], 1, "inputs use a FunctionArgs root");
-    u64::from_le_bytes(blob[34..42].try_into().unwrap())
+    let decoded =
+        btel_core::cas::decode_blob(&blob, &btel_core::cas::DecodeLimits::default()).unwrap();
+    let btel_core::cas::DecodedRoot::FunctionArgs {
+        parameter_count, ..
+    } = decoded.root
+    else {
+        panic!("inputs use a FunctionArgs root");
+    };
+    parameter_count
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recorded_argument_layouts_align_with_captured_input_slots() {
     let root = tempfile::tempdir().unwrap();
-    let mut program = baml_db::testing::compile_source(SOURCE);
+    let mut program = baml_test_support::compile_source(SOURCE);
     for object in &mut program.objects.0 {
         if let bex_vm_types::Object::Function(f) = object
             && matches!(
-                f.name.rsplit('.').next(),
+                f.name().rsplit('.').next(),
                 Some("greet" | "Extract" | "Nothing")
             )
         {
             // Exercise real input capture without network/LLM calls.
-            f.body_meta = Some(bex_vm_types::FunctionMeta::Llm {
-                client: "test".into(),
-            });
+            f.body_meta = Some(bex_vm_types::FunctionMeta::Llm);
         }
     }
     let recording = TelemetryRecording::local_files(root.path(), RecordingConfig::default());
@@ -90,22 +94,32 @@ async fn recorded_argument_layouts_align_with_captured_input_slots() {
     engine.shutdown().await;
     assert_eq!(engine.telemetry_result(), Some(Ok(())));
 
-    let read = btel_file::read_directory(&directory).unwrap();
+    let read = btel_core::recording::read_directory(&directory).unwrap();
     let mut functions = HashMap::new();
     let mut unavailable = 0;
     let mut paths = HashMap::new();
     let mut inputs = Vec::new();
     for file in &read.files {
-        let mut expected_minor = btel_settings::encoding::FORMAT_MINOR;
+        let header = file.header.as_ref().unwrap();
+        let mut expected_minor = btel_core::recording::minor::BASE;
+        if header.process_id.is_some() {
+            expected_minor = expected_minor.max(btel_core::recording::minor::PROCESS_CONTEXT);
+        }
         if file.spans.as_ref().is_some_and(|spans| {
             spans
                 .sections
                 .iter()
                 .any(|section| section.context.is_some())
         }) {
-            expected_minor = expected_minor.max(btel_settings::encoding::CONTEXT_FORMAT_MINOR);
+            expected_minor = expected_minor.max(btel_core::recording::minor::CONTEXT);
         }
-        assert_eq!(file.header.as_ref().unwrap().format_minor, expected_minor);
+        if header.program_id.is_some() {
+            expected_minor = expected_minor.max(btel_core::recording::minor::PACKAGE_IDENTITY);
+        }
+        if header.os.is_some() {
+            expected_minor = expected_minor.max(btel_core::recording::minor::PROCESS_PLATFORM);
+        }
+        assert_eq!(header.format_minor, expected_minor);
         let definitions = file.definitions.as_ref().unwrap();
         for function in &definitions.functions {
             match function.resolution.as_ref().unwrap() {

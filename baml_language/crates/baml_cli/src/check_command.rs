@@ -1,13 +1,15 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
 use baml_db::{
-    ProjectDatabase,
-    baml_compiler_diagnostics::{Diagnostic, Severity, render},
+    CheckedWorld, ProjectDatabase, ProjectDiagnostics, SourceRoot, WorldHasErrors,
+    baml_compiler_diagnostics::{Diagnostic, render},
 };
 use clap::Args;
 
-use crate::reporter::Reporter;
+use crate::{
+    ExitCode,
+    output::{Command, CommandContext, Outcome},
+    reporter::Reporter,
+};
 
 /// Check BAML source files for compiler errors.
 ///
@@ -20,30 +22,27 @@ Examples:
     baml check
 
   Check a specific project:
-    baml check --project ./my-project")]
+    baml check --project-dir ./my-project")]
 pub struct CheckArgs {
     #[command(flatten)]
     pub compiler: crate::commands::CompilerArgs,
-
-    /// Deprecated alias for `--project`.
-    #[arg(long, value_name = "PATH", hide = true)]
-    pub from: Option<PathBuf>,
 }
 
-impl CheckArgs {
-    pub fn run(&self) -> Result<crate::ExitCode> {
+impl Command for CheckArgs {
+    type Output = ();
+
+    fn run(&self, cx: &CommandContext) -> Result<Outcome<()>> {
         let reporter = Reporter::new();
         let mut session = crate::project_session::ProjectSession::open(
-            self.from.as_deref(),
+            cx.project_dir.as_deref(),
             crate::project_session::CacheUse::ReadWrite,
         )?;
         if session.is_empty() {
-            reporter.abandon();
             crate::reporter::print_error(format_args!(
                 "no .baml files found in {}",
                 session.root().display()
             ));
-            return Ok(crate::ExitCode::Other);
+            return Ok(Outcome::new((), ExitCode::Failure));
         }
         let file_count = session.file_count();
 
@@ -65,7 +64,7 @@ impl CheckArgs {
                 let incremental = ctx.collect_diagnostics_incremental(db, package, served.as_ref());
                 (incremental.merged, Some(incremental.fresh_by_file))
             }
-            None => (baml_db::collect_diagnostics(db), None),
+            None => (ProjectDiagnostics::collect(db), None),
         };
         if let Some(cache) = cache {
             cache.verify_diagnostics(db, package)?;
@@ -84,42 +83,29 @@ impl CheckArgs {
             // re-derivation is Salsa-memoized against the check just performed.
             cache.store_stdlib_diagnostics(db);
         }
-        // Warm evidence (mirrors run/test): with the check rows served and the
-        // stdlib blob serving builtins, this is 0; a cold check walks every
-        // scope.
-        crate::bytecode_cache::cache_debug(format_args!(
-            "body inferences: {} this process",
-            baml_db::baml_compiler2_hir_ty::infer::body_inferences()
-        ));
         if !diagnostics.is_empty() {
             let rendered = render_project_diagnostics(db, &diagnostics);
-            reporter.suspend(|| {
-                #[allow(clippy::print_stderr)]
-                {
-                    eprintln!("{rendered}");
-                }
-            });
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("{rendered}");
+            }
         }
 
-        let error_count = diagnostics
-            .iter()
-            .filter(|diag| diag.severity == Severity::Error)
-            .count();
-        if error_count > 0 {
-            reporter.abandon();
-            return Ok(crate::ExitCode::Other);
-        }
+        // Every diagnostic is rendered above; the world's check is the verdict.
+        let Ok(world) = CheckedWorld::check(&diagnostics, package) else {
+            return Ok(Outcome::new((), ExitCode::Failure));
+        };
 
         // Seed the bytecode cache from this clean check — the same
         // compile-and-store path run/test use — but only when it advances the
         // manifest: a project whose rows were served is the one the manifest
         // already describes, so there is nothing to store, and skipping keeps
         // the no-op check emit-free. Seeding is an optimization: a failed
-        // emit on a diagnostics-clean project is logged, never surfaced as a
-        // check failure.
+        // emit on a diagnostics-clean project is not a check failure, except
+        // an internal lowering error, which is a compiler bug.
         if let Some(ctx) = cache {
             if served.is_none() {
-                match crate::bytecode_cache::compile_program(db, package, cache.as_ref()) {
+                match crate::bytecode_cache::compile_program(&world, cache.as_ref()) {
                     Ok(program) => {
                         let fresh = fresh_diagnostics
                             .as_ref()
@@ -132,18 +118,56 @@ impl CheckArgs {
                             stdlib_interface_hit,
                         )?;
                     }
-                    Err(err) => {
-                        crate::bytecode_cache::cache_debug(format_args!(
-                            "check: cache seeding skipped (emit failed): {err:?}"
+                    // An internal lowering error is a compiler bug the checked
+                    // program would hit on every `run`/`test`, not a cold
+                    // cache: report it rather than pass the check.
+                    Err(baml_db::CompileProgramError::Emit(
+                        baml_db::baml_compiler2_emit::LoweringError::Internal(message),
+                    )) => {
+                        crate::reporter::print_error(format_args!(
+                            "internal compiler error: {message}"
                         ));
+                        return Ok(Outcome::new((), ExitCode::Failure));
                     }
+                    // Any other failed emit leaves the cache cold and is not
+                    // an error.
+                    Err(_) => {}
                 }
             }
         }
 
         reporter.finish("Finished", format!("checked {file_count} file(s)"));
-        Ok(crate::ExitCode::Success)
+        Ok(Outcome::ok(()))
     }
+}
+
+/// The world `package` heads, admitted by its check
+/// ([`CheckedWorld::check`]); a refused world has its errors rendered and the
+/// command bails with `context`.
+pub(crate) fn checked_world<'db>(
+    diagnostics: &ProjectDiagnostics<'db>,
+    package: SourceRoot,
+    context: &str,
+) -> Result<CheckedWorld<'db>> {
+    CheckedWorld::check(diagnostics, package)
+        .map_err(|refused| refused_world_error(diagnostics.db(), &refused, context))
+}
+
+/// Renders a refused world's errors and returns the command's error.
+pub(crate) fn refused_world_error(
+    db: &ProjectDatabase,
+    refused: &WorldHasErrors,
+    context: &str,
+) -> anyhow::Error {
+    let rendered = render_project_diagnostics(db, refused.errors());
+    #[expect(
+        clippy::print_stderr,
+        reason = "a refused compile's diagnostics are the command's error output"
+    )]
+    {
+        eprintln!("{rendered}");
+    }
+    anyhow::anyhow!("{context}")
 }
 
 pub(crate) fn render_project_diagnostics(
@@ -161,7 +185,7 @@ pub(crate) fn render_project_diagnostics(
         file_paths.insert(file_id, source_file.path(db));
         source_files.insert(file_id, source_file);
     }
-    let config = crate::output::policy().diagnostic_render_config();
+    let config = crate::output::diagnostic_render_config();
     // Colorized human output classifies the offending sources through the
     // same compiler classifier the editor uses; every other preset renders
     // plain, so the highlighting work is skipped entirely.

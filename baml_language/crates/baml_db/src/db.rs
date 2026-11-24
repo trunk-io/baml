@@ -17,7 +17,8 @@ use std::{
 };
 
 use baml_base::{
-    Dependency, FileId, Name, SourceFile, SourceRoot, SourceRootKind, SourceRootTable,
+    ClaimedIdentity, Dependency, FileId, Name, SourceFile, SourceRoot, SourceRootKind,
+    SourceRootTable,
 };
 use baml_compiler2_hir::{
     inputs::{LangRootsInput, SeededCallableThrows, SeededStdlibInterface, SeededThrowFacts},
@@ -45,6 +46,9 @@ pub struct SourceRootSpec {
     /// by the database to every non-`Stdlib` root; only explicit edges go
     /// here, and every root they name must already be live.
     pub dependencies: Vec<Dependency>,
+    /// What the package's manifest claims it is. Ignored for a root served
+    /// from an interface, whose blob states the claim it was compiled under.
+    pub claim: ClaimedIdentity,
 }
 
 impl SourceRootSpec {
@@ -56,6 +60,7 @@ impl SourceRootSpec {
             self_name: None,
             interface: None,
             dependencies: Vec::new(),
+            claim: ClaimedIdentity::default(),
         }
     }
 
@@ -74,6 +79,12 @@ impl SourceRootSpec {
     #[must_use]
     pub fn depending_on(mut self, dependencies: Vec<Dependency>) -> Self {
         self.dependencies = dependencies;
+        self
+    }
+
+    #[must_use]
+    pub fn claiming(mut self, claim: ClaimedIdentity) -> Self {
+        self.claim = claim;
         self
     }
 }
@@ -245,6 +256,24 @@ impl baml_compiler2_emit::Db for ProjectDatabase {
         // table. `ProjectDatabase` is `Send` but deliberately not `Sync`, so
         // handing out owned handles is the only way workers can read salsa.
         Some(Box::new(self.clone()))
+    }
+}
+
+/// Replaces every line break, `\r\n` or a lone `\r`, with `\n`, so file text
+/// in the database never contains `\r`.
+///
+/// Normalizing once where source enters the compiler is what rustc's
+/// `normalize_src` does. Rust only folds `\r\n` and rejects a bare `\r`;
+/// BAML instead counts a lone `\r` as a line break, as backtick strings
+/// already did (BEP-049 §AA, TypeScript parity) and as the LSP's position
+/// codec does. Line numbers therefore match what an editor shows, and a
+/// string literal spanning lines has the same value however the file was
+/// checked out. A real carriage return is written `\r`.
+fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
     }
 }
 
@@ -572,8 +601,6 @@ impl ProjectDatabase {
     ///
     /// Invariants enforced (each is a [`SourceRootError`]):
     /// - at most one live root per canonical path;
-    /// - one live root per wire name (`self_name`, else the unnamed default)
-    ///   — the interim consequence of name-spelled type heads;
     /// - every declared dependency names a live root, under a name that is
     ///   neither reserved nor declared twice;
     /// - a served-from-interface root's bytes decode as a `PackageInterface`.
@@ -591,6 +618,7 @@ impl ProjectDatabase {
             self_name,
             interface,
             dependencies,
+            claim,
         } = spec;
         let path = canonicalize_lossy(&path);
 
@@ -602,6 +630,9 @@ impl ProjectDatabase {
             .map(|bytes| Self::decode_interface(kind, bytes))
             .transpose()?;
         let dependencies = self.complete_dependencies(kind, dependencies)?;
+        let claim = wire_interface
+            .as_ref()
+            .map_or(claim, |wire| wire.claimed.clone());
 
         // Revive the tombstoned input if a root lived at this path before —
         // creating a fresh input would leak the old one forever.
@@ -614,6 +645,8 @@ impl ProjectDatabase {
                 );
                 root.set_kind(self).to(kind);
                 root.set_self_name(self).to(self_name);
+                root.set_exclude_tests(self).to(false);
+                root.set_claim(self).to(ClaimedIdentity::default());
                 root.set_interface(self).to(interface);
                 root.set_dependencies(self).to(dependencies);
                 root
@@ -637,6 +670,9 @@ impl ProjectDatabase {
         roots.insert(at, root);
         table.set_roots(self).to(roots);
         Arc::make_mut(&mut self.roots_by_path).insert(path, root);
+        if claim != root.claim(self) {
+            root.set_claim(self).to(claim);
+        }
 
         // A served-from-interface root's blob must be a faithful export of
         // the root it now is: every slot of its dependency table binds
@@ -658,6 +694,19 @@ impl ProjectDatabase {
             });
         }
         Ok(root)
+    }
+
+    /// State what `root`'s manifest claims the package is. A tracked input
+    /// change: the claim is part of the package's interface, so the root's
+    /// interface digest and everything compiled against it follow.
+    pub fn set_claimed_identity(&mut self, root: SourceRoot, claim: ClaimedIdentity) {
+        debug_assert!(
+            root.interface(self).is_none(),
+            "a root served from an interface takes its claim from the blob"
+        );
+        if claim != root.claim(self) {
+            root.set_claim(self).to(claim);
+        }
     }
 
     /// Add one dependency edge to a live root.
@@ -717,7 +766,7 @@ impl ProjectDatabase {
         let reserved = if kind == SourceRootKind::Stdlib {
             matches!(name, "root" | "env")
         } else {
-            baml_builtins2::reserved_edge_names().contains(&name)
+            baml_builtins2::RESERVED_EDGE_NAMES.contains(&name)
         };
         if reserved {
             return Err(SourceRootError::ReservedDependencyName {
@@ -868,6 +917,7 @@ impl ProjectDatabase {
     /// leaves the file attributed to the wrong package.
     fn upsert_file(&mut self, root: SourceRoot, path: &Path, text: &str) -> (SourceFile, bool) {
         let path = canonicalize_lossy(path);
+        let text = &*normalize_newlines(text);
         // A served root is its interface alone: consumers read its items from
         // the interface, so a file under it would be read by nothing.
         debug_assert!(
@@ -1065,23 +1115,6 @@ impl ProjectDatabase {
         self.file_id_to_path.get(&file_id)
     }
 
-    /// Find a [`SourceFile`] by file path (matches by suffix to handle
-    /// different path formats).
-    pub fn find_source_file(&self, file_path: &str) -> Option<SourceFile> {
-        // Try exact match first
-        if let Some(&file) = self.file_map.get(Path::new(file_path)) {
-            return Some(file);
-        }
-        // Fallback: match by file name suffix (handles editors' relative paths)
-        self.file_map
-            .iter()
-            .find(|(stored_path, _)| {
-                stored_path.ends_with(file_path)
-                    || file_path.ends_with(stored_path.to_string_lossy().as_ref())
-            })
-            .map(|(_, file)| *file)
-    }
-
     /// Add compiler-generated source for a `Session.eval` submission to
     /// `root`, the session's workspace. Session files use the dedicated
     /// CST→AST lowering mode that admits persistent root bindings; ordinary
@@ -1159,60 +1192,32 @@ impl ProjectDatabase {
 
     // ── Bytecode ─────────────────────────────────────────────────────────────
 
+    /// Exclude test/testset blocks from subsequent compilation of `root` and
+    /// its source dependencies. This is a tracked semantic-input change, so
+    /// already-queried HIR and package interfaces are invalidated as well.
+    ///
+    /// SDK generation calls this after checking the complete project. Compile
+    /// the resulting program fresh: cached programs/packages include tests.
+    pub fn exclude_tests(&mut self, root: SourceRoot) {
+        let roots = baml_compiler2_hir::package::world_roots(self, root).clone();
+        for root in roots {
+            root.set_exclude_tests(self).to(true);
+        }
+    }
+
     /// The compiled bytecode of `root`'s program — the root and its
     /// dependency closure, never another workspace root that shares this
-    /// database.
+    /// database — after the world's check ([`crate::CheckedWorld`]): an
+    /// error-bearing world is a recoverable
+    /// [`crate::CompileProgramError::WorldHasErrors`], never an attempt at
+    /// codegen, whose runtime-conversion boundary refuses an error-recovery
+    /// type loudly.
     pub fn get_bytecode(
         &self,
         root: SourceRoot,
     ) -> Result<bex_vm_types::Program, crate::program::CompileProgramError> {
-        // Bytecode generation lowers types through the runtime-conversion
-        // boundary (`ResolvedAliases::convert`), which deliberately panics on
-        // inference-only `Unknown`/`Error` types. Those are legitimate
-        // error-recovery types in a program that does not type-check, so do not
-        // attempt codegen on an error-bearing project: surface the failure as a
-        // recoverable `LoweringError`. The diagnostics themselves are reported
-        // through the normal check path. (CLI commands gate before calling
-        // `compile_program` directly; this protects the in-process /
-        // runtime-eval callers that go through `get_bytecode`.) The filter is
-        // the emitted WORLD's files, not the root's own: emit lowers the root
-        // plus its dependency closure, and an error left in a dependency
-        // reaches the runtime conversion, which has no error case and panics.
-        // Gating on the root alone would let exactly that through.
-        let user_file_ids: std::collections::HashSet<FileId> =
-            baml_compiler2_hir::package::world_files(self, root)
-                .iter()
-                .map(|f| f.file_id(self))
-                .collect();
-        let error_count = crate::check::collect_compiler2_diagnostics(self)
-            .iter()
-            .filter(|d| matches!(d.severity, baml_compiler_diagnostics::Severity::Error))
-            .filter(|d| {
-                d.primary_span()
-                    .is_some_and(|span| user_file_ids.contains(&span.file_id))
-            })
-            .count();
-        if error_count > 0 {
-            return Err(crate::program::CompileProgramError::Emit(
-                baml_compiler2_emit::LoweringError::ProjectHasErrors { error_count },
-            ));
-        }
-        self.get_bytecode_unchecked(root)
-    }
-
-    /// [`Self::get_bytecode`] without the error gate: goes straight to codegen.
-    ///
-    /// Only for callers that have already run a full-project check (per-file
-    /// `check_file` sweep **plus** package-level diagnostics) at the current
-    /// revision and found no workspace-file errors — the gate in
-    /// `get_bytecode` would re-derive exactly that result. Calling this on an
-    /// error-bearing project can panic in the runtime-conversion boundary (see
-    /// the gate comment above).
-    pub fn get_bytecode_unchecked(
-        &self,
-        root: SourceRoot,
-    ) -> Result<bex_vm_types::Program, crate::program::CompileProgramError> {
-        crate::program::compile_program(self, root, baml_compiler2_emit::OptLevel::Two)
+        crate::program::CheckedWorld::collect(self, root)?
+            .compile(baml_compiler2_emit::OptLevel::Two)
     }
 }
 
@@ -1438,7 +1443,7 @@ mod tests {
                 .all(|root| root.kind(&db) == SourceRootKind::Stdlib && *root < workspace)
         );
         // One stdlib root per builtin package, holding all of its files.
-        for name in baml_builtins2::stdlib_package_names() {
+        for name in baml_builtins2::STDLIB_PACKAGE_NAMES {
             let root = db
                 .source_root_for_path(Path::new(&format!("<builtin>/{name}")))
                 .expect("stdlib root");
@@ -1484,7 +1489,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(edges("log"), vec![]);
-        assert_eq!(edges("baml"), vec![("log".to_string(), root_of("log"))]);
+        assert_eq!(
+            edges("baml"),
+            vec![
+                ("log".to_string(), root_of("log")),
+                ("reflect".to_string(), root_of("reflect")),
+                ("trace".to_string(), root_of("trace")),
+            ]
+        );
         assert_eq!(
             edges("testing"),
             vec![("baml".to_string(), root_of("baml"))]
@@ -1506,16 +1518,19 @@ mod tests {
     /// own manifests declare: a stdlib package that reaches a sibling it does
     /// not list, or lists a sibling that does not exist, fails here with the
     /// offending file and message rather than deep inside runtime lowering.
+    /// Warnings count too: stdlib diagnostics surface in every user's
+    /// `baml check`, so one stray warning here is noise for everyone (#5075).
     #[test]
     fn stdlib_compiles_cleanly_under_its_declared_graph() {
         let mut db = ProjectDatabase::new();
         db.ensure_stdlib_sources();
-        let errors: Vec<String> = crate::check::collect_diagnostics(&db)
+        let problems: Vec<String> = crate::check::collect_diagnostics(&db)
             .into_iter()
             .filter(|diagnostic| {
                 matches!(
                     diagnostic.severity,
                     baml_compiler_diagnostics::Severity::Error
+                        | baml_compiler_diagnostics::Severity::Warning
                 )
             })
             .map(|diagnostic| {
@@ -1528,9 +1543,9 @@ mod tests {
             })
             .collect();
         assert!(
-            errors.is_empty(),
-            "the embedded stdlib has errors under its declared graph:\n{}",
-            errors.join("\n")
+            problems.is_empty(),
+            "the embedded stdlib has errors or warnings under its declared graph:\n{}",
+            problems.join("\n")
         );
     }
 
@@ -1547,10 +1562,43 @@ mod tests {
             .iter()
             .map(|edge| edge.name.as_str())
             .collect();
-        for (prefix, package, _) in baml_compiler2_ast::SHORTHAND_PROVIDERS {
+        for (prefix, constructor) in baml_compiler2_ast::SHORTHAND_PROVIDERS {
+            let package = constructor[0].as_str();
             assert!(
-                prelude.contains(package),
+                prelude.contains(&package),
                 "shorthand `{prefix}/…` constructs a client from `{package}`, which is not a prelude package"
+            );
+        }
+    }
+
+    /// The compiler's package table and the stdlib's own inventory are one
+    /// set: every stdlib package can be named by identity (a desugar may write
+    /// a path into any of them), and nothing is named that the stdlib does not
+    /// ship.
+    #[test]
+    fn the_language_package_table_is_the_stdlib_inventory() {
+        let mut known: Vec<&str> = baml_base::LangPackage::ALL
+            .into_iter()
+            .map(baml_base::LangPackage::manifest_name)
+            .collect();
+        let mut shipped = baml_builtins2::STDLIB_PACKAGE_NAMES.to_vec();
+        known.sort_unstable();
+        shipped.sort_unstable();
+        assert_eq!(known, shipped);
+    }
+
+    /// Every language package is installed by [`ProjectDatabase::ensure_stdlib_sources`],
+    /// so a compiler-written path into any of them resolves.
+    #[test]
+    fn every_language_package_is_installed_with_the_stdlib() {
+        let mut db = ProjectDatabase::new();
+        db.ensure_stdlib_sources();
+        let lang = baml_compiler2_hir::package::lang_roots(&db);
+        for package in baml_base::LangPackage::ALL {
+            assert!(
+                lang.get(package).is_some(),
+                "`{}` is not installed",
+                package.manifest_name()
             );
         }
     }
@@ -1610,17 +1658,12 @@ mod tests {
             db.add_source_root(workspace_spec("/ws")),
             Err(SourceRootError::PathTaken(workspace))
         );
-        // Spellings are not an identity: two roots may share one, and the
-        // boundary that needs the spelling table injective reports it.
+        // A name is not an identity: two roots may declare one, and both
+        // are live roots.
         let dep = db.add_source_root(dependency_spec("/dep", "dep")).unwrap();
         let dep2 = db.add_source_root(dependency_spec("/dep2", "dep")).unwrap();
-        assert_eq!(
-            baml_compiler2_hir::package::spelling(&db).collisions(),
-            &[baml_compiler2_hir::package::SpellingCollision::SharedName {
-                name: Name::new("dep"),
-                roots: vec![dep, dep2],
-            }]
-        );
+        assert_ne!(dep, dep2);
+        assert_eq!(dep.self_name(&db), dep2.self_name(&db));
         // Dependency roots sort before the workspace root; Dynamic roots
         // (runtime-loaded) sort after it, whatever the insertion order.
         let dynamic = db
@@ -1678,12 +1721,16 @@ mod tests {
         let blob = baml_artifact::encode(
             baml_artifact::ArtifactKind::PackageInterface,
             &baml_compiler2_hir_ty::package_interface::WireInterface {
+                claimed: baml_base::ClaimedIdentity::default(),
+                compiler_version: baml_compiler2_hir_ty::package_interface::COMPILER_VERSION
+                    .to_owned(),
                 dependencies: Vec::new(),
                 rows: baml_compiler2_hir_ty::package_interface::PackageInterface::<
                     baml_type::WireName,
                 > {
                     types: std::iter::empty().collect(),
                     functions: std::iter::empty().collect(),
+                    values: indexmap::IndexMap::default(),
                     throw_sets:
                         baml_compiler2_hir_ty::package_interface::FunctionThrowSets::default(),
                     namespaces: std::collections::BTreeSet::default(),
@@ -1768,6 +1815,7 @@ mod tests {
         assert!(!revived.is_session_submission(&db));
     }
 
+    /// Revived inputs retain their identities and restore fresh-root compilation defaults.
     #[test]
     fn removed_roots_are_revived_and_files_tombstoned() {
         let mut db = ProjectDatabase::new();
@@ -1775,6 +1823,7 @@ mod tests {
         let path = Path::new("/dep/a.baml");
         let file = db.add_or_update_file_in(dep, path, "class A {}");
         let file_id = file.file_id(&db);
+        db.exclude_tests(dep);
 
         db.remove_source_root(dep);
         assert!(db.source_roots().is_empty());
@@ -1790,10 +1839,22 @@ mod tests {
             revived.self_name(&db).as_ref().map(Name::as_str),
             Some("dep2")
         );
-        let file_again = db.add_or_update_file_in(revived, path, "class B {}");
+        let file_again =
+            db.add_or_update_file_in(revived, path, "class B {} test \"restored\" { null }");
         assert_eq!(file_again.file_id(&db), file_id);
         assert_eq!(file_again.source_root(&db), revived);
         assert_eq!(db.root_files(revived), vec![file_again]);
+        assert!(
+            baml_compiler2_hir::item_data::file_functions(&db, file_again)
+                .iter()
+                .any(|&function| {
+                    baml_compiler2_hir::item_data::function_data(&db, function)
+                        .metadata
+                        .origin
+                        == baml_compiler2_ast::FunctionOrigin::TestInitializer
+                }),
+            "a revived root must include tests by default"
+        );
     }
 
     #[test]

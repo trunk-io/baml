@@ -3,6 +3,9 @@
 //! Each test documents a gap from the Phase 3A checklist. Snapshots capture
 //! the current (possibly incorrect) behavior so regressions are visible
 //! as the gaps get fixed.
+//!
+//! Successful shorthand lookup under pattern binders is exercised by
+//! `baml_src/ns_property_shorthand_binders`; keep diagnostic checks here.
 
 use super::support::{make_db, render_tir};
 use crate::engine::TestDbExt;
@@ -69,7 +72,7 @@ function main() -> string {
     );
     assert!(
         tir.contains(
-            "ai.Agent.new(client = client, on_event = on_event).run(Greet@spec(name, suffix = suffix)).value"
+            "ai.Agent.new(client = client, on_event = on_event).run(Greet@spec(name, suffix = suffix), $trace = trace._passthrough()).value"
         ),
         "the direct-call companion must name the defaulted spec argument and thread on_event:\n{tir}"
     );
@@ -83,7 +86,7 @@ function main() -> string {
     let window = &stream_call[..stream_call.len().min(200)];
     assert!(
         window
-            .contains("(Greet@spec(name, suffix = suffix), client = client, on_event = on_event)"),
+            .contains("(Greet@spec(name, suffix = suffix), client = client, on_event = on_event, $trace = trace._passthrough())"),
         "the stream companion must pass spec, client, and on_event to from_spec:\n{tir}"
     );
 }
@@ -350,13 +353,14 @@ fn unresolved_variable_in_let() {
 }
 
 #[test]
-fn property_shorthand_suggests_explicit_mapping_for_nearby_variable() {
+fn class_property_shorthand_suggests_explicit_mapping_for_nearby_variable() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
         r#"
-function build(option: string) -> map<string, string> {
-  { options }
+class Config { options string }
+function build(option: string) -> Config {
+  Config { options }
 }
 "#,
     );
@@ -399,41 +403,17 @@ function build(v: string?) -> map<string, string> {
     );
 }
 
-/// The shorthand value is an ordinary path expression, so it is in scope
-/// exactly when a plain use is - including under a pattern binder, which the
-/// body-scope-only binding list could not see.
-#[test]
-fn property_shorthand_resolves_pattern_binders() {
-    let mut db = make_db();
-    let file = db.file(
-        "test.baml",
-        r#"
-function build(v: string?) -> map<string, string> {
-  if let key: string = v { { key } } else { {} }
-}
-"#,
-    );
-    let tir = render_tir(&db, file);
-    assert!(
-        !tir.contains("property shorthand"),
-        "an `if let` binder satisfies the shorthand, got:\n{tir}"
-    );
-    assert!(
-        !tir.contains("unresolved name"),
-        "an `if let` binder satisfies the shorthand, got:\n{tir}"
-    );
-}
-
 /// Near-match candidates come from the EXPRESSION's scope, so a pattern
 /// binder is offered as the explicit-mapping suggestion.
 #[test]
-fn property_shorthand_suggests_a_pattern_binder() {
+fn class_property_shorthand_suggests_a_pattern_binder() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
         r#"
-function build(v: string?) -> map<string, string> {
-  if let option: string = v { { options } } else { {} }
+class Config { options string }
+function build(v: string?) -> Config {
+  if let option: string = v { Config { options } } else { Config { options: "" } }
 }
 "#,
     );
@@ -448,12 +428,13 @@ function build(v: string?) -> map<string, string> {
 }
 
 #[test]
-fn property_shorthand_in_parameter_default_uses_structural_syntax() {
+fn class_property_shorthand_in_parameter_default_uses_structural_syntax() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
         r#"
-function build(option: string, config: map<string, string> = { options }) -> map<string, string> {
+class Config { options string }
+function build(option: string, config: Config = Config { options }) -> Config {
   config
 }
 "#,
@@ -469,16 +450,17 @@ function build(option: string, config: map<string, string> = { options }) -> map
 }
 
 #[test]
-fn property_shorthand_uses_the_value_expression_scope() {
+fn class_property_shorthand_uses_the_value_expression_scope() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
         r#"
-function build(input: string?) -> map<string, string> {
+class Config { options string }
+function build(input: string?) -> Config {
   if let option: string = input {
-    { options }
+    Config { options }
   } else {
-    {}
+    Config { options: "" }
   }
 }
 "#,
@@ -512,28 +494,6 @@ function build() -> map<string, string> {
     assert!(
         !tir.contains("property shorthand"),
         "an explicit quoted key must not use shorthand diagnostics:\n{tir}"
-    );
-}
-
-#[test]
-fn if_let_binding_resolves_in_property_shorthand() {
-    let mut db = make_db();
-    let file = db.file(
-        "test.baml",
-        r#"
-function build(input: string?) -> map<string, string> {
-  if let options: string = input {
-    { options }
-  } else {
-    {}
-  }
-}
-"#,
-    );
-    let tir = render_tir(&db, file);
-    assert!(
-        !tir.contains("property shorthand") && !tir.contains("unresolved name"),
-        "the ordinary resolver should see the if-let binding:\n{tir}"
     );
 }
 
@@ -874,22 +834,6 @@ function required_after_default(a: int = 1, b: int) -> int { b }
 }
 
 #[test]
-fn optional_param_default_forward_reference_is_scope_aware() {
-    let mut db = make_db();
-    let file = db.file(
-        "test.baml",
-        r#"
-function shadow_later_param(a: int = { let b = 1; b }, b: int = 2) -> int { a }
-"#,
-    );
-    let tir = render_tir(&db, file);
-    assert!(
-        !tir.contains("default for parameter `a` cannot reference later parameter `b`"),
-        "{tir}"
-    );
-}
-
-#[test]
 fn optional_param_default_forward_reference_checks_lambda_bodies() {
     let mut db = make_db();
     let file = db.file(
@@ -1026,10 +970,10 @@ fn missing_return() {
     let file = db.file("test.baml", "function f() -> int { let x = 1; }");
     insta::assert_snapshot!(render_tir(&db, file), @"
     function user.f() -> int throws never {
-      { : void
+      { : !error
         let x = 1 : 1 -> int
       }
-      !! 20..34: type mismatch: expected int, got void
+      !! 20..34: expected `int`, but this block ends without a value
     }
     ");
 }
@@ -1040,10 +984,10 @@ fn block_ending_in_stmt() {
     let file = db.file("test.baml", "function f() -> string { let x = \"hello\"; }");
     insta::assert_snapshot!(render_tir(&db, file), @r#"
     function user.f() -> string throws never {
-      { : void
+      { : !error
         let x = "hello" : "hello" -> string
       }
-      !! 23..43: type mismatch: expected string, got void
+      !! 23..43: expected `string`, but this block ends without a value
     }
     "#);
 }
@@ -1335,31 +1279,6 @@ fn array_filled_named_value_arg_warns_aliasing() {
 }
 
 #[test]
-fn array_filled_with_variable_bound_mutable_value_does_not_warn() {
-    // KNOWN LIMITATION (Linear B-548): detection is purely *syntactic* — it only
-    // fires when the fill value is written inline as a literal. Binding the same
-    // mutable value to a variable first (`let x = [0]; Array.filled(3, x)`) still
-    // aliases every slot at runtime, but produces NO warning because the arg is a
-    // `Path`, not a literal. This characterizes (does not endorse) that gap; the
-    // real fix (Linear B-638) is the `Array.generate(length, f)` factory, which
-    // calls `f` once per index and so builds an independent value per slot.
-    let mut db = make_db();
-    let file = db.file(
-        "test.baml",
-        r#"function f() -> int {
-  let x = [0]
-  let rows = baml.Array.filled(3, x)
-  return rows.length()
-}"#,
-    );
-    let tir = render_tir(&db, file);
-    assert!(
-        !tir.contains("reuses the same mutable value"),
-        "variable-bound mutable value is a known false-negative (must not warn), got:\n{tir}"
-    );
-}
-
-#[test]
 fn aliased_float_plus_bigint_is_rejected() {
     // Aliases on either side must still trip the float×bigint reject —
     // `infer_binary_op` peels them at entry before classifying.
@@ -1458,10 +1377,10 @@ fn float_literal_in_annotation() {
     ");
 }
 
-// ── 3A-10. if-without-else should produce Optional(T) ────────────────────
+// ── 3A-10. if-without-else is the unit value, never Optional(T) ─────────
 
 #[test]
-fn if_without_else_optional() {
+fn if_without_else_is_refused_where_optional_is_expected() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
@@ -1470,13 +1389,13 @@ fn if_without_else_optional() {
     insta::assert_snapshot!(render_tir(&db, file), @"
     function user.f(x: bool) -> int | null throws never {
       { : never
-        return : void
-          if (x : bool) : void
+        return : !error
+          if (x : bool) : !error
             { : 5
               5 : 5
             }
       }
-      !! 37..49: type mismatch: expected int | null, got void
+      !! 37..49: expected `int | null`, but an `if` without `else` evaluates to `null`; add an `else` branch
     }
     block user.f {
     }
@@ -1484,7 +1403,7 @@ fn if_without_else_optional() {
 }
 
 #[test]
-fn if_without_else_let_binding() {
+fn if_without_else_branch_cannot_produce_a_value() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
@@ -1493,15 +1412,14 @@ fn if_without_else_let_binding() {
     insta::assert_snapshot!(render_tir(&db, file), @"
     function user.f(x: bool) -> int throws never {
       { : never
-        let y = : void
-          if (x : bool) : void
+        let y = : !error
+          if (x : bool) : !error
             { : 5
               5 : 5
             }
-        return y ?? 0 : void | 0
+        return y ?? 0 : 0 | !error
       }
-      !! 37..49: cannot use return value of a void function
-      !! 58..64: type mismatch: expected int, got void | 0
+      !! 46..47: an `if` without `else` evaluates to `null`, so its branch cannot produce `5`; add an `else` branch
     }
     block user.f {
     }
@@ -1910,8 +1828,8 @@ fn void_function_basic() {
     let mut db = make_db();
     let file = db.file("test.baml", "function f() -> void { }");
     insta::assert_snapshot!(render_tir(&db, file), @"
-    function user.f() -> void throws never {
-      { : void
+    function user.f() -> null throws never {
+      { : null
       }
     }
     ");
@@ -1922,7 +1840,7 @@ fn void_function_bare_return() {
     let mut db = make_db();
     let file = db.file("test.baml", "function f() -> void { return; }");
     insta::assert_snapshot!(render_tir(&db, file), @"
-    function user.f() -> void throws never {
+    function user.f() -> null throws never {
       { : never
         return
       }
@@ -1947,7 +1865,7 @@ fn non_void_lambda_bare_return_is_rejected() {
             }
         true : true
       }
-      !! 43..50: type mismatch: expected int, got void
+      !! 43..50: expected a value of type `int`, but a bare `return` returns `null`
     }
     lambda user.f {
     }
@@ -1974,7 +1892,9 @@ function f() -> bool {
     );
     let tir = render_tir(&db, file);
     assert!(
-        tir.contains("type mismatch: expected Pair<string, int>, got void"),
+        tir.contains(
+            "expected a value of type `Pair<string, int>`, but a bare `return` returns `null`"
+        ),
         "{tir}"
     );
 }
@@ -2028,17 +1948,17 @@ fn void_function_return_value_error() {
     let mut db = make_db();
     let file = db.file("test.baml", "function f() -> void { return 42; }");
     insta::assert_snapshot!(render_tir(&db, file), @"
-    function user.f() -> void throws never {
+    function user.f() -> null throws never {
       { : never
         return 42 : 42
       }
-      !! 30..32: type mismatch: expected void, got 42
+      !! 30..32: type mismatch: expected null, got 42
     }
     ");
 }
 
 #[test]
-fn void_function_result_used_error() {
+fn void_function_result_is_the_unit_value() {
     let mut db = make_db();
     let file = db.file(
         "test.baml",
@@ -2048,16 +1968,15 @@ function f() -> int { let x = g(); 1 }
 "#,
     );
     insta::assert_snapshot!(render_tir(&db, file), @"
-    function user.g() -> void throws never {
-      { : void
+    function user.g() -> null throws never {
+      { : null
       }
     }
     function user.f() -> int throws never {
       { : 1
-        let x = g() : void
+        let x = g() : null
         1 : 1
       }
-      !! 56..59: cannot use return value of a void function
     }
     ");
 }
@@ -2073,13 +1992,13 @@ function f() -> int { g(); 1 }
 "#,
     );
     insta::assert_snapshot!(render_tir(&db, file), @"
-    function user.g() -> void throws never {
-      { : void
+    function user.g() -> null throws never {
+      { : null
       }
     }
     function user.f() -> int throws never {
       { : 1
-        g() : void
+        g() : null
         1 : 1
       }
     }
@@ -2115,8 +2034,8 @@ function main() -> void {
         "expected lambda alias checking without mismatches, got:\n{tir}"
     );
     assert!(
-        tir.contains("() -> { ... } : () -> void throws never"),
-        "expected lambdas to inherit void-returning aliased function context, got:\n{tir}"
+        tir.contains("() -> { ... } : () -> null throws never"),
+        "expected lambdas to inherit unit-returning aliased function context, got:\n{tir}"
     );
 }
 

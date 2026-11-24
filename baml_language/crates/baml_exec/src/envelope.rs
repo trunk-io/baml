@@ -7,8 +7,6 @@
 
 use bex_vm_types::types::Program;
 
-use crate::output::OutputFormat;
-
 /// Name of the embedded section that holds the [`PackEnvelope`] inside a
 /// packaged binary. Read by `baml_pack_host` at startup, written by
 /// `baml_cli::pack_command` at pack time. Both ends reference this
@@ -65,6 +63,10 @@ pub struct PackEnvelope {
     /// exactly one element; in [`PackMode::Subcommand`] one or more.
     pub targets: Vec<TargetEntry>,
 
-    /// Output serialization format, baked in at pack time.
-    pub output_format: OutputFormat,
+    /// Recording defaults and the runtime overrides permitted by the publisher.
+    pub telemetry: btel_settings::artifact::ArtifactTelemetry,
+
+    /// The heap collection policy from `[pack.gc]` and the environment
+    /// variables that may override it.
+    pub gc: crate::PackGc,
 }

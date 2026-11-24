@@ -11,15 +11,25 @@
 //! ([`encode`]), the result-envelope decoding ([`decode`]), the typed
 //! error surface ([`error`]), and the call machinery ([`runtime`]).
 
+// Symlink to `crates/baml_env/src/lib.rs`: this crate is published and cannot
+// depend on the workspace-only `baml_env`, so it compiles the same file.
+#[allow(dead_code, unreachable_pub)]
+mod baml_env;
 pub mod baml_value;
 mod capi;
 mod completion;
 pub mod decode;
+pub mod dynamic;
 pub mod encode;
 pub mod error;
 mod function;
+mod handle;
 pub mod host_value;
+#[doc(hidden)]
+pub mod invocation;
+mod json;
 pub mod loader;
+mod outbound;
 pub mod runtime;
 mod spec;
 #[cfg(test)]
@@ -29,12 +39,18 @@ mod version;
 pub mod wire;
 
 pub use baml_value::{BamlMapKey, BamlValue, OptionalArg};
-pub use error::{DecodeError, Error, SdkError};
+pub use encode::{ArgumentError, EncodeError};
+pub use error::{DecodeError, Error, SdkError, ThrownValue};
 pub use function::{BamlFunction, FunctionArgs};
-pub use host_value::{HostCallable, HostCallback, HostParam};
+pub use host_value::{HostCallable, HostCallback, HostParam, HostValue};
 // reexports
 pub use indexmap::IndexMap;
+pub use json::Json;
 pub use num_bigint::BigInt;
+/// The `serde_json` [`Json`] belongs to, re-exported so code using a
+/// generated SDK can build values (`baml_bridge::serde_json::json!`)
+/// without depending on it separately.
+pub use serde_json;
 pub use spec::{CallOptions, FunctionSpec, Prompt, Stream};
 
 /// Order-preserving map type of BAML `map` values (the engine's own

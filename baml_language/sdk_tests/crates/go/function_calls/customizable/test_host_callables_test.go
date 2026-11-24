@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
 	"strings"
@@ -65,21 +66,21 @@ func waitForCallbackStart(t *testing.T, started <-chan struct{}, done <-chan err
 
 func Test_host_callable_primitive_and_multiple_arguments(t *testing.T) {
 	ctx := context.Background()
-	got, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(value int64) string {
+	got, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(_ context.Context, value int64) string {
 		return fmt.Sprintf("got %d", value)
 	}, 5)
 	if err != nil || got != "got 5" {
 		t.Fatalf("callback result = %q, %v", got, err)
 	}
 
-	got, err = baml_sdk.HostCallableTestsCallWithTwoArgs(ctx, func(value int64, prefix string) string {
+	got, err = baml_sdk.HostCallableTestsCallWithTwoArgs(ctx, func(_ context.Context, value int64, prefix string) string {
 		return fmt.Sprintf("%s:%d", prefix, value)
 	}, 7, "value")
 	if err != nil || got != "value:7" {
 		t.Fatalf("two-argument callback result = %q, %v", got, err)
 	}
 
-	integer, err := baml_sdk.HostCallableTestsCallIntCallback(ctx, func(value int64) int64 {
+	integer, err := baml_sdk.HostCallableTestsCallIntCallback(ctx, func(_ context.Context, value int64) int64 {
 		return value * 2
 	}, 21)
 	if err != nil || integer != 42 {
@@ -93,10 +94,10 @@ func Test_baml_closure_is_a_native_callable_with_host_language_arguments(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := addTen(ctx, 5); got != 15 {
+	if got := addTen.Call(ctx, 5); got != 15 {
 		t.Fatalf("addTen(5) = %d, want 15", got)
 	}
-	if got := addTen(ctx, 7); got != 17 {
+	if got := addTen.Call(ctx, 7); got != 17 {
 		t.Fatalf("addTen(7) = %d, want 17", got)
 	}
 }
@@ -107,10 +108,10 @@ func Test_baml_closure_decodes_multiple_args_and_structured_return_values(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := build(ctx, 12, "Ada"); got != (baml_sdk.HostCallableTestsPerson{Name: "Ada", Age: 42}) {
+	if got := build.Call(ctx, 12, "Ada"); got != (baml_sdk.HostCallableTestsPerson{Name: "Ada", Age: 42}) {
 		t.Fatalf("build(12, Ada) = %#v", got)
 	}
-	if got := build(ctx, 5, "Grace"); got != (baml_sdk.HostCallableTestsPerson{Name: "Grace", Age: 35}) {
+	if got := build.Call(ctx, 5, "Grace"); got != (baml_sdk.HostCallableTestsPerson{Name: "Grace", Age: 35}) {
 		t.Fatalf("build(5, Grace) = %#v", got)
 	}
 }
@@ -121,15 +122,15 @@ func Test_baml_closure_is_reusable_and_retains_mutable_captures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := nextValue(ctx); got != 41 {
+	if got := nextValue.Call(ctx); got != 41 {
 		t.Fatalf("first counter value = %d, want 41", got)
 	}
-	if got := nextValue(ctx); got != 42 {
+	if got := nextValue.Call(ctx); got != 42 {
 		t.Fatalf("second counter value = %d, want 42", got)
 	}
 }
 
-func optionalArgsCallback(
+func optionalArgsCallback(_ context.Context,
 	x int64,
 	options baml_sdk.CallbackIntWithYIntWithZIntOptions,
 ) int64 {
@@ -156,7 +157,7 @@ func Test_host_callable_optional_arguments(t *testing.T) {
 }
 
 func Test_host_callable_nullable_optional_distinguishes_all_three_states(t *testing.T) {
-	callback := func(x int64, options baml_sdk.CallbackIntWithValueOptionalIntOptions) int64 {
+	callback := func(_ context.Context, x int64, options baml_sdk.CallbackIntWithValueOptionalIntOptions) int64 {
 		value, supplied := options.Value.Get()
 		if !supplied {
 			return x * 100
@@ -177,7 +178,7 @@ func Test_host_callable_nullable_optional_distinguishes_all_three_states(t *test
 }
 
 func Test_host_callable_optional_names_avoid_generated_and_projection_collisions(t *testing.T) {
-	callback := func(options baml_sdk.CallbackWithCtxIntWithErrIntWithResultIntWithZeroIntWithBootstrapIntWithInitIntWithMainIntWithFooBarIntWithFooBarIntOptions) int64 {
+	callback := func(_ context.Context, options baml_sdk.CallbackWithCtxIntWithErrIntWithResultIntWithZeroIntWithBootstrapIntWithInitIntWithMainIntWithFooBarIntWithFooBarIntOptions) int64 {
 		return options.Ctx.Or(0) + options.Err.Or(0) + options.Result.Or(0) +
 			options.Zero.Or(0) + options.Bootstrap.Or(0) + options.Init.Or(0) +
 			options.Main.Or(0) + options.FooBar.Or(0)*10 + options.FooBar_.Or(0)
@@ -191,11 +192,24 @@ func Test_host_callable_optional_names_avoid_generated_and_projection_collisions
 	}
 }
 
+func Test_host_callable_two_cbs_callbacks_named_f_and_f_returns_both_run(t *testing.T) {
+	// Two callback parameters whose names differ by a `_returns` suffix each
+	// keep their own function: `f(1) + f_returns(2)`.
+	got, err := baml_sdk.HostCallableTestsTwoCbs(
+		context.Background(),
+		func(_ context.Context, x int64) int64 { return x * 10 },
+		func(_ context.Context, x int64) int64 { return x * 100 },
+	)
+	if err != nil || got != 210 {
+		t.Fatalf("two_cbs = %d, %v; want 210", got, err)
+	}
+}
+
 func Test_host_callable_class_argument(t *testing.T) {
 	person := baml_sdk.HostCallableTestsPerson{Name: "Ada", Age: 37}
 	got, err := baml_sdk.HostCallableTestsCallWithClassCallback(
 		context.Background(),
-		func(value baml_sdk.HostCallableTestsPerson) string {
+		func(_ context.Context, value baml_sdk.HostCallableTestsPerson) string {
 			return fmt.Sprintf("%s:%d", value.Name, value.Age)
 		},
 		person,
@@ -208,7 +222,7 @@ func Test_host_callable_class_argument(t *testing.T) {
 func Test_host_callable_structured_round_trips(t *testing.T) {
 	ctx := context.Background()
 	person := baml_sdk.HostCallableTestsPerson{Name: "Grace", Age: 45}
-	gotPerson, err := baml_sdk.HostCallableTestsCallClassRoundtripCallback(ctx, func(value baml_sdk.HostCallableTestsPerson) baml_sdk.HostCallableTestsPerson {
+	gotPerson, err := baml_sdk.HostCallableTestsCallClassRoundtripCallback(ctx, func(_ context.Context, value baml_sdk.HostCallableTestsPerson) baml_sdk.HostCallableTestsPerson {
 		value.Age++
 		return value
 	}, person)
@@ -216,7 +230,7 @@ func Test_host_callable_structured_round_trips(t *testing.T) {
 		t.Fatalf("class round trip = %#v, %v", gotPerson, err)
 	}
 
-	gotMood, err := baml_sdk.HostCallableTestsCallEnumRoundtripCallback(ctx, func(value baml_sdk.HostCallableTestsCallbackMood) baml_sdk.HostCallableTestsCallbackMood {
+	gotMood, err := baml_sdk.HostCallableTestsCallEnumRoundtripCallback(ctx, func(_ context.Context, value baml_sdk.HostCallableTestsCallbackMood) baml_sdk.HostCallableTestsCallbackMood {
 		if value == baml_sdk.HostCallableTestsCallbackMoodHAPPY {
 			return baml_sdk.HostCallableTestsCallbackMoodSAD
 		}
@@ -226,14 +240,14 @@ func Test_host_callable_structured_round_trips(t *testing.T) {
 		t.Fatalf("enum round trip = %q, %v", gotMood, err)
 	}
 
-	gotList, err := baml_sdk.HostCallableTestsCallListRoundtripCallback(ctx, func(values []int64) []int64 {
+	gotList, err := baml_sdk.HostCallableTestsCallListRoundtripCallback(ctx, func(_ context.Context, values []int64) []int64 {
 		return append(values, 3)
 	}, []int64{1, 2})
 	if err != nil || !reflect.DeepEqual(gotList, []int64{1, 2, 3}) {
 		t.Fatalf("list round trip = %#v, %v", gotList, err)
 	}
 
-	gotMap, err := baml_sdk.HostCallableTestsCallMapRoundtripCallback(ctx, func(values map[string]int64) map[string]int64 {
+	gotMap, err := baml_sdk.HostCallableTestsCallMapRoundtripCallback(ctx, func(_ context.Context, values map[string]int64) map[string]int64 {
 		values["two"] = 2
 		return values
 	}, map[string]int64{"one": 1})
@@ -245,7 +259,7 @@ func Test_host_callable_structured_round_trips(t *testing.T) {
 func Test_host_callable_closed_union_round_trips(t *testing.T) {
 	ctx := context.Background()
 	input := baml_sdk.NewStringOrIntFromInt(7)
-	got, err := baml_sdk.HostCallableTestsCallUnionRoundtripCallback(ctx, func(value baml_sdk.StringOrInt) baml_sdk.StringOrInt {
+	got, err := baml_sdk.HostCallableTestsCallUnionRoundtripCallback(ctx, func(_ context.Context, value baml_sdk.StringOrInt) baml_sdk.StringOrInt {
 		if integer, ok := value.AsInt(); !ok || integer != 7 {
 			t.Fatalf("union callback input = %#v", value)
 		}
@@ -258,7 +272,7 @@ func Test_host_callable_closed_union_round_trips(t *testing.T) {
 		t.Fatalf("union callback output = %#v", got)
 	}
 
-	nullable, err := baml_sdk.HostCallableTestsCallNullableUnionRoundtripCallback(ctx, func(value *baml_sdk.StringOrInt) *baml_sdk.StringOrInt {
+	nullable, err := baml_sdk.HostCallableTestsCallNullableUnionRoundtripCallback(ctx, func(_ context.Context, value *baml_sdk.StringOrInt) *baml_sdk.StringOrInt {
 		if value != nil {
 			t.Fatalf("nullable union input = %#v; want nil", value)
 		}
@@ -271,7 +285,7 @@ func Test_host_callable_closed_union_round_trips(t *testing.T) {
 	if integer, ok := nullable.AsInt(); !ok || integer != 11 {
 		t.Fatalf("nullable union arm = %#v", nullable)
 	}
-	nullable, err = baml_sdk.HostCallableTestsCallNullableUnionRoundtripCallback(ctx, func(*baml_sdk.StringOrInt) *baml_sdk.StringOrInt {
+	nullable, err = baml_sdk.HostCallableTestsCallNullableUnionRoundtripCallback(ctx, func(context.Context, *baml_sdk.StringOrInt) *baml_sdk.StringOrInt {
 		return nil
 	}, nullable)
 	if err != nil || nullable != nil {
@@ -285,7 +299,7 @@ func Test_host_callable_closed_union_containers_and_nominal_arms(t *testing.T) {
 		baml_sdk.NewStringOrIntFromString("one"),
 		baml_sdk.NewStringOrIntFromInt(2),
 	}
-	list, err := baml_sdk.HostCallableTestsCallUnionListRoundtripCallback(ctx, func(values []baml_sdk.StringOrInt) []baml_sdk.StringOrInt {
+	list, err := baml_sdk.HostCallableTestsCallUnionListRoundtripCallback(ctx, func(_ context.Context, values []baml_sdk.StringOrInt) []baml_sdk.StringOrInt {
 		return append(values, baml_sdk.NewStringOrIntFromString("three"))
 	}, listInput)
 	if err != nil || len(list) != 3 {
@@ -295,7 +309,7 @@ func Test_host_callable_closed_union_containers_and_nominal_arms(t *testing.T) {
 		t.Fatalf("nested union list arm = %#v", list[2])
 	}
 
-	unionMap, err := baml_sdk.HostCallableTestsCallUnionMapRoundtripCallback(ctx, func(values map[string]baml_sdk.StringOrInt) map[string]baml_sdk.StringOrInt {
+	unionMap, err := baml_sdk.HostCallableTestsCallUnionMapRoundtripCallback(ctx, func(_ context.Context, values map[string]baml_sdk.StringOrInt) map[string]baml_sdk.StringOrInt {
 		values["answer"] = baml_sdk.NewStringOrIntFromInt(42)
 		return values
 	}, map[string]baml_sdk.StringOrInt{"label": baml_sdk.NewStringOrIntFromString("ok")})
@@ -309,7 +323,7 @@ func Test_host_callable_closed_union_containers_and_nominal_arms(t *testing.T) {
 	person := baml_sdk.NewStringOrHostCallableTestsPersonOrHostCallableTestsCallbackMoodFromHostCallableTestsPerson(
 		baml_sdk.HostCallableTestsPerson{Name: "Ada", Age: 37},
 	)
-	nominal, err := baml_sdk.HostCallableTestsCallNominalUnionRoundtripCallback(ctx, func(value baml_sdk.StringOrHostCallableTestsPersonOrHostCallableTestsCallbackMood) baml_sdk.StringOrHostCallableTestsPersonOrHostCallableTestsCallbackMood {
+	nominal, err := baml_sdk.HostCallableTestsCallNominalUnionRoundtripCallback(ctx, func(_ context.Context, value baml_sdk.StringOrHostCallableTestsPersonOrHostCallableTestsCallbackMood) baml_sdk.StringOrHostCallableTestsPersonOrHostCallableTestsCallbackMood {
 		if gotPerson, ok := value.AsHostCallableTestsPerson(); !ok || gotPerson.Name != "Ada" {
 			t.Fatalf("nominal union input = %#v", value)
 		}
@@ -328,7 +342,7 @@ func Test_host_callable_closed_union_containers_and_nominal_arms(t *testing.T) {
 func Test_host_callable_closed_union_literal_optional_and_selected_empty_container_arms(t *testing.T) {
 	ctx := context.Background()
 	literalInput := baml_sdk.NewIntOrStringLiteralcd322617OrStringLiteral6ca6c75cFromStringLiteralcd322617()
-	literal, err := baml_sdk.HostCallableTestsCallLiteralUnionRoundtripCallback(ctx, func(value baml_sdk.IntOrStringLiteralcd322617OrStringLiteral6ca6c75c) baml_sdk.IntOrStringLiteralcd322617OrStringLiteral6ca6c75c {
+	literal, err := baml_sdk.HostCallableTestsCallLiteralUnionRoundtripCallback(ctx, func(_ context.Context, value baml_sdk.IntOrStringLiteralcd322617OrStringLiteral6ca6c75c) baml_sdk.IntOrStringLiteralcd322617OrStringLiteral6ca6c75c {
 		if text, ok := value.AsStringLiteralcd322617(); !ok || text != "first" {
 			t.Fatalf("literal union input = %#v", value)
 		}
@@ -341,7 +355,7 @@ func Test_host_callable_closed_union_literal_optional_and_selected_empty_contain
 		t.Fatalf("literal union output = %#v", literal)
 	}
 
-	states, err := baml_sdk.HostCallableTestsCallCallbackWithOptionalUnionStates(ctx, func(options baml_sdk.CallbackWithValueOptionalStringOrIntOptions) int64 {
+	states, err := baml_sdk.HostCallableTestsCallCallbackWithOptionalUnionStates(ctx, func(_ context.Context, options baml_sdk.CallbackWithValueOptionalStringOrIntOptions) int64 {
 		value, supplied := options.Value.Get()
 		if !supplied {
 			return 0
@@ -362,7 +376,7 @@ func Test_host_callable_closed_union_literal_optional_and_selected_empty_contain
 	}
 
 	emptyInts := baml_sdk.NewStringListOrIntListFromIntList([]int64{})
-	emptyStrings, err := baml_sdk.HostCallableTestsCallOverlappingContainerUnionCallback(ctx, func(value baml_sdk.StringListOrIntList) baml_sdk.StringListOrIntList {
+	emptyStrings, err := baml_sdk.HostCallableTestsCallOverlappingContainerUnionCallback(ctx, func(_ context.Context, value baml_sdk.StringListOrIntList) baml_sdk.StringListOrIntList {
 		if integers, ok := value.AsIntList(); !ok || len(integers) != 0 {
 			t.Fatalf("selected empty int-list arm = %#v", value)
 		}
@@ -382,7 +396,7 @@ func Test_host_callable_media_round_trip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := baml_sdk.HostCallableTestsCallMediaRoundtripCallback(context.Background(), func(value baml_go.Image) baml_go.Image {
+	got, err := baml_sdk.HostCallableTestsCallMediaRoundtripCallback(context.Background(), func(_ context.Context, value baml_go.Image) baml_go.Image {
 		return value
 	}, image)
 	if err != nil {
@@ -397,7 +411,7 @@ func Test_host_callable_media_round_trip(t *testing.T) {
 func Test_host_callable_repeated_and_concurrent_reuse(t *testing.T) {
 	ctx := context.Background()
 	var calls atomic.Int64
-	callback := func(value int64) string {
+	callback := func(_ context.Context, value int64) string {
 		calls.Add(1)
 		return fmt.Sprintf("item-%d", value)
 	}
@@ -433,7 +447,7 @@ func Test_host_callable_repeated_and_concurrent_reuse(t *testing.T) {
 func Test_host_callable_declared_throw_is_catchable(t *testing.T) {
 	got, err := baml_sdk.HostCallableTestsCallWithThrowing(
 		context.Background(),
-		func(int64) (string, error) { return "", errors.New("callback failed") },
+		func(context.Context, int64) (string, error) { return "", errors.New("callback failed") },
 		1,
 	)
 	if err != nil || got != "caught:Error" {
@@ -444,11 +458,41 @@ func Test_host_callable_declared_throw_is_catchable(t *testing.T) {
 func Test_host_callable_panic_does_not_cross_cgo_boundary(t *testing.T) {
 	_, err := baml_sdk.HostCallableTestsCallWithCallback(
 		context.Background(),
-		func(int64) string { panic("callback exploded") },
+		func(context.Context, int64) string { panic("callback exploded") },
 		1,
 	)
 	if err == nil {
 		t.Fatal("panicking callback unexpectedly succeeded")
+	}
+}
+
+// A callback slot without `throws` leaves its effect open, so a Go failure
+// (panic, runtime.Goexit) is raised: the engine builds a
+// baml.errors.HostCallable around it, BAML catches it, and when rethrown it
+// reaches Go as a BAML error rather than a host-contract violation.
+func Test_host_callable_failure_under_open_throws_is_catchable(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name     string
+		callback func(context.Context) int64
+	}{
+		{"panic", func(context.Context) int64 { panic("callback exploded") }},
+		{"goexit", func(context.Context) int64 {
+			runtime.Goexit()
+			return 1
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := baml_sdk.HostCallableTestsCallbackErrorCaught(ctx, test.callback)
+			if err != nil || got != 0 {
+				t.Fatalf("caught callback failure = %d, %v; want 0, nil", got, err)
+			}
+			_, err = baml_sdk.HostCallableTestsCallbackErrorRethrown(ctx, test.callback)
+			var failure *baml_go.BamlError
+			if !errors.As(err, &failure) || failure.Kind != "error" || failure.ClassName != "baml.errors.HostCallable" {
+				t.Fatalf("rethrown callback failure = %#v; want a thrown baml.errors.HostCallable", err)
+			}
+		})
 	}
 }
 
@@ -458,7 +502,7 @@ func Test_host_callable_cancellation_while_dispatched(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(int64) string {
+		_, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(context.Context, int64) string {
 			close(started)
 			<-release
 			return "late"
@@ -475,30 +519,83 @@ func Test_host_callable_cancellation_while_dispatched(t *testing.T) {
 
 func Test_host_callable_void_signatures(t *testing.T) {
 	var seen atomic.Int64
-	got, err := baml_sdk.HostCallableTestsCallVoidCallback(context.Background(), func(value int64) {
+	got, err := baml_sdk.HostCallableTestsCallVoidCallback(context.Background(), func(_ context.Context, value int64) {
 		seen.Store(value)
 	}, 42)
 	if err != nil || got != 42 || seen.Load() != 42 {
 		t.Fatalf("void callback = %d, seen %d, error %v", got, seen.Load(), err)
 	}
 
-	if err := baml_sdk.HostCallableTestsCallThrowingVoidCallback(context.Background(), func(int64) error { return nil }, 1); err != nil {
+	if err := baml_sdk.HostCallableTestsCallThrowingVoidCallback(context.Background(), func(context.Context, int64) error { return nil }, 1); err != nil {
 		t.Fatalf("throwing void callback success = %v", err)
 	}
-	if err := baml_sdk.HostCallableTestsCallThrowingVoidCallback(context.Background(), func(int64) error {
+	if err := baml_sdk.HostCallableTestsCallThrowingVoidCallback(context.Background(), func(context.Context, int64) error {
 		return errors.New("void failed")
 	}, 1); err == nil {
 		t.Fatal("throwing void callback error unexpectedly succeeded")
 	}
-	if _, err := baml_sdk.HostCallableTestsCallVoidCallback(context.Background(), func(int64) {
+	if _, err := baml_sdk.HostCallableTestsCallVoidCallback(context.Background(), func(context.Context, int64) {
 		panic("void panic")
 	}, 1); err == nil {
 		t.Fatal("panicking void callback unexpectedly succeeded")
 	}
+
+	ctx := context.Background()
+	var mu sync.Mutex
+	var calls []string
+	record := func(call string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, call)
+	}
+	got, err = baml_sdk.HostCallableTestsCallVoidCallbackTwoArgs(ctx, func(_ context.Context, value int64, label string) {
+		record(fmt.Sprintf("%d:%s", value, label))
+	}, 2, "two")
+	if err != nil || got != 2 {
+		t.Fatalf("two-argument void callback = %d, error %v", got, err)
+	}
+	got, err = baml_sdk.HostCallableTestsCallVoidCallbackThreeArgs(ctx, func(_ context.Context, value int64, label string, flag bool) {
+		record(fmt.Sprintf("%d:%s:%t", value, label, flag))
+	}, 3, "three", true)
+	if err != nil || got != 3 {
+		t.Fatalf("three-argument void callback = %d, error %v", got, err)
+	}
+
+	nothing, err := baml_sdk.HostCallableTestsMakeVoidCallback(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nothing.Call(ctx)
+
+	forward, err := baml_sdk.HostCallableTestsMakeVoidForwarder(ctx, func(_ context.Context, value int64, label string) error {
+		if value < 0 {
+			return errors.New("void failed")
+		}
+		record(fmt.Sprintf("%d:%s", value, label))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := forward.Call(ctx, 5, "five"); err != nil {
+		t.Fatalf("forward(5, five) = %v", err)
+	}
+	if err := forward.Call(ctx, -1, "negative"); err == nil {
+		t.Fatal("forward(-1, negative) unexpectedly succeeded")
+	}
+	if err := forward.Call(ctx, 6, "six"); err != nil {
+		t.Fatalf("forward(6, six) = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"2:two", "3:three:true", "5:five", "6:six"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("void callbacks saw %v, want %v", calls, want)
+	}
 }
 
 func Test_nil_host_callable_fails_before_dispatch(t *testing.T) {
-	var callback func(int64) string
+	var callback func(context.Context, int64) string
 	_, err := baml_sdk.HostCallableTestsIgnoreCallback(context.Background(), callback)
 	if err == nil || !strings.Contains(err.Error(), `argument "callback"`) || !strings.Contains(err.Error(), "host callable is nil") {
 		t.Fatalf("nil callback error = %v", err)
@@ -508,7 +605,7 @@ func Test_nil_host_callable_fails_before_dispatch(t *testing.T) {
 func Test_host_callable_reentrant_call_does_not_deadlock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	got, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(int64) string {
+	got, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(context.Context, int64) string {
 		inner, innerErr := baml_sdk.HelloWorld(ctx)
 		if innerErr != nil {
 			return "inner-error:" + innerErr.Error()
@@ -524,13 +621,13 @@ func Test_host_callable_late_and_uncaught_failures_release_native_identity(t *te
 	const repetitions = 16
 	var finalized atomic.Int64
 	for index := 0; index < repetitions; index++ {
-		_, err := baml_sdk.HostCallableTestsPropagateThrowingCallback(context.Background(), func(int64) (string, error) {
+		_, err := baml_sdk.HostCallableTestsPropagateThrowingCallback(context.Background(), func(context.Context, int64) (string, error) {
 			return "", trackedCallbackError(&finalized)
 		}, 1)
 		if err == nil {
 			t.Fatal("uncaught callback error unexpectedly succeeded")
 		}
-		_, err = baml_sdk.HostCallableTestsCallWithCallback(context.Background(), func(int64) string {
+		_, err = baml_sdk.HostCallableTestsCallWithCallback(context.Background(), func(context.Context, int64) string {
 			panic(trackedPanicValue(&finalized))
 		}, 1)
 		if err == nil {
@@ -546,7 +643,7 @@ func Test_host_callable_late_and_uncaught_failures_release_native_identity(t *te
 		done := make(chan error, 1)
 		go func(panicLate bool) {
 			if panicLate {
-				_, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(int64) string {
+				_, err := baml_sdk.HostCallableTestsCallWithCallback(ctx, func(context.Context, int64) string {
 					close(started)
 					<-release
 					panic(trackedPanicValue(&finalized))
@@ -554,7 +651,7 @@ func Test_host_callable_late_and_uncaught_failures_release_native_identity(t *te
 				done <- err
 				return
 			}
-			_, err := baml_sdk.HostCallableTestsPropagateThrowingCallback(ctx, func(int64) (string, error) {
+			_, err := baml_sdk.HostCallableTestsPropagateThrowingCallback(ctx, func(context.Context, int64) (string, error) {
 				close(started)
 				<-release
 				return "", trackedCallbackError(&finalized)
@@ -569,4 +666,105 @@ func Test_host_callable_late_and_uncaught_failures_release_native_identity(t *te
 		close(release)
 	}
 	waitForFinalizers(t, &finalized, 3*repetitions)
+}
+
+func Test_host_callables_throwing_callable_bamlerror_wrapping_codegenned_class_is_caught_in_baml(t *testing.T) {
+	// A callback whose declared throws names a BAML class throws a value of
+	// it with baml_go.Throw; it crosses as that class, so BAML's typed catch
+	// arm matches and reads its fields.
+	got, err := baml_sdk.HostCallableTestsCallWithTypedThrows(context.Background(), func(context.Context, int64) (string, error) {
+		return "", baml_go.Throw(baml_sdk.HostCallableTestsValidationError{
+			Code: 4, Message: "bad shape", Fields: []string{"name", "age", "email", "phone"},
+		})
+	}, 1)
+	if err != nil || got != "caught: bad shape" {
+		t.Fatalf("typed callback throw = %q, %v; want \"caught: bad shape\"", got, err)
+	}
+}
+
+func Test_host_callables_throwing_callable_bamlerror_propagates_back_with_typed_fields(t *testing.T) {
+	_, err := baml_sdk.HostCallableTestsCallWithTypedThrowsPropagating(context.Background(), func(context.Context, int64) (string, error) {
+		return "", baml_go.Throw(baml_sdk.HostCallableTestsValidationError{
+			Code: 7, Message: "propagated through", Fields: []string{"x", "y"},
+		})
+	}, 1)
+	var failure *baml_go.BamlError
+	if !errors.As(err, &failure) || failure.Kind != "error" || failure.ClassName != "user.host_callable_tests.ValidationError" {
+		t.Fatalf("propagated typed throw = %#v; want a thrown ValidationError", err)
+	}
+	want := map[string]any{"code": int64(7), "message": "propagated through", "fields": []any{"x", "y"}}
+	if !reflect.DeepEqual(failure.Value, want) {
+		t.Fatalf("propagated typed throw fields = %#v; want %#v", failure.Value, want)
+	}
+}
+
+// SDK_PARITY_LINT(skip): Go's completion classification of a value thrown as a Go type other than the declared one
+func Test_host_callables_thrown_value_of_another_go_type_is_a_contract_violation(t *testing.T) {
+	_, err := baml_sdk.HostCallableTestsCallWithTypedThrows(context.Background(), func(context.Context, int64) (string, error) {
+		return "", baml_go.Throw("not a ValidationError")
+	}, 1)
+	var failure *baml_go.BamlError
+	if !errors.As(err, &failure) || failure.Kind != "panic" || failure.ClassName != "baml.panics.HostContractViolation" ||
+		!strings.Contains(failure.Message, "threw a Go string") {
+		t.Fatalf("mistyped callback throw = %#v; want a baml.panics.HostContractViolation panic naming the Go type", err)
+	}
+}
+
+// SDK_PARITY_LINT(skip): Go's completion classification of a returned value that does not fit its declared type
+func Test_host_callables_non_finite_json_result_is_a_contract_violation(t *testing.T) {
+	_, err := baml_sdk.GoJsonTestsCallJsonCallback(context.Background(), func(context.Context, any) any {
+		return math.NaN()
+	}, int64(1))
+	var failure *baml_go.BamlError
+	if !errors.As(err, &failure) || failure.Kind != "panic" || failure.ClassName != "baml.panics.HostContractViolation" {
+		t.Fatalf("non-finite JSON callback result = %#v; want a baml.panics.HostContractViolation panic", err)
+	}
+}
+
+// SDK_PARITY_LINT(skip): Go's completion classification of a BAML error a callback forwards by panicking with it
+func Test_host_callables_baml_error_panicked_with_is_thrown_on(t *testing.T) {
+	ctx := context.Background()
+	// The callback's Go surface returns no error, so it forwards the BAML
+	// error it received by panicking with it: the error is thrown on as the
+	// value it is, caught and rethrown by BAML, and reaches Go as itself.
+	_, err := baml_sdk.HostCallableTestsCallbackErrorRethrown(ctx, func(ctx context.Context) int64 {
+		_, err := baml_sdk.ThrowsTestThrowMyError(ctx)
+		panic(err)
+	})
+	var failure *baml_go.BamlError
+	if !errors.As(err, &failure) || failure.Kind != "error" || failure.ClassName != "user.throws_test.MyError" {
+		t.Fatalf("forwarded BAML error = %#v; want the thrown user.throws_test.MyError", err)
+	}
+	if want := map[string]any{"code": int64(42), "detail": "boom"}; !reflect.DeepEqual(failure.Value, want) {
+		t.Fatalf("forwarded BAML error value = %#v; want %#v", failure.Value, want)
+	}
+}
+
+// SDK_PARITY_LINT(skip): Go's completion classification of a forwarded BAML error held to the declared throws type
+func Test_host_callables_forwarded_baml_error_is_held_to_the_declared_throws(t *testing.T) {
+	ctx := context.Background()
+	// Thrown on, a BAML error the callback's declared throws does not admit
+	// is the callback's breach of contract, not a raised Go error.
+	_, err := baml_sdk.HostCallableTestsPropagateThrowingCallback(ctx, func(ctx context.Context, _ int64) (string, error) {
+		_, err := baml_sdk.ThrowsTestThrowMyError(ctx)
+		return "", err
+	}, 1)
+	var failure *baml_go.BamlError
+	if !errors.As(err, &failure) || failure.Kind != "panic" || failure.ClassName != "baml.panics.HostContractViolation" {
+		t.Fatalf("forwarded undeclared BAML error = %#v; want a baml.panics.HostContractViolation panic", err)
+	}
+}
+
+// SDK_PARITY_LINT(skip): pins a typed SDK's completion of a forwarded panic under a single-class throws
+func Test_host_callables_forwarded_panic_stays_a_panic_under_a_declared_throws_class(t *testing.T) {
+	ctx := context.Background()
+	// A panic is a panic whatever the callback declares: BAML's catch-all
+	// does not catch it, and it reaches Go as the panic it was.
+	got, err := baml_sdk.HostCallableTestsCallWithThrowing(ctx, func(ctx context.Context, _ int64) (string, error) {
+		return "", baml_sdk.ThrowsTestDoPanic(ctx, "forwarded")
+	}, 1)
+	var failure *baml_go.BamlError
+	if !errors.As(err, &failure) || failure.Kind != "panic" || failure.ClassName != "baml.panics.UserPanic" {
+		t.Fatalf("forwarded BAML panic = %q, %#v; want the baml.panics.UserPanic panic", got, err)
+	}
 }

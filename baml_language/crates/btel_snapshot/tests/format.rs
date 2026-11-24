@@ -1,0 +1,524 @@
+//! Frozen v3 decoding compatibility and current writer round trips.
+use std::{fmt::Write as _, sync::Arc};
+
+use baml_type::{DeclarationName, RealizedTy, TypeName, typetag::TypeTag};
+use btel_snapshot::{
+    BlobScratch, Description, Leaves, Limit, Limits, ShapePolicy, Shaper, Snapshot,
+    SnapshotObject as O, SnapshotPool, SnapshotRoot, SnapshotValue as V,
+};
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for byte in bytes {
+        write!(output, "{byte:02x}").unwrap();
+    }
+    output
+}
+
+fn graph(pool: &SnapshotPool, arguments: bool) -> Snapshot {
+    let mut b = pool.try_acquire().unwrap();
+    let name = DeclarationName::Declared(TypeName::local("Golden".into()));
+    let declaration = b.declaration(&name, TypeTag::from_i64(42), true, None);
+    let declaration = b.leaves().object(declaration).unwrap();
+    let ty = b.leaves().ty(RealizedTy::Int);
+    let text = b.leaves().string(&"value".into()).unwrap();
+    let label = b.leaves().label(&"value".into()).unwrap();
+    let field = |_: &mut Leaves<'_>, ()| ("field".into(), V::Int(7));
+    let list = b.list(ty, [false, true].into_iter(), |_, flag| V::Bool(flag));
+    let map = b.map(ty, ty, std::iter::once(()), |leaves, ()| {
+        (leaves.string_value(&"field".into()), V::Int(7))
+    });
+    let instance = b.instance(declaration, [RealizedTy::Int], std::iter::once(()), field);
+    let mut objects = vec![declaration];
+    for object in [
+        // Five bytes that a limit kept out of the capture.
+        O::Uint8ArrayTruncated { original_len: 5 },
+        list,
+        map,
+        instance,
+        O::NonSnapshotableValue {},
+    ] {
+        objects.push(b.leaves().object(object).unwrap());
+    }
+    let cycle = b.leaves().reserve().unwrap();
+    objects.push(cycle.id());
+    let itself = V::Object(cycle.id());
+    b.fill(cycle, O::Cell(itself));
+    for (index, kind) in [
+        Description::Function,
+        Description::Closure,
+        Description::BoundMethod,
+        Description::GenericFunction,
+        Description::HostFunction,
+        Description::Future,
+        Description::UnscheduledFuture,
+        Description::Package,
+        Description::Interface,
+        Description::Implementation,
+        Description::TypeAlias,
+        Description::Sentinel,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let described = O::Descriptive {
+            kind,
+            name: (index % 2 == 0).then_some(label),
+        };
+        objects.push(b.leaves().object(described).unwrap());
+    }
+    let mut values = vec![
+        V::Null,
+        V::OmittedArg,
+        V::Bool(true),
+        V::Int(-7),
+        V::Float(f64::from_bits(0x7ff8_0000_0000_1234)),
+        V::String(text),
+        V::Type(ty),
+        V::Enum {
+            declaration,
+            variant: 2,
+            name: label,
+        },
+    ];
+    for integer in [-123, 0, 123] {
+        values.push(b.leaves().bigint(&Arc::new(integer.into())));
+    }
+    for reason in [Limit::Values, Limit::Objects, Limit::Bytes, Limit::Depth] {
+        objects.push(b.leaves().object(O::Truncated(reason)).unwrap());
+        values.push(V::Truncated(reason));
+    }
+    values.extend(objects.into_iter().map(V::Object));
+    let mut shaper = Shaper::default();
+    if arguments {
+        let mut root = b.arguments(values.into_iter(), |_, value| value);
+        // As a limit leaves the arguments of a call that had one more.
+        let SnapshotRoot::FunctionArgs(slots) = &mut root else {
+            panic!("expected arguments")
+        };
+        slots.parameter_count += 1;
+        b.finish(root, &mut shaper)
+    } else {
+        // The value root is a list of the same values.
+        let everything = b.list(ty, values.into_iter(), |_, value| value);
+        let everything = b.leaves().object(everything).unwrap();
+        b.finish(V::Object(everything), &mut shaper)
+    }
+}
+
+fn root_blob(snapshot: &Snapshot) -> Vec<u8> {
+    assert_eq!(snapshot.blobs().len(), 1);
+    let mut bytes = Vec::new();
+    snapshot
+        .root_blob()
+        .write(&mut BlobScratch::default(), &mut bytes)
+        .unwrap();
+    bytes
+}
+
+#[test]
+fn all_snapshot_tags_round_trip() {
+    let pool = SnapshotPool::unbounded(Limits::default());
+    for arguments in [true, false] {
+        let snapshot = graph(&pool, arguments);
+        let bytes = root_blob(&snapshot);
+        assert_eq!(&bytes[12..28], snapshot.root_id().as_bytes());
+        let decoded = btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default())
+            .expect("the reader must verify the writer's bytes");
+        assert_eq!(decoded.id, snapshot.root_id());
+        drop(snapshot);
+        assert_eq!(pool.stats().in_use, 0);
+    }
+}
+
+#[test]
+#[ignore = "prints current encodings for review; never rewrites the fixtures"]
+#[expect(clippy::print_stdout, reason = "the output is the point")]
+fn print_current_encodings() {
+    let pool = SnapshotPool::unbounded(Limits::default());
+    for arguments in [true, false] {
+        println!("{arguments}: {}", hex(&root_blob(&graph(&pool, arguments))));
+    }
+}
+
+/// Arguments cut into blobs: a string and bytes stored alone, a map that
+/// names a stored string, and two lists that hold each other, named once at
+/// the root of their blob and once inside it.
+fn cut_graph(pool: &SnapshotPool) -> Snapshot {
+    let mut b = pool.try_acquire().unwrap();
+    let ty = b.leaves().ty(RealizedTy::Int);
+    let text = b.leaves().string_value(&"t".repeat(40).as_str().into());
+    let note = b.leaves().string_value(&"n".repeat(40).as_str().into());
+    let bytes = b.bytes(&[9; 40]);
+    let array = b.leaves().object(bytes).unwrap();
+    let entries = [
+        ("note", note),
+        ("padding", V::Int(1)),
+        ("more padding", V::Int(2)),
+    ];
+    let map = b.map(ty, ty, entries.into_iter(), |leaves, (key, value)| {
+        (leaves.string_value(&key.into()), value)
+    });
+    let map = b.leaves().object(map).unwrap();
+    let [first_slot, second_slot] = [(); 2].map(|()| b.leaves().reserve().unwrap());
+    let (first, second) = (first_slot.id(), second_slot.id());
+    for (slot, other, label) in [
+        (first_slot, second, "first"),
+        (second_slot, first, "second"),
+    ] {
+        let label = b.leaves().string_value(&label.repeat(4).as_str().into());
+        let list = b.list(ty, [V::Object(other), label].into_iter(), |_, item| item);
+        b.fill(slot, list);
+    }
+    let slots = [
+        text,
+        V::Object(first),
+        V::Object(map),
+        V::Object(second),
+        V::Object(array),
+        text,
+    ];
+    let root = b.arguments(slots.into_iter(), |_, slot| slot);
+    let mut shaper = Shaper::new(ShapePolicy::Split {
+        unit_bytes: 64,
+        leaf_bytes: 32,
+    });
+    b.finish(root, &mut shaper)
+}
+
+/// One line of hex per blob, children first.
+fn blob_lines(snapshot: &Snapshot) -> Vec<String> {
+    let mut scratch = BlobScratch::default();
+    snapshot
+        .blobs()
+        .map(|blob| {
+            let mut bytes = Vec::new();
+            blob.write(&mut scratch, &mut bytes).unwrap();
+            assert_eq!(blob.encoded_len(), bytes.len() as u64);
+            let decoded =
+                btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default())
+                    .expect("the reader must verify the writer's bytes");
+            assert_eq!(decoded.id, blob.id());
+            hex(&bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn references_between_blobs_round_trip() {
+    let pool = SnapshotPool::unbounded(Limits::default());
+    let lines = blob_lines(&cut_graph(&pool));
+    assert!(lines.len() > 1);
+    assert_eq!(pool.stats().in_use, 0);
+}
+
+#[test]
+#[ignore = "prints current encodings for review; never rewrites the fixtures"]
+#[expect(clippy::print_stdout, reason = "the output is the point")]
+fn print_current_external_encodings() {
+    let pool = SnapshotPool::unbounded(Limits::default());
+    for line in blob_lines(&cut_graph(&pool)) {
+        println!("{line}");
+    }
+}
+
+/// Media of every kind and source, with and without a MIME type and loaded
+/// content, as a list root. The longest content is stored alone.
+fn media_graph(pool: &SnapshotPool) -> Snapshot {
+    use baml_type::ConcreteMediaKind;
+    use btel_snapshot::MediaSource;
+    let mut b = pool.try_acquire().unwrap();
+    let ty = b.leaves().ty(RealizedTy::Unknown);
+    let mime = b.leaves().label(&"image/png".into()).unwrap();
+    let url = b
+        .leaves()
+        .label(&"https://example.test/a.png".into())
+        .unwrap();
+    let path = b.leaves().label(&"/data/b.png".into()).unwrap();
+    let short = b.leaves().string(&"iVBORw==".into()).unwrap();
+    let long = b
+        .leaves()
+        .string(&"iVBORw0K".repeat(6).as_str().into())
+        .unwrap();
+    let sources = [
+        (
+            ConcreteMediaKind::Image,
+            Some(mime),
+            MediaSource::Url { url, data: None },
+        ),
+        (
+            ConcreteMediaKind::Audio,
+            None,
+            MediaSource::Url {
+                url,
+                data: Some(short),
+            },
+        ),
+        (
+            ConcreteMediaKind::Video,
+            Some(mime),
+            MediaSource::File { path, data: None },
+        ),
+        (
+            ConcreteMediaKind::Pdf,
+            None,
+            MediaSource::File {
+                path,
+                data: Some(long),
+            },
+        ),
+        (
+            ConcreteMediaKind::Audio,
+            Some(mime),
+            MediaSource::Base64 { data: short },
+        ),
+        (
+            ConcreteMediaKind::Image,
+            None,
+            MediaSource::Base64 { data: long },
+        ),
+    ];
+    let list = b.list(
+        ty,
+        sources.into_iter(),
+        |leaves, (kind, mime_type, source)| {
+            let media = O::Media {
+                kind,
+                mime_type,
+                source,
+            };
+            V::Object(leaves.object(media).unwrap())
+        },
+    );
+    let list = b.leaves().object(list).unwrap();
+    let mut shaper = Shaper::new(ShapePolicy::Split {
+        unit_bytes: 1 << 20,
+        leaf_bytes: 32,
+    });
+    b.finish(V::Object(list), &mut shaper)
+}
+
+#[test]
+fn media_round_trips() {
+    let pool = SnapshotPool::unbounded(Limits::default());
+    let lines = blob_lines(&media_graph(&pool));
+    assert!(lines.len() > 1);
+    assert_eq!(pool.stats().in_use, 0);
+}
+
+#[test]
+#[ignore = "prints current encodings for review; never rewrites the fixtures"]
+#[expect(clippy::print_stdout, reason = "the output is the point")]
+fn print_current_media_encodings() {
+    let pool = SnapshotPool::unbounded(Limits::default());
+    for line in blob_lines(&media_graph(&pool)) {
+        println!("{line}");
+    }
+}
+
+fn fixture_blobs(fixture: &str) -> impl Iterator<Item = Vec<u8>> + '_ {
+    fixture.lines().map(|line| {
+        line.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    })
+}
+
+#[test]
+fn frozen_v3_blobs_remain_readable_with_verified_content_ids() {
+    for fixture in [
+        include_str!("fixtures/format_v3_args.hex"),
+        include_str!("fixtures/format_v3_value.hex"),
+        include_str!("fixtures/format_v3_external.hex"),
+        include_str!("fixtures/format_v3_media.hex"),
+    ] {
+        for bytes in fixture_blobs(fixture) {
+            let decoded =
+                btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default())
+                    .unwrap();
+            assert_eq!(decoded.id.as_bytes(), &bytes[12..28]);
+            for object in decoded.objects {
+                if let btel_core::cas::DecodedObject::Map { entries, .. } = object {
+                    assert!(
+                        entries
+                            .iter()
+                            .all(|(key, _)| matches!(key, btel_core::cas::DecodedValue::String(_)))
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Format 4 blobs, as canary wrote them before definitions were recorded:
+/// their declarations are identified by tag and name no definition.
+#[test]
+fn frozen_v4_blobs_remain_readable_with_verified_content_ids() {
+    let mut declarations = 0;
+    for fixture in [
+        include_str!("fixtures/format_v4_args.hex"),
+        include_str!("fixtures/format_v4_value.hex"),
+        include_str!("fixtures/format_v4_external.hex"),
+        include_str!("fixtures/format_v4_media.hex"),
+    ] {
+        for bytes in fixture_blobs(fixture) {
+            assert_eq!(bytes[8..12], 4_u32.to_le_bytes());
+            let decoded =
+                btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default())
+                    .unwrap();
+            assert_eq!(decoded.id.as_bytes(), &bytes[12..28]);
+            for object in decoded.objects {
+                if let btel_core::cas::DecodedObject::Declaration {
+                    tag, definition, ..
+                } = object
+                {
+                    assert_eq!(tag, Some(btel_core::cas::RuntimeTag(42)));
+                    assert_eq!(definition, None);
+                    declarations += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        declarations, 2,
+        "the argument and value graphs each name one"
+    );
+}
+
+/// Format 6 redacted values, hand-built since nothing writes format 6 yet,
+/// then sealed with the ID their content hashes to: a declared redaction, a
+/// pattern's, a reason this reader does not know, and an argument root with
+/// a redacted slot. A writer of format 6 must produce these bytes.
+fn redacted_v6_blobs() -> Vec<Vec<u8>> {
+    let header = || {
+        let mut bytes = btel_core::cas::MAGIC.to_vec();
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // no children
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // no objects
+        bytes
+    };
+    let redacted = |body: &[u8]| {
+        let mut bytes = vec![13];
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let value_root = |value: Vec<u8>| {
+        let mut bytes = header();
+        bytes.push(0);
+        bytes.extend_from_slice(&value);
+        bytes
+    };
+    let mut arguments = header();
+    arguments.push(1);
+    arguments.extend_from_slice(&2_u64.to_le_bytes()); // parameters
+    arguments.extend_from_slice(&2_u32.to_le_bytes()); // slots
+    arguments.extend_from_slice(&redacted(b"\x01github-pat"));
+    arguments.push(3);
+    arguments.extend_from_slice(&7_i64.to_le_bytes());
+    [
+        value_root(redacted(&[0])),
+        value_root(redacted(b"\x01openai-api-key")),
+        value_root(redacted(&[7, 1, 2, 3])),
+        arguments,
+    ]
+    .into_iter()
+    .map(|mut bytes| {
+        let Err(btel_core::cas::BlobError::IdMismatch { computed, .. }) =
+            btel_core::cas::decode_blob(&bytes, &btel_core::cas::DecodeLimits::default())
+        else {
+            panic!("a hand-built blob decodes to an ID mismatch")
+        };
+        bytes[12..28].copy_from_slice(computed.as_bytes());
+        bytes
+    })
+    .collect()
+}
+
+#[test]
+#[ignore = "prints current encodings for review; never rewrites the fixtures"]
+#[expect(clippy::print_stdout, reason = "the output is the point")]
+fn print_redacted_v6_encodings() {
+    for bytes in redacted_v6_blobs() {
+        println!("{}", hex(&bytes));
+    }
+}
+
+#[test]
+fn frozen_v6_redactions_decode_with_verified_content_ids() {
+    use btel_core::cas::{DecodedRoot, DecodedValue, Redaction};
+    let fixture = include_str!("fixtures/format_v6_redacted.hex");
+    let blobs: Vec<_> = fixture_blobs(fixture).collect();
+    assert_eq!(
+        blobs,
+        redacted_v6_blobs(),
+        "the fixture is the hand-built blobs"
+    );
+    let roots: Vec<_> = blobs
+        .iter()
+        .map(|bytes| {
+            assert_eq!(bytes[8..12], 6_u32.to_le_bytes());
+            let decoded =
+                btel_core::cas::decode_blob(bytes, &btel_core::cas::DecodeLimits::default())
+                    .unwrap();
+            assert_eq!(decoded.id.as_bytes(), &bytes[12..28]);
+            decoded.root
+        })
+        .collect();
+    let redacted = |reason| DecodedRoot::Value(DecodedValue::Redacted(reason));
+    assert_eq!(
+        roots,
+        [
+            redacted(Redaction::Declared),
+            redacted(Redaction::Pattern("openai-api-key".into())),
+            redacted(Redaction::Unknown { kind: 7 }),
+            DecodedRoot::FunctionArgs {
+                parameter_count: 2,
+                slots: vec![
+                    DecodedValue::Redacted(Redaction::Pattern("github-pat".into())),
+                    DecodedValue::Int(7),
+                ],
+            },
+        ]
+    );
+}
+
+/// The writer's redacted value is the frozen one: a declared redaction as a
+/// value root writes the fixture's first blob byte for byte, ID included, and
+/// one among arguments decodes back as itself.
+#[test]
+fn the_writer_writes_redactions_as_frozen() {
+    use btel_core::cas::{DecodedRoot, DecodedValue, Redaction};
+    use btel_snapshot::RedactionReason;
+    let pool = SnapshotPool::unbounded(Limits::default());
+    let declared = V::Redacted(RedactionReason::Declared);
+    let builder = pool.try_acquire().unwrap();
+    let value = builder.finish(declared, &mut Shaper::default());
+    assert_eq!(root_blob(&value), redacted_v6_blobs()[0]);
+
+    let mut builder = pool.try_acquire().unwrap();
+    let arguments = builder.arguments(0..2, |_, slot| match slot {
+        0 => declared,
+        _ => V::Int(7),
+    });
+    let arguments = builder.finish(arguments, &mut Shaper::default());
+    let decoded = btel_core::cas::decode_blob(
+        &root_blob(&arguments),
+        &btel_core::cas::DecodeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decoded.root,
+        DecodedRoot::FunctionArgs {
+            parameter_count: 2,
+            slots: vec![
+                DecodedValue::Redacted(Redaction::Declared),
+                DecodedValue::Int(7)
+            ],
+        }
+    );
+}

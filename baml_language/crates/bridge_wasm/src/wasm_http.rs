@@ -4,20 +4,18 @@
 //! reqwest directly for SSE streaming. Each `BamlWasmRuntime` gets its own
 //! `WasmHttp` instance, so there are no globals.
 
-use std::{
-    any::{Any as _, TypeId},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use bex_events::run::{HeaderObservation, InMemoryRunStore};
 use js_sys::{Function, Object, Promise, Reflect};
 use sys_ops::io::{self, IoClassHttpResponse, IoNamespaceHttp};
 use sys_types::{
-    BexHeap, CallId, SysOpContext, SysOpOutput, VmBamlError, VmInternalError, VmPanic,
+    BexHeap, CallId, OpOutput, SysOpContext, SysOpOutput, VmBamlError, VmInternalError, VmPanic,
     VmRustFnError,
+    resource::{HttpBodyResource, SseStreamResource},
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -218,42 +216,28 @@ impl WasmHttp {
             }
 
             let key = registry.store_body_promise(body_promise);
-            let body: Arc<dyn std::any::Any + Send + Sync> =
-                Arc::new(WasmResponseBody { registry, key });
-
             Ok(io::owned::http::Response {
                 status_code: status,
                 headers,
                 url: final_url,
-                _body: body,
+                _body: Arc::new(WasmResponseBody { registry, key }),
             })
         }))
     }
 }
 
-impl IoClassHttpResponse for WasmHttp {
-    fn text(
-        &self,
-        _heap: &Arc<BexHeap>,
-        _call_id: CallId,
-        response: io::owned::http::Response,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<String> {
-        let registry = Arc::clone(&self.registry);
-        let body = response
-            ._body
-            .downcast_ref::<WasmResponseBody>()
-            .map(|b| b.key);
-        let Some(key) = body else {
-            return SysOpOutput::err(VmInternalError::RustTypeError {
-                expected: TypeId::of::<WasmResponseBody>(),
-                got: response._body.type_id(),
-            });
-        };
+fn not_writable() -> VmBamlError {
+    VmBamlError::Io {
+        message: "a fetched response's body is read, not written".into(),
+    }
+}
 
-        SysOpOutput::async_op(SendFuture(async move {
-            let promise = registry
-                .take_body_promise(key)
+impl HttpBodyResource for WasmResponseBody {
+    fn text(self: Arc<Self>) -> OpOutput<String> {
+        OpOutput::async_op(SendFuture(async move {
+            let promise = self
+                .registry
+                .take_body_promise(self.key)
                 // `Response.text`/`bytes` declare `throws root.errors.Io`,
                 // and the native transport reports a re-read of an
                 // already-consumed body the same way.
@@ -281,28 +265,11 @@ impl IoClassHttpResponse for WasmHttp {
         }))
     }
 
-    fn bytes(
-        &self,
-        _heap: &Arc<BexHeap>,
-        _call_id: CallId,
-        response: io::owned::http::Response,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Vec<u8>> {
-        let registry = Arc::clone(&self.registry);
-        let body = response
-            ._body
-            .downcast_ref::<WasmResponseBody>()
-            .map(|b| b.key);
-        let Some(key) = body else {
-            return SysOpOutput::err(VmInternalError::RustTypeError {
-                expected: TypeId::of::<WasmResponseBody>(),
-                got: response._body.type_id(),
-            });
-        };
-
-        SysOpOutput::async_op(SendFuture(async move {
-            let promise = registry
-                .take_body_promise(key)
+    fn bytes(self: Arc<Self>) -> OpOutput<Vec<u8>> {
+        OpOutput::async_op(SendFuture(async move {
+            let promise = self
+                .registry
+                .take_body_promise(self.key)
                 // `Response.text`/`bytes` declare `throws root.errors.Io`,
                 // and the native transport reports a re-read of an
                 // already-consumed body the same way.
@@ -334,6 +301,20 @@ impl IoClassHttpResponse for WasmHttp {
         }))
     }
 
+    fn write(self: Arc<Self>, _data: Vec<u8>) -> OpOutput<()> {
+        OpOutput::err(not_writable())
+    }
+
+    fn end(self: Arc<Self>) -> OpOutput<()> {
+        OpOutput::err(not_writable())
+    }
+
+    fn measure(&self, _: &mut sys_types::Meter) {
+        // The body is a promise the registry holds on the host's behalf.
+    }
+}
+
+impl IoClassHttpResponse for WasmHttp {
     fn new(
         &self,
         _heap: &Arc<BexHeap>,
@@ -357,33 +338,6 @@ impl IoClassHttpResponse for WasmHttp {
         _headers: indexmap::IndexMap<String, String>,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<io::owned::http::Response> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn write(
-        &self,
-        _heap: &Arc<BexHeap>,
-        _call_id: CallId,
-        _response: io::owned::http::Response,
-        _data: Vec<u8>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn end(
-        &self,
-        _heap: &Arc<BexHeap>,
-        _call_id: CallId,
-        _response: io::owned::http::Response,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "http".to_string(),
             message: "Operation not supported on this platform".to_string(),
@@ -429,10 +383,12 @@ impl io::IoClassHttpServer for WasmHttp {
         &self,
         _heap: &Arc<BexHeap>,
         _call_id: CallId,
-        _server: io::owned::http::Server,
+        _state: io::owned::http::ServerState,
         _handler: sys_types::Handle,
         _websocket: sys_types::Handle,
-        _tls_config: Option<io::owned::http::TlsConfig>,
+        _tls_keys: Option<io::owned::http::TlsKeys>,
+        _allow_tls1_2: bool,
+        _tls_handshake_timeout_nanos: Arc<num_bigint::BigInt>,
         _allow_http1: bool,
         _allow_http2: bool,
         _max_body_size: i64,
@@ -447,45 +403,29 @@ impl io::IoClassHttpServer for WasmHttp {
     }
 }
 
-impl io::IoClassHttpSseStream for WasmHttp {
-    fn next(
-        &self,
-        _heap: &Arc<BexHeap>,
-        _call_id: CallId,
-        sse_stream: io::owned::http::SseStream,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<String>> {
-        let handle = sse_stream
-            ._handle
-            .clone()
-            .downcast::<WasmSseStreamHandle>()
-            .ok();
-        let Some(handle) = handle else {
-            return SysOpOutput::err(VmInternalError::RustTypeError {
-                expected: TypeId::of::<WasmSseStreamHandle>(),
-                got: sse_stream._handle.type_id(),
-            });
-        };
+impl SseStreamResource for WasmSseStreamHandle {
+    fn next(self: Arc<Self>) -> OpOutput<Option<String>> {
+        let handle = self;
 
         if handle.is_done() {
-            return SysOpOutput::ok(None);
+            return OpOutput::ok(None);
         }
 
         // Try to drain available events synchronously first (no async needed).
         match drain_receiver(&handle) {
             DrainResult::Events(events) => {
                 return match serialize_sse_events(events) {
-                    Ok(json) => SysOpOutput::ok(Some(json)),
-                    Err(e) => SysOpOutput::err(e),
+                    Ok(json) => OpOutput::ok(Some(json)),
+                    Err(e) => OpOutput::err(e),
                 };
             }
             DrainResult::Error(e) => {
-                return SysOpOutput::err(VmBamlError::Io {
+                return OpOutput::err(VmBamlError::Io {
                     message: format!("SSE stream error: {e}"),
                 });
             }
             DrainResult::Done => {
-                return SysOpOutput::ok(None);
+                return OpOutput::ok(None);
             }
             DrainResult::Empty => {
                 // No events available — need to await.
@@ -495,7 +435,7 @@ impl io::IoClassHttpSseStream for WasmHttp {
         // No events ready — await the next one. We use poll_fn to borrow
         // the receiver only during poll (not across await points), so there
         // is no take/return pattern that could break on re-entrant calls.
-        SysOpOutput::async_op(SendFuture(async move {
+        OpOutput::async_op(SendFuture(async move {
             use futures::stream::StreamExt;
 
             let event = futures::future::poll_fn(|cx| {
@@ -509,6 +449,7 @@ impl io::IoClassHttpSseStream for WasmHttp {
 
             match event {
                 Some(Ok(first)) => {
+                    handle.received(&first);
                     let mut events = vec![first];
                     // Drain any additional events that arrived while we were awaiting.
                     match drain_receiver(&handle) {
@@ -537,18 +478,14 @@ impl io::IoClassHttpSseStream for WasmHttp {
         }))
     }
 
-    fn close(
-        &self,
-        _heap: &Arc<BexHeap>,
-        _call_id: CallId,
-        sse_stream: io::owned::http::SseStream,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
+    fn close(self: Arc<Self>) -> OpOutput<()> {
         // Drop the receiver, which signals the background task to exit.
-        if let Some(handle) = sse_stream._handle.downcast_ref::<WasmSseStreamHandle>() {
-            handle.mark_done();
-        }
-        SysOpOutput::ok(())
+        self.mark_done();
+        OpOutput::ok(())
+    }
+
+    fn measure(&self, meter: &mut sys_types::Meter) {
+        meter.bytes(self.retained_bytes());
     }
 }
 
@@ -574,7 +511,10 @@ fn drain_receiver(handle: &WasmSseStreamHandle) -> DrainResult {
     let mut events = Vec::new();
     loop {
         match receiver.try_recv() {
-            Ok(Ok(event)) => events.push(event),
+            Ok(Ok(event)) => {
+                handle.received(&event);
+                events.push(event);
+            }
             Ok(Err(e)) => {
                 // Drop receiver to signal background task.
                 guard.take();
@@ -625,6 +565,7 @@ async fn sse_background_task(
     byte_stream: crate::registry::ByteStream,
     content_type: Option<String>,
     sender: futures::channel::mpsc::UnboundedSender<Result<sys_types::sse::SseEvent, String>>,
+    retained: Arc<sys_types::RetainedBytes>,
 ) {
     use futures::StreamExt;
 
@@ -642,10 +583,12 @@ async fn sse_background_task(
                     }
                 };
                 for event in events {
+                    let bytes = event.retained_bytes();
                     if sender.unbounded_send(Ok(event)).is_err() {
                         // Receiver dropped — stream was closed.
                         return;
                     }
+                    retained.add(bytes);
                 }
             }
             Some(Err(e)) => {
@@ -662,9 +605,11 @@ async fn sse_background_task(
                     }
                 };
                 for event in final_events {
+                    let bytes = event.retained_bytes();
                     if sender.unbounded_send(Ok(event)).is_err() {
                         return;
                     }
+                    retained.add(bytes);
                 }
                 return;
             }
@@ -767,20 +712,19 @@ impl IoNamespaceHttp for WasmHttp {
 
             // Create channel and spawn background task to parse SSE events.
             let (sender, receiver) = futures::channel::mpsc::unbounded();
+            let retained = Arc::new(sys_types::RetainedBytes::new(0));
             wasm_bindgen_futures::spawn_local(sse_background_task(
                 byte_stream,
                 content_type,
                 sender,
+                Arc::clone(&retained),
             ));
-
-            let handle: Arc<dyn std::any::Any + Send + Sync> =
-                Arc::new(WasmSseStreamHandle::new(receiver));
 
             Ok(io::owned::http::SseStream {
                 url,
                 status_code,
                 headers,
-                _handle: handle,
+                _state: Arc::new(WasmSseStreamHandle::new(receiver, retained)),
             })
         }))
     }

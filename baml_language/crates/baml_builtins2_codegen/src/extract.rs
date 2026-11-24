@@ -3,20 +3,19 @@
 //! Iterates `baml_builtins2::ALL`, parses each file through the compiler2
 //! front-end (lex → parse → lower), and collects every function whose body is
 //! `FunctionBodyDef::Builtin(BuiltinKind::Vm)` or `BuiltinKind::Io` into a
-//! `NativeBuiltin` record. The CST is also retained per file for
-//! `//baml:mut_self`, `//baml:vm`, and `//baml:mut_vm` directive scanning.
+//! `NativeBuiltin` record. The `//baml:` directives a native declares travel
+//! on the lowered function as [`baml_compiler2_ast::ast::NativeDirectives`].
 
-use baml_base::FileId;
-use baml_compiler_diagnostics::ToDiagnostic;
-use baml_compiler_syntax::{NodeOrToken, SyntaxKind, SyntaxNode};
+use baml_base::{FileId, native_key_spelling};
+use baml_compiler_diagnostics::typed_parse_error_diagnostic;
 use baml_compiler2_ast::ast::{
-    BuiltinKind, ClassDef, FunctionBodyDef, FunctionDef, ImplementsForDef, Item, TypeExpr,
-    TypeExprKind,
+    BuiltinKind, ClassDef, FunctionBodyDef, FunctionDef, ImplementsForDef, Item, NativeDirective,
+    TypeExpr, TypeExprKind,
 };
 
 use crate::types::{
-    BamlType, BuiltinPipeline, NativeBuiltin, NativeClassDef, NativeClassField, Param, Receiver,
-    ReceiverType, VmUsage,
+    BamlType, BuiltinPipeline, IoCallers, NativeBuiltin, NativeClassBody, NativeClassDef,
+    NativeClassField, NativeEnum, Param, Receiver, ReceiverType, VmUsage,
 };
 
 /// Convert a byte offset in source text to a 1-based `(line, column)` pair.
@@ -119,12 +118,13 @@ fn extract_scoped(
     let mut vm_builtins = Vec::new();
     let mut io_builtins = Vec::new();
     let mut class_defs = Vec::new();
+    let mut enums = PackageEnums::new();
     let mut diagnostic_lines: Vec<String> = Vec::new();
 
-    for builtin_file in baml_builtins2::ALL
-        .iter()
-        .filter(|f| f.package == package && keep_file(f))
-    {
+    // Every file of the package is read for the enums it declares, which a
+    // kept file's signatures may name; only a kept file's builtins and
+    // classes are extracted.
+    for builtin_file in baml_builtins2::ALL.iter().filter(|f| f.package == package) {
         let path = builtin_file.virtual_path();
         // Real filesystem path for diagnostic messages (clickable in editors).
         let diag_path = format!(
@@ -133,11 +133,9 @@ fn extract_scoped(
             builtin_file.package,
             builtin_file.relative_path
         );
-        // Lex and parse into a lossless CST.
-        let tokens = baml_compiler_lexer::lex_lossless(builtin_file.contents, FileId::new(0));
-        let (green, errors) = baml_compiler_parser::parse_file(&tokens);
-        for e in &errors {
-            let d = e.to_diagnostic();
+        let parsed = baml_parser::parse(builtin_file.contents);
+        for e in &parsed.errors {
+            let d = typed_parse_error_diagnostic(e, FileId::new(0));
             let location = d
                 .primary_span()
                 .map(|span| {
@@ -148,13 +146,13 @@ fn extract_scoped(
                 .unwrap_or_else(|| diag_path.clone());
             diagnostic_lines.push(format!("  {location}: [{}] {}", d.id.code(), d.message));
         }
-        if !errors.is_empty() {
+        if !parsed.errors.is_empty() {
             continue;
         }
-        let cst_root = SyntaxNode::new_root(green);
 
-        // Lower CST → AST items.
-        let (items, diags, _) = baml_compiler2_ast::lower_file(&cst_root);
+        // Lower the tree to AST items.
+        let (items, diags, _) =
+            baml_compiler2_ast::lower_tree::lower_file(&parsed.tree, None, None);
         for ld in &diags {
             let d = ld.to_diagnostic(FileId::new(0));
             let location = d
@@ -182,12 +180,26 @@ fn extract_scoped(
         };
 
         for item in &items {
+            if let Item::Enum(enum_def) = item {
+                let path = format!("{namespace_prefix}.{}", enum_def.name);
+                let variants = enum_def
+                    .variants
+                    .iter()
+                    .map(|variant| variant.name.to_string())
+                    .collect();
+                enums.insert(path.clone(), NativeEnum { path, variants });
+            }
+        }
+        if !keep_file(builtin_file) {
+            continue;
+        }
+        for item in &items {
             match item {
                 Item::Class(class_def) => {
                     extract_from_class(
                         class_def,
+                        &items,
                         &namespace_prefix,
-                        &cst_root,
                         &path,
                         &mut vm_builtins,
                         &mut io_builtins,
@@ -202,23 +214,28 @@ fn extract_scoped(
                     extract_from_free_function(
                         func_def,
                         &namespace_prefix,
-                        &cst_root,
                         &path,
                         &mut vm_builtins,
                         &mut io_builtins,
                     );
                 }
-                Item::ImplementsFor(impl_def) => {
+                // A block for a class of this file is extracted with the class
+                // (its natives are the class's, receiver and all).
+                Item::ImplementsFor(impl_def)
+                    if !items.iter().any(
+                        |item| matches!(item, Item::Class(class) if impl_def.is_for_class(class)),
+                    ) =>
+                {
                     extract_from_implements_for(
                         impl_def,
                         &items,
                         &namespace_prefix,
-                        &cst_root,
                         &path,
                         &mut vm_builtins,
                         &mut io_builtins,
                     );
                 }
+                Item::ImplementsFor(_) => {}
                 _ => {}
             }
         }
@@ -246,14 +263,88 @@ fn extract_scoped(
         });
     }
 
+    for builtin in vm_builtins.iter_mut().chain(io_builtins.iter_mut()) {
+        let scope = if builtin.namespace.is_empty() {
+            package.to_string()
+        } else {
+            format!("{package}.{}", builtin.namespace)
+        };
+        for param in &mut builtin.params {
+            resolve_enums(&mut param.ty, package, &scope, &enums);
+        }
+        resolve_enums(&mut builtin.return_type, package, &scope, &enums);
+    }
+    for class_def in &mut class_defs {
+        if let NativeClassBody::Fields(fields) = &mut class_def.body {
+            for field in fields {
+                resolve_enums(
+                    &mut field.field_type,
+                    package,
+                    &class_def.namespace_prefix,
+                    &enums,
+                );
+            }
+        }
+    }
+
     Ok((vm_builtins, io_builtins, class_defs))
+}
+
+/// Every enum a package declares, by its dotted path.
+type PackageEnums = std::collections::BTreeMap<String, NativeEnum>;
+
+/// Turn each path in `ty` that names one of the package's `enums` into that
+/// enum. `scope` is the dotted namespace the type is written in.
+fn resolve_enums(ty: &mut BamlType, package: &str, scope: &str, enums: &PackageEnums) {
+    match ty {
+        BamlType::Named(written) => {
+            if let Some(enm) = enums.get(&written_path(written, package, scope)) {
+                *ty = BamlType::Enum(enm.clone());
+            }
+        }
+        BamlType::Optional(inner) | BamlType::List(inner) => {
+            resolve_enums(inner, package, scope, enums);
+        }
+        BamlType::Map(key, value) => {
+            resolve_enums(key, package, scope, enums);
+            resolve_enums(value, package, scope, enums);
+        }
+        BamlType::Union(members) => {
+            for member in members {
+                resolve_enums(member, package, scope, enums);
+            }
+        }
+        BamlType::String
+        | BamlType::Int
+        | BamlType::Bigint
+        | BamlType::Float
+        | BamlType::Bool
+        | BamlType::Null
+        | BamlType::Generic(_)
+        | BamlType::Uint8Array
+        | BamlType::Media(_)
+        | BamlType::Enum(_)
+        | BamlType::StringLiteral(_) => {}
+    }
+}
+
+/// The dotted path a type path written in `scope` names: a written `root.`
+/// is the package, and a bare name is in `scope`.
+pub(crate) fn written_path(written: &str, package: &str, scope: &str) -> String {
+    if let Some(rest) = written.strip_prefix("root.") {
+        format!("{package}.{rest}")
+    } else if written.contains('.') {
+        written.to_string()
+    } else {
+        format!("{scope}.{written}")
+    }
 }
 
 /// Extract `$rust_function` and `$rust_io_function` methods from a class definition.
 fn extract_from_class(
     class_def: &ClassDef,
+    items: &[Item],
     namespace_prefix: &str,
-    cst_root: &SyntaxNode,
     source_file: &str,
     vm_builtins: &mut Vec<NativeBuiltin>,
     io_builtins: &mut Vec<NativeBuiltin>,
@@ -270,16 +361,26 @@ fn extract_from_class(
     // implementors put their `$rust_function` / `$rust_io_function` methods in
     // an `implements Rng { ... }` block. A method inside `implements I` is an
     // impl-block method like any other and is keyed `{ns}.{I}$for${Class}.{method}`
-    // (matching MIR's `native_key_for` — the KEY partner; `definition_link_name`
+    // (matching MIR's `native_key_for` — the KEY partner; `definition_display_name`
     // renders the separate `<(target as iface)>` DISPLAY spelling); a direct
     // method is just `{ns}.{Class}.{method}`.
     let direct = class_def.methods.iter().map(|m| (m, None));
-    let in_impl = class_def.implements.iter().flat_map(|b| {
-        // The interface `TypeExpr`'s `Display` is the exact form MIR uses to
-        // build the method's fully-qualified name, so reuse it verbatim.
-        let iface = b.target.to_string();
-        b.methods.iter().map(move |m| (m, Some(iface.clone())))
-    });
+    let in_impl = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ImplementsFor(b) if b.is_for_class(class_def) => Some(b),
+            _ => None,
+        })
+        .flat_map(|b| {
+            // The interface `TypeExpr`'s `Display` is the exact form MIR keys
+            // on, with a written `root.` spelled as the package — through the
+            // same function MIR uses, so the two cannot drift.
+            let iface = native_key_spelling(
+                package_of(namespace_prefix),
+                &b.interface_target.to_string(),
+            );
+            b.methods.iter().map(move |m| (m, Some(iface.clone())))
+        });
     for (method, iface_qualifier) in direct.chain(in_impl) {
         let Some(pipeline) = extract_builtin_pipeline(method) else {
             continue;
@@ -316,13 +417,11 @@ fn extract_from_class(
             .map(|p| p.name.as_str() == "self")
             .unwrap_or(false);
 
-        let method_name = method.name.as_str();
-        let is_mut =
-            has_self && has_method_directive(cst_root, class_name, method_name, "//baml:mut_self");
-        let has_vm = has_method_directive(cst_root, class_name, method_name, "//baml:vm");
-        let has_mut_vm = has_method_directive(cst_root, class_name, method_name, "//baml:mut_vm");
-        let may_yield = has_method_directive(cst_root, class_name, method_name, "//baml:may_yield");
-        let fallible = has_method_directive(cst_root, class_name, method_name, "//baml:fallible");
+        let is_mut = has_self && method.directives.has(NativeDirective::MutSelf);
+        let has_vm = method.directives.has(NativeDirective::Vm);
+        let has_mut_vm = method.directives.has(NativeDirective::MutVm);
+        let may_yield = method.directives.has(NativeDirective::MayYield);
+        let fallible = method.directives.has(NativeDirective::Fallible);
 
         assert!(
             !(has_vm && has_mut_vm),
@@ -368,9 +467,11 @@ fn extract_from_class(
                 .split_once('.')
                 .map_or("", |(_, namespaces)| namespaces)
                 .to_string(),
-            instance_backed: class_is_instance_backed(class_def),
+            instance_backed: class_is_instance_backed(class_def, namespace_prefix),
+            rust_type: rust_type_of(class_def),
             class_generics: class_generics.clone(),
             receiver_type,
+            builtin: package_of(namespace_prefix) == baml_builtins2::PACKAGE_BAML,
         });
         let params = if has_self {
             extract_params_skip_self(method, &all_generics)
@@ -408,6 +509,7 @@ fn extract_from_class(
             vm_usage,
             may_yield,
             fallible,
+            local_twin: method.directives.has(NativeDirective::LocalTwin),
             pipeline,
             throws,
             source_file: source_file.to_string(),
@@ -415,22 +517,52 @@ fn extract_from_class(
 
         match pipeline {
             BuiltinPipeline::Vm => vm_builtins.push(builtin),
-            BuiltinPipeline::Io => io_builtins.push(builtin),
+            BuiltinPipeline::Io(_) => io_builtins.push(builtin),
         }
     }
 }
 
-/// Whether `class_def`'s values are `Object::Instance`s with a generated `view::`
-/// struct. Classes that keep dedicated `Object` variants (Array, Map, String,
-/// `Uint8Array`) are not, and neither are field-less classes (pure namespace
-/// markers, method-only and opaque classes). The ONE rule behind
-/// [`extract_class_fields`] and every receiver built for the class, so a
-/// receiver can never promise a view struct that was not generated.
-fn class_is_instance_backed(class_def: &ClassDef) -> bool {
-    !matches!(
-        class_def.name.as_str(),
-        "Array" | "Map" | "String" | "Uint8Array"
-    ) && !class_def.fields.is_empty()
+/// Whether `class_def`'s values are instances with a generated `view::` struct:
+/// an `Object::Instance` of its fields, or the `Object::RustInstance` of a
+/// `@@rust_type` class. The `baml` package's classes that keep dedicated
+/// `Object` variants (Array, Map, String, `Uint8Array`) are not, and neither
+/// are field-less untagged classes (pure namespace markers, method-only
+/// classes). The ONE rule behind [`extract_class_fields`] and every receiver
+/// built for the class, so a receiver can never promise a view struct that was
+/// not generated.
+fn class_is_instance_backed(class_def: &ClassDef, namespace_prefix: &str) -> bool {
+    let dedicated_variant = package_of(namespace_prefix) == baml_builtins2::PACKAGE_BAML
+        && matches!(
+            class_def.name.as_str(),
+            "Array" | "Map" | "String" | "Uint8Array"
+        );
+    !dedicated_variant && (!class_def.fields.is_empty() || rust_type_of(class_def).is_some())
+}
+
+/// The `@@rust_type` kind of `class_def`, if it is tagged. The compiler has
+/// already checked the attribute, so a spelling it does not know is a build
+/// error here, never a guess.
+fn rust_type_of(class_def: &ClassDef) -> Option<baml_base::RustPayloadKind> {
+    let attr = class_def
+        .attributes
+        .iter()
+        .find(|attr| attr.name.as_str() == "rust_type")?;
+    Some(match attr.args.as_slice() {
+        [] => baml_base::RustPayloadKind::Foreign,
+        [arg] => {
+            let spelling =
+                baml_compiler2_ast::parse_string_attr_value(&arg.value).unwrap_or_else(|| {
+                    panic!("`@@rust_type` argument `{}` is not a string", arg.value)
+                });
+            baml_base::RustPayloadKind::from_spelling(&spelling).unwrap_or_else(|| {
+                panic!("`@@rust_type(\"{spelling}\")` names no kind of Rust state")
+            })
+        }
+        _ => panic!(
+            "`@@rust_type` on `{}` takes at most one argument",
+            class_def.name.as_str()
+        ),
+    })
 }
 
 /// Extract field definitions from a class, producing a `NativeClassDef`.
@@ -444,7 +576,7 @@ fn extract_class_fields(
 ) -> Option<NativeClassDef> {
     let class_name = class_def.name.as_str();
 
-    if !class_is_instance_backed(class_def) {
+    if !class_is_instance_backed(class_def, namespace_prefix) {
         return None;
     }
 
@@ -454,25 +586,36 @@ fn extract_class_fields(
         .map(|param| param.name.as_str().to_string())
         .collect();
 
-    let fields: Vec<NativeClassField> = class_def
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let field_type = type_expr_to_baml_type(&field.type_expr, &generic_params);
-            NativeClassField {
-                name: field.name.as_str().to_string(),
-                field_type,
-                index,
-            }
-        })
-        .collect();
+    let body = match rust_type_of(class_def) {
+        Some(kind) => {
+            assert!(
+                class_def.fields.is_empty(),
+                "`@@rust_type` class `{class_name}` declares fields"
+            );
+            NativeClassBody::RustType(kind)
+        }
+        None => NativeClassBody::Fields(
+            class_def
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let field_type = type_expr_to_baml_type(&field.type_expr, &generic_params);
+                    NativeClassField {
+                        name: field.name.as_str().to_string(),
+                        field_type,
+                        index,
+                    }
+                })
+                .collect(),
+        ),
+    };
 
     Some(NativeClassDef {
         name: class_name.to_string(),
         namespace_prefix: namespace_prefix.to_string(),
         generic_params,
-        fields,
+        body,
         source_file: source_file.to_string(),
     })
 }
@@ -481,7 +624,6 @@ fn extract_class_fields(
 fn extract_from_free_function(
     func_def: &FunctionDef,
     namespace_prefix: &str,
-    cst_root: &SyntaxNode,
     source_file: &str,
     vm_builtins: &mut Vec<NativeBuiltin>,
     io_builtins: &mut Vec<NativeBuiltin>,
@@ -498,10 +640,10 @@ fn extract_from_free_function(
 
     let path = format!("{namespace_prefix}.{}", func_def.name.as_str());
     let fn_name = path_to_fn_name(&path);
-    let has_vm = has_free_fn_directive(cst_root, func_def.name.as_str(), "//baml:vm");
-    let has_mut_vm = has_free_fn_directive(cst_root, func_def.name.as_str(), "//baml:mut_vm");
-    let may_yield = has_free_fn_directive(cst_root, func_def.name.as_str(), "//baml:may_yield");
-    let fallible = has_free_fn_directive(cst_root, func_def.name.as_str(), "//baml:fallible");
+    let has_vm = func_def.directives.has(NativeDirective::Vm);
+    let has_mut_vm = func_def.directives.has(NativeDirective::MutVm);
+    let may_yield = func_def.directives.has(NativeDirective::MayYield);
+    let fallible = func_def.directives.has(NativeDirective::Fallible);
 
     assert!(
         !(has_vm && has_mut_vm),
@@ -556,6 +698,7 @@ fn extract_from_free_function(
         vm_usage,
         may_yield,
         fallible,
+        local_twin: false,
         pipeline,
         throws,
         source_file: source_file.to_string(),
@@ -563,7 +706,7 @@ fn extract_from_free_function(
 
     match pipeline {
         BuiltinPipeline::Vm => vm_builtins.push(builtin),
-        BuiltinPipeline::Io => io_builtins.push(builtin),
+        BuiltinPipeline::Io(_) => io_builtins.push(builtin),
     }
 }
 
@@ -587,7 +730,6 @@ fn extract_from_implements_for(
     impl_def: &ImplementsForDef,
     items: &[Item],
     namespace_prefix: &str,
-    cst_root: &SyntaxNode,
     source_file: &str,
     vm_builtins: &mut Vec<NativeBuiltin>,
     io_builtins: &mut Vec<NativeBuiltin>,
@@ -612,8 +754,14 @@ fn extract_from_implements_for(
             )
         });
 
-    // The synthetic class segment must match MIR's `{iface}$for${for}` exactly.
-    let synthetic_class = format!("{}$for${}", impl_def.interface_target, impl_def.for_target);
+    // The synthetic class segment must match MIR's `{iface}$for${for}`
+    // exactly: both spell a written `root.` as the package.
+    let package = package_of(namespace_prefix);
+    let synthetic_class = format!(
+        "{}$for${}",
+        native_key_spelling(package, &impl_def.interface_target.to_string()),
+        native_key_spelling(package, &impl_def.for_target.to_string()),
+    );
 
     let impl_generics: Vec<String> = impl_def
         .generic_params
@@ -658,15 +806,12 @@ fn extract_from_implements_for(
         );
         let fn_name = path_to_fn_name(&path);
 
-        // Scan the method's `//baml:` directives, scoped to this exact method by
-        // its `name_span` (the method names `add` / `div` / … collide across
-        // `implement` blocks, so a name-keyed lookup would be ambiguous). The
-        // `implement` blocks have no `//baml:mut_self` (the receiver is always
-        // `&self`), so only VM-access, yielding, and fallibility are scanned.
-        let has_vm = impl_method_has_directive(cst_root, method, "//baml:vm");
-        let has_mut_vm = impl_method_has_directive(cst_root, method, "//baml:mut_vm");
-        let may_yield = impl_method_has_directive(cst_root, method, "//baml:may_yield");
-        let fallible = impl_method_has_directive(cst_root, method, "//baml:fallible");
+        // The `implement` blocks have no `//baml:mut_self` (the receiver is
+        // always `&self`), so only VM access, yielding and fallibility count.
+        let has_vm = method.directives.has(NativeDirective::Vm);
+        let has_mut_vm = method.directives.has(NativeDirective::MutVm);
+        let may_yield = method.directives.has(NativeDirective::MayYield);
+        let fallible = method.directives.has(NativeDirective::Fallible);
 
         assert!(
             !(has_vm && has_mut_vm),
@@ -695,9 +840,16 @@ fn extract_from_implements_for(
                 .split_once('.')
                 .map_or("", |(_, namespaces)| namespaces)
                 .to_string(),
-            instance_backed: impl_receiver.is_instance_backed(),
+            instance_backed: impl_receiver.is_instance_backed(namespace_prefix),
+            rust_type: impl_receiver.rust_type(),
             class_generics: impl_generics.clone(),
             receiver_type: ReceiverType::RefSelf,
+            builtin: match impl_receiver {
+                ImplReceiver::Builtin(_) => true,
+                ImplReceiver::Class(_) => {
+                    package_of(namespace_prefix) == baml_builtins2::PACKAGE_BAML
+                }
+            },
         });
 
         let params: Vec<Param> = method
@@ -733,6 +885,7 @@ fn extract_from_implements_for(
             vm_usage,
             may_yield,
             fallible,
+            local_twin: false,
             pipeline,
             throws: extract_throws(method),
             source_file: source_file.to_string(),
@@ -740,7 +893,7 @@ fn extract_from_implements_for(
 
         match pipeline {
             BuiltinPipeline::Vm => vm_builtins.push(builtin),
-            BuiltinPipeline::Io => io_builtins.push(builtin),
+            BuiltinPipeline::Io(_) => io_builtins.push(builtin),
         }
     }
 }
@@ -772,8 +925,8 @@ impl<'a> ImplReceiver<'a> {
             TypeExprKind::Uint8Array => Self::Builtin("Uint8Array"),
             TypeExprKind::List { .. } => Self::Builtin("Array"),
             TypeExprKind::Map { .. } => Self::Builtin("Map"),
-            TypeExprKind::Path { segments, .. } => {
-                let [name] = segments.as_slice() else {
+            TypeExprKind::Path { path, .. } => {
+                let [name] = path.segments() else {
                     return None;
                 };
                 return items.iter().find_map(|item| match item {
@@ -794,10 +947,17 @@ impl<'a> ImplReceiver<'a> {
         }
     }
 
-    fn is_instance_backed(self) -> bool {
+    fn is_instance_backed(self, namespace_prefix: &str) -> bool {
         match self {
             Self::Builtin(_) => false,
-            Self::Class(class_def) => class_is_instance_backed(class_def),
+            Self::Class(class_def) => class_is_instance_backed(class_def, namespace_prefix),
+        }
+    }
+
+    fn rust_type(self) -> Option<baml_base::RustPayloadKind> {
+        match self {
+            Self::Builtin(_) => None,
+            Self::Class(class_def) => rust_type_of(class_def),
         }
     }
 }
@@ -820,9 +980,7 @@ fn type_expr_to_baml_type_with_self(
 ) -> BamlType {
     let recurse = |inner: &TypeExpr| type_expr_to_baml_type_with_self(inner, generics, self_baml);
     match &ty.kind {
-        TypeExprKind::Path { segments, .. }
-            if segments.len() == 1 && segments[0].as_str() == "Self" =>
-        {
+        TypeExprKind::Path { path, .. } if path.len() == 1 && path[0].as_str() == "Self" => {
             self_baml.clone()
         }
         TypeExprKind::Optional { inner, .. } => BamlType::Optional(Box::new(recurse(inner))),
@@ -838,7 +996,7 @@ fn type_expr_to_baml_type_with_self(
             if non_null.len() == 1 && non_null.len() < variants.len() {
                 BamlType::Optional(Box::new(recurse(non_null[0])))
             } else {
-                BamlType::Named("union".to_string())
+                union_type(variants, &recurse)
             }
         }
         _ => type_expr_to_baml_type(ty, generics),
@@ -846,10 +1004,29 @@ fn type_expr_to_baml_type_with_self(
 }
 
 /// Returns the pipeline kind if the function body is a Rust builtin, or None otherwise.
+///
+/// Panics for a `$rust_function` marked `//baml:runtime_only`: only an IO
+/// builtin is reached from outside the VM, so only one can be reached by the
+/// running engine alone.
 fn extract_builtin_pipeline(func: &FunctionDef) -> Option<BuiltinPipeline> {
+    let runtime_only = func.directives.has(NativeDirective::RuntimeOnly);
     match &func.body {
-        Some(FunctionBodyDef::Builtin(BuiltinKind::Vm)) => Some(BuiltinPipeline::Vm),
-        Some(FunctionBodyDef::Builtin(BuiltinKind::Io)) => Some(BuiltinPipeline::Io),
+        Some(FunctionBodyDef::Builtin(BuiltinKind::Vm)) => {
+            assert!(
+                !runtime_only,
+                "baml codegen error: `{}` is a `$rust_function` marked `//baml:runtime_only`, \
+                 which only a `$rust_io_function` can be",
+                func.name
+            );
+            Some(BuiltinPipeline::Vm)
+        }
+        Some(FunctionBodyDef::Builtin(BuiltinKind::Io)) => {
+            Some(BuiltinPipeline::Io(if runtime_only {
+                IoCallers::RuntimeOnly
+            } else {
+                IoCallers::Hosts
+            }))
+        }
         _ => None,
     }
 }
@@ -873,13 +1050,15 @@ fn extract_throws(func: &FunctionDef) -> Option<Vec<String>> {
 #[allow(clippy::redundant_closure_for_method_calls)]
 fn extract_throw_categories(ty: &TypeExpr) -> Vec<String> {
     match &ty.kind {
-        TypeExprKind::Path { segments, .. } => {
-            let path: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+        TypeExprKind::Path {
+            path: type_path, ..
+        } => {
+            let path: Vec<&str> = type_path.iter().map(|s| s.as_str()).collect();
             if path.len() >= 3 && (path[0] == "baml" || path[0] == "root") && path[1] == "errors" {
                 vec![path[2..].join(".")]
             } else {
                 vec![
-                    segments
+                    type_path
                         .iter()
                         .map(|s| s.as_str())
                         .collect::<Vec<_>>()
@@ -892,6 +1071,14 @@ fn extract_throw_categories(ty: &TypeExpr) -> Vec<String> {
         }
         _ => vec![],
     }
+}
+
+/// The package of a `{package}` or `{package}.{ns…}` prefix: the stdlib
+/// package's fixed name, which a native key spells a written `root.` as.
+fn package_of(namespace_prefix: &str) -> &str {
+    namespace_prefix
+        .split_once('.')
+        .map_or(namespace_prefix, |(package, _)| package)
 }
 
 /// The namespace-only part of a `{package}` or `{package}.{ns…}` prefix.
@@ -949,6 +1136,21 @@ fn extract_params_skip_self(func: &FunctionDef, generics: &[String]) -> Vec<Para
         .collect()
 }
 
+/// A union that is not `T?`: its members, a string literal member as itself.
+fn union_type(variants: &[TypeExpr], member: &dyn Fn(&TypeExpr) -> BamlType) -> BamlType {
+    BamlType::Union(
+        variants
+            .iter()
+            .map(|variant| match &variant.kind {
+                TypeExprKind::Literal {
+                    value: baml_base::Literal::String(choice),
+                } => BamlType::StringLiteral(choice.clone()),
+                _ => member(variant),
+            })
+            .collect(),
+    )
+}
+
 /// Convert a `TypeExpr` from the AST to a `BamlType`.
 ///
 /// `generics` is the combined set of type parameter names in scope (class + method).
@@ -962,7 +1164,6 @@ fn type_expr_to_baml_type(ty: &TypeExpr, generics: &[String]) -> BamlType {
         TypeExprKind::Bool => BamlType::Bool,
         TypeExprKind::Null => BamlType::Null,
         TypeExprKind::Never => BamlType::Null,
-        TypeExprKind::Void => BamlType::Null,
 
         TypeExprKind::Media { kind, .. } => {
             // Map MediaKind to the class name string.
@@ -991,10 +1192,10 @@ fn type_expr_to_baml_type(ty: &TypeExpr, generics: &[String]) -> BamlType {
             Box::new(type_expr_to_baml_type(value, generics)),
         ),
 
-        TypeExprKind::Path { segments, .. } => {
+        TypeExprKind::Path { path, .. } => {
             // Single-segment path may be a generic type param or a named type.
-            if segments.len() == 1 {
-                let name = segments[0].as_str();
+            if path.len() == 1 {
+                let name = path[0].as_str();
                 if generics.iter().any(|g| g == name) {
                     BamlType::Generic(name.to_string())
                 } else {
@@ -1002,9 +1203,9 @@ fn type_expr_to_baml_type(ty: &TypeExpr, generics: &[String]) -> BamlType {
                 }
             } else {
                 // Multi-segment path (e.g. `baml.errors.Io`) — treat as Named.
-                let name = segments
+                let name = path
                     .iter()
-                    .map(|s| s.as_str())
+                    .map(baml_base::Name::as_str)
                     .collect::<Vec<_>>()
                     .join(".");
                 BamlType::Named(name)
@@ -1019,177 +1220,19 @@ fn type_expr_to_baml_type(ty: &TypeExpr, generics: &[String]) -> BamlType {
             if non_null.len() == 1 && non_null.len() < variants.len() {
                 BamlType::Optional(Box::new(type_expr_to_baml_type(non_null[0], generics)))
             } else {
-                BamlType::Named("union".to_string())
+                union_type(variants, &|member| type_expr_to_baml_type(member, generics))
             }
         }
         TypeExprKind::Literal { .. } => BamlType::Named("literal".to_string()),
         TypeExprKind::Function { .. } => BamlType::Named("function".to_string()),
+        TypeExprKind::Tuple { .. } => BamlType::Named("tuple".to_string()),
         TypeExprKind::AssociatedTypeProjection { .. }
         | TypeExprKind::Unknown
         | TypeExprKind::Missing
         | TypeExprKind::Error
         | TypeExprKind::Infer => BamlType::Named("unknown".to_string()),
         TypeExprKind::Type => BamlType::Named("type".to_string()),
-        TypeExprKind::Rust => BamlType::RustType,
     }
-}
-
-/// Check if a method inside a class has the given `directive` comment (e.g. `"//baml:mut_self"`)
-/// before its `function` keyword in the CST.
-///
-/// In the Rowan CST, the parser's `bump()` emits leading trivia tokens (whitespace,
-/// comments) immediately before the `function` keyword inside the `FUNCTION_DEF` node
-/// itself. So the directive appears as a `LINE_COMMENT` token child of the
-/// `FUNCTION_DEF` node, before the `KW_FUNCTION` token.
-fn has_method_directive(
-    cst_root: &SyntaxNode,
-    class_name: &str,
-    method_name: &str,
-    directive: &str,
-) -> bool {
-    for class_node in cst_root.descendants() {
-        if class_node.kind() != SyntaxKind::CLASS_DEF {
-            continue;
-        }
-        if !class_node_has_name(&class_node, class_name) {
-            continue;
-        }
-        for func_node in class_node.descendants() {
-            if func_node.kind() != SyntaxKind::FUNCTION_DEF {
-                continue;
-            }
-            if !func_node_has_name(&func_node, method_name) {
-                continue;
-            }
-            if function_node_has_leading_directive(&func_node, directive) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Check if an `implement`-block method has the given `directive` comment before
-/// its `function` keyword in the CST.
-///
-/// Unlike [`has_method_directive`], the lookup is scoped to a single method by
-/// its `name_span` rather than by `(class_name, method_name)`: the method names
-/// in `implement` blocks (`add`, `div`, `eq`, …) repeat across every block, so a
-/// name-keyed search would match the wrong block. Exactly one `FUNCTION_DEF`
-/// node contains the method's name token, so containment uniquely identifies it.
-/// Offsets are compared as raw `u32`s so the match does not depend on the
-/// `text_size` version the AST and CST crates each resolve.
-fn impl_method_has_directive(cst_root: &SyntaxNode, method: &FunctionDef, directive: &str) -> bool {
-    let name_start = u32::from(method.name_span.start());
-    for node in cst_root.descendants() {
-        if node.kind() != SyntaxKind::FUNCTION_DEF {
-            continue;
-        }
-        let range = node.text_range();
-        if u32::from(range.start()) <= name_start && name_start < u32::from(range.end()) {
-            return function_node_has_leading_directive(&node, directive);
-        }
-    }
-    false
-}
-
-/// Check if a top-level (non-class) function has the given `directive` comment
-/// before its `function` keyword in the CST.
-fn has_free_fn_directive(cst_root: &SyntaxNode, fn_name: &str, directive: &str) -> bool {
-    for node in cst_root.children() {
-        if node.kind() != SyntaxKind::FUNCTION_DEF {
-            continue;
-        }
-        if !func_node_has_name(&node, fn_name) {
-            continue;
-        }
-        if function_node_has_leading_directive(&node, directive) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Returns true if the `CLASS_DEF` node has a name token matching `class_name`.
-fn class_node_has_name(class_node: &SyntaxNode, class_name: &str) -> bool {
-    // The class name is the first WORD token that is a direct meaningful child.
-    // In the CST: `class WORD<...> { ... }`
-    // Scan children_with_tokens: skip the `class` keyword and trivia,
-    // then the next WORD should be the class name.
-    for element in class_node.children_with_tokens() {
-        if let NodeOrToken::Token(tok) = element {
-            if tok.kind().is_trivia() || tok.kind() == SyntaxKind::KW_CLASS {
-                continue;
-            }
-            // First non-trivia, non-keyword token should be the class name.
-            return tok.kind() == SyntaxKind::WORD && tok.text() == class_name;
-        }
-        // Encountered a child node before finding the name token — not a match.
-        // (Shouldn't happen for CLASS_DEF in practice.)
-    }
-    false
-}
-
-/// Returns true if the `FUNCTION_DEF` node has a name matching `method_name`.
-fn func_node_has_name(func_node: &SyntaxNode, method_name: &str) -> bool {
-    for element in func_node.children_with_tokens() {
-        if let NodeOrToken::Token(tok) = element {
-            if tok.kind().is_trivia() || tok.kind() == SyntaxKind::KW_FUNCTION {
-                continue;
-            }
-            // First non-trivia, non-`function` token is the function name.
-            // BEP-044 introduced `implements`, `extends`, and `interface` as
-            // top-level keywords; the parser still accepts them as method
-            // names so reflection methods like `TypeValue.implements(...)`
-            // can keep their natural spelling.
-            let kind = tok.kind();
-            let is_name_token = matches!(
-                kind,
-                SyntaxKind::WORD
-                    | SyntaxKind::KW_IMPLEMENTS
-                    | SyntaxKind::KW_IMPLEMENT
-                    | SyntaxKind::KW_EXTENDS
-                    | SyntaxKind::KW_REQUIRES
-                    | SyntaxKind::KW_INTERFACE
-            );
-            return is_name_token && tok.text() == method_name;
-        }
-        // Encountered a child node — past the name.
-        break;
-    }
-    false
-}
-
-/// Check whether a `FUNCTION_DEF` node contains a specific directive `LINE_COMMENT`
-/// (e.g. `"//baml:mut_self"` or `"//baml:mut_vm"`) before its `KW_FUNCTION` token.
-///
-/// The parser emits trivia (whitespace, comments) as tokens within the containing
-/// syntactic node before the first real token. So any directive comment that
-/// appears immediately before `function foo(...)` in source is stored as a
-/// `LINE_COMMENT` child of that `FUNCTION_DEF` node.
-fn function_node_has_leading_directive(func_node: &SyntaxNode, directive: &str) -> bool {
-    for element in func_node.children_with_tokens() {
-        match element {
-            NodeOrToken::Token(tok) => match tok.kind() {
-                SyntaxKind::LINE_COMMENT => {
-                    let text = tok.text().trim();
-                    if text == directive {
-                        return true;
-                    }
-                }
-                k if k.is_whitespace() => {}
-                SyntaxKind::KW_FUNCTION => {
-                    return false;
-                }
-                SyntaxKind::AT_AT | SyntaxKind::BLOCK_COMMENT => {}
-                _ => {
-                    return false;
-                }
-            },
-            NodeOrToken::Node(_) => {}
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -1215,10 +1258,11 @@ mod tests {
             .find(|c| c.name == "Pdf")
             .expect("missing Pdf");
         assert_eq!(pdf.namespace_prefix, "baml.media");
-        assert_eq!(pdf.fields.len(), 1);
-        assert_eq!(pdf.fields[0].name, "_data");
-        assert_eq!(pdf.fields[0].index, 0);
-        assert!(matches!(pdf.fields[0].field_type, BamlType::RustType));
+        assert!(pdf.fields().is_empty());
+        assert!(matches!(
+            pdf.body,
+            crate::types::NativeClassBody::RustType(baml_base::RustPayloadKind::Pdf)
+        ));
 
         assert!(
             class_defs.iter().any(|c| c.name == "Audio"),
@@ -1252,18 +1296,20 @@ mod tests {
             .find(|c| c.name == "File")
             .expect("missing File");
         assert_eq!(file.namespace_prefix, "baml.fs");
-        assert_eq!(file.fields.len(), 1);
-        assert_eq!(file.fields[0].name, "_handle");
-        assert!(matches!(file.fields[0].field_type, BamlType::RustType));
+        assert!(matches!(
+            file.body,
+            NativeClassBody::RustType(baml_base::RustPayloadKind::File)
+        ));
 
         let socket = class_defs
             .iter()
             .find(|c| c.name == "TcpStream")
             .expect("missing TcpStream");
         assert_eq!(socket.namespace_prefix, "baml.net");
-        assert_eq!(socket.fields.len(), 1);
-        assert_eq!(socket.fields[0].name, "_handle");
-        assert!(matches!(socket.fields[0].field_type, BamlType::RustType));
+        assert!(matches!(
+            socket.body,
+            NativeClassBody::RustType(baml_base::RustPayloadKind::TcpStream)
+        ));
 
         // UDP datagram is a plain data class (payload + sender address).
         let datagram = class_defs
@@ -1271,29 +1317,35 @@ mod tests {
             .find(|c| c.name == "Datagram")
             .expect("missing Datagram");
         assert_eq!(datagram.namespace_prefix, "baml.net");
-        assert_eq!(datagram.fields.len(), 2);
-        assert_eq!(datagram.fields[0].name, "data");
+        assert_eq!(datagram.fields().len(), 2);
+        assert_eq!(datagram.fields()[0].name, "data");
         assert!(matches!(
-            datagram.fields[0].field_type,
+            datagram.fields()[0].field_type,
             BamlType::Uint8Array
         ));
-        assert_eq!(datagram.fields[1].name, "addr");
-        assert!(matches!(datagram.fields[1].field_type, BamlType::String));
+        assert_eq!(datagram.fields()[1].name, "addr");
+        assert!(matches!(datagram.fields()[1].field_type, BamlType::String));
 
         let response = class_defs
             .iter()
             .find(|c| c.name == "Response")
             .expect("missing Response");
         assert_eq!(response.namespace_prefix, "baml.http");
-        assert_eq!(response.fields.len(), 4);
-        assert_eq!(response.fields[0].name, "status_code");
-        assert!(matches!(response.fields[0].field_type, BamlType::Int));
-        assert_eq!(response.fields[1].name, "headers");
-        assert!(matches!(response.fields[1].field_type, BamlType::Map(_, _)));
-        assert_eq!(response.fields[2].name, "url");
-        assert!(matches!(response.fields[2].field_type, BamlType::String));
-        assert_eq!(response.fields[3].name, "_body");
-        assert!(matches!(response.fields[3].field_type, BamlType::RustType));
+        assert_eq!(response.fields().len(), 4);
+        assert_eq!(response.fields()[0].name, "status_code");
+        assert!(matches!(response.fields()[0].field_type, BamlType::Int));
+        assert_eq!(response.fields()[1].name, "headers");
+        assert!(matches!(
+            response.fields()[1].field_type,
+            BamlType::Map(_, _)
+        ));
+        assert_eq!(response.fields()[2].name, "url");
+        assert!(matches!(response.fields()[2].field_type, BamlType::String));
+        assert_eq!(response.fields()[3].name, "_body");
+        assert!(matches!(
+            &response.fields()[3].field_type,
+            BamlType::Named(name) if name == "_ResponseBody"
+        ));
 
         let request = class_defs
             .iter()
@@ -1301,7 +1353,7 @@ mod tests {
             .expect("missing Request");
         assert_eq!(request.namespace_prefix, "baml.http");
         // method, url, headers, body, timeout, connect_timeout
-        assert_eq!(request.fields.len(), 6);
+        assert_eq!(request.fields().len(), 6);
 
         // The structural prompt lives in the ai package.
         let (_ai_vm, _ai_io, ai_class_defs) = extract_native_builtins_for("ai").unwrap();
@@ -1310,8 +1362,11 @@ mod tests {
             .find(|c| c.name == "Prompt")
             .expect("missing ai.Prompt");
         assert_eq!(prompt.namespace_prefix, "ai");
-        assert_eq!(prompt.fields.len(), 1);
-        assert!(matches!(prompt.fields[0].field_type, BamlType::RustType));
+        assert!(prompt.fields().is_empty());
+        assert!(matches!(
+            prompt.body,
+            crate::types::NativeClassBody::RustType(baml_base::RustPayloadKind::Prompt)
+        ));
     }
 
     #[test]
@@ -1337,7 +1392,8 @@ mod tests {
             vm_usage: VmUsage::None,
             may_yield: false,
             fallible: false,
-            pipeline: BuiltinPipeline::Io,
+            local_twin: false,
+            pipeline: BuiltinPipeline::Io(IoCallers::Hosts),
             throws: Some(vec![]),
             source_file: String::new(),
         };
@@ -1456,10 +1512,15 @@ mod tests {
 
         assert_eq!(deep_copy.vm_usage, VmUsage::MutRef);
 
-        // `//baml:vm` on a non-container receiver: `Array`/`Map` methods default to
-        // `Ref` without the directive, so a media method is what actually pins the
-        // directive being read.
-        assert_eq!(pdf_url.vm_usage, VmUsage::Ref);
+        // `Array`/`Map` methods default to `Ref` without the directive, so a free
+        // function is what pins `//baml:vm` being read; a media accessor reads
+        // its payload and needs no VM.
+        let to_string_primitive = vm_builtins
+            .iter()
+            .find(|b| b.path == "baml._to_string_primitive")
+            .expect("missing baml._to_string_primitive");
+        assert_eq!(to_string_primitive.vm_usage, VmUsage::Ref);
+        assert_eq!(pdf_url.vm_usage, VmUsage::None);
 
         assert_eq!(array_length.vm_usage, VmUsage::None);
         assert_eq!(array_push.vm_usage, VmUsage::None);
@@ -1484,7 +1545,7 @@ interface Modifier<T, E> {
 }
 
 class Limit {
-    _handle: $rust_type,
+    _handle: int,
 }
 
 class Root {}
@@ -1503,11 +1564,10 @@ implements<T, E> Modifier<T, E> for Root {
     }
 }
 "#;
-        let tokens = baml_compiler_lexer::lex_lossless(source, FileId::new(0));
-        let (green, errors) = baml_compiler_parser::parse_file(&tokens);
-        assert!(errors.is_empty(), "the source parses");
-        let cst_root = SyntaxNode::new_root(green);
-        let (items, diags, _) = baml_compiler2_ast::lower_file(&cst_root);
+        let parsed = baml_parser::parse(source);
+        assert!(parsed.errors.is_empty(), "the source parses");
+        let (items, diags, _) =
+            baml_compiler2_ast::lower_tree::lower_file(&parsed.tree, None, None);
         assert!(diags.is_empty(), "the source lowers");
 
         let mut vm_builtins = Vec::new();
@@ -1518,7 +1578,6 @@ implements<T, E> Modifier<T, E> for Root {
                     impl_def,
                     &items,
                     "test",
-                    &cst_root,
                     "test.baml",
                     &mut vm_builtins,
                     &mut io_builtins,
@@ -1579,8 +1638,15 @@ implements<T, E> Modifier<T, E> for Root {
             .find(|b| b.path == "baml.http._fetch")
             .unwrap();
         assert_eq!(http_fetch.throws, throws(&["Io", "Timeout"]));
+    }
 
-        let sap_final = io_builtins
+    /// Schema-aligned parsing does no IO, so its entry points are VM natives.
+    #[test]
+    fn test_sap_parse_is_a_vm_builtin() {
+        let (vm_builtins, io_builtins, _class_defs) = extract_native_builtins().unwrap();
+
+        assert!(!io_builtins.iter().any(|b| b.path.starts_with("baml.sap.")));
+        let sap_final = vm_builtins
             .iter()
             .find(|b| b.path == "baml.sap._ParseCache._parse_final")
             .unwrap();
@@ -1602,8 +1668,8 @@ implements<T, E> Modifier<T, E> for Root {
             "baml_random_rng_for_systemrandom_random"
         );
         assert_eq!(
-            super::path_to_fn_name("baml.fs.root.io.Read$for$File.read"),
-            "baml_fs_root_io_read_for_file_read"
+            super::path_to_fn_name("baml.fs.baml.io.Read$for$File.read"),
+            "baml_fs_baml_io_read_for_file_read"
         );
     }
 

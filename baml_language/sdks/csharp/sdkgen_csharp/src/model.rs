@@ -181,6 +181,7 @@ fn reclassify_companion_methods(class: &Class) -> Class {
         }
     }
     Class {
+        crossing: class.crossing,
         name: class.name.clone(),
         generic_params: class.generic_params.clone(),
         docstring: class.docstring.clone(),
@@ -188,6 +189,7 @@ fn reclassify_companion_methods(class: &Class) -> Class {
         static_methods,
         instance_methods,
         origin: class.origin.clone(),
+        json_omit_nulls: false,
     }
 }
 
@@ -238,6 +240,7 @@ mod tests {
 
     fn class(static_methods: &[&str], instance_methods: &[&str]) -> Class {
         Class {
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
             name: Name::new(BaseName::new("test"), Vec::new(), BaseName::new("Fixture")),
             generic_params: Vec::new(),
             docstring: None,
@@ -248,6 +251,7 @@ mod tests {
                 source_file_path: "fixture.baml".to_string(),
                 span_start: 0,
             },
+            json_omit_nulls: false,
         }
     }
 

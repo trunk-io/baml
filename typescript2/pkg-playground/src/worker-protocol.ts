@@ -103,6 +103,9 @@ export type FieldSchema =
   | { type: 'enumVariant'; name: string; value: string }
   | { type: 'list'; item: FieldSchema }
   | { type: 'map'; key: FieldSchema; value: FieldSchema }
+  /** A fixed-arity tuple: one schema per slot, in slot order. Its value is
+   *  a JSON array of exactly `elements.length` entries. */
+  | { type: 'tuple'; elements: FieldSchema[] }
   | { type: 'optional'; inner: FieldSchema }
   | { type: 'union'; variants: FieldSchema[] }
   | { type: 'unsupported'; display: string };
@@ -941,7 +944,7 @@ export type WebSocketInMessage =
       requestId: number;
       project: string;
       functionName: string;
-      argsBytes: string;
+      args: string;
     }
   | {
       type: 'startPreviewRun';
@@ -950,7 +953,7 @@ export type WebSocketInMessage =
       parentFunctionName: string;
       helper: string;
       functionName: string;
-      argsBytes: string;
+      args: string;
     }
   | {
       type: 'startTestRun';
@@ -1130,7 +1133,7 @@ export type WorkerInMessage =
       requestId: number;
       project: string;
       functionName: string;
-      argsBytes: Uint8Array;
+      args: string;
     }
   | {
       type: 'startPreviewRun';
@@ -1139,7 +1142,7 @@ export type WorkerInMessage =
       parentFunctionName: string;
       helper: string;
       functionName: string;
-      argsBytes: Uint8Array;
+      args: string;
     }
   | {
       type: 'startTestRun';

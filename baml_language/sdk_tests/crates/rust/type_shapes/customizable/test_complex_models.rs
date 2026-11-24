@@ -5,12 +5,12 @@
 // arms as unit variants from their value, class/primitive arms wrapping
 // their payload — and a trailing `| null` lowering to `Option<...>`
 // around the enum.
-use baml_bridge::Map;
+use baml_sdk::baml_bridge::Map;
 use baml_sdk::complex_models::{
     AccountTier, AuditEvent, CardPayment, CardPaymentOrWirePayment, ComplexProfile, ContactMethod,
     CreatedOrUpdatedOrApproved, DraftOrSentOrPaid, GeoPoint, IntOrStringOrBool, Invoice,
     InvoiceOrPostalAddressOrString, LineItem, PostalAddress, ProfileOwner, WirePayment,
-    round_trip_complex_profile,
+    round_trip_complex_profile_sync,
 };
 
 #[test]
@@ -125,7 +125,7 @@ fn test_complex_models_round_trip_complex_profile_preserves_deeply_nested_mixed_
     };
 
     assert_eq!(
-        round_trip_complex_profile(profile.clone()).unwrap(),
+        round_trip_complex_profile_sync(profile.clone()).unwrap(),
         profile
     );
 }

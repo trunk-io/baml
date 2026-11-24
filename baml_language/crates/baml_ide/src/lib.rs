@@ -29,8 +29,9 @@ pub mod definition;
 pub mod describe;
 pub mod env_vars;
 pub mod export;
+#[cfg(test)]
+mod global_variable_tests;
 pub mod info;
-pub mod line_index;
 pub mod listing;
 #[cfg(test)]
 mod mounted_package_tests;
@@ -53,6 +54,7 @@ pub use annotations::{AnnotationKind, InlineAnnotation, file_annotations};
 // Re-exported so protocol/CLI consumers convert kinds without depending on
 // the compiler crates directly.
 pub use baml_compiler2_hir::contributions::DefinitionKind;
+pub use baml_compiler2_metrics as metrics;
 pub use cfg::ast_control_flow_graph;
 pub use completion::{
     Completion, CompletionInsert, CompletionKind, CompletionRelevance, completions,

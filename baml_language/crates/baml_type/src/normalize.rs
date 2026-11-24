@@ -30,10 +30,9 @@
 //! absorb, or equate, so a missing fact can only yield "not *necessarily*
 //! equivalent / subtype", never a false claim of equivalence or membership.
 
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-};
+use std::{cell::RefCell, collections::HashSet};
+
+use rustc_hash::FxHashMap;
 
 use crate::{
     DeclName, FunctionParamMode, FunctionParamTy, Head, Interface, Literal, MediaKind, Name,
@@ -55,11 +54,15 @@ pub enum WellKnownHead {
 }
 
 impl WellKnownHead {
-    /// The declaration's short name at the root namespace of `reflect`.
-    pub const fn name(self) -> &'static str {
+    /// Every head, in declaration order.
+    pub const ALL: [Self; 2] = [Self::AnyFunction, Self::AnyClass];
+
+    /// The declaration by identity: an item at the root namespace of
+    /// `reflect`. The one spelling; everything else derives from it.
+    pub const fn item(self) -> baml_base::LangItem {
         match self {
-            Self::AnyFunction => "AnyFunction",
-            Self::AnyClass => "AnyClass",
+            Self::AnyFunction => baml_base::lang_item!(Reflect: AnyFunction),
+            Self::AnyClass => baml_base::lang_item!(Reflect: AnyClass),
         }
     }
 }
@@ -74,7 +77,7 @@ pub trait SpelledHead: Head {
 
 impl SpelledHead for TypeName {
     fn well_known(head: WellKnownHead) -> Self {
-        TypeName::new(Name::new("reflect"), Vec::new(), Name::new(head.name()))
+        TypeName::of_lang_item(head.item())
     }
 }
 
@@ -138,8 +141,7 @@ impl TypeContext<DeclName> for LangFacts {
 /// installed. Every compiler-side [`TypeContext`] answers
 /// [`well_known`](TypeContext::well_known) through here.
 pub fn well_known_decl(lang: baml_base::LangRoots, head: WellKnownHead) -> Option<DeclName> {
-    lang.get(baml_base::LangPackage::Reflect)
-        .map(|reflect| DeclName::in_root(reflect, Vec::new(), Name::new(head.name())))
+    DeclName::of_lang_item(lang, head.item())
 }
 
 /// Whether `head` is the [`WellKnownHead::AnyFunction`] declaration, decided
@@ -374,9 +376,9 @@ pub trait TypeContext<H: Head = DeclName> {
     /// Recursive Types): equality holds across alias renaming
     /// (`type A = int | A[]` ≡ `type B = int | B[]`), finite unfolding depth,
     /// and mutually recursive definitions. The residual divergences from mutual
-    /// subtyping are deliberate: the error-recovery sentinels (`Unknown`/`Error`
-    /// are bidirectionally *compatible* with everything but equivalent only to
-    /// themselves), and fact sets with a mutual `requires` cycle (mutual
+    /// subtyping are deliberate: the error-recovery sentinel (`Error` is
+    /// bidirectionally *compatible* with everything but equivalent only to
+    /// itself), and fact sets with a mutual `requires` cycle (mutual
     /// subtypes as existentials, nominally distinct — rejected in well-formed
     /// programs by the interface `requires`-cycle check).
     fn equivalent(&self, a: &Ty<H>, b: &Ty<H>) -> bool
@@ -414,17 +416,18 @@ pub trait TypeContext<H: Head = DeclName> {
         if sub == sup {
             return true;
         }
-        // Narrow definite-mismatch filter. Unlike `equivalent`, differing heads
-        // do NOT generally refute subtyping (a literal is a subtype of its base,
-        // a member of its union, a class of an interface it implements) — but
-        // those pairs are different `Ty` *variants*, for which
-        // `heads_definitely_differ` already answers `false`. Of the same-variant
-        // nominal pairs it does claim, only interface-to-interface can still be
-        // a subtype under different names (`A <: B` iff `A` requires `B`), so it
-        // is excluded. For the rest the canonical walk below is a foregone
-        // `false`: class heads are preserved by canonicalization and the class
-        // subtype rule requires equal names (generic args are invariant), while
-        // enums and enum variants are nominal with no cross-name rule at all.
+        // Definite-mismatch filter. Unlike `equivalent`, differing heads do NOT
+        // generally refute subtyping (a literal is a subtype of its base, a
+        // member of its union, a class of an interface it implements) — but
+        // `heads_definitely_differ` claims none of those pairs: a literal and
+        // its base share a category, and unions and interfaces have none. Of
+        // the same-variant nominal pairs it does claim, only
+        // interface-to-interface can still be a subtype under different names
+        // (`A <: B` iff `A` requires `B`), so it is excluded. For the rest the
+        // canonical walk below is a foregone `false`: class heads are preserved
+        // by canonicalization and the class subtype rule requires equal names
+        // (generic args are invariant), enums and enum variants are nominal
+        // with no cross-name rule at all, and no rule relates two categories.
         if !matches!((sub, sup), (Ty::Interface(..), Ty::Interface(..)))
             && heads_definitely_differ(sub, sup)
         {
@@ -612,6 +615,13 @@ pub fn is_subtype<H: Head, C: TypeContext<H>>(sub: &Ty<H>, sup: &Ty<H>, ctx: &C)
     ctx.is_subtype(sub, sup)
 }
 
+/// Whether a map's declared key type can cross a string-keyed boundary.
+/// This checks the declaration even for empty maps; callers must also validate
+/// actual key payloads. The written type is not replaced by its normalization.
+pub fn is_string_key<H: Head, C: TypeContext<H>>(key: &Ty<H>, ctx: &C) -> bool {
+    ctx.is_subtype(key, &Ty::string())
+}
+
 /// True only when `a` and `b` provably canonicalize to different forms, judged
 /// from their outermost constructor alone — a cheap reject for [`TypeContext::
 /// equivalent`] that skips the two canonicalization walks on the common
@@ -624,22 +634,32 @@ pub fn is_subtype<H: Head, C: TypeContext<H>>(sub: &Ty<H>, sup: &Ty<H>, ctx: &C)
 /// are rewritten), and equality is nominal, so two of the same kind with
 /// different names can never share a canonical form.
 ///
-/// This is deliberately *conservative* — it decides only same-kind pairs whose
-/// heads are stable and never uses a cross-kind "different discriminant ⇒
-/// differ" catch-all. That catch-all would be unsound under the current
-/// normalization: `TypeAlias` / `Union` / `AssociatedTypeProjection` / generic `Media` /
-/// `Infer` heads can be rewritten into any other shape. Leaving every such case
-/// undecided (`false`) preserves correctness; only the unambiguous nominal
-/// misses are fast-rejected. Context-independent: canonicalization preserves
-/// these nominal heads regardless of the `TypeContext`.
+/// Across kinds it decides only pairs whose heads both have a [`Category`]
+/// (see [`Category::of_head`]), never with a "different discriminant ⇒ differ"
+/// catch-all. That catch-all would be unsound: `TypeAlias` / `Union` /
+/// `AssociatedTypeProjection` heads can be rewritten into any other shape, so
+/// they have no category and stay undecided (`false`). Canonicalization keeps
+/// every head that has a category, so two different categories never share a
+/// canonical form — and no subtyping rule relates them either: no concrete type
+/// is a subtype of another (TYPE_SYSTEM.md §Concrete Types), and a literal and
+/// its base, or a variant and its enum, share a category. This is the common
+/// miss of a runtime `match` on a `json` value: a string or a list tested
+/// against `map<string, json>` would otherwise expand the recursive alias on
+/// every test. Context-independent: canonicalization preserves these heads
+/// regardless of the `TypeContext`.
 fn heads_definitely_differ<H: Head>(a: &Ty<H>, b: &Ty<H>) -> bool {
     match (a, b) {
         (Ty::Class(q1, ..), Ty::Class(q2, ..))
         | (Ty::Interface(q1, ..), Ty::Interface(q2, ..))
         | (Ty::Enum(q1, ..), Ty::Enum(q2, ..)) => q1 != q2,
         (Ty::EnumVariant(q1, v1, ..), Ty::EnumVariant(q2, v2, ..)) => q1 != q2 || v1 != v2,
-        _ => false,
+        _ => categories_differ(Category::of_head(a), Category::of_head(b)),
     }
+}
+
+/// Whether two heads are of different, known categories.
+fn categories_differ(a: Option<Category>, b: Option<Category>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a != b)
 }
 
 /// Free-function form of [`TypeContext::definitely_disjoint`], for a context held
@@ -726,7 +746,9 @@ impl<H: Head> NormalTy<H> {
             NormalTy::Map { key, value } | NormalTy::Future(key, value) => {
                 key.contains_mu() || value.contains_mu()
             }
-            NormalTy::Union(members) => members.iter().any(NormalTy::contains_mu),
+            NormalTy::Union(members) | NormalTy::Tuple(members) => {
+                members.iter().any(NormalTy::contains_mu)
+            }
             NormalTy::Class(_, args) => args.iter().any(NormalTy::contains_mu),
             NormalTy::Interface(_, args, bindings) => {
                 args.iter().any(NormalTy::contains_mu)
@@ -752,8 +774,6 @@ impl<H: Head> NormalTy<H> {
             | NormalTy::Null
             | NormalTy::Uint8Array
             | NormalTy::Media(_)
-            | NormalTy::Void
-            | NormalTy::RustType
             | NormalTy::Type
             | NormalTy::Resource
             | NormalTy::PromptAst
@@ -773,10 +793,11 @@ impl<H: Head> NormalTy<H> {
 // CONCRETE-TYPE DISJOINTNESS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Top-level concrete category of a ground-headed type, used only for the
-/// cross-category check (a value of one category is never a value of another).
-/// Same-category pairs are decided by the structural arms of
-/// [`NormalTy::is_disjoint_from`], not by this.
+/// Top-level concrete category of a ground-headed type, for the cross-category
+/// checks: a value of one category is never a value of another
+/// ([`NormalTy::is_disjoint_from`]), and no subtyping rule or canonical form
+/// relates two categories ([`heads_definitely_differ`]). Same-category pairs
+/// are decided by the structural arms, not by this.
 #[derive(PartialEq, Eq)]
 enum Category {
     Int,
@@ -787,14 +808,13 @@ enum Category {
     Null,
     Uint8Array,
     Media(MediaKind),
-    Void,
-    RustType,
     Type,
     Resource,
     PromptAst,
     Class,
     List,
     Map,
+    Tuple,
     Enum,
     Function,
     Future,
@@ -814,14 +834,13 @@ impl<H: Head> NormalTy<H> {
             NormalTy::Null => Category::Null,
             NormalTy::Uint8Array => Category::Uint8Array,
             NormalTy::Media(kind) => Category::Media(*kind),
-            NormalTy::Void => Category::Void,
-            NormalTy::RustType => Category::RustType,
             NormalTy::Type => Category::Type,
             NormalTy::Resource => Category::Resource,
             NormalTy::PromptAst => Category::PromptAst,
             NormalTy::Class(..) => Category::Class,
             NormalTy::List(_) => Category::List,
             NormalTy::Map { .. } => Category::Map,
+            NormalTy::Tuple(_) => Category::Tuple,
             NormalTy::Enum(_) | NormalTy::EnumVariant(..) => Category::Enum,
             NormalTy::Function { .. } => Category::Function,
             NormalTy::Future(..) => Category::Future,
@@ -849,8 +868,8 @@ impl<H: Head> NormalTy<H> {
     /// than a placeholder that could still resolve to something else. Only ground
     /// arguments make two generic instantiations *provably* distinct.
     ///
-    /// The non-ground cases are the error-recovery sentinels (`Unknown`, `Error`)
-    /// and the not-yet-resolved variables (a generic `TypeVar`, an unresolved
+    /// The non-ground cases are the error-recovery sentinel (`Error`) and the
+    /// not-yet-resolved variables (a generic `TypeVar`, an unresolved
     /// `AssociatedTypeProjection`, an `OpaqueAlias`) — each could later stand for
     /// the same type as the other side. The `unknown` top type (`Unknown`)
     /// is *not* one of these: it is user-written and fully determined, so
@@ -869,8 +888,6 @@ impl<H: Head> NormalTy<H> {
             | NormalTy::Null
             | NormalTy::Uint8Array
             | NormalTy::Media(_)
-            | NormalTy::Void
-            | NormalTy::RustType
             | NormalTy::Type
             | NormalTy::Resource
             | NormalTy::PromptAst
@@ -887,7 +904,9 @@ impl<H: Head> NormalTy<H> {
             NormalTy::Map { key, value } | NormalTy::Future(key, value) => {
                 key.is_ground() && value.is_ground()
             }
-            NormalTy::Union(members) => members.iter().all(NormalTy::is_ground),
+            NormalTy::Union(members) | NormalTy::Tuple(members) => {
+                members.iter().all(NormalTy::is_ground)
+            }
             NormalTy::Class(_, args) | NormalTy::Interface(_, args, _) => {
                 args.iter().all(NormalTy::is_ground)
             }
@@ -967,6 +986,10 @@ impl<H: Head> NormalTy<H> {
                 v1.arg_forces_disjoint(v2) || e1.arg_forces_disjoint(e2)
             }
 
+            (NormalTy::Tuple(xa), NormalTy::Tuple(xb)) => {
+                xa.len() != xb.len() || xa.iter().zip(xb).any(|(x, y)| x.is_disjoint_from(y))
+            }
+
             // Functions are *not* invariant (contravariant args, covariant
             // return/throws), so they are not provably disjoint here.
             (NormalTy::Function { .. }, NormalTy::Function { .. }) => false,
@@ -1017,6 +1040,46 @@ impl<H: Head> NormalTy<H> {
     }
 }
 
+/// The one table behind [`Category::of_head`] and
+/// [`Category::of_interned_head`]. Both are `ty_family!` members with the same
+/// variant names, so `$member` is the enum's path and `$none` adds the member's own
+/// variants that have no category. Exhaustive on purpose: a new variant must
+/// be classified here.
+macro_rules! family_head_category {
+    ($ty:expr, $($member:ident)::+ $(, $none:pat)*) => {
+        Some(match $ty {
+            $($member)::+::Int => Category::Int,
+            $($member)::+::Bigint => Category::Bigint,
+            $($member)::+::Float => Category::Float,
+            $($member)::+::String => Category::String,
+            $($member)::+::Bool => Category::Bool,
+            $($member)::+::Literal(lit, _) => Category::of_literal(lit),
+            $($member)::+::Null => Category::Null,
+            $($member)::+::Uint8Array => Category::Uint8Array,
+            $($member)::+::Media(kind) => Category::Media(*kind),
+            $($member)::+::Type => Category::Type,
+            $($member)::+::Resource => Category::Resource,
+            $($member)::+::PromptAst => Category::PromptAst,
+            $($member)::+::Class(..) => Category::Class,
+            $($member)::+::List(_) => Category::List,
+            $($member)::+::Map { .. } => Category::Map,
+            $($member)::+::Enum(_) | $($member)::+::EnumVariant(..) => Category::Enum,
+            $($member)::+::Function { .. } => Category::Function,
+            $($member)::+::Future(..) => Category::Future,
+            $($member)::+::Interface(..)
+            | $($member)::+::Tuple(_)
+            | $($member)::+::Union(_)
+            | $($member)::+::TypeAlias(_)
+            | $($member)::+::TypeVar(_)
+            | $($member)::+::AssociatedTypeProjection { .. }
+            | $($member)::+::Unknown
+            | $($member)::+::Never
+            | $($member)::+::Error
+            $(| $none)* => return None,
+        })
+    };
+}
+
 impl Category {
     fn of_literal(lit: &Literal) -> Category {
         match lit {
@@ -1026,6 +1089,22 @@ impl Category {
             Literal::String(_) => Category::String,
             Literal::Bool(_) => Category::Bool,
         }
+    }
+
+    /// The category of a head that canonicalization keeps, read before
+    /// canonicalizing: the [`Ty`] twin of [`NormalTy::head_category`]. `None`
+    /// for a head canonicalization can rewrite into another kind (an alias, a
+    /// union, a projection), one a context-driven rule relates across kinds
+    /// (an interface, a type variable), and the sentinels (`unknown`, `never`,
+    /// the error type).
+    fn of_head<H: Head>(ty: &Ty<H>) -> Option<Category> {
+        family_head_category!(ty, Ty)
+    }
+
+    /// [`Category::of_head`] for the interned kind. A live inference variable
+    /// can still become any type, so it has no category.
+    fn of_interned_head(ty: &interned::InferTy) -> Option<Category> {
+        family_head_category!(ty, interned::InferTy, interned::InferTy::InferVar { .. })
     }
 }
 
@@ -1095,8 +1174,6 @@ enum NormalTy<H: Head = DeclName, P: MuPhase<H> = Canonical> {
     Uint8Array,
     Media(MediaKind),
     // Nominal opaque leaves — each compatible only with itself.
-    Void,
-    RustType,
     Type,
     Resource,
     PromptAst,
@@ -1114,6 +1191,7 @@ enum NormalTy<H: Head = DeclName, P: MuPhase<H> = Canonical> {
         value: Box<NormalTy<H, P>>,
     },
     Union(Vec<NormalTy<H, P>>),
+    Tuple(Vec<NormalTy<H, P>>),
     Function {
         params: Vec<NormalParam<H, P>>,
         ret: Box<NormalTy<H, P>>,
@@ -1239,8 +1317,6 @@ impl<H: Head> NormalTy<H, Named> {
             Ty::Null => NormalTy::Null,
             Ty::Uint8Array => NormalTy::Uint8Array,
             Ty::Media(kind) => NormalTy::Media(*kind),
-            Ty::Void => NormalTy::Void,
-            Ty::RustType => NormalTy::RustType,
             Ty::Type => NormalTy::Type,
             Ty::Resource => NormalTy::Resource,
             Ty::PromptAst => NormalTy::PromptAst,
@@ -1279,6 +1355,7 @@ impl<H: Head> NormalTy<H, Named> {
                 value: Box::new(Self::from_ty(value, ctx, expanding, fuel)),
             },
             Ty::Union(members) => NormalTy::Union(Self::from_tys(members, ctx, expanding, fuel)),
+            Ty::Tuple(elements) => NormalTy::Tuple(Self::from_tys(elements, ctx, expanding, fuel)),
             Ty::Function {
                 params,
                 ret,
@@ -1380,7 +1457,9 @@ impl<H: Head> NormalTy<H, Named> {
             NormalTy::Map { key, value } => {
                 key.mentions_rec_var(var) || value.mentions_rec_var(var)
             }
-            NormalTy::Union(members) => members.iter().any(|m| m.mentions_rec_var(var)),
+            NormalTy::Union(members) | NormalTy::Tuple(members) => {
+                members.iter().any(|m| m.mentions_rec_var(var))
+            }
             NormalTy::Function {
                 params,
                 ret,
@@ -1404,8 +1483,6 @@ impl<H: Head> NormalTy<H, Named> {
             | NormalTy::Null
             | NormalTy::Uint8Array
             | NormalTy::Media(_)
-            | NormalTy::Void
-            | NormalTy::RustType
             | NormalTy::Type
             | NormalTy::Resource
             | NormalTy::PromptAst
@@ -1438,8 +1515,6 @@ impl<H: Head> NormalTy<H, Named> {
             NormalTy::Null => Ty::Null,
             NormalTy::Uint8Array => Ty::Uint8Array,
             NormalTy::Media(kind) => Ty::Media(*kind),
-            NormalTy::Void => Ty::Void,
-            NormalTy::RustType => Ty::RustType,
             NormalTy::Type => Ty::Type,
             NormalTy::Resource => Ty::Resource,
             NormalTy::PromptAst => Ty::PromptAst,
@@ -1468,6 +1543,9 @@ impl<H: Head> NormalTy<H, Named> {
             },
             NormalTy::Union(members) => {
                 Ty::Union(members.iter().map(NormalTy::legacy_render).collect())
+            }
+            NormalTy::Tuple(elements) => {
+                Ty::Tuple(elements.iter().map(NormalTy::legacy_render).collect())
             }
             NormalTy::Function {
                 params,
@@ -1593,6 +1671,12 @@ impl<H: Head> NormalTy<H, Named> {
                     .map(|m| m.resolve_binders(stack, saw_mu))
                     .collect(),
             ),
+            NormalTy::Tuple(elements) => NormalTy::Tuple(
+                elements
+                    .into_iter()
+                    .map(|e| e.resolve_binders(stack, saw_mu))
+                    .collect(),
+            ),
             NormalTy::Function {
                 params,
                 ret,
@@ -1630,8 +1714,6 @@ impl<H: Head> NormalTy<H, Named> {
             NormalTy::Null => NormalTy::Null,
             NormalTy::Uint8Array => NormalTy::Uint8Array,
             NormalTy::Media(kind) => NormalTy::Media(kind),
-            NormalTy::Void => NormalTy::Void,
-            NormalTy::RustType => NormalTy::RustType,
             NormalTy::Type => NormalTy::Type,
             NormalTy::Resource => NormalTy::Resource,
             NormalTy::PromptAst => NormalTy::PromptAst,
@@ -1750,7 +1832,37 @@ impl<H: Head> NormalTy<H> {
                     .collect();
                 Self::canonicalize_union(members, ctx, saw_mu, assumptions)
             }
-            leaf => leaf,
+            NormalTy::Tuple(elements) => {
+                let elements: Vec<_> = elements
+                    .into_iter()
+                    .map(|e| e.canonicalize(ctx, saw_mu, assumptions))
+                    .collect();
+                if elements.iter().any(|e| matches!(e, NormalTy::Never)) {
+                    NormalTy::Never
+                } else {
+                    NormalTy::Tuple(elements)
+                }
+            }
+            leaf @ (NormalTy::Int
+            | NormalTy::Bigint
+            | NormalTy::Float
+            | NormalTy::String
+            | NormalTy::Bool
+            | NormalTy::Null
+            | NormalTy::Uint8Array
+            | NormalTy::Media(_)
+            | NormalTy::Type
+            | NormalTy::Resource
+            | NormalTy::PromptAst
+            | NormalTy::Literal(_)
+            | NormalTy::Enum(_)
+            | NormalTy::EnumVariant(..)
+            | NormalTy::RecVar(_)
+            | NormalTy::TypeVar(_)
+            | NormalTy::OpaqueAlias(_)
+            | NormalTy::Never
+            | NormalTy::Unknown
+            | NormalTy::Error) => leaf,
         }
     }
 
@@ -1762,9 +1874,9 @@ impl<H: Head> NormalTy<H> {
     /// BAML (type arguments are real instance data), so `T<A>` relates to `T<B>`
     /// only when every `A`/`B` pair is compatible here.
     ///
-    /// Error-recovery sentinels (`Unknown`, `Error`) satisfy this either way via
-    /// [`Self::is_subtype_of`]'s bidirectional escape, so a hole argument still
-    /// matches anything. The `unknown` top type does *not* — it is a real,
+    /// The error-recovery sentinel (`Error`) satisfies this either way via
+    /// [`Self::is_subtype_of`]'s bidirectional escape, so an erroneous argument
+    /// still matches anything. The `unknown` top type does *not* — it is a real,
     /// distinct argument (`Box<unknown>` is not `Box<int>`).
     fn invariant_compatible<C: TypeContext<H>>(
         &self,
@@ -2071,6 +2183,13 @@ impl<H: Head> NormalTy<H> {
                     && v1.invariant_compatible(v2, ctx, assumptions)
             }
 
+            (NormalTy::Tuple(a), NormalTy::Tuple(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.invariant_compatible(y, ctx, assumptions))
+            }
+
             // Future is an invariant container.
             (NormalTy::Future(v1, e1), NormalTy::Future(v2, e2)) => {
                 v1.invariant_compatible(v2, ctx, assumptions)
@@ -2125,8 +2244,6 @@ impl<H: Head> NormalTy<H> {
             NormalTy::Null => Ty::Null,
             NormalTy::Uint8Array => Ty::Uint8Array,
             NormalTy::Media(kind) => Ty::Media(kind),
-            NormalTy::Void => Ty::Void,
-            NormalTy::RustType => Ty::RustType,
             NormalTy::Type => Ty::Type,
             NormalTy::Resource => Ty::Resource,
             NormalTy::PromptAst => Ty::PromptAst,
@@ -2151,6 +2268,7 @@ impl<H: Head> NormalTy<H> {
                 value: Box::new(value.into_ty()),
             },
             NormalTy::Union(members) => Ty::Union(Self::into_tys(members)),
+            NormalTy::Tuple(elements) => Ty::Tuple(Self::into_tys(elements)),
             NormalTy::Function {
                 params,
                 ret,
@@ -2383,7 +2501,9 @@ impl<H: Head> NormalTy<H> {
             NormalTy::Map { key, value } | NormalTy::Future(key, value) => {
                 key.has_unguarded_mu() || value.has_unguarded_mu()
             }
-            NormalTy::Union(members) => members.iter().any(NormalTy::has_unguarded_mu),
+            NormalTy::Union(members) | NormalTy::Tuple(members) => {
+                members.iter().any(NormalTy::has_unguarded_mu)
+            }
             NormalTy::Class(_, args) => args.iter().any(NormalTy::has_unguarded_mu),
             NormalTy::Interface(_, args, bindings) => {
                 args.iter().any(NormalTy::has_unguarded_mu)
@@ -2409,8 +2529,6 @@ impl<H: Head> NormalTy<H> {
             | NormalTy::Null
             | NormalTy::Uint8Array
             | NormalTy::Media(_)
-            | NormalTy::Void
-            | NormalTy::RustType
             | NormalTy::Type
             | NormalTy::Resource
             | NormalTy::PromptAst
@@ -2545,7 +2663,9 @@ impl<H: Head> NormalTy<H> {
             NormalTy::Map { key, value } | NormalTy::Future(key, value) => {
                 key.has_free_rec_var(depth) || value.has_free_rec_var(depth)
             }
-            NormalTy::Union(members) => members.iter().any(|m| m.has_free_rec_var(depth)),
+            NormalTy::Union(members) | NormalTy::Tuple(members) => {
+                members.iter().any(|m| m.has_free_rec_var(depth))
+            }
             NormalTy::Class(_, args) => args.iter().any(|a| a.has_free_rec_var(depth)),
             NormalTy::Interface(_, args, bindings) => {
                 args.iter().any(|a| a.has_free_rec_var(depth))
@@ -2571,8 +2691,6 @@ impl<H: Head> NormalTy<H> {
             | NormalTy::Null
             | NormalTy::Uint8Array
             | NormalTy::Media(_)
-            | NormalTy::Void
-            | NormalTy::RustType
             | NormalTy::Type
             | NormalTy::Resource
             | NormalTy::PromptAst
@@ -2625,6 +2743,12 @@ impl<H: Head> NormalTy<H> {
                     .map(|m| m.replace_rec_var(depth, replacement))
                     .collect(),
             ),
+            NormalTy::Tuple(elements) => NormalTy::Tuple(
+                elements
+                    .iter()
+                    .map(|e| e.replace_rec_var(depth, replacement))
+                    .collect(),
+            ),
             NormalTy::Function {
                 params,
                 ret,
@@ -2655,7 +2779,26 @@ impl<H: Head> NormalTy<H> {
                 member: member.clone(),
             },
             // Leaves and non-matching indices are untouched.
-            _ => self.clone(),
+            NormalTy::RecVar(_)
+            | NormalTy::Int
+            | NormalTy::Bigint
+            | NormalTy::Float
+            | NormalTy::String
+            | NormalTy::Bool
+            | NormalTy::Null
+            | NormalTy::Uint8Array
+            | NormalTy::Media(_)
+            | NormalTy::Type
+            | NormalTy::Resource
+            | NormalTy::PromptAst
+            | NormalTy::Literal(_)
+            | NormalTy::Enum(_)
+            | NormalTy::EnumVariant(..)
+            | NormalTy::TypeVar(_)
+            | NormalTy::OpaqueAlias(_)
+            | NormalTy::Never
+            | NormalTy::Unknown
+            | NormalTy::Error => self.clone(),
         }
     }
 }
@@ -2723,7 +2866,7 @@ mod tests;
 
 use crate::interned;
 
-/// Memoizes canonical forms for a sequence of interned relations evaluated
+/// Memoizes canonical forms and normalized spellings for interned types evaluated
 /// under one immutable [`TypeContext`]. The cache deliberately takes the
 /// context at each call rather than owning it; callers are responsible for
 /// keeping one cache scoped to one fact set (compiler inference uses one per
@@ -2731,18 +2874,61 @@ use crate::interned;
 /// their meaning is table-relative rather than a property of the handle alone.
 #[derive(Default)]
 pub struct InternedCanonicalCache {
-    canonical: RefCell<HashMap<interned::ClosedTy, NormalTy>>,
+    resolved: RefCell<FxHashMap<interned::ClosedTy, ResolvedTy>>,
+}
+
+#[derive(Default)]
+struct ResolvedTy {
+    canonical: Option<NormalTy>,
+    normalized: Option<interned::ClosedTy>,
 }
 
 impl InternedCanonicalCache {
+    fn get_canonical(&self, ty: &interned::ClosedTy) -> Option<NormalTy> {
+        self.resolved.borrow().get(ty)?.canonical.clone()
+    }
+
+    fn set_canonical(&self, ty: &interned::ClosedTy, canonical: NormalTy) {
+        self.resolved
+            .borrow_mut()
+            .entry(ty.clone())
+            .or_default()
+            .canonical = Some(canonical);
+    }
+
+    fn get_normalized(&self, ty: &interned::ClosedTy) -> Option<interned::ClosedTy> {
+        self.resolved.borrow().get(ty)?.normalized.clone()
+    }
+
+    fn set_normalized(&self, ty: &interned::ClosedTy, normalized: interned::ClosedTy) {
+        self.resolved
+            .borrow_mut()
+            .entry(ty.clone())
+            .or_default()
+            .normalized = Some(normalized);
+    }
+
+    /// The cached structural spelling of [`normalize_interned`], including
+    /// its root-unfold-once rendering of recursive aliases.
+    pub fn normalize<C: TypeContext>(
+        &self,
+        ty: &interned::ClosedTy,
+        ctx: &C,
+    ) -> interned::ClosedTy {
+        if let Some(normalized) = self.get_normalized(ty) {
+            return normalized;
+        }
+        let normalized = normalize_interned(ty, ctx);
+        self.set_normalized(ty, normalized.clone());
+        normalized
+    }
+
     fn canonical<C: TypeContext>(&self, ty: &interned::ClosedTy, ctx: &C) -> NormalTy {
-        if let Some(canonical) = self.canonical.borrow().get(ty) {
-            return canonical.clone();
+        if let Some(canonical) = self.get_canonical(ty) {
+            return canonical;
         }
         let canonical = NormalTy::canonical_interned(ty, ctx);
-        self.canonical
-            .borrow_mut()
-            .insert(ty.clone(), canonical.clone());
+        self.set_canonical(ty, canonical.clone());
         canonical
     }
 
@@ -2833,8 +3019,6 @@ impl NormalTy {
             NormalTy::Null => K::Null,
             NormalTy::Uint8Array => K::Uint8Array,
             NormalTy::Media(kind) => K::Media(kind),
-            NormalTy::Void => K::Void,
-            NormalTy::RustType => K::RustType,
             NormalTy::Type => K::Type,
             NormalTy::Resource => K::Resource,
             NormalTy::PromptAst => K::PromptAst,
@@ -2859,6 +3043,7 @@ impl NormalTy {
                 value: value.into_interned(),
             },
             NormalTy::Union(members) => K::Union(Self::into_interned_all(members)),
+            NormalTy::Tuple(elements) => K::Tuple(Self::into_interned_all(elements)),
             NormalTy::Function {
                 params,
                 ret,
@@ -2940,10 +3125,8 @@ impl NormalTy {
 /// (`interned::InferTy::Class(DeclName, ..)`), so this whole ingestion path is
 /// fixed at `H = DeclName`; only the μ-phase varies.
 impl NormalTy<DeclName, Named> {
-    /// [`NormalTy::from_ty`], mirrored over `interned::InferTy`. The one
-    /// naming trap: the interned `Unknown` is the TOP type (the plain enum's
-    /// `Unknown`); TIR's `Unknown` recovery sentinel is
-    /// unrepresentable in the interned form by design.
+    /// [`NormalTy::from_ty`], mirrored over `interned::InferTy`; the interned
+    /// `Unknown` is the top type, as the plain enum's is.
     fn from_interned<C: TypeContext>(
         ty: &interned::Ty,
         ctx: &C,
@@ -2960,8 +3143,6 @@ impl NormalTy<DeclName, Named> {
             K::Null => NormalTy::Null,
             K::Uint8Array => NormalTy::Uint8Array,
             K::Media(kind) => NormalTy::Media(*kind),
-            K::Void => NormalTy::Void,
-            K::RustType => NormalTy::RustType,
             K::Type => NormalTy::Type,
             K::Resource => NormalTy::Resource,
             K::PromptAst => NormalTy::PromptAst,
@@ -3003,6 +3184,9 @@ impl NormalTy<DeclName, Named> {
             },
             K::Union(members) => {
                 NormalTy::Union(Self::from_interned_all(members, ctx, expanding, fuel))
+            }
+            K::Tuple(elements) => {
+                NormalTy::Tuple(Self::from_interned_all(elements, ctx, expanding, fuel))
             }
             K::Function {
                 params,
@@ -3166,7 +3350,7 @@ fn interned_heads_definitely_differ(a: &interned::Ty, b: &interned::Ty) -> bool 
         | (K::Interface(q1, ..), K::Interface(q2, ..))
         | (K::Enum(q1, ..), K::Enum(q2, ..)) => q1 != q2,
         (K::EnumVariant(q1, v1, ..), K::EnumVariant(q2, v2, ..)) => q1 != q2 || v1 != v2,
-        _ => false,
+        (a, b) => categories_differ(Category::of_interned_head(a), Category::of_interned_head(b)),
     }
 }
 

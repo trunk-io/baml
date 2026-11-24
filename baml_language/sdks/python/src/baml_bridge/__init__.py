@@ -16,16 +16,13 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 from typing_extensions import Sentinel
 
 from .baml_py import (
-    BamlCallContext,
     BamlPyHandle,
     BamlRuntime,
     FunctionResult,
-    HostSpanManager,
     cancel_function_call,
-    flush_events,
     get_runtime as _rust_get_runtime,
-    get_bridge_runtime_version,
-    get_toolchain_version,
+    get_bridge_runtime_version as get_bridge_runtime_version,
+    get_toolchain_version as get_toolchain_version,
     get_version,
     new_function_call,
     register_unhandled_spawn_error_callback,
@@ -40,43 +37,107 @@ from .errors import (
 )
 from ._stream import BamlStream
 from ._function_spec import BamlFunctionSpec
-from ._runtime_value import BamlRuntimeValue
-from .ctx_manager import CtxManager as BamlCtxManager
+from ._runtime_value import BamlOpaque, BamlRuntimeValue
 from .proto import (
     BamlType,
     decode_call_result,
     encode_call_args,
-    pydantic_instance_type_args,
     python_type_to_wire_ty,
+    receiver_type_args,
 )
 from .typemap import (
+    BamlClassInstance,
     BamlTypeMap,
     set_type_map,
     get_type_map,
 )
 
 
-# Complete spawned work before flushing buffered trace events.
-atexit.register(flush_events)
+# Complete spawned work before interpreter shutdown.
 atexit.register(shutdown_runtime)
 
 
+UnhandledSpawnErrorHandler = Callable[[BaseException, bool], None]
+"""What `set_unhandled_spawn_error_handler` takes: `(error, cancelled)`.
+
+`error` is the exception a call would have raised for the same failure (a
+`BamlError`, a `BamlPanic`, or the exception a host callback raised), with the
+BAML frames in its traceback. `cancelled` is true when the task was cancelled:
+its cancellation fired before it failed (the error is then often one of its
+cleanup), or `cancel()` was called on it at any time, also after it failed."""
+
+
+def default_unhandled_spawn_error_handler(error: BaseException, cancelled: bool) -> None:
+    """Print the error of a spawned task that nothing observed, and end the
+    process unless the task was cancelled.
+
+    A failure that no code awaited is a defect of the program, as an uncaught
+    exception is, so the default does not let the program run on. The exit is
+    immediate (`os._exit(1)`; on Windows the process terminates itself with
+    `SIGTERM`): no `atexit` handler and no `finally` block runs, and buffered
+    output is lost."""
+    traceback.print_exception(error)
+    if not cancelled:
+        sys.stderr.flush()
+        if os.name == "nt":
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            os._exit(1)
+
+
+_unhandled_spawn_error_handler: UnhandledSpawnErrorHandler = default_unhandled_spawn_error_handler
+
+
+def set_unhandled_spawn_error_handler(
+    handler: Optional[UnhandledSpawnErrorHandler],
+) -> UnhandledSpawnErrorHandler:
+    """Choose what the process does when a BAML `spawn { ... }` task ends with
+    an error that nothing observed. Returns the handler it replaces; `None`
+    restores `default_unhandled_spawn_error_handler`, which ends the process.
+
+    A server sets a handler that reports the error and returns, so one stray
+    task does not end every request in the process:
+
+        def report(error: BaseException, cancelled: bool) -> None:
+            logger.error("unobserved BAML spawn error", exc_info=error)
+
+        set_unhandled_spawn_error_handler(report)
+
+    The handler runs on a thread of the BAML runtime, not on the thread or the
+    event loop of the call that spawned the task, and no event loop is running
+    there. It must return soon and must not call BAML: pass the error to the
+    application with `loop.call_soon_threadsafe` or a queue. If the handler
+    raises, the error it was given is printed, its own exception goes to
+    `sys.unraisablehook`, and the process continues. A handler that wants the
+    default for some errors calls `default_unhandled_spawn_error_handler`."""
+    global _unhandled_spawn_error_handler
+    previous = _unhandled_spawn_error_handler
+    _unhandled_spawn_error_handler = (
+        default_unhandled_spawn_error_handler if handler is None else handler
+    )
+    return previous
+
+
 def _handle_unhandled_spawn_error(error_bytes: bytes, cancelled: bool) -> None:
+    """The one callback the native runtime holds (its registration is
+    first-wins): decode the error and hand it to the current handler."""
     try:
         decode_call_result(error_bytes)
     except BaseException as error:
-        traceback.print_exception(error)
-        if not cancelled:
-            sys.stderr.flush()
-            if os.name == "nt":
-                os.kill(os.getpid(), signal.SIGTERM)
-            else:
-                os._exit(1)
+        try:
+            _unhandled_spawn_error_handler(error, cancelled)
+        except BaseException:
+            # The handler failed before it reported: do not lose the error of
+            # the spawned task. The native caller hands the handler's own
+            # exception to `sys.unraisablehook`, which does not show the
+            # exception it was raised from.
+            traceback.print_exception(error)
+            raise
 
 
 register_unhandled_spawn_error_callback(_handle_unhandled_spawn_error)
 
-__version__ = "0.20.1"
+__version__ = "0.26.0"
 
 
 # ---------------------------------------------------------------------------
@@ -91,16 +152,6 @@ def get_runtime() -> BamlRuntime:
 
 
 _CANCELLED_PANIC_CLASS = "baml.panics.Cancelled"
-
-
-def _attach_call_ctx(call_ctx: Any, call_id: int) -> None:
-    if call_ctx is not None:
-        call_ctx._attach_call_id(call_id)
-
-
-def _detach_call_ctx(call_ctx: Any, call_id: int) -> None:
-    if call_ctx is not None:
-        call_ctx._detach_call_id(call_id)
 
 
 def _decode_call_result_async(result_bytes: bytes) -> Any:
@@ -126,32 +177,37 @@ def _decode_call_result_async(result_bytes: bytes) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def call_function_sync(rt, function_name, kwargs, ctx=None, _ctx=None):
+def call_function_sync(rt, function_name, kwargs, *, _baml=None):
     call_id = new_function_call()
-    args_proto = encode_call_args(kwargs, call_id, function_name=function_name)
-    _attach_call_ctx(_ctx, call_id)
-    try:
-        result_bytes = rt.call_function_sync(args_proto, ctx)
-    finally:
-        _detach_call_ctx(_ctx, call_id)
+    args_proto = encode_call_args(kwargs, call_id, function_name=function_name, _baml=_baml)
+    result_bytes = rt.call_function_sync(args_proto, args_proto.kwargs, args_proto.cancel)
     return FunctionResult(decode_call_result(result_bytes))
 
 
-async def call_function(
-    rt, function_name, kwargs, ctx=None, _ctx=None
-):
+async def call_function(rt, function_name, kwargs, *, _baml=None):
     call_id = new_function_call()
-    args_proto = encode_call_args(kwargs, call_id, function_name=function_name)
-    _attach_call_ctx(_ctx, call_id)
+    args_proto = encode_call_args(kwargs, call_id, function_name=function_name, _baml=_baml)
     try:
-        try:
-            result_bytes = await rt.call_function(args_proto, ctx)
-        except asyncio.CancelledError:
-            cancel_function_call(call_id)
-            raise
-    finally:
-        _detach_call_ctx(_ctx, call_id)
+        result_bytes = await rt.call_function(args_proto, args_proto.kwargs, args_proto.cancel)
+    except asyncio.CancelledError:
+        cancel_function_call(call_id)
+        raise
     return FunctionResult(_decode_call_result_async(result_bytes))
+
+
+def _media_from_file(class_fqn, file, mime_type):
+    """`from_file` of a media class: the BAML function `<class_fqn>.from_file`,
+    which reads the file. The media classes call this for their own
+    `from_file`, so a file that cannot be read is the same `baml.errors.Io`
+    here as in BAML code."""
+    encoded = encode_call_args(
+        {"file": file, "mime_type": mime_type},
+        new_function_call(),
+        function_name=f"{class_fqn}.from_file",
+    )
+    return decode_call_result(
+        get_runtime().call_function_sync(encoded, encoded.kwargs, encoded.cancel)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,20 +316,19 @@ def _build_type_args(
 ) -> List[Any]:
     """Build the named, order-preserving `BamlTyArg` list for a generic call: each
     entry is `(type_var_name, wire_ty)`. Enclosing class params (recovered from
-    the `self` receiver's Pydantic generic metadata) come first, then the
-    callee's own `<...>` params (`_types=`) — De Bruijn order. The engine maps
-    each entry onto the entry frame's `type_args` slot by TypeVar name. Returns
-    `[]` when the call binds nothing.
+    the `self` receiver: a reference's type args, or a Pydantic instance's
+    generic metadata) come first, then the callee's own `<...>` params
+    (`_types=`) — De Bruijn order. The engine maps each entry onto the entry
+    frame's `type_args` slot by TypeVar name. Returns `[]` when the call binds
+    nothing.
 
     Class params are seeded only when concrete args are actually recovered from
-    a Pydantic generic *instance*. For builtin/handle receivers (no Pydantic
-    generic metadata) nothing is sent, so the engine keeps recovering class
-    type args from the receiver itself — preserving pre-existing behavior for
-    stdlib generic methods (`baml.llm.Array`, `Stream`, …)."""
+    the receiver. For other handle receivers and unparameterized Pydantic
+    instances nothing is sent, so the engine recovers class type args from the
+    receiver itself — preserving pre-existing behavior for stdlib generic
+    methods (`baml.llm.Array`, `Stream`, …)."""
     wire: List[Any] = []
-    class_args = (
-        pydantic_instance_type_args(merged.get("self")) if class_type_params else []
-    )
+    class_args = receiver_type_args(merged.get("self")) if class_type_params else []
     if class_args:
         for i, name in enumerate(class_type_params):
             arg = class_args[i] if i < len(class_args) else None
@@ -294,11 +349,13 @@ def _build_type_args(
             # The method's own params sit *after* the class prefix in De Bruijn
             # order; without recovered class args we can't position an
             # explicitly-bound one. This combined shape (a method-level TypeVar
-            # bound via `_types=` on a non-Pydantic generic receiver) isn't
-            # supported yet. (A *bare* such call infers fine — `bound` is empty.)
+            # bound via `_types=` on a receiver that carries no class type
+            # args) isn't supported yet. (A *bare* such call infers fine —
+            # `bound` is empty.)
             raise TypeError(
-                "_types= on a generic method requires a Pydantic generic "
-                "receiver so the class type args can be recovered"
+                "_types= on a generic method requires a receiver that carries "
+                "its class type args (a reference, or a parameterized Pydantic "
+                "instance)"
             )
         wire.extend(
             (name, r if isinstance(r, BamlType) else python_type_to_wire_ty(r))
@@ -429,7 +486,7 @@ def define_function(
     if mode == "sync":
 
         def _sync(*args: Any, **kwargs: Any) -> Any:
-            call_ctx = kwargs.pop("_ctx", None)
+            options = kwargs.pop("_baml", None)
             types_kwarg = kwargs.pop("_types", None)
             merged = _build_kwargs(
                 args,
@@ -456,12 +513,16 @@ def define_function(
                 call_id,
                 type_args,
                 function_name=baml_fqn,
+                _baml=options,
             )
-            _attach_call_ctx(call_ctx, call_id)
-            try:
-                result_bytes = rt.call_function_sync(args_proto, None)
-            finally:
-                _detach_call_ctx(call_ctx, call_id)
+            if baml_fqn.endswith("@stream"):
+                from ._stream import _decode_stream_result
+                return _decode_stream_result(
+                    rt.call_function_sync(
+                        args_proto, args_proto.kwargs, args_proto.cancel, stream=True
+                    )
+                )
+            result_bytes = rt.call_function_sync(args_proto, args_proto.kwargs, args_proto.cancel)
             return decode_call_result(result_bytes)
 
         _set_binding_metadata(_sync)
@@ -469,7 +530,7 @@ def define_function(
     elif mode == "async":
 
         async def _async(*args: Any, **kwargs: Any) -> Any:
-            call_ctx = kwargs.pop("_ctx", None)
+            options = kwargs.pop("_baml", None)
             types_kwarg = kwargs.pop("_types", None)
             merged = _build_kwargs(
                 args,
@@ -496,16 +557,21 @@ def define_function(
                 call_id,
                 type_args,
                 function_name=baml_fqn,
+                _baml=options,
             )
-            _attach_call_ctx(call_ctx, call_id)
             try:
-                try:
-                    result_bytes = await rt.call_function(args_proto, None)
-                except asyncio.CancelledError:
-                    cancel_function_call(call_id)
-                    raise
-            finally:
-                _detach_call_ctx(call_ctx, call_id)
+                result_bytes = await rt.call_function(
+                    args_proto,
+                    args_proto.kwargs,
+                    args_proto.cancel,
+                    stream=baml_fqn.endswith("@stream"),
+                )
+            except asyncio.CancelledError:
+                cancel_function_call(call_id)
+                raise
+            if baml_fqn.endswith("@stream"):
+                from ._stream import _decode_stream_result
+                return _decode_stream_result(result_bytes, asynchronous=True)
             return _decode_call_result_async(result_bytes)
 
         _set_binding_metadata(_async)
@@ -515,23 +581,23 @@ def define_function(
 
 
 __all__ = [
-    "BamlCallContext",
     "BamlPyHandle",
     "BamlRuntime",
     "BamlType",
     "BamlStream",
     "BamlFunctionSpec",
     "BamlRuntimeValue",
+    "BamlOpaque",
     "FunctionResult",
-    "HostSpanManager",
     "UNSET",
-    "BamlCtxManager",
     "BamlCancelledError",
     "BamlError",
     "BamlPanic",
     "make_sdk_panic",
-    "flush_events",
     "shutdown_runtime",
+    "UnhandledSpawnErrorHandler",
+    "default_unhandled_spawn_error_handler",
+    "set_unhandled_spawn_error_handler",
     "get_runtime",
     "get_version",
     "new_function_call",
@@ -541,6 +607,7 @@ __all__ = [
     "call_function",
     "call_function_sync",
     "define_function",
+    "BamlClassInstance",
     "BamlTypeMap",
     "set_type_map",
     "get_type_map",

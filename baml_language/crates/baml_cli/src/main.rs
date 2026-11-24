@@ -1,8 +1,4 @@
-// TODO: This file has been simplified to remove baml_runtime/baml_log dependencies.
-
-// TODO: baml_runtime is disabled for now
-// use baml_runtime::RuntimeCliDefaults;
-
+#![warn(clippy::disallowed_methods)]
 use std::io::Write as _;
 
 /// The compiler workload is dominated by small short-lived allocations
@@ -10,15 +6,26 @@ use std::io::Write as _;
 /// remaining single-threaded CPU in the cold-compile audit. Installing
 /// mimalloc as the global allocator substantially cuts cold `baml check` /
 /// `baml build` wall time. This affects allocation only, not any rendered
-/// bytes, so it is safe with respect to `BAML_CACHE_VERIFY`.
+/// bytes, so it is safe with respect to `DEV_BAML_BUILD_CACHE_VERIFY`.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    // TODO: baml_log is disabled for now
-    // baml_log::init()?;
+    // `check` lowers and type-checks files on rayon's workers, and the
+    // compiler recurses once per nesting level (the parser bounds nesting;
+    // lowering and type checking follow the same shape). The default 2 MiB
+    // worker stack is tight for that in a debug build: reserve 16 MiB per
+    // worker, virtual and committed lazily. `RUST_MIN_STACK` in
+    // `.cargo/config.toml` gives tests the same figure.
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(16 << 20)
+        .build_global()
+        .unwrap_or_else(|error| unreachable!("the global pool is built once, first: {error}"));
 
-    warn_if_direct_invocation();
+    if let Err(error) = warn_if_direct_invocation() {
+        let _ = writeln!(std::io::stderr(), "error: {error}");
+        std::process::exit(baml_cli::ExitCode::Failure.into());
+    }
 
     let argv: Vec<String> = std::env::args().collect();
 
@@ -31,24 +38,19 @@ fn main() {
         Ok(code) => code,
         Err(e) => {
             baml_cli::reporter::print_anyhow_error(&e);
-            baml_cli::ExitCode::Other
+            baml_cli::ExitCode::for_error(&e)
         }
     };
     std::process::exit(exit_code.into());
 }
 
-fn warn_if_direct_invocation() {
-    if env_flag("BAML_WRAPPER_EXEC") || env_flag("BAML_CLI_ALLOW_DIRECT") {
-        return;
+fn warn_if_direct_invocation() -> Result<(), baml_env::EnvError> {
+    if baml_env::bool_var("BAML_CLI_ALLOW_DIRECT")? == Some(true) {
+        return Ok(());
     }
     let _ = writeln!(
         std::io::stderr(),
         "warning: using the internal BAML toolchain binary directly is not recommended. Use `baml` instead."
     );
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
-        .unwrap_or(false)
+    Ok(())
 }

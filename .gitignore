@@ -197,11 +197,6 @@ rpi/
 .humanlayer/tasks/
 .codeboarding/
 
-# Track generated Node bridge package JS/TS dist outputs, but not native addons.
-!baml_language/sdks/typescript/bridge_typescript/dist/
-!baml_language/sdks/typescript/bridge_typescript/dist/**
-baml_language/sdks/typescript/bridge_typescript/dist/*.node
-
 # Local developer-docs planning artifacts
 /DEVELOPER_DOCS_*.md
 
@@ -209,7 +204,3 @@ baml_language/sdks/typescript/bridge_typescript/dist/*.node
 !/baml_language/vendor/
 /baml_language/vendor/*
 !/baml_language/vendor/quanta/
-
-# JUnit reports for Trunk Flaky Tests uploads (nextest writes its own under
-# baml_language/target/, already ignored).
-junit.xml

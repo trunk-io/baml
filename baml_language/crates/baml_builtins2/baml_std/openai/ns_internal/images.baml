@@ -84,11 +84,6 @@ class OaImagesResponse {
 // Request construction.
 
 /// (internal) The client's canonical id, shared by `ai.Client.id` and the error paths.
-function _oai_images_client_id(c: root.ImageClient) -> string {
-    let id = `openai-images/${c.model}`;
-    id
-}
-
 /// (internal) Drop every null-valued key, recursively. A typed request class serializes
 /// its unset options as explicit nulls; the Images API wants them absent (and
 /// `merge_request_body`'s null-deletes-a-key contract only makes sense against a
@@ -147,7 +142,7 @@ function _oai_images_collect(blocks: ai.content.Block[], parts: string[]) -> voi
                 null
             },
             let media: ai.content.Media => {
-                throw _oai_images_media_rejected(media.kind())
+                throw _oai_images_media_rejected(media.kind());
             },
         };
     }
@@ -175,7 +170,7 @@ function _oai_images_prompt_text(prompt: ai.Prompt, journal: ai.Journal) -> stri
             status_code: null,
             detail: "Images API request requires a text prompt",
             raw_body: null,
-        }
+        };
     }
     joined
 }
@@ -205,7 +200,8 @@ function _oai_images_trim_slash(url: string) -> string {
 /// `baml.http` has no query-string builder; this covers what a header/query
 /// passthrough realistically carries.
 function _oai_images_escape_query(raw: string) -> string {
-    let escaped = raw.replace_all("%", "%25")
+    let escaped = raw
+        .replace_all("%", "%25")
         .replace_all(" ", "%20")
         .replace_all("&", "%26")
         .replace_all("=", "%3D")
@@ -226,11 +222,7 @@ function _oai_images_with_query(url: string, params: map<string, string>?) -> st
     if (pairs.length() == 0) {
         return url;
     }
-    let separator = if (url.includes("?")) {
-        "&"
-    } else {
-        "?"
-    };
+    let separator = if (url.includes("?")) { "&" } else { "?" };
     `${url}${separator}${pairs.join("&")}`
 }
 
@@ -262,13 +254,16 @@ function images_render(
             status_code: null,
             detail: "the Images API has no tool calling; run tools with a chat client instead",
             raw_body: null,
-        }
+        };
     }
-    let journal = ai.wire.sanitize_for_client(input.journal, _oai_images_client_id(c));
+    let journal = ai.wire.sanitize_for_client(input.journal, "openai-images", c.model);
     // The schema block an ordinary client injects is noise for an image
     // endpoint (`Return an image output.` is the only shape it can produce),
     // so the rendered prompt carries the authored text alone.
-    let text = _oai_images_prompt_text(input.prompt(ai.internal.build_output_format(input.output_type)), journal);
+    let text = _oai_images_prompt_text(
+        (input.prompt)(ai.internal.build_output_format(input.output_type)),
+        journal,
+    );
     let request = OaImagesRequest {
         model: c.model,
         prompt: text,
@@ -283,7 +278,7 @@ function images_render(
         user: c.user,
         response_format: _oai_images_response_format(c.model, c.response_format),
     };
-    let base = _oai_images_drop_nulls(baml.json.to_json(request));
+    let base = _oai_images_drop_nulls(baml.json.from(request));
     let merged = ai.wire.merge_request_body(base, c.request_body);
     let url = _oai_images_with_query(
         `${_oai_images_trim_slash(c.resolved_base_url() ?? "https://api.openai.com/v1")}/images/generations`,
@@ -322,21 +317,30 @@ function _oai_images_fetch_inline(location: string, fallback_mime: string) -> im
     let response = baml.http.fetch(location) catch_all (e) {
         let timeout: baml.errors.Timeout => throw timeout,
         _ => {
-            throw ai.errors.NetworkFailure { status_code: null,
+            throw ai.errors.NetworkFailure {
+                status_code: null,
                 provider: "openai-images",
-                detail: `fetching the generated image at ${location} failed: ${e.to_string()}`,
+                detail: ai.wire.redact_url_secrets(
+                    `fetching the generated image at ${location} failed: ${e.to_string()}`,
+                ),
                 raw_body: null,
-            }
+            };
         },
     };
     if (!response.ok()) {
-        throw ai.errors.NetworkFailure { status_code: null,
+        throw ai.errors.NetworkFailure {
+            status_code: null,
             provider: "openai-images",
-            detail: `fetching the generated image at ${location} returned HTTP ${response.status_code}`,
+            detail: ai.wire.redact_url_secrets(
+                `fetching the generated image at ${location} returned HTTP ${response.status_code}`,
+            ),
             raw_body: null,
-        }
+        };
     }
-    let reported = (response.headers.get("content-type") ?? "").split(";").at(0) ?? "";
+    let reported = (response.headers.get("content-type") ?? "")
+        .split(";")
+        .at(0)
+        ?? "";
     let mime = if (reported.trim() == "") {
         fallback_mime
     } else {
@@ -376,26 +380,32 @@ function images_parse(c: root.ImageClient, resp: OaImagesResponse) -> ai.ModelTu
         }
     }
     if (content.length() == 0) {
-        throw ai.errors.ParseFailed {
+        throw ai.errors.InvalidResponse {
             provider: "openai-images",
-            raw_output: "the images response contained no image data in data[]",
-        }
+            message: "the images response contained no image data in data[]",
+            raw_body: baml.json.stringify(resp),
+            status_code: null,
+        };
     }
-    let usage: ai.events.Usage? = if let reported: OaImagesUsage = resp.usage {
+    ai.ModelTurn {
+        calls: [],
+        child_turns: [],
+        content: content,
+        stop_reason: ai.content.StopReason.Complete,
+    }
+}
+
+/// One decoded response's usage, null when it reported none.
+function images_usage(resp: OaImagesResponse) -> ai.events.Usage? {
+    if let reported: OaImagesUsage = resp.usage {
         ai.events.Usage {
-            input_tokens: reported.input_tokens ?? 0,
-            output_tokens: reported.output_tokens ?? 0,
+            input_tokens: reported.input_tokens,
+            output_tokens: reported.output_tokens,
             cached_input_tokens: null,
             reasoning_tokens: null,
         }
     } else {
         null
-    };
-    ai.ModelTurn {
-        calls: [],
-        content: content,
-        stop_reason: ai.content.StopReason.Complete,
-        usage: usage,
     }
 }
 
@@ -409,10 +419,17 @@ function images_invoke(c: root.ImageClient, input: ai.ModelTurnInput) -> ai.Mode
     let req = ai.LlmTimeoutOptions._resolve(c.timeout)._apply(images_render(c, input));
     let sent = ai.wire.send_as_with_wire<OaImagesResponse>(
         req,
-        "openai-images",
-        c.id(),
+        ai.events.ModelKey {
+            provider: c.provider(),
+            model: c.model,
+        },
         capture_wire = c.capture_wire,
     );
-    let turn = images_parse(c, sent.value);
-    ai.ModelTurn { ...turn, calls: [sent.call] }
+    ai.internal.with_own_call(
+        images_parse(c, sent.value),
+        sent.call,
+        images_usage(sent.value),
+        c.model,
+        null,
+    )
 }

@@ -94,12 +94,20 @@ pub struct FunctionMetadata {
     pub lambda_path: Option<String>,
     pub definition_key: Option<DefinitionKey>,
     pub package_name: Option<String>,
+    /// Hash of the compiled package that owns the function (BEP-085's
+    /// compilation unit hash): which build of the package a span of this
+    /// function ran. `None` for a function no compiled package owns (host
+    /// and native functions, named spans).
+    pub compilation_unit_hash: Option<[u8; 32]>,
     pub namespace: Vec<String>,
     /// Slot names for captured inputs; `None` when they cannot be determined.
     pub argument_layout: Option<ArgumentLayout>,
     /// PC-to-source table of the code the VM executes; `None` when the
     /// function has no compact code (native functions, unlowered bytecode).
     pub source_map: Option<SourceMap>,
+    /// An `ai.Client.invoke` implementation or a stream's settle step: the
+    /// model calls its returned turn made are its own usage.
+    pub model_invoke: bool,
 }
 
 /// Line table of one function's compact bytecode. PCs are byte offsets into

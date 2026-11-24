@@ -11,41 +11,94 @@
 //! The instructions that the VM runs are defined in [`Instruction`] enum.
 
 pub mod bytecode;
+pub mod cancellation;
+pub mod class_builder;
+pub mod csv;
+mod csv_record;
 pub mod errors;
 pub mod float_order;
 pub mod head_walk;
 pub mod heap_ptr;
+pub mod http;
 pub mod identity;
 pub mod indexable;
+mod interface_witness;
 pub mod lazy_biased_mutex;
 pub mod limit;
+pub mod media;
+pub mod meter;
+pub mod monitor;
+pub mod network;
+pub mod op_output;
+mod owned_state;
+pub mod prompt;
 pub mod relink;
+pub mod resource;
 mod roots;
 pub mod runtime_compile;
+pub mod rust_data;
+pub mod stack_effect;
 pub mod trace;
 pub mod type_head;
 pub mod types;
 
 pub use bex_str::BexStr;
-pub use btel_types::{FunctionRegistration, TelemetryPolicyId};
+pub use btel_types::{DefinitionCell, FunctionRegistration, TelemetryPolicyId};
 pub use bytecode::{BinOp, Bytecode, CmpOp, Instruction, JumpTableData, UnaryOp};
+pub use csv_record::{CsvCell, CsvHeader, CsvRecord};
 pub use heap_ptr::HeapPtr;
 pub use indexable::{
     GlobalIndex, GlobalPool, ObjectIndex, ObjectPool, SharedGlobals, StackIndex, VmGlobals,
 };
-pub use limit::{Admission, AdmissionTicket, LimitInner, LimitSet};
-pub use roots::{PermitProof, RootHaver, WriteBarrier};
+pub use interface_witness::InterfaceWitness;
+pub use limit::{Admission, AdmissionTicket, LimitInner, LimitSet, PermitState};
+pub use media::{MediaContent, MediaValue};
+pub use meter::{AllocDebt, Meter};
+pub use monitor::{MonitorTable, Waiter};
+pub use op_output::OpOutput;
+pub use owned_state::OwnedState;
+pub use prompt::{PromptAst, PromptAstSimple, StructuredMessage};
+pub use roots::{
+    CollectRoots, ForwardRoots, Forwarding, NothingCollected, PermitProof, RootHaver, RootHaverExt,
+    RootVisitor, Survival, Weak,
+};
 pub use runtime_compile::{
-    RuntimeCompileDiagnostic, RuntimeCompileMode, RuntimeCompileRequest,
-    RuntimeDiagnosticAnnotation, RuntimeDiagnosticDetails, RuntimeDiagnosticHighlight,
-    RuntimeDiagnosticHighlightKind, RuntimeDiagnosticPhase, RuntimeDiagnosticRelatedInfo,
-    RuntimeDiagnosticSeverity, RuntimeMountEdge, RuntimeMountSurface, RuntimeMountedAlias,
-    RuntimeMountedClass, RuntimeMountedEnum, RuntimeMountedFieldAttrs, RuntimeMountedImpl,
-    RuntimeMountedVariantAttrs, RuntimePackageIdentity, RuntimePackageMount,
+    DeclFingerprints, MountHead, RecordBuild, RuntimeCompileDiagnostic, RuntimeCompileMode,
+    RuntimeCompileRequest, RuntimeDiagnosticAnnotation, RuntimeDiagnosticDetails,
+    RuntimeDiagnosticHighlight, RuntimeDiagnosticHighlightKind, RuntimeDiagnosticPhase,
+    RuntimeDiagnosticRelatedInfo, RuntimeDiagnosticSeverity, RuntimeMountEdge, RuntimeMountSurface,
+    RuntimeMountedAlias, RuntimeMountedClass, RuntimeMountedEnum, RuntimeMountedFieldAttrs,
+    RuntimeMountedImpl, RuntimeMountedVariantAttrs, RuntimePackageIdentity, RuntimePackageMount,
     RuntimeProjectedSurface, RuntimeReExport, RuntimeReExportKind, RuntimeSessionCompileRequest,
     RuntimeSourceSpan, SessionContract, SessionEvalLease, SessionVisibleKind, SessionVisibleSymbol,
 };
+pub use rust_data::{
+    BexRustData, MeteredGuard, MeteredMutex, RetainedBytes, RetainedFootprint, RustDataArc,
+    TestRustData,
+};
+pub use thin_vec::ThinVec;
 pub use type_head::TypeHead;
+
+/// The name prefix of the helper that evaluates one global's initializer.
+const INIT_LET_HELPER_PREFIX: &str = "$init_let.";
+
+/// The rendered name of the helper that evaluates the initializer of the
+/// global rendered `global` (`<package>.<namespace…>.<name>`):
+/// `$init_let.<global>`. The helper's identity
+/// ([`types::FunctionIdentity::InitLet`]) is the global it initializes, so
+/// this is the one spelling every rendering of it uses.
+#[must_use]
+pub fn init_let_helper_name(global: &str) -> String {
+    format!("{INIT_LET_HELPER_PREFIX}{global}")
+}
+
+/// The global a rendered function name initializes, when it is a
+/// [`init_let_helper_name`]: how the engine reads off a failing `$init`'s
+/// stack which global failed.
+#[must_use]
+pub fn init_let_helper_global(function_name: &str) -> Option<&str> {
+    function_name.strip_prefix(INIT_LET_HELPER_PREFIX)
+}
 
 // ── The runtime's instantiation of the `baml_type` family ────────────────────
 //
@@ -116,29 +169,20 @@ impl std::fmt::Display for UnnameableHead {
 
 impl std::error::Error for UnnameableHead {}
 
-/// Re-anchor a runtime type onto names, for handing it outside the VM.
-///
-/// A [`TypeHead`] is a live pointer into this process's heap, so it is
-/// meaningless in an FFI payload or a file. Every boundary out of the VM
-/// converts through here — see [`TypeHead::declared_name`].
-pub fn name_headed(ty: &RuntimeTy) -> Result<baml_type::RuntimeTy, UnnameableHead> {
-    ty.try_map_heads(&mut |head| head.declared_name().ok_or(UnnameableHead(head.tag())))
-}
-
-/// [`name_headed`] for a realized type.
-pub fn name_headed_realized(ty: &RealizedTy) -> Result<baml_type::RealizedTy, UnnameableHead> {
-    ty.try_map_heads(&mut |head| head.declared_name().ok_or(UnnameableHead(head.tag())))
-}
 pub use types::{
-    ArrayContainer, ArrayReadGuard, ArrayWriteGuard, AtomicValueSlot, BodyKey, BoundMethod, Class,
-    ClassField, ClassMethodDef, CleanupLatch, ConstValue, DeclPath, DeclarationName, Enum,
-    EnumVariant, FnPath, Function, FunctionKind, FunctionMeta, FunctionOrigin, Future, FutureRead,
-    GenericFunction, HostClosure, ImplBodyCoherence, ImplBodyKey, ImplCoherenceKey, Instance,
-    InterfaceBound, InterfaceKey, ItemPath, LockedContainer, LockedReadGuard, LockedWriteGuard,
-    MapContainer, MapReadGuard, MapWriteGuard, MediaValue, Object, ObjectType, PanicClass, Program,
-    PromptAst, RenderedCallable, SpelledBound, SysOp, SysOpErrorCategory, SysOpPanicCategory,
-    Uint8ArrayContainer, Uint8ArrayReadGuard, Uint8ArrayWriteGuard, Value, ValueKind, Variant,
-    format_float, sys_op_for_path, type_tags,
+    ArrayContainer, ArrayReadGuard, ArrayWriteGuard, AtomicValueSlot, BodyKey, BoundMethod,
+    CLEANED, Class, ClassBody, ClassField, ClassLayout, ClassMethodDef, ClassShape, CleanupLatch,
+    CleanupSubject, ConstValue, DeclPath, DeclarationName, EntryId, Enum, EnumVariant, FORWARDED,
+    Field, FieldRef, FloatBits, FnPath, Function, FunctionKind, FunctionMeta, FunctionOrigin,
+    Future, FutureRead, GenericFunction, HEADER_FLAGS, HostClosure, ImplBodyCoherence, ImplBodyKey,
+    ImplCoherenceKey, InstanceRef, InterfaceBound, InterfaceKey, ItemPath, LockedContainer,
+    LockedReadGuard, LockedWriteGuard, MapContainer, MapData, MapEntry, MapEpochChanged,
+    MapKeyUndecided, MapReadGuard, MapWriteGuard, OBJECT_BODY, OBJECT_CELL_WORDS, Object,
+    ObjectType, PanicClass, Program, RenderedCallable, RustInstance, RustPayload, SlotKind,
+    SlotKindMismatch, SpelledBound, SysOp, SysOpErrorCategory, SysOpPanicCategory, Tuple,
+    TupleShapeMismatch, Uint8ArrayContainer, Uint8ArrayReadGuard, Uint8ArrayWriteGuard,
+    Unbuildable, Value, ValueKind, Variant, WORD_BYTES, format_float, map_int_hash, map_key_hasher,
+    map_string_hash, payload, sys_op_for_path, type_tags,
 };
 
 /// Used to check if the VM should yield early.
@@ -225,20 +269,55 @@ impl EarlyYieldCheck {
             park_requested,
         }
     }
-    /// Decrement and return true if we should yield.
-    ///
-    /// Checks every ~32M calls (~1.5s at typical IPC). GC parks at async
-    /// yield points anyway; this is just a fallback for tight compute loops.
+    /// Decrement and return true if we should yield: [`Self::tick`] followed
+    /// by [`Self::poll`] when the interval has elapsed.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub fn should_early_yield(&mut self) -> bool {
+        self.tick() && self.poll()
+    }
+
+    /// Count one control-flow check; true when the interval has elapsed and
+    /// the caller should [`Self::poll`].
     ///
     /// Counts down to zero so the check is a single `subs` + `b.ne` on ARM —
     /// the subtraction sets the zero flag, no separate compare needed.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    pub fn should_early_yield(&mut self) -> bool {
+    pub fn tick(&mut self) -> bool {
         self.counter -= 1;
-        if self.counter != 0 {
-            return false;
+        self.counter == 0
+    }
+
+    /// [`Self::tick`] when that tick leaves the interval running; false, and
+    /// no tick, when it would elapse it. A dispatch fast path that cannot
+    /// poll uses this, then hands the elapsing tick to the full check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub fn tick_unless_due(&mut self) -> bool {
+        if self.counter > 1 {
+            self.counter -= 1;
+            true
+        } else {
+            false
         }
+    }
+
+    /// Make the next [`Self::tick`] elapse, so the flags are polled at the
+    /// next control-flow check instead of up to an interval later. For a VM
+    /// that has just learned it took spending over the GC budget.
+    #[inline]
+    pub fn poll_soon(&mut self) {
+        self.counter = 1;
+    }
+
+    /// Read the flags and restart the interval; true if the VM should yield.
+    ///
+    /// GC parks at async yield points anyway; this is the fallback for tight
+    /// compute loops.
+    #[cold]
+    #[inline(never)]
+    pub fn poll(&mut self) -> bool {
         self.counter = self.interval;
 
         if self

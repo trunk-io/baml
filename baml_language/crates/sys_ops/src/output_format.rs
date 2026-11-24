@@ -2,8 +2,12 @@ use std::fmt::Write as _;
 
 use ::sys_types::SapTy;
 use baml_base::Literal as LiteralValue;
+use baml_type::json_inhabit::{JsonInhabitance, JsonNaming, JsonStatus};
+use bex_vm_types::resource as render;
 use indexmap::IndexMap;
 use thiserror::Error;
+
+use crate::json_defs::{ContextDefs, Reader, llm_shape, llm_shape_hint};
 
 /// Error type for output format rendering.
 #[derive(Clone, Debug, Error)]
@@ -46,6 +50,8 @@ pub enum RenderError {
         first: String,
         second: String,
     },
+    #[error("The baml.FromLlmOutput shape of '{0}' holds '{0}' itself")]
+    ShapeHoldsItself(String),
 }
 
 /// A value within an enum definition for output format rendering.
@@ -77,6 +83,15 @@ pub struct ClassField {
     pub docstring: Option<String>,
 }
 
+/// A type a model writes as its `baml.FromLlmOutput` shape: what is rendered
+/// in its place, and the hint shown beside it.
+#[derive(Clone, Debug)]
+pub struct Shaped {
+    pub shape: SapTy,
+    /// The type's `@@description`.
+    pub hint: Option<String>,
+}
+
 /// A class definition for output format rendering.
 #[derive(Clone, Debug)]
 pub struct Class {
@@ -101,7 +116,191 @@ pub struct OutputFormatContent {
     pub recursive_classes: indexmap::IndexSet<String>,
     /// Recursive type aliases: alias name → target type.
     pub recursive_type_aliases: IndexMap<String, SapTy>,
+    /// Each class instantiation (its arguments flat) or enum a model writes
+    /// as its `baml.FromLlmOutput` shape. It renders as the shape, and its
+    /// fields or variants are not collected.
+    pub shapes: IndexMap<SapTy, Shaped>,
+    /// Which parts of the target a model's JSON answer can fill, under the
+    /// names a model is shown. A union member with no JSON form or no value
+    /// is left out of the schema. `None` when the definitions the target
+    /// reaches are not all known; nothing is left out then.
+    json: Option<JsonInhabitance<::sys_types::DefKey>>,
     build_error: Option<RenderError>,
+}
+
+/// `ai.OutputFormat`: the schema renders with the caller's options. Every
+/// option is a typed choice, so there is none to refuse.
+impl bex_vm_types::resource::OutputFormatResource for OutputFormatContent {
+    fn _render(
+        self: std::sync::Arc<Self>,
+        prefix: render::OutputFormatRenderPrefix,
+        or_splitter: render::OutputFormatRenderOrSplitter,
+        enum_value_prefix: render::OutputFormatRenderEnumValuePrefix,
+        hoisted_class_prefix: render::OutputFormatRenderHoistedClassPrefix,
+        always_hoist_enums: render::OutputFormatRenderAlwaysHoistEnums,
+        quote_class_fields: render::OutputFormatRenderQuoteClassFields,
+        hoist_classes: render::OutputFormatRenderHoistClasses,
+        map_style: render::OutputFormatRenderMapStyle,
+        render_null_as: render::OutputFormatRenderRenderNullAs,
+    ) -> bex_vm_types::OpOutput<String> {
+        use render::OutputFormatDefault::Auto;
+        let options = RenderOptions {
+            prefix: match prefix {
+                render::OutputFormatRenderPrefix::String(prefix) => RenderSetting::Always(prefix),
+                render::OutputFormatRenderPrefix::Null => RenderSetting::Never,
+                render::OutputFormatRenderPrefix::OutputFormatDefault(Auto) => RenderSetting::Auto,
+            },
+            or_splitter: match or_splitter {
+                render::OutputFormatRenderOrSplitter::String(splitter) => {
+                    RenderSetting::Always(splitter)
+                }
+                render::OutputFormatRenderOrSplitter::OutputFormatDefault(Auto) => {
+                    RenderSetting::Auto
+                }
+            },
+            enum_value_prefix: match enum_value_prefix {
+                render::OutputFormatRenderEnumValuePrefix::String(prefix) => {
+                    RenderSetting::Always(prefix)
+                }
+                render::OutputFormatRenderEnumValuePrefix::Null => RenderSetting::Never,
+                render::OutputFormatRenderEnumValuePrefix::OutputFormatDefault(Auto) => {
+                    RenderSetting::Auto
+                }
+            },
+            hoisted_class_prefix: match hoisted_class_prefix {
+                render::OutputFormatRenderHoistedClassPrefix::String(prefix) => {
+                    RenderSetting::Always(prefix)
+                }
+                render::OutputFormatRenderHoistedClassPrefix::Null => RenderSetting::Never,
+                render::OutputFormatRenderHoistedClassPrefix::OutputFormatDefault(Auto) => {
+                    RenderSetting::Auto
+                }
+            },
+            hoist_classes: match hoist_classes {
+                render::OutputFormatRenderHoistClasses::Bool(true) => HoistClasses::All,
+                render::OutputFormatRenderHoistClasses::Bool(false)
+                | render::OutputFormatRenderHoistClasses::Auto
+                | render::OutputFormatRenderHoistClasses::OutputFormatDefault(Auto) => {
+                    HoistClasses::Auto
+                }
+                render::OutputFormatRenderHoistClasses::StringList(classes) => {
+                    HoistClasses::Subset(classes)
+                }
+            },
+            always_hoist_enums: match always_hoist_enums {
+                render::OutputFormatRenderAlwaysHoistEnums::Bool(hoist) => {
+                    RenderSetting::Always(hoist)
+                }
+                render::OutputFormatRenderAlwaysHoistEnums::OutputFormatDefault(Auto) => {
+                    RenderSetting::Auto
+                }
+            },
+            map_style: match map_style {
+                render::OutputFormatRenderMapStyle::Angle => MapStyle::TypeParameters,
+                render::OutputFormatRenderMapStyle::Object => MapStyle::ObjectLiteral,
+                render::OutputFormatRenderMapStyle::OutputFormatDefault(Auto) => {
+                    MapStyle::default()
+                }
+            },
+            quote_class_fields: match quote_class_fields {
+                render::OutputFormatRenderQuoteClassFields::Bool(quote) => {
+                    RenderSetting::Always(quote)
+                }
+                render::OutputFormatRenderQuoteClassFields::OutputFormatDefault(Auto) => {
+                    RenderSetting::Auto
+                }
+            },
+            // `null` renders as the default spelling: there is no "never".
+            render_null_as: match render_null_as {
+                render::OutputFormatRenderRenderNullAs::String(spelling) => {
+                    RenderSetting::Always(spelling)
+                }
+                render::OutputFormatRenderRenderNullAs::Null
+                | render::OutputFormatRenderRenderNullAs::OutputFormatDefault(Auto) => {
+                    RenderSetting::Auto
+                }
+            },
+        };
+        match render_output_format_content(&self, &options) {
+            Ok(rendered) => bex_vm_types::OpOutput::ok(rendered),
+            Err(error) => {
+                bex_vm_types::OpOutput::err(bex_vm_types::errors::VmBamlError::RenderPrompt {
+                    message: error.to_string(),
+                })
+            }
+        }
+    }
+
+    fn measure(&self, meter: &mut bex_vm_types::Meter) {
+        meter.bytes(self.enums.capacity() * size_of::<(String, Enum)>());
+        meter.bytes(self.classes.capacity() * size_of::<(String, Class)>());
+        meter.bytes(self.enum_reference_order.capacity() * size_of::<String>());
+        meter.bytes(self.recursive_classes.capacity() * size_of::<String>());
+        meter.bytes(self.recursive_type_aliases.capacity() * size_of::<(String, SapTy)>());
+        meter.bytes(self.shapes.capacity() * size_of::<(SapTy, Shaped)>());
+        for shaped in self.shapes.values() {
+            if let Some(hint) = &shaped.hint {
+                meter.bytes(hint.capacity());
+            }
+        }
+        for (key, enm) in &self.enums {
+            meter.bytes(key.capacity() + enm.name.capacity());
+            measure_text(
+                meter,
+                enm.alias.as_ref(),
+                enm.description.as_ref(),
+                enm.docstring.as_ref(),
+            );
+            meter.bytes(enm.values.capacity() * size_of::<EnumValue>());
+            for value in &enm.values {
+                meter.bytes(value.name.capacity());
+                measure_text(
+                    meter,
+                    value.alias.as_ref(),
+                    value.description.as_ref(),
+                    value.docstring.as_ref(),
+                );
+            }
+        }
+        for (key, class) in &self.classes {
+            meter.bytes(key.capacity() + class.name.capacity());
+            measure_text(
+                meter,
+                class.alias.as_ref(),
+                class.description.as_ref(),
+                class.docstring.as_ref(),
+            );
+            meter.bytes(class.fields.capacity() * size_of::<ClassField>());
+            for field in &class.fields {
+                meter.bytes(field.name.capacity());
+                measure_text(
+                    meter,
+                    field.alias.as_ref(),
+                    field.description.as_ref(),
+                    field.docstring.as_ref(),
+                );
+            }
+        }
+        for name in self
+            .enum_reference_order
+            .iter()
+            .chain(self.recursive_classes.iter())
+            .chain(self.recursive_type_aliases.keys())
+        {
+            meter.bytes(name.capacity());
+        }
+    }
+}
+
+fn measure_text(
+    meter: &mut bex_vm_types::Meter,
+    alias: Option<&String>,
+    description: Option<&String>,
+    docstring: Option<&String>,
+) {
+    for text in [alias, description, docstring].into_iter().flatten() {
+        meter.bytes(text.capacity());
+    }
 }
 
 impl OutputFormatContent {
@@ -114,7 +313,118 @@ impl OutputFormatContent {
             target,
             recursive_classes: indexmap::IndexSet::new(),
             recursive_type_aliases: IndexMap::new(),
+            shapes: IndexMap::new(),
+            json: None,
             build_error: None,
+        }
+    }
+
+    /// What is rendered for `ty`, a class or enum type, if a model writes it
+    /// as its shape.
+    fn shaped(&self, ty: &SapTy) -> Option<&Shaped> {
+        if self.shapes.is_empty() {
+            return None;
+        }
+        match ty {
+            SapTy::Class(head, args) => self.shapes.get(&SapTy::Class(
+                head.clone(),
+                args.iter().cloned().map(SapTy::flatten_union).collect(),
+            )),
+            SapTy::Enum(_) => self.shapes.get(ty),
+            _ => None,
+        }
+    }
+
+    /// `ty` with each type at its top (itself, a union member, a list
+    /// element, a map value) that a model writes as its shape replaced by
+    /// the shape: the type the answer has at the top. A class keeps its name.
+    fn shown(&self, ty: &SapTy) -> SapTy {
+        if let Some(shaped) = self.shaped(ty) {
+            return self.shown(&shaped.shape);
+        }
+        match ty {
+            SapTy::Union(members) => {
+                SapTy::Union(members.iter().map(|member| self.shown(member)).collect())
+            }
+            SapTy::List(inner) => SapTy::List(Box::new(self.shown(inner))),
+            SapTy::Map { key, value } => SapTy::Map {
+                key: key.clone(),
+                value: Box::new(self.shown(value)),
+            },
+            _ => ty.clone(),
+        }
+    }
+
+    /// The hints of the types at the top of `ty` (see [`Self::shown`]) that a
+    /// model writes as their shapes, and of those inside their shapes, each
+    /// once, in the order met.
+    fn hints(&self, ty: &SapTy, hints: &mut Vec<String>, seen: &mut Vec<SapTy>) {
+        if let Some(shaped) = self.shaped(ty) {
+            if seen.contains(ty) {
+                return;
+            }
+            seen.push(ty.clone());
+            if let Some(hint) = &shaped.hint
+                && !hints.contains(hint)
+            {
+                hints.push(hint.clone());
+            }
+            self.hints(&shaped.shape, hints, seen);
+            return;
+        }
+        match ty {
+            SapTy::Union(members) => {
+                for member in members.iter().filter(|member| self.fillable(member)) {
+                    self.hints(member, hints, seen);
+                }
+            }
+            SapTy::List(inner) | SapTy::Map { value: inner, .. } => self.hints(inner, hints, seen),
+            _ => {}
+        }
+    }
+
+    /// Whether a model's answer can fill `ty`. Every type can when nothing
+    /// is known about the target.
+    fn fillable(&self, ty: &SapTy) -> bool {
+        self.json
+            .as_ref()
+            .is_none_or(|json| json.status(ty) == JsonStatus::Json)
+    }
+
+    /// Whether `ty` has no values at all, so a list or map of it is only the
+    /// empty one.
+    fn empty(&self, ty: &SapTy) -> bool {
+        self.json
+            .as_ref()
+            .is_some_and(|json| json.status(ty) == JsonStatus::Empty)
+    }
+
+    /// `ty` as a model is asked for it: each union at the top, or under a
+    /// list or map there, without the members a model's answer cannot fill.
+    /// A union left with one member is that member. A union left with none
+    /// stays whole: nothing in it can be asked for.
+    fn answerable(&self, ty: &SapTy) -> SapTy {
+        match ty {
+            SapTy::Union(members) => {
+                let mut flat = Vec::new();
+                baml_type::json_inhabit::flatten_union(members, &mut flat);
+                let mut kept: Vec<SapTy> = flat
+                    .into_iter()
+                    .filter(|member| self.fillable(member))
+                    .map(|member| self.answerable(member))
+                    .collect();
+                match kept.len() {
+                    0 => ty.clone(),
+                    1 => kept.remove(0),
+                    _ => SapTy::Union(kept.into()),
+                }
+            }
+            SapTy::List(inner) => SapTy::List(Box::new(self.answerable(inner))),
+            SapTy::Map { key, value } => SapTy::Map {
+                key: key.clone(),
+                value: Box::new(self.answerable(value)),
+            },
+            _ => ty.clone(),
         }
     }
 
@@ -155,21 +465,29 @@ impl OutputFormatContent {
             return Err(error.clone());
         }
 
+        let answerable = self.answerable(&self.target);
+        // A type a model writes as its shape is asked for as the shape, with
+        // its hint beside it.
+        let mut hints = Vec::new();
+        self.hints(&answerable, &mut hints, &mut Vec::new());
+        let target = &self.shown(&answerable);
+
         if matches!(options.prefix, RenderSetting::Auto) {
-            if let Some(instruction) = media_output_instruction(&self.target, options) {
+            if let Some(instruction) = media_output_instruction(target, options) {
                 return Ok(Some(instruction));
             }
         }
 
-        // For string target with no explicit prefix, return None
-        if matches!(self.target, SapTy::String) && matches!(options.prefix, RenderSetting::Auto) {
-            return Ok(None);
+        // For string target with no explicit prefix, return None: the hint
+        // alone, when a model writes the target as a string.
+        if matches!(target, SapTy::String) && matches!(options.prefix, RenderSetting::Auto) {
+            return Ok((!hints.is_empty()).then(|| hints.join("\n")));
         }
 
         // The `json` type alias is an opaque leaf from the LLM's perspective.
         // Regardless of rendering options, the only thing we ask the model to produce
         // is arbitrary JSON — no schema body, no prefix enumeration.
-        if let SapTy::TypeAlias(tn) = &self.target {
+        if let SapTy::TypeAlias(tn) = target {
             if tn.display_name().as_str() == ::baml_base::qualified_name::BAML_JSON_JSON {
                 return Ok(Some("Respond with valid JSON.".to_string()));
             }
@@ -180,20 +498,25 @@ impl OutputFormatContent {
         let hoisted_enums = self.compute_hoisted_enums(options);
         self.validate_hoisted_definition_names(&hoisted_classes, &hoisted_enums)?;
 
-        let prefix = self.get_prefix(options, &hoisted_classes);
+        let prefix = Self::get_prefix(target, options, &hoisted_classes);
 
         // For simple primitives (int, bigint, float, bool) with Auto prefix, the prefix IS the full message
         // But with explicit prefix, we need to append the type
         if matches!(
-            self.target,
+            target,
             SapTy::Int | SapTy::Bigint | SapTy::Float | SapTy::Bool
         ) && matches!(options.prefix, RenderSetting::Auto)
         {
-            return Ok(prefix);
+            return Ok(prefix.map(|prefix| {
+                std::iter::once(prefix)
+                    .chain(hints.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }));
         }
 
         // Check if the target is a hoisted enum
-        let target_is_hoisted_enum = if let SapTy::Enum(tn) = &self.target {
+        let target_is_hoisted_enum = if let SapTy::Enum(tn) = target {
             hoisted_enums.contains(tn.display_name().as_str())
         } else {
             false
@@ -207,7 +530,7 @@ impl OutputFormatContent {
                 let enum_str = self.render_enum(enm, options);
                 // If this is the target enum, prepend prefix
                 if target_is_hoisted_enum
-                    && enm_display_name(&self.target)
+                    && enm_display_name(target)
                         .as_ref()
                         .map(baml_type::Name::as_str)
                         == Some(name.as_str())
@@ -276,19 +599,19 @@ impl OutputFormatContent {
         }
 
         // Render the target type with hoisting awareness
-        let message = if let SapTy::Class(tn, _) | SapTy::Interface(tn, _, _) = &self.target {
+        let message = if let SapTy::Class(tn, _) | SapTy::Interface(tn, _, _) = target {
             let tn_display_name = tn.display_name();
-            let class_key = class_instantiation_key(&self.target);
+            let class_key = class_instantiation_key(target);
             if hoisted_classes.contains(&class_key) {
                 Some(rendered_hoisted_class_name(
-                    &self.target,
+                    target,
                     self.find_class(&class_key)
                         .or_else(|| self.find_class(tn_display_name.as_str())),
                 ))
             } else {
-                self.render_type_hoisted(&self.target, options, &hoisted_classes, &hoisted_enums)?
+                self.render_type_hoisted(target, options, &hoisted_classes, &hoisted_enums)?
             }
-        } else if let SapTy::Enum(tn) = &self.target {
+        } else if let SapTy::Enum(tn) = target {
             if target_is_hoisted_enum {
                 // Hoisted target enum: rendered in enum_definitions block
                 None
@@ -298,10 +621,10 @@ impl OutputFormatContent {
             } else {
                 Some(tn.display_name().to_string())
             }
-        } else if let SapTy::TypeAlias(fqn) = &self.target {
+        } else if let SapTy::TypeAlias(fqn) = target {
             Some(fqn.display_name().to_string())
         } else {
-            self.render_type_hoisted(&self.target, options, &hoisted_classes, &hoisted_enums)?
+            self.render_type_hoisted(target, options, &hoisted_classes, &hoisted_enums)?
         };
 
         // Assemble: enum defs + class defs + alias defs + prefix + target
@@ -328,6 +651,20 @@ impl OutputFormatContent {
             // Only add prefix if not already included in hoisted target enum
             if !target_is_hoisted_enum {
                 output.push_str(p);
+            }
+        }
+        if message.is_some() && !hints.is_empty() {
+            // The hints go on lines of their own, between the prefix and the
+            // target, as a definition's docs go above it.
+            let trimmed = output.trim_end_matches(' ').len();
+            output.truncate(trimmed);
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            for hint in &hints {
+                for line in hint.lines() {
+                    let _ = writeln!(output, "/// {line}");
+                }
             }
         }
         if let Some(t) = &message {
@@ -453,7 +790,7 @@ impl OutputFormatContent {
     }
 
     fn get_prefix(
-        &self,
+        target: &SapTy,
         options: &RenderOptions,
         hoisted: &indexmap::IndexSet<String>,
     ) -> Option<String> {
@@ -466,7 +803,7 @@ impl OutputFormatContent {
                     _ => "schema",
                 };
 
-                Self::auto_prefix(&self.target, type_word, hoisted)
+                Self::auto_prefix(target, type_word, hoisted)
             }
         }
     }
@@ -485,7 +822,9 @@ impl OutputFormatContent {
             SapTy::Bigint => Some("Answer as a bigint".to_string()),
             SapTy::Float => Some("Answer as a float".to_string()),
             SapTy::Bool => Some("Answer as a bool".to_string()),
-            SapTy::List(..) => Some("Answer with a JSON Array using this schema:\n".to_string()),
+            SapTy::List(..) | SapTy::Tuple(..) => {
+                Some("Answer with a JSON Array using this schema:\n".to_string())
+            }
             SapTy::Class(_, _) | SapTy::Interface(_, _, _) => {
                 let end = if class_is_hoisted(ty, hoisted) {
                     " "
@@ -541,6 +880,16 @@ impl OutputFormatContent {
         hoisted_classes: &indexmap::IndexSet<String>,
         hoisted_enums: &indexmap::IndexSet<String>,
     ) -> Result<Option<String>, RenderError> {
+        // A type a model writes as its shape renders as the shape, and a list
+        // or map of one renders as a list or map of the shape.
+        let shown;
+        let ty = if self.shapes.is_empty() {
+            ty
+        } else {
+            shown = self.shown(ty);
+            &shown
+        };
+
         // Intercept hoisted classes: return just the (aliased) name
         if let SapTy::Class(tn, _) | SapTy::Interface(tn, _, _) = ty {
             let tn_display_name = tn.display_name();
@@ -567,6 +916,8 @@ impl OutputFormatContent {
             SapTy::Bool => Ok(Some("bool".to_string())),
             SapTy::Null => Ok(Some(rendered_null_type(options).to_string())),
 
+            // A list of a type with no values is only the empty list.
+            SapTy::List(inner) if self.empty(inner) => Ok(Some("[]".to_string())),
             SapTy::List(inner) => {
                 let inner_str = self
                     .render_type_hoisted(inner, options, hoisted_classes, hoisted_enums)?
@@ -606,6 +957,7 @@ impl OutputFormatContent {
                                     | SapTy::Null
                             )
                         }),
+                        SapTy::Tuple(..) => inner_str.contains('\n'),
                         _ => true,
                     };
 
@@ -618,6 +970,29 @@ impl OutputFormatContent {
                 }
             }
 
+            SapTy::Tuple(items) => {
+                let rendered = items
+                    .iter()
+                    .map(|item| {
+                        Ok(self
+                            .render_type_hoisted(item, options, hoisted_classes, hoisted_enums)?
+                            .unwrap_or_else(|| "unknown".to_string()))
+                    })
+                    .collect::<Result<Vec<_>, RenderError>>()?;
+                if rendered.iter().any(|item| item.contains('\n')) {
+                    let body = rendered
+                        .iter()
+                        .map(|item| item.replace('\n', "\n  "))
+                        .collect::<Vec<_>>()
+                        .join(",\n  ");
+                    Ok(Some(format!("[\n  {body}\n]")))
+                } else {
+                    Ok(Some(format!("[{}]", rendered.join(", "))))
+                }
+            }
+
+            // A map of a type with no values is only the empty object.
+            SapTy::Map { value, .. } if self.empty(value) => Ok(Some("{}".to_string())),
             SapTy::Map { key, value, .. } => {
                 let key_str = self
                     .render_type_hoisted(key, options, hoisted_classes, hoisted_enums)?
@@ -635,19 +1010,21 @@ impl OutputFormatContent {
 
             SapTy::Union(variants) => {
                 // Null arms render last (`X or null`), matching the legacy
-                // renderer regardless of the union's internal arm order.
+                // renderer regardless of the union's internal arm order. A
+                // member a model's answer cannot fill is left out: `bytes:
+                // uint8array?` renders as `bytes: null`.
                 let (null_variants, value_variants): (Vec<&SapTy>, Vec<&SapTy>) = variants
                     .iter()
+                    .filter(|v| self.fillable(v))
                     .partition(|v| matches!(v, SapTy::Null));
-                let rendered: Vec<String> = value_variants
-                    .into_iter()
-                    .chain(null_variants)
-                    .filter_map(|v| {
-                        self.render_type_hoisted(v, options, hoisted_classes, hoisted_enums)
-                            .ok()
-                            .flatten()
-                    })
-                    .collect();
+                let mut rendered = Vec::new();
+                for v in value_variants.into_iter().chain(null_variants) {
+                    if let Some(text) =
+                        self.render_type_hoisted(v, options, hoisted_classes, hoisted_enums)?
+                    {
+                        rendered.push(text);
+                    }
+                }
                 Ok(Some(rendered.join(or_splitter)))
             }
 
@@ -720,18 +1097,16 @@ impl OutputFormatContent {
             }
 
             SapTy::Function { .. }
-            | SapTy::Void
             | SapTy::Unknown
             | SapTy::EnumVariant(..)
             | SapTy::Future(..)
             | SapTy::TypeVar(..)
             | SapTy::AssociatedTypeProjection { .. }
-            | SapTy::Never
             // Checked LLM execution and render-companion paths reject these at
             // `validate_output_type`. Throws-never low-level output-format
             // helpers may still degrade this error to an empty string, so keep
             // the formatter fallible rather than aborting the process.
-            | SapTy::RustType => Err(RenderError::UnsupportedType(ty.to_string()))
+            | SapTy::Never => Err(RenderError::UnsupportedType(ty.to_string()))
         }
     }
 
@@ -824,12 +1199,16 @@ impl OutputFormatContent {
             } else {
                 display_name.to_string()
             };
-            // Field description and source docs render in that order.
-            for docs in [&field.description, &field.docstring]
+            // Field description and source docs render in that order, then the
+            // hint of each type in the field a model writes as its shape.
+            let mut hints = Vec::new();
+            self.hints(&field.field_type, &mut hints, &mut Vec::new());
+            for docs in [field.description.as_deref(), field.docstring.as_deref()]
                 .into_iter()
                 .flatten()
-                .map(|docs| docs.trim())
+                .map(str::trim)
                 .filter(|docs| !docs.is_empty())
+                .chain(hints.iter().map(String::as_str))
             {
                 fields_str.push(format!("  /// {}", docs.replace('\n', "\n  /// ")));
             }
@@ -897,7 +1276,10 @@ fn class_is_hoisted(ty: &SapTy, hoisted: &indexmap::IndexSet<String>) -> bool {
 
 /// Key a class definition by its realized generic instantiation. A generic
 /// class's display name alone is insufficient: `Box<int>` and `Box<string>`
-/// have different field schemas even though both are named `Box`.
+/// have different field schemas even though both are named `Box`. Each
+/// argument's union is spelled flat ([`SapTy::flatten_union`]), so
+/// `Box<(int | null) | null>` and `Box<int | null>` share a definition, as they
+/// share a parse model.
 fn class_instantiation_key(ty: &SapTy) -> String {
     let (SapTy::Class(type_name, type_args) | SapTy::Interface(type_name, type_args, _)) = ty
     else {
@@ -911,7 +1293,7 @@ fn class_instantiation_key(ty: &SapTy) -> String {
             type_name.display_name(),
             type_args
                 .iter()
-                .map(ToString::to_string)
+                .map(|arg| arg.clone().flatten_union().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -1083,12 +1465,6 @@ impl Default for RenderOptions {
     }
 }
 
-impl RenderOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 // ============================================================================
 // Clean (owned-type) entry points for trait-based dispatch
 // ============================================================================
@@ -1124,22 +1500,38 @@ pub fn build_output_format_content(
 ) -> self::OutputFormatContent {
     use std::collections::HashSet;
 
-    let mut content = self::OutputFormatContent::new(ty.clone());
-    let mut visited = HashSet::new();
-    let mut ancestry = Vec::new();
+    let walk = |json: Option<JsonInhabitance<::sys_types::DefKey>>| {
+        let mut content = self::OutputFormatContent::new(ty.clone());
+        content.json = json;
+        let result = walk_ty(
+            ty,
+            &LaneOrigins::root(),
+            ctx,
+            &mut content,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+        );
+        (content, result)
+    };
 
-    if let Err(error) = walk_ty(
-        ty,
-        &LaneOrigins::root(),
-        ctx,
-        &mut content,
-        &mut visited,
-        &mut ancestry,
-    ) {
+    // The first walk finds what makes the target unrenderable, a generic
+    // class whose instantiations grow forever among it. Only a target that
+    // passes has finitely many definitions for the JSON analysis to visit.
+    let (mut content, result) = walk(None);
+    if let Err(error) = result {
         content.build_error = Some(error);
+        return content;
     }
-
-    content
+    let defs = ContextDefs {
+        ctx,
+        reader: Reader::Render,
+    };
+    match JsonInhabitance::of(ty, &defs, JsonNaming::Aliased) {
+        // The second walk collects only the definitions a model's answer can
+        // fill, so a dropped member's classes are not hoisted.
+        Ok(json) => walk(Some(json)).0,
+        Err(_) => content,
+    }
 }
 
 /// Look up a class definition by declaration identity.
@@ -1188,6 +1580,58 @@ struct ClassFrame {
     head: ::sys_types::DefKey,
     output_name: String,
     arity: usize,
+    /// A type a model writes as its shape, whose shape is being walked: it
+    /// has no fields of its own.
+    shaped: bool,
+}
+
+/// Record `ty`, a class instantiation or enum a model writes as its `shape`,
+/// and walk the shape instead of its fields or variants.
+///
+/// A shape can hold `ty` again. Through a class, that class is recursive, and
+/// renders by name. With no class in between, the shape would render forever.
+fn walk_shaped(
+    ty: &SapTy,
+    shape: &SapTy,
+    ctx: &::sys_types::SysOpContext,
+    content: &mut self::OutputFormatContent,
+    visited: &mut std::collections::HashSet<OutputVisitKey>,
+    ancestry: &mut Vec<ClassFrame>,
+) -> Result<(), RenderError> {
+    if let Some(start) = ancestry.iter().position(|frame| frame.ty == *ty) {
+        let mut through_class = false;
+        for frame in ancestry[start..].iter().filter(|frame| !frame.shaped) {
+            through_class = true;
+            content.recursive_classes.insert(frame.output_name.clone());
+        }
+        return if through_class {
+            Ok(())
+        } else {
+            Err(RenderError::ShapeHoldsItself(ty.to_string()))
+        };
+    }
+    let (SapTy::Class(head, _) | SapTy::Enum(head)) = ty else {
+        unreachable!("only a class or enum type is written as its shape: {ty}")
+    };
+    content.shapes.insert(
+        ty.clone(),
+        self::Shaped {
+            shape: shape.clone(),
+            hint: llm_shape_hint(ctx, ty),
+        },
+    );
+    ancestry.push(ClassFrame {
+        ty: ty.clone(),
+        head: head.clone(),
+        output_name: ty.to_string(),
+        arity: 0,
+        shaped: true,
+    });
+    // A shape is a type of its own, not relative to an enclosing class.
+    let origins = LaneOrigins::opaque(ancestry.len());
+    let walked = walk_ty(shape, &origins, ctx, content, visited, ancestry);
+    ancestry.pop();
+    walked
 }
 
 /// Recursive DFS walk of a type tree. `ancestry` tracks the realized classes
@@ -1204,20 +1648,33 @@ fn walk_ty(
 ) -> Result<(), RenderError> {
     match ty {
         SapTy::Class(type_name, type_args) => {
+            // One spelling per instantiation, as SAP keys it: with each
+            // argument's union flat, `Opt<T?>` at `int?` is `Opt<int?>` again,
+            // so a recursion through unions alone closes.
+            let type_args: &[SapTy] = &type_args
+                .iter()
+                .cloned()
+                .map(SapTy::flatten_union)
+                .collect::<Box<[_]>>();
+            let ty = &SapTy::Class(type_name.clone(), type_args.into());
+            if let Some(shape) = llm_shape(ctx, ty) {
+                return walk_shaped(ty, shape, ctx, content, visited, ancestry);
+            }
             let output_key = class_instantiation_key(ty);
             let output_name = type_name.display_name().to_string();
 
             // If this class is already on the ancestry stack, it's a recursive cycle.
             // Only mark classes from the cycle start, not unrelated ancestors.
             if let Some(start) = ancestry.iter().position(|frame| frame.ty == *ty) {
-                for frame in &ancestry[start..] {
+                for frame in ancestry[start..].iter().filter(|frame| !frame.shaped) {
                     content.recursive_classes.insert(frame.output_name.clone());
                 }
                 return Ok(());
             }
 
             for (index, ancestor) in ancestry.iter().enumerate() {
-                if ancestor.head == *type_name
+                if !ancestor.shaped
+                    && ancestor.head == *type_name
                     && origins.class_transform_expands(index, type_name, ancestor.arity)
                 {
                     return Err(RenderError::NonRegularRecursiveGeneric {
@@ -1228,13 +1685,16 @@ fn walk_ty(
                 }
             }
 
-            if let Some(class_def) = find_class_definition(ctx, type_name) {
+            // A class only the runtime builds has no JSON form: the analysis
+            // keeps it out of every format, so it has no definition to show.
+            if let Some(class_def) = find_class_definition(ctx, type_name)
+                && let sys_types::ClassDefinitionBody::Fields(class_fields) = &class_def.body
+            {
                 // `field_type` is the erased/runtime shape used by older
                 // callers. Emitted classes also carry a symbolic template so
                 // a generic class visited as `Outer<Choice>` can substitute
                 // `T` through nested positions such as `Inner<T>.values`.
-                let field_types: Vec<SapTy> = class_def
-                    .fields
+                let field_types: Vec<SapTy> = class_fields
                     .iter()
                     .filter(|f| !f.skip)
                     .map(|f| {
@@ -1244,8 +1704,7 @@ fn walk_ty(
                             .unwrap_or_else(|| f.field_type.clone())
                     })
                     .collect();
-                let fields: Vec<self::ClassField> = class_def
-                    .fields
+                let fields: Vec<self::ClassField> = class_fields
                     .iter()
                     .filter(|f| !f.skip)
                     .zip(field_types.iter())
@@ -1275,9 +1734,9 @@ fn walk_ty(
                     head: type_name.clone(),
                     output_name: output_key,
                     arity: type_args.len(),
+                    shaped: false,
                 });
-                for (field, field_type) in class_def
-                    .fields
+                for (field, field_type) in class_fields
                     .iter()
                     .filter(|field| !field.skip)
                     .zip(&field_types)
@@ -1290,6 +1749,11 @@ fn walk_ty(
                     walk_ty(field_type, &field_origins, ctx, content, visited, ancestry)?;
                 }
                 ancestry.pop();
+            }
+        }
+        SapTy::Enum(_) if llm_shape(ctx, ty).is_some() => {
+            if let Some(shape) = llm_shape(ctx, ty) {
+                return walk_shaped(ty, shape, ctx, content, visited, ancestry);
             }
         }
         SapTy::Enum(type_name) => {
@@ -1309,8 +1773,7 @@ fn walk_ty(
                 let output_name = type_name.display_name().to_string();
                 // Skipped variants are already filtered out in bex_engine extraction.
                 let values: Vec<self::EnumValue> = enum_def
-                    .variants
-                    .iter()
+                    .variants()
                     .map(|v| self::EnumValue {
                         name: v.name.clone(),
                         alias: v.alias.clone(),
@@ -1372,6 +1835,12 @@ fn walk_ty(
             let inner_origins = origins.list_element();
             walk_ty(inner, &inner_origins, ctx, content, visited, ancestry)?;
         }
+        SapTy::Tuple(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let item_origins = origins.tuple_element(index);
+                walk_ty(item, &item_origins, ctx, content, visited, ancestry)?;
+            }
+        }
         SapTy::Map { key, value, .. } => {
             let key_origins = origins.map_key();
             let value_origins = origins.map_value();
@@ -1380,6 +1849,9 @@ fn walk_ty(
         }
         SapTy::Union(members) => {
             for (index, member) in members.iter().enumerate() {
+                if !content.fillable(member) {
+                    continue;
+                }
                 let member_origins = origins.union_member(index);
                 walk_ty(member, &member_origins, ctx, content, visited, ancestry)?;
             }
@@ -1392,6 +1864,27 @@ fn walk_ty(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schema_measurement_includes_definition_and_variant_text() {
+        use bex_vm_types::{Meter, resource::OutputFormatResource};
+        let content =
+            super::OutputFormatContent::new(sys_types::SapTy::String).with_enum(super::Enum {
+                name: "Choice".into(),
+                alias: None,
+                description: Some("d".repeat(50_000)),
+                docstring: None,
+                values: vec![super::EnumValue {
+                    name: "v".repeat(10_000),
+                    alias: Some("a".repeat(20_000)),
+                    description: None,
+                    docstring: None,
+                }],
+            });
+        let mut meter = Meter::census();
+        content.measure(&mut meter);
+        assert!(meter.total() >= 80_000);
+    }
+
     use std::sync::Arc;
 
     use baml_type::{DeclarationName, Freshness, TypeName};
@@ -1433,11 +1926,13 @@ mod tests {
             docstring: None,
             description: None,
             alias: Some("SharedChoice".to_string()),
-            variants: vec![sys_types::EnumVariantDefinition {
+            declared_variants: vec![sys_types::EnumVariantDefinition {
                 name: "Value".to_string(),
                 docstring: None,
                 description: None,
                 alias: None,
+                skip: false,
+                json_rename: None,
             }],
         };
         let mut enums = indexmap::IndexMap::new();
@@ -1486,11 +1981,13 @@ mod tests {
                 docstring: None,
                 description: None,
                 alias: Some("SharedChoice".to_string()),
-                variants: vec![sys_types::EnumVariantDefinition {
+                declared_variants: vec![sys_types::EnumVariantDefinition {
                     name: "Value".to_string(),
                     docstring: None,
                     description: None,
                     alias: None,
+                    skip: false,
+                    json_rename: None,
                 }],
             },
         );
@@ -2243,11 +2740,13 @@ mod tests {
             docstring: None,
             description: None,
             alias: Some("SharedChoice".to_string()),
-            variants: vec![sys_types::EnumVariantDefinition {
+            declared_variants: vec![sys_types::EnumVariantDefinition {
                 name: "Value".to_string(),
                 docstring: None,
                 description: None,
                 alias: None,
+                skip: false,
+                json_rename: None,
             }],
         };
         let mut enums = indexmap::IndexMap::new();
@@ -2346,6 +2845,9 @@ mod tests {
             docstring: None,
             alias: None,
             skip: false,
+            json_rename: None,
+            json_flatten: false,
+            json_fallback: false,
             stream_done: false,
             must_exist: false,
         }
@@ -2360,7 +2862,7 @@ mod tests {
             description: None,
             docstring: None,
             alias: None,
-            fields,
+            body: sys_types::ClassDefinitionBody::Fields(fields),
             stream_done: false,
         }
     }
@@ -4193,6 +4695,52 @@ Answer in JSON using this type: A"#
         ));
     }
 
+    /// `class Opt<T> { inner: Opt<T?>? }` grows its argument only through a
+    /// union, and `(int?)?` is `int?`: it renders `Opt<int>` and `Opt<int | null>`
+    /// once each, rather than being rejected or walked forever.
+    #[test]
+    fn test_render_output_format_closes_union_only_recursive_generic() {
+        let opt = key(&baml_type::TypeName::local("Opt".into()));
+        let target = RuntimeTy::Class(opt.clone(), Box::new([ty_int()]));
+        let optional = |inner| baml_type::TyTemplate::union([inner, baml_type::TyTemplate::Null]);
+        let inner_template = optional(baml_type::TyTemplate::class(
+            opt.clone(),
+            Box::new([optional(baml_type::TyTemplate::TypeArgRef(0))]),
+        ));
+        let inner_realized = RuntimeTy::optional(RuntimeTy::Class(
+            opt.clone(),
+            Box::new([RuntimeTy::optional(ty_int())]),
+        ));
+
+        let mut classes = indexmap::IndexMap::new();
+        classes.insert(
+            opt.clone(),
+            ctx_class_definition(
+                &opt,
+                vec![ctx_class_field(
+                    "inner",
+                    inner_realized,
+                    Some(inner_template),
+                )],
+            ),
+        );
+
+        let mut ctx = sys_types::SysOpContext::empty();
+        ctx.class_definitions = Arc::new(classes);
+
+        let content = build_output_format_content(&target, &ctx);
+        assert_eq!(
+            content
+                .classes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["Opt<int>", "Opt<int | null>"]
+        );
+        render_output_format_content(&content, &RenderOptions::default())
+            .expect("a recursion through unions alone renders");
+    }
+
     #[test]
     fn test_build_output_format_rejects_mutually_expansive_recursive_generic() {
         let a = key(&baml_type::TypeName::local("A".into()));
@@ -4482,6 +5030,179 @@ Answer in JSON using this type: A"#
         assert!(
             !rendered.contains("/// \n  age"),
             "Field without description should have no comment"
+        );
+    }
+
+    fn ty_tuple(items: Vec<RuntimeTy>) -> RuntimeTy {
+        RuntimeTy::Tuple(items.into())
+    }
+
+    #[test]
+    fn test_render_tuple() {
+        let content = OutputFormatContent::new(ty_tuple(vec![ty_int(), ty_string()]));
+        let rendered = content.render(&RenderOptions::default()).unwrap();
+        assert_eq!(
+            rendered,
+            Some("Answer with a JSON Array using this schema:\n[int, string]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_render_one_tuple() {
+        let content = OutputFormatContent::new(ty_tuple(vec![ty_bool()]));
+        let rendered = content.render(&RenderOptions::default()).unwrap();
+        assert_eq!(
+            rendered,
+            Some("Answer with a JSON Array using this schema:\n[bool]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_render_list_of_tuples() {
+        let content = OutputFormatContent::new(ty_list(ty_tuple(vec![ty_int(), ty_string()])));
+        let rendered = content.render(&RenderOptions::default()).unwrap();
+        assert_eq!(
+            rendered,
+            Some("Answer with a JSON Array using this schema:\n[int, string][]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_render_optional_tuple_and_union_elements() {
+        let content = OutputFormatContent::new(ty_optional(ty_tuple(vec![
+            RuntimeTy::union([ty_int(), ty_string()]),
+            ty_bool(),
+        ])));
+        let rendered = content.render(&RenderOptions::default()).unwrap();
+        assert_eq!(
+            rendered,
+            Some(
+                "Answer with a JSON Array using this schema:\n[int or string, bool] or null"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_render_tuple_with_class_is_multiline() {
+        let content = OutputFormatContent::new(ty_tuple(vec![ty_class("Point"), ty_string()]))
+            .with_class(mk_class("Point", vec![("x", ty_int()), ("y", ty_int())]));
+        let rendered = content.render(&RenderOptions::default()).unwrap();
+        assert_eq!(
+            rendered,
+            Some(String::from(
+                r#"Answer with a JSON Array using this schema:
+[
+  {
+    x: int,
+    y: int,
+  },
+  string
+]"#
+            ))
+        );
+    }
+
+    #[test]
+    fn test_render_list_of_multiline_tuples() {
+        let content =
+            OutputFormatContent::new(ty_list(ty_tuple(vec![ty_class("Point"), ty_string()])))
+                .with_class(mk_class("Point", vec![("x", ty_int())]));
+        let rendered = content.render(&RenderOptions::default()).unwrap();
+        assert_eq!(
+            rendered,
+            Some(String::from(
+                r#"Answer with a JSON Array using this schema:
+[
+  [
+    {
+      x: int,
+    },
+    string
+  ]
+]"#
+            ))
+        );
+    }
+
+    #[test]
+    fn test_build_output_format_collects_definitions_inside_tuples() {
+        let point = key(&baml_type::TypeName::local("Point".into()));
+        let color = key(&baml_type::TypeName::local("Color".into()));
+        let target = ty_tuple(vec![
+            RuntimeTy::Class(point.clone(), Box::new([])),
+            RuntimeTy::Enum(color.clone()),
+        ]);
+
+        let mut classes = indexmap::IndexMap::new();
+        classes.insert(
+            point.clone(),
+            ctx_class_definition(&point, vec![ctx_class_field("x", ty_int(), None)]),
+        );
+        let mut enums = indexmap::IndexMap::new();
+        enums.insert(
+            color,
+            sys_types::EnumDefinition {
+                name: "Color".to_string(),
+                description: None,
+                docstring: None,
+                alias: None,
+                declared_variants: ["Red", "Blue"]
+                    .into_iter()
+                    .map(|name| sys_types::EnumVariantDefinition {
+                        name: name.to_string(),
+                        description: None,
+                        docstring: None,
+                        alias: None,
+                        skip: false,
+                        json_rename: None,
+                    })
+                    .collect(),
+            },
+        );
+        let mut ctx = sys_types::SysOpContext::empty();
+        ctx.class_definitions = Arc::new(classes);
+        ctx.enum_definitions = Arc::new(enums);
+
+        let content = build_output_format_content(&target, &ctx);
+        assert!(content.classes.contains_key("Point"));
+        assert!(content.enums.contains_key("Color"));
+        let rendered = content.render(&RenderOptions::default()).unwrap().unwrap();
+        assert_eq!(
+            rendered,
+            "Answer with a JSON Array using this schema:\n[\n  {\n    x: int,\n  },\n  'Red' or 'Blue'\n]"
+        );
+    }
+
+    #[test]
+    fn test_build_output_format_detects_recursion_through_tuple() {
+        let node = key(&baml_type::TypeName::local("Node".into()));
+        let node_ty = RuntimeTy::Class(node.clone(), Box::new([]));
+        let mut classes = indexmap::IndexMap::new();
+        classes.insert(
+            node.clone(),
+            ctx_class_definition(
+                &node,
+                vec![
+                    ctx_class_field("value", ty_int(), None),
+                    ctx_class_field(
+                        "next",
+                        ty_optional(ty_tuple(vec![ty_int(), node_ty.clone()])),
+                        None,
+                    ),
+                ],
+            ),
+        );
+        let mut ctx = sys_types::SysOpContext::empty();
+        ctx.class_definitions = Arc::new(classes);
+
+        let content = build_output_format_content(&node_ty, &ctx);
+        assert!(content.recursive_classes.contains("Node"));
+        let rendered = content.render(&RenderOptions::default()).unwrap().unwrap();
+        assert_eq!(
+            rendered,
+            "Node {\n  value: int,\n  next: [int, Node] or null,\n}\n\n\
+             Answer in JSON using this schema: Node"
         );
     }
 }

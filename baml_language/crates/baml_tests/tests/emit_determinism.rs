@@ -9,8 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use baml_base::{Dependency, Name};
 use baml_compiler2_emit::OptLevel;
-use baml_db::{ProjectDatabase, compile_program, discover_baml_files};
+use baml_db::{CheckedWorld, ProjectDatabase, SourceRootKind, SourceRootSpec, discover_baml_files};
 use baml_tests::engine::TestDbExt;
 use bex_vm_types::RuntimeCompileRequest;
 
@@ -34,7 +35,9 @@ fn compile_to_bytes(root: &Path, sources: &[(PathBuf, String)]) -> Vec<u8> {
     for (path, content) in sources {
         db.file(path, content);
     }
-    let program = compile_program(&db, package, OptLevel::Two)
+    let program = CheckedWorld::collect(&db, package)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
         .unwrap_or_else(|e| panic!("compilation of {} failed: {e:?}", root.display()));
     borsh::to_vec(&program).expect("borsh serialization failed")
 }
@@ -77,58 +80,9 @@ fn empty_project_emit_is_deterministic() {
     assert_deterministic(&root);
 }
 
-/// Realistic multi-file workload: the full `baml_src/` test project exercises
-/// classes, enums, interfaces, match tables, clients, and template strings.
-#[test]
-fn baml_src_project_emit_is_deterministic() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("baml_src");
-    assert_deterministic(&root);
-}
-
-/// The default (parallel) emit must produce byte-identical output to the
-/// serial reference pass: parallel emit compiles each body into a fragment
-/// pool with item-local import tables and the merge replays the exact serial
-/// layout (including cross-function `GenericFunction` interning, which the
-/// `ns_instantiation_expr` fixtures in this corpus exercise).
-/// The serial path is selected the same way a user would get it — a
-/// single-threaded rayon pool (`RAYON_NUM_THREADS=1`).
-#[test]
-fn parallel_emit_is_byte_identical_to_serial() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("baml_src");
-    let sources = read_project(&root);
-    // Both paths are pinned to explicit pools so the test exercises what it
-    // claims regardless of the ambient pool's size: 1 thread forces the serial
-    // reference emitter, >1 forces `emit_functions_parallel`. (On a single-core
-    // CI runner the default pool is 1 thread, which would otherwise make the
-    // "parallel" call silently take the serial path and test nothing.)
-    let run_with = |threads: usize| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("build rayon pool")
-            .install(|| compile_to_bytes(&root, &sources))
-    };
-    let serial = run_with(1);
-    let parallel = run_with(4);
-
-    if serial != parallel {
-        let diff_at = serial
-            .iter()
-            .zip(parallel.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or_else(|| serial.len().min(parallel.len()));
-        panic!(
-            "parallel emit diverges from serial for {}: lengths {} vs {}, first difference at \
-             byte {} (context: {:02x?} vs {:02x?})",
-            root.display(),
-            serial.len(),
-            parallel.len(),
-            diff_at,
-            &serial[diff_at.saturating_sub(8)..(diff_at + 8).min(serial.len())],
-            &parallel[diff_at.saturating_sub(8)..(diff_at + 8).min(parallel.len())],
-        );
-    }
-}
+// Whole-corpus determinism and serial/parallel comparisons live in
+// `package_emit_oracle`: it compares both linked programs and package artifacts
+// from each fresh database, without repeating the same corpus compilation.
 
 /// A package unit with every database-local debug `FileId` normalized: the
 /// two lanes number `main.baml` differently, and nothing else may differ.
@@ -187,5 +141,65 @@ function count(value: RuntimeValue) -> int throws never {
         borsh::to_vec(&normalize_package_unit(full.unit))
             .expect("serialize normalized full-compile unit"),
         "Package.compile artifact differs from the full-source compile",
+    );
+}
+
+/// A dependency's unit does not depend on where its root lives on disk: the
+/// same package emits byte-identical units from every checkout, so one cached
+/// entry serves all of them. Two things in a unit are derived from a file's
+/// path — `Function::source_file` and the name of the file's `$init_test_…`
+/// function — and both read the root-relative path.
+#[test]
+fn a_dependency_emits_identically_wherever_its_root_lives() {
+    fn dependency_unit(dependency_root: &str) -> baml_linker_types::CompilationUnit {
+        let mut db = ProjectDatabase::new();
+        let workspace = db.workspace(Path::new("/app"));
+        let dependency = db
+            .add_source_root(
+                SourceRootSpec::new(dependency_root, SourceRootKind::Dependency)
+                    .named(Name::new("lib")),
+            )
+            .expect("a dependency root at an absolute path");
+        db.add_dependency(
+            workspace,
+            Dependency {
+                name: Name::new("lib"),
+                root: dependency,
+            },
+        )
+        .expect("the workspace depends on the dependency");
+        db.add_or_update_file_in(
+            dependency,
+            &Path::new(dependency_root).join("lib.baml"),
+            "function shout(s: string) -> string throws never { s }\n\
+             test \"shout_is_identity\" { assert.equal(shout(\"a\"), \"a\") }\n",
+        );
+        baml_compiler2_emit::emit_package(&db, dependency, OptLevel::Two)
+            .expect("the dependency emits on its own")
+            .unit
+    }
+    let here = dependency_unit("/home/alice/deps/lib");
+    let there = dependency_unit("/opt/build/checkout/lib");
+    let mut names = Vec::new();
+    for object in &here.code {
+        if let bex_vm_types::Object::Function(function) = object {
+            assert_eq!(
+                function.source_file,
+                "lib.baml",
+                "`{}` carries its root's location",
+                function.name()
+            );
+            names.push(function.name());
+        }
+    }
+    // Unplaced, so unlabelled: the loader prefixes the package's label.
+    assert!(
+        names.iter().any(|name| name == "$init_test_lib"),
+        "the test initializer is named from the root-relative path, found {names:?}"
+    );
+    assert_eq!(
+        borsh::to_vec(&normalize_package_unit(here)).expect("serialize the first unit"),
+        borsh::to_vec(&normalize_package_unit(there)).expect("serialize the second unit"),
+        "the dependency's unit depends on where its root lives",
     );
 }

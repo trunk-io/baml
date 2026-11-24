@@ -1,8 +1,52 @@
-use std::cell::UnsafeCell;
+use std::{
+    cell::UnsafeCell,
+    collections::{
+        HashMap,
+        hash_map::{DefaultHasher, RandomState},
+    },
+    hash::{BuildHasher, BuildHasherDefault, Hasher},
+    sync::LazyLock,
+};
 
 use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 
-use crate::{Value, lazy_biased_mutex::LazyBiasedMutex};
+use crate::{AllocDebt, Value, lazy_biased_mutex::LazyBiasedMutex};
+
+#[cfg(debug_assertions)]
+mod lock_stats {
+    use std::sync::{
+        Once,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    };
+    static LOCKS: AtomicU64 = AtomicU64::new(0);
+    static LOCAL: AtomicU64 = AtomicU64::new(0);
+    static INIT: Once = Once::new();
+    pub(super) fn count(local: bool) {
+        INIT.call_once(|| {
+            #[cfg(not(target_family = "wasm"))]
+            if std::env::var("BAML_LOCK_STATS").as_deref() == Ok("1") {
+                unsafe extern "C" {
+                    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+                }
+                #[allow(clippy::print_stderr, reason = "opt-in process-exit lock statistics")]
+                extern "C" fn report() {
+                    eprintln!(
+                        "locks={} lock_free={}",
+                        LOCKS.load(Relaxed),
+                        LOCAL.load(Relaxed)
+                    );
+                }
+                // SAFETY: report only reads process-lifetime atomics.
+                unsafe {
+                    atexit(report);
+                }
+            }
+        });
+        (if local { &LOCAL } else { &LOCKS }).fetch_add(1, Relaxed);
+    }
+}
 
 /// Heap-mutable structural container. Pairs a dynamic backing store with a
 /// [`LazyBiasedMutex`] so cross-fiber `spawn`-racing mutations don't corrupt
@@ -45,6 +89,8 @@ impl<T> LockedContainer<T> {
     /// Acquire the container's mutex and return a read guard. The lock is
     /// released when the guard is dropped.
     pub fn lock(&self) -> LockedReadGuard<'_, T> {
+        #[cfg(debug_assertions)]
+        lock_stats::count(false);
         let access = self.mutex.enter();
         // SAFETY: we just acquired the lock; no other thread can hold a
         // `&mut` to `data` (the only place `&mut data` is materialized
@@ -53,7 +99,7 @@ impl<T> LockedContainer<T> {
         let data = unsafe { &*self.data.get() };
         LockedReadGuard {
             data,
-            _access: access,
+            _access: Some(access),
         }
     }
 
@@ -62,16 +108,84 @@ impl<T> LockedContainer<T> {
     /// `&mut self`) so callers can lock through a shared reference
     /// obtained from the shared heap (`get_object`, not the unsound
     /// `get_object_mut`).
-    pub fn lock_mut(&self) -> LockedWriteGuard<'_, T> {
+    ///
+    /// Whatever the backing store grows or shrinks by while the guard is
+    /// held is charged to `debt` when the guard is dropped. There is no way
+    /// to reach the store mutably without naming an account, so growth is
+    /// never unaccounted for.
+    pub fn lock_mut<'a>(&'a self, debt: &'a AllocDebt) -> LockedWriteGuard<'a, T>
+    where
+        T: Footprint,
+    {
+        #[cfg(debug_assertions)]
+        lock_stats::count(false);
         let access = self.mutex.enter();
         // SAFETY: the access guard provides mutual exclusion against
         // all other lock holders for this container. The returned
         // `&mut T` lifetime is bounded by the guard's lifetime.
         let data = unsafe { &mut *self.data.get() };
         LockedWriteGuard {
+            before: data.footprint(),
+            data,
+            _access: Some(access),
+            debt,
+        }
+    }
+
+    /// [`Self::lock`] for a container no other thread can reach, which
+    /// takes no lock. Debug builds take it anyway, without waiting, and
+    /// panic when another holder has it: the container was not thread-local.
+    ///
+    /// # Safety
+    ///
+    /// No other thread may be able to reach this container for the guard's
+    /// lifetime. Escape analysis proves this for the access sites it marks
+    /// thread-local (`baml_compiler2_mir::escape`).
+    pub unsafe fn lock_thread_local(&self) -> LockedReadGuard<'_, T> {
+        #[cfg(debug_assertions)]
+        lock_stats::count(true);
+        let access = self.assert_thread_local();
+        // SAFETY: no other thread can reach the container (caller contract),
+        // and this thread holds no other guard across this access.
+        let data = unsafe { &*self.data.get() };
+        LockedReadGuard {
             data,
             _access: access,
         }
+    }
+
+    /// [`Self::lock_mut`] for a container no other thread can reach; see
+    /// [`Self::lock_thread_local`]. Footprint changes are still charged.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::lock_thread_local`].
+    pub unsafe fn lock_mut_thread_local<'a>(
+        &'a self,
+        debt: &'a AllocDebt,
+    ) -> LockedWriteGuard<'a, T>
+    where
+        T: Footprint,
+    {
+        #[cfg(debug_assertions)]
+        lock_stats::count(true);
+        let access = self.assert_thread_local();
+        // SAFETY: as for `lock_thread_local`.
+        let data = unsafe { &mut *self.data.get() };
+        LockedWriteGuard {
+            before: data.footprint(),
+            data,
+            _access: access,
+            debt,
+        }
+    }
+
+    fn assert_thread_local(&self) -> Option<crate::lazy_biased_mutex::AccessGuard<'_>> {
+        cfg!(debug_assertions).then(|| {
+            self.mutex.try_enter().unwrap_or_else(|| {
+                panic!("a container accessed as thread-local is locked by another holder")
+            })
+        })
     }
 
     /// Get a reference to the underlying `Vec` WITHOUT acquiring the lock.
@@ -107,11 +221,37 @@ impl<T> LockedContainer<T> {
         // SAFETY: caller upholds the contract.
         unsafe { &mut *self.data.get() }
     }
+
+    /// The backing store, through exclusive access to the container. No lock
+    /// is taken: `&mut self` already proves nothing else can reach it.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
 }
 
 impl<T> From<T> for LockedContainer<T> {
     fn from(data: T) -> Self {
         Self::new(data)
+    }
+}
+
+/// The bytes a value's backing storage occupies in its own allocations.
+///
+/// This is capacity, not length: it is what the allocator handed out, so a
+/// container that grew and was then emptied still reports the buffer it holds.
+pub trait Footprint {
+    fn footprint(&self) -> usize;
+}
+
+impl<T> Footprint for Vec<T> {
+    fn footprint(&self) -> usize {
+        self.capacity().saturating_mul(size_of::<T>())
+    }
+}
+
+impl Footprint for Box<MapData> {
+    fn footprint(&self) -> usize {
+        size_of::<MapData>().saturating_add(self.backing_bytes())
     }
 }
 
@@ -155,7 +295,8 @@ impl<T: Clone> LockedContainer<Vec<T>> {
 /// [`LazyBiasedMutex`] for the duration of the guard's lifetime.
 pub struct LockedReadGuard<'a, T> {
     data: &'a T,
-    _access: crate::lazy_biased_mutex::AccessGuard<'a>,
+    /// `None` for a thread-local access, which takes no lock.
+    _access: Option<crate::lazy_biased_mutex::AccessGuard<'a>>,
 }
 
 impl<T> std::ops::Deref for LockedReadGuard<'_, T> {
@@ -166,20 +307,41 @@ impl<T> std::ops::Deref for LockedReadGuard<'_, T> {
 }
 
 /// Write guard for a [`LockedContainer`]. Holds the container's
-/// [`LazyBiasedMutex`] for the duration of the guard's lifetime.
-pub struct LockedWriteGuard<'a, T> {
+/// [`LazyBiasedMutex`] for the duration of the guard's lifetime, and charges
+/// the change in the store's footprint to an [`AllocDebt`] when dropped.
+pub struct LockedWriteGuard<'a, T: Footprint> {
     data: &'a mut T,
-    _access: crate::lazy_biased_mutex::AccessGuard<'a>,
+    /// `None` for a thread-local access, which takes no lock.
+    _access: Option<crate::lazy_biased_mutex::AccessGuard<'a>>,
+    debt: &'a AllocDebt,
+    /// The store's footprint when the guard was taken.
+    before: usize,
 }
 
-impl<T> std::ops::Deref for LockedWriteGuard<'_, T> {
+impl<T: Footprint> Drop for LockedWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        // Still under the container's lock, so the footprint cannot change
+        // between measuring it and charging it. Growth is positive; a store
+        // replaced by a smaller one, or shrunk, is a release.
+        let after = self.data.footprint();
+        let before = self.before;
+        let delta = if after >= before {
+            isize::try_from(after - before).unwrap_or(isize::MAX)
+        } else {
+            isize::try_from(before - after).map_or(isize::MIN, |shrink| -shrink)
+        };
+        self.debt.add(delta);
+    }
+}
+
+impl<T: Footprint> std::ops::Deref for LockedWriteGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.data
     }
 }
 
-impl<T> std::ops::DerefMut for LockedWriteGuard<'_, T> {
+impl<T: Footprint> std::ops::DerefMut for LockedWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         self.data
     }
@@ -206,8 +368,28 @@ impl Array {
     }
 
     /// Lock the backing store for writing (see [`LockedContainer::lock_mut`]).
-    pub fn lock_mut(&self) -> ArrayWriteGuard<'_> {
-        self.data.lock_mut()
+    pub fn lock_mut<'a>(&'a self, debt: &'a AllocDebt) -> ArrayWriteGuard<'a> {
+        self.data.lock_mut(debt)
+    }
+
+    /// Read a thread-local array's backing store without the lock.
+    ///
+    /// # Safety
+    ///
+    /// See [`LockedContainer::lock_thread_local`].
+    pub unsafe fn lock_thread_local(&self) -> ArrayReadGuard<'_> {
+        // SAFETY: forwarded contract.
+        unsafe { self.data.lock_thread_local() }
+    }
+
+    /// Write a thread-local array's backing store without the lock.
+    ///
+    /// # Safety
+    ///
+    /// See [`LockedContainer::lock_thread_local`].
+    pub unsafe fn lock_mut_thread_local<'a>(&'a self, debt: &'a AllocDebt) -> ArrayWriteGuard<'a> {
+        // SAFETY: forwarded contract.
+        unsafe { self.data.lock_mut_thread_local(debt) }
     }
 
     /// Locked convenience: number of elements.
@@ -255,6 +437,75 @@ impl Array {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Tuple {
+    pub element_tys: Box<[crate::RealizedTy]>,
+    slots: Box<[Value]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TupleShapeMismatch {
+    pub types: usize,
+    pub values: usize,
+}
+
+impl std::fmt::Display for TupleShapeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tuple of {} slot types given {} elements",
+            self.types, self.values
+        )
+    }
+}
+
+impl std::error::Error for TupleShapeMismatch {}
+
+impl Tuple {
+    pub fn new(
+        element_tys: impl Into<Box<[crate::RealizedTy]>>,
+        data: impl IntoIterator<Item = Value>,
+    ) -> Result<Self, TupleShapeMismatch> {
+        let element_tys = element_tys.into();
+        let slots: Box<[Value]> = data.into_iter().collect();
+        if element_tys.len() != slots.len() {
+            return Err(TupleShapeMismatch {
+                types: element_tys.len(),
+                values: slots.len(),
+            });
+        }
+        Ok(Self { element_tys, slots })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline]
+    pub fn try_load_slot(&self, idx: usize) -> Option<Value> {
+        self.slots.get(idx).copied()
+    }
+
+    #[inline]
+    pub fn load_slot(&self, idx: usize) -> Value {
+        self.slots[idx]
+    }
+
+    pub fn values_mut(&mut self) -> &mut [Value] {
+        &mut self.slots
+    }
+
+    pub fn slot_values(&self) -> impl ExactSizeIterator<Item = Value> + '_ {
+        self.slots.iter().copied()
+    }
+}
+
 /// Heap-mutable array container.
 ///
 /// Held inline by `Object::Array`. Size: 24 (Vec) + 1 (mutex) + padding = 32 bytes.
@@ -274,31 +525,352 @@ pub struct Map {
     pub value_ty: Box<crate::RealizedTy>,
     pub data: MapContainer,
 }
-/// Heap-mutable map container. Pairs a boxed `IndexMap<BexStr, Value>` with
+/// Heap-mutable map container. Pairs a boxed [`MapData`] with
 /// the generic [`LockedContainer`] lock/guard machinery.
 ///
 /// `IndexMap` is 72 bytes before the lock, so storing it inline would push
 /// `Object` past its size cap. Storing only the backing map behind `Box<_>`
 /// keeps the container itself small while avoiding an extra indirection around
 /// the lock.
-pub type MapContainer = LockedContainer<Box<IndexMap<bex_str::BexStr, Value>>>;
-pub type MapReadGuard<'a> = LockedReadGuard<'a, Box<IndexMap<bex_str::BexStr, Value>>>;
-pub type MapWriteGuard<'a> = LockedWriteGuard<'a, Box<IndexMap<bex_str::BexStr, Value>>>;
+pub type MapContainer = LockedContainer<Box<MapData>>;
+pub type MapReadGuard<'a> = LockedReadGuard<'a, Box<MapData>>;
+pub type MapWriteGuard<'a> = LockedWriteGuard<'a, Box<MapData>>;
 
-impl MapReadGuard<'_> {
-    /// Snapshot the underlying `IndexMap`.
-    pub fn to_index_map(&self) -> IndexMap<bex_str::BexStr, Value> {
-        self.data.as_ref().clone()
+pub type EntryId = u64;
+
+/// The keys of every map key hash: std's `RandomState`, whose SipHash-1-3
+/// keys come from the OS once per process. Keys can come from untrusted
+/// input (JSON), so where they land must be unpredictable.
+static MAP_KEY_STATE: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+
+/// A hasher for the hash a map files a key under: SipHash-1-3 keyed per
+/// process, so unlike `baml.hash.DefaultHasher` its results differ between
+/// processes. A key whose `Hash` runs BAML code writes into one of these.
+pub fn map_key_hasher() -> DefaultHasher {
+    MAP_KEY_STATE.build_hasher()
+}
+
+/// Hash a native string key as the VM's `Hash` driver frames it, so a map
+/// finds a string key whichever of the two hashed it.
+pub fn map_string_hash(key: &str) -> u64 {
+    framed_hash(5, key.as_bytes())
+}
+
+/// Hash a native int key as the VM's `Hash` driver frames it.
+pub fn map_int_hash(key: i64) -> u64 {
+    framed_hash(1, &key.to_le_bytes())
+}
+
+/// The map key hash of the `Hash` driver's framing of a primitive: `tag`,
+/// the byte length, the bytes. A short key is framed on the stack and
+/// written once, which hashes faster than three small writes.
+fn framed_hash(tag: u8, bytes: &[u8]) -> u64 {
+    const HEADER: usize = 1 + size_of::<u64>();
+    const INLINE: usize = 128;
+    let len = (bytes.len() as u64).to_le_bytes();
+    let mut hasher = map_key_hasher();
+    if HEADER + bytes.len() <= INLINE {
+        let mut stream = [0_u8; INLINE];
+        stream[0] = tag;
+        stream[1..HEADER].copy_from_slice(&len);
+        stream[HEADER..HEADER + bytes.len()].copy_from_slice(bytes);
+        hasher.write(&stream[..HEADER + bytes.len()]);
+    } else {
+        hasher.write(&[tag]);
+        hasher.write(&len);
+        hasher.write(bytes);
+    }
+    hasher.finish()
+}
+
+/// The bucket table's hasher. Its keys are map key hashes, already keyed
+/// and well mixed, so they index the table as they are.
+#[derive(Default)]
+struct KeyHashHasher(u64);
+
+impl Hasher for KeyHashHasher {
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("bucket-table keys are u64 hashes")
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MapEntry {
+    pub key: Value,
+    pub value: Value,
+    pub hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapEpochChanged;
+
+/// A bucket held a key that [`MapData::find_hashed`]'s comparison could not
+/// judge without running VM code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapKeyUndecided;
+
+/// The ids of the entries whose keys share one hash. Almost every bucket has
+/// one entry, so it is held inline.
+type MapBucket = SmallVec<[EntryId; 2]>;
+
+/// The id slots `bucket` allocated beyond its inline room.
+fn spilled_capacity(bucket: &MapBucket) -> usize {
+    if bucket.spilled() {
+        bucket.capacity()
+    } else {
+        0
+    }
+}
+
+/// Ordered entries indexed by hashes computed by the VM, never by Rust's
+/// pointer-based `Value` equality or hashing.
+#[derive(Debug, Default)]
+pub struct MapData {
+    /// Fx-hashed: entry ids are this map's own counter, never program input.
+    entries: IndexMap<EntryId, MapEntry, FxBuildHasher>,
+    /// Indexed by the keys' hashes, which are keyed per process
+    /// ([`map_key_hasher`]): keys may come from untrusted input.
+    buckets: HashMap<u64, MapBucket, BuildHasherDefault<KeyHashHasher>>,
+    /// Id slots allocated by buckets that outgrew their inline room, for the
+    /// footprint. A bucket keeps its allocation until it is dropped.
+    spilled_capacity: usize,
+    next_id: EntryId,
+    // Only membership changes invalidate an in-flight key comparison.
+    epoch: u64,
+}
+
+impl Clone for MapData {
+    fn clone(&self) -> Self {
+        let buckets = self.buckets.clone();
+        // A cloned bucket allocates only what its ids need: one that kept a
+        // spilled allocation after removals can come back inline, or with
+        // less room. Charge what the clone holds.
+        let spilled_capacity = buckets.values().map(spilled_capacity).sum();
+        Self {
+            entries: self.entries.clone(),
+            buckets,
+            spilled_capacity,
+            next_id: self.next_id,
+            epoch: self.epoch,
+        }
+    }
+}
+
+impl MapData {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct from distinct keys with their VM-computed hashes.
+    pub fn from_hashed_entries(entries: impl IntoIterator<Item = (u64, Value, Value)>) -> Self {
+        let mut data = Self::new();
+        for (hash, key, value) in entries {
+            data.insert_hashed(hash, key, value);
+        }
+        data
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Everything this map allocates: the entry storage, its index, and the
+    /// per-hash buckets. Estimated from capacities without walking entries.
+    fn backing_bytes(&self) -> usize {
+        // An entry stores its id, the entry and its hash, plus an index slot.
+        let entry = size_of::<EntryId>() + size_of::<MapEntry>() + 2 * size_of::<usize>();
+        // A bucket-table slot stores the hash, the bucket and a control byte.
+        let bucket_slot = size_of::<u64>() + size_of::<MapBucket>() + 1;
+        // A bucket holds its first ids inline; only a hash collision past
+        // them allocates, charged by the allocation it keeps.
+        self.entries
+            .capacity()
+            .saturating_mul(entry)
+            .saturating_add(self.buckets.capacity().saturating_mul(bucket_slot))
+            .saturating_add(self.spilled_capacity.saturating_mul(size_of::<EntryId>()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        if !self.entries.is_empty() {
+            self.advance_epoch();
+            self.entries.clear();
+            self.buckets.clear();
+            self.spilled_capacity = 0;
+        }
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Value, &Value)> {
+        self.entries
+            .values()
+            .map(|entry| (&entry.key, &entry.value))
+    }
+
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (&EntryId, &MapEntry)> {
+        self.entries.iter()
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &Value> {
+        self.entries.values().map(|entry| &entry.key)
+    }
+
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &Value> {
+        self.entries.values().map(|entry| &entry.value)
+    }
+
+    /// Only for GC forwarding: changing a key's identity or contents invalidates
+    /// its cached hash. GC relocation preserves the VM hash.
+    pub fn trace_values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.entries
+            .values_mut()
+            .flat_map(|entry| [&mut entry.key, &mut entry.value])
+    }
+
+    /// Capture candidates for equality checks performed after releasing the lock.
+    /// The caller must root copied keys and values if a check can trigger GC.
+    pub fn snapshot_bucket(&self, hash: u64) -> (u64, Vec<(EntryId, MapEntry)>) {
+        (
+            self.epoch,
+            self.buckets
+                .get(&hash)
+                .into_iter()
+                .flatten()
+                .map(|id| (*id, self.entries[id]))
+                .collect(),
+        )
+    }
+
+    /// The entry with key hash `hash` whose key `matches` accepts, for keys
+    /// whose equality the caller can decide without running VM code, such as
+    /// strings and ints. `matches` returns `None` for a candidate it cannot
+    /// judge (a key with its own `Equals`); the search then stops with
+    /// [`MapKeyUndecided`] and the caller takes the general, snapshot-based
+    /// search. Under the caller's lock the result is current, so the ids it
+    /// returns are valid for this map's current epoch.
+    pub fn find_hashed(
+        &self,
+        hash: u64,
+        mut matches: impl FnMut(&Value) -> Option<bool>,
+    ) -> Result<Option<EntryId>, MapKeyUndecided> {
+        let Some(bucket) = self.buckets.get(&hash) else {
+            return Ok(None);
+        };
+        for id in bucket {
+            match matches(&self.entries[id].key) {
+                Some(true) => return Ok(Some(*id)),
+                Some(false) => {}
+                None => return Err(MapKeyUndecided),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The value of the entry with key hash `hash` whose key `matches`
+    /// accepts. For keys whose equality the caller can decide without
+    /// running VM code, such as strings.
+    pub fn get_hashed(&self, hash: u64, mut matches: impl FnMut(&Value) -> bool) -> Option<Value> {
+        self.buckets
+            .get(&hash)?
+            .iter()
+            .map(|id| &self.entries[id])
+            .find(|entry| matches(&entry.key))
+            .map(|entry| entry.value)
+    }
+
+    fn advance_epoch(&mut self) {
+        self.epoch = self.epoch.checked_add(1).expect("map epoch exhausted");
+    }
+
+    /// Insert a key already known to be distinct by the caller.
+    pub fn insert_hashed(&mut self, hash: u64, key: Value, value: Value) -> EntryId {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("map entry IDs exhausted");
+        self.advance_epoch();
+        self.entries.insert(id, MapEntry { key, value, hash });
+        let bucket = self.buckets.entry(hash).or_default();
+        let before = spilled_capacity(bucket);
+        bucket.push(id);
+        self.spilled_capacity = self.spilled_capacity - before + spilled_capacity(bucket);
+        id
+    }
+
+    /// Validate a search against this map's snapshot epoch. The ID must come
+    /// from that snapshot; `None` denotes a completed search with no match.
+    pub fn get_if_epoch(
+        &self,
+        epoch: u64,
+        id: Option<EntryId>,
+    ) -> Result<Option<Value>, MapEpochChanged> {
+        if epoch != self.epoch {
+            return Err(MapEpochChanged);
+        }
+        Ok(id.map(|id| self.entries[&id].value))
+    }
+
+    pub fn set_if_epoch(
+        &mut self,
+        epoch: u64,
+        id: Option<EntryId>,
+        hash: u64,
+        key: Value,
+        value: Value,
+    ) -> Result<Option<Value>, MapEpochChanged> {
+        if epoch != self.epoch {
+            return Err(MapEpochChanged);
+        }
+        if let Some(id) = id {
+            Ok(Some(std::mem::replace(&mut self.entries[&id].value, value)))
+        } else {
+            self.insert_hashed(hash, key, value);
+            Ok(None)
+        }
+    }
+
+    pub fn remove_if_epoch(
+        &mut self,
+        epoch: u64,
+        id: Option<EntryId>,
+    ) -> Result<Option<Value>, MapEpochChanged> {
+        if epoch != self.epoch {
+            return Err(MapEpochChanged);
+        }
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        self.advance_epoch();
+        let entry = self.entries.shift_remove(&id).expect("validated map entry");
+        let bucket = self.buckets.get_mut(&entry.hash).expect("map bucket");
+        // Removal keeps a spilled bucket's allocation until the bucket goes.
+        bucket.retain(|candidate| *candidate != id);
+        if bucket.is_empty() {
+            self.spilled_capacity -= spilled_capacity(bucket);
+            self.buckets.remove(&entry.hash);
+        }
+        Ok(Some(entry.value))
     }
 }
 
 impl Map {
     /// Build a map of `key_ty`/`value_ty` from its backing entries.
-    pub fn new(
-        key_ty: crate::RealizedTy,
-        value_ty: crate::RealizedTy,
-        data: IndexMap<bex_str::BexStr, Value>,
-    ) -> Self {
+    pub fn new(key_ty: crate::RealizedTy, value_ty: crate::RealizedTy, data: MapData) -> Self {
         Self {
             key_ty: Box::new(key_ty),
             value_ty: Box::new(value_ty),
@@ -312,8 +884,28 @@ impl Map {
     }
 
     /// Lock the backing store for writing (see [`LockedContainer::lock_mut`]).
-    pub fn lock_mut(&self) -> MapWriteGuard<'_> {
-        self.data.lock_mut()
+    pub fn lock_mut<'a>(&'a self, debt: &'a AllocDebt) -> MapWriteGuard<'a> {
+        self.data.lock_mut(debt)
+    }
+
+    /// Read a thread-local map's backing store without the lock.
+    ///
+    /// # Safety
+    ///
+    /// See [`LockedContainer::lock_thread_local`].
+    pub unsafe fn lock_thread_local(&self) -> MapReadGuard<'_> {
+        // SAFETY: forwarded contract.
+        unsafe { self.data.lock_thread_local() }
+    }
+
+    /// Write a thread-local map's backing store without the lock.
+    ///
+    /// # Safety
+    ///
+    /// See [`LockedContainer::lock_thread_local`].
+    pub unsafe fn lock_mut_thread_local<'a>(&'a self, debt: &'a AllocDebt) -> MapWriteGuard<'a> {
+        // SAFETY: forwarded contract.
+        unsafe { self.data.lock_mut_thread_local(debt) }
     }
 
     /// Unlocked read of the backing store. See [`LockedContainer::data_unchecked`].
@@ -322,7 +914,7 @@ impl Map {
     ///
     /// The caller must uphold the no-concurrent-writer contract documented on
     /// [`LockedContainer::data_unchecked`].
-    pub unsafe fn data_unchecked(&self) -> &IndexMap<bex_str::BexStr, Value> {
+    pub unsafe fn data_unchecked(&self) -> &MapData {
         // SAFETY: forwarded to the caller's obligation.
         unsafe { self.data.data_unchecked() }
     }
@@ -335,7 +927,7 @@ impl Map {
     /// The caller must uphold the contract documented on
     /// [`LockedContainer::data_unchecked_mut`].
     #[expect(clippy::mut_from_ref)]
-    pub unsafe fn data_unchecked_mut(&self) -> &mut IndexMap<bex_str::BexStr, Value> {
+    pub unsafe fn data_unchecked_mut(&self) -> &mut MapData {
         // SAFETY: forwarded to the caller's obligation.
         unsafe { self.data.data_unchecked_mut() }
     }
@@ -350,13 +942,210 @@ impl Map {
         self.data.lock().data.is_empty()
     }
 
-    /// Locked convenience: copy the value at `key`, or `None` if absent.
-    pub fn get(&self, key: &str) -> Option<Value> {
-        self.data.lock().data.get(key).copied()
+    pub fn snapshot_bucket(&self, hash: u64) -> (u64, Vec<(EntryId, MapEntry)>) {
+        self.lock().snapshot_bucket(hash)
     }
 
-    /// Locked convenience: snapshot the underlying `IndexMap`.
-    pub fn to_index_map(&self) -> IndexMap<bex_str::BexStr, Value> {
-        self.data.lock().to_index_map()
+    pub fn snapshot_entries(&self) -> Vec<(Value, Value)> {
+        self.lock()
+            .iter()
+            .map(|(key, value)| (*key, *value))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// A write guard charges what the store's footprint changed by while it
+    /// was held: growth is charged, a shrink is credited, and an in-place
+    /// write charges nothing.
+    #[test]
+    fn write_guards_charge_the_change_in_footprint() {
+        let debt = AllocDebt::new();
+        let array: ArrayContainer = LockedContainer::new(vec![Value::int(1); 4]);
+
+        array.lock_mut(&debt)[..].fill(Value::int(0));
+        assert_eq!(debt.balance(), 0, "an in-place write costs nothing");
+
+        {
+            let mut guard = array.lock_mut(&debt);
+            guard.extend((0..100).map(Value::int));
+        }
+        let grown = debt.balance();
+        assert!(
+            grown >= 96 * size_of::<Value>().cast_signed(),
+            "{grown} bytes charged for growing from 4 to at least 104 elements"
+        );
+
+        array.lock_mut(&debt).clear();
+        assert_eq!(debt.balance(), grown, "clearing keeps the capacity");
+
+        // The initial four elements were never charged through a guard, so
+        // replacing the store credits them too: a guard reports the change
+        // it saw, not the history of the account.
+        *array.lock_mut(&debt) = Vec::new();
+        assert_eq!(
+            debt.balance(),
+            -(4 * size_of::<Value>().cast_signed()),
+            "replacing the store credits its whole capacity"
+        );
+    }
+
+    /// Thread-local guards take no lock, still charge footprint, and in debug
+    /// builds catch a container someone else holds: the classifier was wrong.
+    #[test]
+    fn thread_local_guards_skip_the_lock_and_still_charge() {
+        let debt = AllocDebt::new();
+        let array: ArrayContainer = LockedContainer::new(vec![Value::int(1)]);
+        // SAFETY: nothing else can reach `array`.
+        unsafe { array.lock_mut_thread_local(&debt) }.extend((0..100).map(Value::int));
+        assert!(
+            debt.balance() > 0,
+            "growth through a thread-local guard is charged"
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { array.lock_thread_local() }.len(), 101);
+
+        if cfg!(debug_assertions) {
+            let held = array.lock();
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: deliberately violated; the debug check must panic
+                // before the store is read.
+                let _ = unsafe { array.lock_thread_local() }.len();
+            }));
+            drop(held);
+            assert!(
+                caught.is_err(),
+                "a held lock must fail a thread-local access"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    #[test]
+    fn collisions_updates_and_reinsertion_preserve_order() {
+        let mut map = MapData::new();
+        let first = map.insert_hashed(7, Value::int(1), Value::int(10));
+        let second = map.insert_hashed(7, Value::int(2), Value::int(20));
+        let (epoch, candidates) = map.snapshot_bucket(7);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            map.set_if_epoch(epoch, Some(first), 7, Value::int(99), Value::int(11)),
+            Ok(Some(Value::int(10)))
+        );
+        assert_eq!(
+            map.keys().copied().collect::<Vec<_>>(),
+            vec![Value::int(1), Value::int(2)]
+        );
+        assert_eq!(
+            map.remove_if_epoch(map.epoch(), Some(first)),
+            Ok(Some(Value::int(11)))
+        );
+        let third = map.insert_hashed(7, Value::int(1), Value::int(12));
+        assert!(third > second);
+        assert_eq!(
+            map.keys().copied().collect::<Vec<_>>(),
+            vec![Value::int(2), Value::int(1)]
+        );
+        assert_eq!(
+            map.snapshot_bucket(7)
+                .1
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![second, third]
+        );
+    }
+
+    #[test]
+    fn membership_changes_invalidate_searches_but_value_updates_do_not() {
+        let mut map = MapData::new();
+        let (epoch, _) = map.snapshot_bucket(0);
+        let id = map.insert_hashed(0, Value::TRUE, Value::FALSE);
+        assert_eq!(map.get_if_epoch(epoch, None), Err(MapEpochChanged));
+        assert_eq!(
+            map.set_if_epoch(epoch, None, 0, Value::NULL, Value::NULL),
+            Err(MapEpochChanged)
+        );
+        assert_eq!(map.remove_if_epoch(epoch, Some(id)), Err(MapEpochChanged));
+        assert_eq!(map.len(), 1);
+        let epoch = map.epoch();
+        map.set_if_epoch(epoch, Some(id), 0, Value::TRUE, Value::NULL)
+            .unwrap();
+        assert_eq!(map.get_if_epoch(epoch, Some(id)), Ok(Some(Value::NULL)));
+    }
+
+    /// A bucket that outgrew its inline room keeps its allocation while it
+    /// has entries, and the footprint charges it until the bucket goes.
+    #[test]
+    fn spilled_buckets_are_charged_until_they_are_dropped() {
+        let mut map = MapData::new();
+        let ids: Vec<_> = (0..3)
+            .map(|i| map.insert_hashed(7, Value::int(i), Value::NULL))
+            .collect();
+        let spilled = map.backing_bytes();
+        assert!(map.spilled_capacity >= 3, "three colliding ids spill");
+        for id in &ids[..2] {
+            map.remove_if_epoch(map.epoch(), Some(*id)).unwrap();
+        }
+        assert_eq!(
+            map.backing_bytes(),
+            spilled,
+            "removal keeps the bucket's allocation"
+        );
+        map.remove_if_epoch(map.epoch(), Some(ids[2])).unwrap();
+        assert_eq!(map.spilled_capacity, 0, "the empty bucket is dropped");
+        assert!(map.backing_bytes() < spilled);
+    }
+
+    /// A clone charges the spilled room its own buckets hold, not the
+    /// original's: a bucket that shrank by removal clones back inline.
+    #[test]
+    fn a_clone_charges_the_spilled_room_it_holds() {
+        let mut map = MapData::new();
+        let ids: Vec<_> = (0..3)
+            .map(|i| map.insert_hashed(7, Value::int(i), Value::NULL))
+            .collect();
+        for id in &ids[..2] {
+            map.remove_if_epoch(map.epoch(), Some(*id)).unwrap();
+        }
+        assert!(map.spilled_capacity > 0, "removal keeps the allocation");
+
+        let mut clone = map.clone();
+        assert_eq!(clone.spilled_capacity, 0, "one id clones back inline");
+        clone.remove_if_epoch(clone.epoch(), Some(ids[2])).unwrap();
+        assert_eq!(
+            clone.spilled_capacity, 0,
+            "an emptied clone charges no spilled room"
+        );
+
+        let mut spilled = MapData::new();
+        for i in 0..5 {
+            spilled.insert_hashed(7, Value::int(i), Value::NULL);
+        }
+        let clone = spilled.clone();
+        assert_eq!(
+            clone.spilled_capacity,
+            clone.buckets.values().map(spilled_capacity).sum::<usize>(),
+            "a spilled bucket's clone is charged for its own allocation"
+        );
+    }
+
+    #[test]
+    fn forwarding_visits_keys_and_values_without_changing_hashes() {
+        let mut map = MapData::from_hashed_entries([(123, Value::int(1), Value::int(2))]);
+        for value in map.trace_values_mut() {
+            *value = Value::int(value.as_int().unwrap() + 10);
+        }
+        let (_, entries) = map.snapshot_bucket(123);
+        assert_eq!(entries[0].1.key, Value::int(11));
+        assert_eq!(entries[0].1.value, Value::int(12));
+        assert_eq!(entries[0].1.hash, 123);
     }
 }

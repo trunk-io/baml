@@ -336,14 +336,16 @@ fn ranked_candidates(
         db.unwind_if_revision_cancelled();
         let prefix = viewpoint
             .package_prefix(package)
-            .unwrap_or(baml_type::ADDRESSABLE_USER_PACKAGE);
+            .unwrap_or(std::borrow::Cow::Borrowed(
+                baml_type::ADDRESSABLE_USER_PACKAGE,
+            ));
         let items = package_items(db, package);
         for (ns_path, ns_items) in &items.namespaces {
             for (name, def) in ns_items.types.iter().chain(ns_items.values.iter()) {
                 if !is_searchable(db, name, *def) {
                     continue;
                 }
-                let path = dotted(prefix, ns_path, name.as_str());
+                let path = dotted(&prefix, ns_path, name.as_str());
                 collect_definition_candidates(db, *def, name, &path, &mut out);
             }
         }
@@ -356,13 +358,9 @@ fn ranked_candidates(
             db.unwind_if_revision_cancelled();
             for &block in item_data::file_impls(db, file) {
                 let data = item_data::impl_block_data(db, block);
-                let for_display = match &data.subject {
-                    item_data::ImplSubjectData::InClass { class, .. } => {
-                        item_data::class_data(db, *class).name.as_str().to_string()
-                    }
-                    item_data::ImplSubjectData::Free { for_target, .. } => {
-                        data.type_refs.display(*for_target).to_string()
-                    }
+                let for_display = match item_data::impl_enclosing_class(db, block) {
+                    Some(class) => item_data::class_data(db, class).name.as_str().to_string(),
+                    None => data.type_refs.display(data.for_target).to_string(),
                 };
                 for &method in &data.methods {
                     let func = item_data::function_data(db, method);

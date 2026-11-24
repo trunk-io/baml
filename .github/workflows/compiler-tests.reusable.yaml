@@ -15,8 +15,6 @@ on:
         required: false
       BAML_SCCACHE_R2_SECRET_ACCESS_KEY:
         required: false
-      TRUNK_ORG_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -38,8 +36,14 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  snapshot-tests:
-    name: "Compiler and documentation tests"
+  # The native backend's correctness oracle: packs the rust_diff probes with
+  # compiled bodies (a cargo build of a generated crate against this
+  # workspace), then runs each as bytecode, compiled and GC-stressed and
+  # requires identical output. Its own job so that build runs in parallel
+  # with the snapshot suites instead of after them.
+  rust-differential:
+    name: "Rust backend differential test"
+    if: inputs.run-compiler-tests && github.event_name != 'merge_group'
     runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -54,10 +58,7 @@ jobs:
       - name: "Install tools (mise)"
         uses: ./.github/actions/setup-mise
         with:
-          install_args: ${{ inputs.run-compiler-tests && 'sccache direnv python uv cargo:cargo-insta cargo:cargo-nextest' || 'sccache direnv' }}
-
-      - name: "Verify sccache"
-        run: sccache --version
+          install_args: "sccache direnv cargo:cargo-nextest"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -66,6 +67,68 @@ jobs:
           cache-targets: false
           save-if: false
           shared-key: "linux-cargo"
+
+      - name: "Load .envrc with direnv"
+        run: |
+          set -euo pipefail
+
+          direnv allow .envrc
+          direnv export gha >> "$GITHUB_ENV"
+
+      - name: "Run the Rust backend differential test"
+        run: cargo nextest run -p baml_tests --test rust_differential --all-features --run-ignored only --success-output immediate
+        working-directory: baml_language
+
+  snapshot-tests:
+    name: "Compiler and documentation tests"
+    runs-on: trunk=${{ github.run_id }}-${{ github.run_attempt }}..size=xlarge
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A Trunk runner starts from a warm checkout of canary with a built
+          # target/ tree. Keep the untracked build output so cargo reuses it.
+          clean: false
+          persist-credentials: false
+
+      # baml_artifact's build script tracks HEAD and refs/heads/canary. The
+      # checkout rewrites both, which makes cargo rebuild every crate that
+      # depends on baml_artifact. Backdate the refs so the warm target/ tree
+      # stays fresh, and stamp the SHA that the warm tree was built from.
+      - name: "Backdate the git refs baml_artifact tracks"
+        run: |
+          echo "variant=$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-variant" 2>/dev/null || echo NONE)"
+          basis="$(cat "${XDG_CACHE_HOME:-/cache}/trunk-template-basis-sha" 2>/dev/null || true)"
+          git cat-file -e "${basis}^{commit}" 2>/dev/null || basis=""
+          p=("$(git rev-parse --git-path HEAD)")
+          if r="$(git symbolic-ref -q HEAD)"; then p+=("$(git rev-parse --git-path "${r}")"); fi
+          if ! git show-ref --verify --quiet refs/heads/canary; then
+            b="${basis:-$(git rev-parse HEAD)}"
+            git update-ref refs/heads/canary "${b}"
+            echo "recreated refs/heads/canary at ${b}"
+          fi
+          p+=("$(git rev-parse --git-path refs/heads/canary)")
+          touch -t 197001010000 "${p[@]}"
+          ls -l --time-style=+%Y-%m-%d\ %H:%M "${p[@]}"
+          if [ -n "${basis}" ]; then
+            echo "BAML_GIT_SHA=${basis}" >> "$GITHUB_ENV"
+            echo "stamping BAML_GIT_SHA=${basis}"
+          else
+            echo "no warm template; build.rs reads HEAD, which matches a cold tree"
+          fi
+
+      - name: "Install Rust toolchain"
+        run: rustup show
+        working-directory: baml_language
+
+      - name: "Install tools (mise)"
+        uses: ./.github/actions/setup-mise
+        with:
+          cache: "false"
+          install_args: ${{ inputs.run-compiler-tests && 'sccache direnv python uv cargo:cargo-insta cargo:cargo-nextest' || 'sccache direnv' }}
+
+      - name: "Verify sccache"
+        run: sccache --version
 
       - name: "Load .envrc with direnv"
         run: |
@@ -97,31 +160,12 @@ jobs:
       # This job owns glibc coverage of baml_tests, baml_cli and baml_pack_host.
       # Keep the GNU job's --exclude list in sync. The musl job also runs
       # pack_e2e, so both Linux libc variants exercise the ELF pack path.
-      # `cargo insta` takes no profile flag, hence NEXTEST_PROFILE.
       - name: "Run compiler, CLI, and snapshot tests"
         if: inputs.run-compiler-tests
-        id: snapshot-test
-        # The shared upload action gates this outcome (including a tokenless
-        # fallback on forks). Do not add a second raw-outcome gate: that would
-        # override Trunk's intentional quarantine handling.
-        continue-on-error: true
         run: cargo insta test --test-runner nextest --dnd -p baml_tests -p baml_cli -p baml_pack_host --all-features --unreferenced=reject
         working-directory: baml_language
         env:
           BAML_PACK_HOST_PREBUILT: "1"
-          NEXTEST_PROFILE: ci
-
-      - name: "Analyze test results in Trunk"
-        if: ${{ success() && inputs.run-compiler-tests }}
-        uses: ./.github/actions/upload-test-results
-        with:
-          junit-path: baml_language/target/nextest/ci/junit.xml
-          # https://app.trunk.io/boundaryml/flaky-tests/collections/jgs6yJXj
-          collection: jgs6yJXj
-          normalize: nextest
-          cargo-manifest-path: baml_language/Cargo.toml
-          test-outcome: ${{ steps.snapshot-test.outcome }}
-          token: ${{ secrets.TRUNK_ORG_TOKEN }}
 
       - name: "Check for snapshot changes"
         if: inputs.run-compiler-tests
@@ -151,7 +195,7 @@ jobs:
         env:
           # Require full diagnostics for both valid and intentionally invalid
           # examples. Do not seed disposable projects during the check pass.
-          BAML_NO_BYTECODE_CACHE: "1"
+          BAML_BUILD_CACHE: "false"
           BAML_BINARY: ${{ github.workspace }}/baml_language/target/debug/baml-cli
         run: pnpm --filter app-developer-docs docs:snippets:validate
         working-directory: typescript2
@@ -160,7 +204,7 @@ jobs:
           BAML_BINARY: ${{ github.workspace }}/baml_language/target/debug/baml-cli
           # Content-addressed keys include the compiler fingerprint and project
           # inputs. Reuse the stdlib across examples without writing into source.
-          BAML_CACHE_DIR: ${{ runner.temp }}/baml-documentation-cache
+          BAML_HOME: ${{ runner.temp }}/baml-documentation-home
         run: pnpm --filter app-developer-docs docs:book:validate
         working-directory: typescript2
       # The full baml_cli::baml_corpus test above already executes
@@ -194,4 +238,3 @@ jobs:
           name: cargo-timings-snapshot
           path: baml_language/target/cargo-timings/cargo-timing-snapshot.html
           if-no-files-found: ignore
-

@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use btel_reader::value::Kind;
+use btel_core::reader::value::Kind;
 use rusqlite::{
     Connection,
     hooks::{AuthAction, AuthContext, Authorization},
@@ -184,7 +184,7 @@ fn cell(value: ValueRef<'_>) -> Json {
 fn typed(rendered: Json, kind: Option<&str>) -> Json {
     match kind.and_then(Kind::from_label) {
         Some(Kind::Bool) => Json::Bool(rendered.as_i64().is_some_and(|n| n != 0)),
-        Some(Kind::Json) => rendered
+        Some(Kind::Json | Kind::Redacted) => rendered
             .as_str()
             .and_then(|text| serde_json::from_str(text).ok())
             .unwrap_or(rendered),
@@ -267,7 +267,13 @@ fn diagnostic_message(code: &str) -> &'static str {
         "comparison_limit" => {
             "comparison exceeded its depth, node or byte limit; compare a smaller subtree"
         }
+        "render_limit" => {
+            "the value is larger than one rendering may be and is shown in part; read a smaller part of it"
+        }
         "value_cycle" => "a cycle of cells does not resolve to a captured logical value",
+        "value_blob_budget" => {
+            "the value continues in more CAS blobs, or larger ones, than one operation may read; read a smaller part of it"
+        }
         _ => "evidence unavailable",
     }
 }

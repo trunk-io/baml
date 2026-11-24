@@ -1,28 +1,31 @@
 //! Raw media handle bindings.
 
-use bex_project::MediaKind;
+use bex_project::ConcreteMediaKind;
 use bridge_cffi::handle_cffi::{self, HandleError, HandleParts};
 use bridge_ctypes::baml_bridge::cffi::BamlHandleType;
 use wasm_bindgen::prelude::*;
 
 use crate::errors::{handle_error, unexpected_handle_type};
 
-fn media_kind(media_kind: i32, operation: &'static str) -> Result<MediaKind, JsError> {
+fn media_kind(media_kind: i32, operation: &'static str) -> Result<ConcreteMediaKind, JsError> {
     handle_cffi::media_kind_from_proto(media_kind)
         .ok_or_else(|| handle_error(operation, &HandleError::UnsupportedHandleType))
 }
 
-fn expected_handle_type(kind: MediaKind) -> BamlHandleType {
+fn expected_handle_type(kind: ConcreteMediaKind) -> BamlHandleType {
     match kind {
-        MediaKind::Image => BamlHandleType::AdtMediaImage,
-        MediaKind::Audio => BamlHandleType::AdtMediaAudio,
-        MediaKind::Video => BamlHandleType::AdtMediaVideo,
-        MediaKind::Pdf => BamlHandleType::AdtMediaPdf,
-        MediaKind::Generic => BamlHandleType::AdtMediaGeneric,
+        ConcreteMediaKind::Image => BamlHandleType::AdtMediaImage,
+        ConcreteMediaKind::Audio => BamlHandleType::AdtMediaAudio,
+        ConcreteMediaKind::Video => BamlHandleType::AdtMediaVideo,
+        ConcreteMediaKind::Pdf => BamlHandleType::AdtMediaPdf,
     }
 }
 
-fn media_key(operation: &'static str, kind: MediaKind, parts: HandleParts) -> Result<u64, JsError> {
+fn media_key(
+    operation: &'static str,
+    kind: ConcreteMediaKind,
+    parts: HandleParts,
+) -> Result<u64, JsError> {
     let expected = expected_handle_type(kind) as i32;
     if parts.handle_type != expected {
         return Err(unexpected_handle_type(
@@ -47,17 +50,38 @@ pub fn media_from_url(
     media_key("mediaFromUrl", kind, parts)
 }
 
-#[wasm_bindgen(js_name = mediaFromFile)]
-#[allow(clippy::needless_pass_by_value)]
-pub fn media_from_file(
+/// Media from the bytes of `file`, which the JavaScript host read: this
+/// module has no file system of its own.
+#[wasm_bindgen(js_name = mediaFromFileBytes)]
+#[expect(clippy::needless_pass_by_value)]
+pub fn media_from_file_bytes(
     media_kind_value: i32,
     file: &str,
+    content: &[u8],
     mime_type: Option<String>,
 ) -> Result<u64, JsError> {
-    let kind = media_kind(media_kind_value, "mediaFromFile")?;
-    let parts = handle_cffi::media_from_file(kind, file, mime_type.as_deref())
-        .map_err(|error| handle_error("mediaFromFile", &error))?;
-    media_key("mediaFromFile", kind, parts)
+    use base64::Engine as _;
+
+    let kind = media_kind(media_kind_value, "mediaFromFileBytes")?;
+    let base64 = base64::engine::general_purpose::STANDARD.encode(content);
+    let parts = handle_cffi::media_from_file_content(kind, file, &base64, mime_type.as_deref())
+        .map_err(|error| handle_error("mediaFromFileBytes", &error))?;
+    media_key("mediaFromFileBytes", kind, parts)
+}
+
+/// Media from base64 content that was read from `file`. Reads nothing.
+#[wasm_bindgen(js_name = mediaFromFileContent)]
+#[expect(clippy::needless_pass_by_value)]
+pub fn media_from_file_content(
+    media_kind_value: i32,
+    file: &str,
+    base64: &str,
+    mime_type: Option<String>,
+) -> Result<u64, JsError> {
+    let kind = media_kind(media_kind_value, "mediaFromFileContent")?;
+    let parts = handle_cffi::media_from_file_content(kind, file, base64, mime_type.as_deref())
+        .map_err(|error| handle_error("mediaFromFileContent", &error))?;
+    media_key("mediaFromFileContent", kind, parts)
 }
 
 #[wasm_bindgen(js_name = mediaFromBase64)]
@@ -78,9 +102,10 @@ pub fn media_url(key: u64, handle_type: i32) -> Result<Option<String>, JsError> 
     handle_cffi::media_url(key, handle_type).map_err(|error| handle_error("mediaUrl", &error))
 }
 
-#[wasm_bindgen(js_name = mediaFile)]
-pub fn media_file(key: u64, handle_type: i32) -> Result<Option<String>, JsError> {
-    handle_cffi::media_file(key, handle_type).map_err(|error| handle_error("mediaFile", &error))
+/// The base name of the file the content was read from, if any.
+#[wasm_bindgen(js_name = mediaName)]
+pub fn media_name(key: u64, handle_type: i32) -> Result<Option<String>, JsError> {
+    handle_cffi::media_name(key, handle_type).map_err(|error| handle_error("mediaName", &error))
 }
 
 #[wasm_bindgen(js_name = mediaBase64)]

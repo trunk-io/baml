@@ -12,8 +12,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    HeapPtr, RealizedTy, SessionEvalLease, Value, errors::StackFrame,
-    runtime_compile::WeakSessionEvalLease,
+    RealizedTy, SessionEvalLease, Value, errors::StackFrame, runtime_compile::WeakSessionEvalLease,
 };
 
 /// Error payload carried by a future's [`Future::ready_waiter`] `SetOnce` when the
@@ -86,8 +85,8 @@ pub struct Future {
     /// Set once when the future is created; the GC repoints the heads inside
     /// through [`Future::visit_heads_mut`] when their declarations move.
     /// `Box`, not `Arc`: a shared allocation cannot be soundly head-walked
-    /// (repointing would either fork it or mutate every holder), and the GC's
-    /// relocation `Clone` must produce an independently-fixable copy.
+    /// (repointing would either fork it or mutate every holder), so each
+    /// future owns the types the GC fixes up in place.
     types: Box<FutureOutputTypes>,
     /// Written at most once by whichever writer wins the `state` CAS.
     /// Valid only when `state` indicates `Ready` or `Error`. For
@@ -325,6 +324,19 @@ impl Future {
         self.flags.fetch_or(FUTURE_FLAG_OBSERVED, Ordering::AcqRel);
     }
 
+    /// Report what this future keeps alive outside its slot: its output
+    /// types, the settlement shared with whoever resolves it, and an error
+    /// trace once one has been recorded.
+    pub(crate) fn measure(&self, meter: &mut crate::Meter) {
+        meter.bytes(size_of::<FutureOutputTypes>());
+        meter.shared(&self.settlement, |_| {});
+        meter.shared(&self.error_trace, |meter| {
+            if let Some(trace) = self.error_trace.get() {
+                meter.shared(trace, |_| {});
+            }
+        });
+    }
+
     pub fn is_observed(&self) -> bool {
         self.flags.load(Ordering::Acquire) & FUTURE_FLAG_OBSERVED != 0
     }
@@ -395,34 +407,15 @@ impl Future {
     /// are the only ones for which GC traces the cell, and our state is
     /// not Ready, so the cell shouldn't claim to hold a tracked Value).
     ///
-    /// Fires the generational write barrier on `heap` for `self_ptr`
-    /// before the value write. This is required because a `Future` can
-    /// survive across GCs (rooted by `FutureManagerInner::active_futures`)
-    /// and may end up in Gen2; if `value` carries a heap-object pointer
-    /// (`value.is_object()`) to a younger-generation object, the next Minor GC's
-    /// dirty-card scan must find this reference. Without the barrier the
-    /// young object would be reclaimed and the `Future`'s `value` left
-    /// dangling.
-    ///
     /// # Safety
     ///
     /// Caller must hold the heap permit (to keep `value`'s embedded
-    /// `HeapPtr`, if any, valid against concurrent GC moves). `self_ptr`
-    /// must be the [`HeapPtr`] under which `self` lives, so the write
-    /// barrier marks the correct card.
-    pub unsafe fn settle_ready(
-        &self,
-        heap: &impl crate::WriteBarrier,
-        self_ptr: HeapPtr,
-        value: Value,
-    ) -> bool {
-        // Fire the generational write barrier BEFORE the speculative
-        // value write. If `value` is a young heap pointer and our CAS
-        // later wins, the card mark is what tells the next minor GC
-        // to find this reference. (If the CAS loses, the rollback
-        // below reverts the value cell but the spurious card mark is
-        // benign — the GC will simply rescan it.)
-        heap.write_barrier(self_ptr, value);
+    /// `HeapPtr`, if any, valid against concurrent GC moves), and must be the
+    /// future's one value writer: the speculative write and its rollback are
+    /// plain writes to the cell, so two settlers racing would corrupt it (a
+    /// loser's rollback could clear the winner's published value).
+    /// [`Self::settle_cancelled`] writes no value and may race freely.
+    pub unsafe fn settle_ready(&self, value: Value) -> bool {
         // SAFETY: speculative write; observed by readers only if our CAS
         // wins (Release synchronizes the write to subsequent Acquire-loads).
         unsafe { (*self.value.get()).write(value) };
@@ -450,19 +443,10 @@ impl Future {
     /// Attempt to transition `Pending → Error`, writing the error value
     /// and firing the wake signal. Mirror of [`Self::settle_ready`].
     ///
-    /// Fires the generational write barrier — see [`Self::settle_ready`].
-    ///
     /// # Safety
     ///
     /// See [`Self::settle_ready`].
-    pub unsafe fn settle_error(
-        &self,
-        heap: &impl crate::WriteBarrier,
-        self_ptr: HeapPtr,
-        value: Value,
-        trace: Vec<StackFrame>,
-    ) -> bool {
-        heap.write_barrier(self_ptr, value);
+    pub unsafe fn settle_error(&self, value: Value, trace: Vec<StackFrame>) -> bool {
         let _ = self.error_trace.set(Arc::from(trace));
         // SAFETY: see settle_ready.
         unsafe { (*self.value.get()).write(value) };
@@ -561,17 +545,14 @@ impl Future {
 impl Clone for Future {
     fn clone(&self) -> Self {
         // Snapshot the current state and clone the corresponding payload.
-        // The only legitimate caller is the GC's heap-relocation copy
-        // (`gc.rs` `copy_object_to_inactive`), which clones the heap object
-        // into the inactive space.
+        // This exists so `Object` can derive `Clone`; the GC relocates a
+        // future by moving it, not by calling this.
         //
         // The `cancel` token and `ready` SetOnce are reference-counted
         // (CancellationToken has internal `Arc`, `ready` is wrapped in an
-        // explicit `Arc`), so the clone shares the same underlying sync
-        // primitives. Producers that hold a clone of `ready` from before
-        // the GC move continue to wake the same set of waiters, and the
-        // moved heap copy observes the same `ready.set(...)` because both
-        // copies share the same settlement allocation.
+        // explicit `Arc`), so a clone shares the same underlying sync
+        // primitives: both copies wake the same set of waiters and observe
+        // the same `ready.set(...)` through the shared settlement allocation.
         //
         // Futures are conceptually *handles*, not values: there is no
         // "the same future, but a copy" at the user level. User-side

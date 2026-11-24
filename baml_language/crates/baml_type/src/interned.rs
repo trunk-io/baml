@@ -15,12 +15,13 @@
 //! - [`TypeFlags`] ("does this contain an inference variable / error /
 //!   type variable...") are computed once at intern time and answered in
 //!   O(1), which is what lets inference fold/resolve loops short-circuit.
-//! - The pool is a global mutex-guarded set, NOT salsa: unlike compiler-local
+//! - The pool is a global sharded set, NOT salsa: unlike compiler-local
 //!   ids (`FunctionLoc`, `ScopeId`), types must outlive any database - they
 //!   are held by the runtime, serialized, and crossed over FFI. This is the
 //!   same reason rust-analyzer interns its types in a global pool despite
-//!   being salsa-based throughout. Entries are freed when the last handle
-//!   drops.
+//!   being salsa-based throughout. Nonprimitive entries are freed when the
+//!   last handle drops. A fixed set of primitive singleton handles lives for
+//!   the process lifetime so common leaf construction needs no pool lock.
 //!
 //! The pool's kind ([`InferTy`]) and its twin satellites are *generated* by
 //! [`ty_family!`](crate::Ty) (the `child: interned(..)` member in
@@ -108,11 +109,43 @@ impl Ty {
     /// Interns `kind`, returning the unique handle for it. Flags are computed
     /// here; there is no other way to construct a `Ty`.
     pub fn intern(kind: InferTy) -> Ty {
+        // Primitive types have no database-local state. Keep one canonical
+        // handle per kind so repeatedly constructing common leaves neither
+        // contends on the pool lock nor allocates after their last caller drops.
+        // Route through this entry point so direct interning, from_plain, and
+        // leaf helpers all observe the same pointer identity.
+        macro_rules! primitive {
+            ($kind:ident) => {{
+                static VALUE: OnceLock<Ty> = OnceLock::new();
+                VALUE
+                    .get_or_init(|| Ty::intern_in_pool(InferTy::$kind))
+                    .clone()
+            }};
+        }
+        match kind {
+            InferTy::Int => primitive!(Int),
+            InferTy::Bigint => primitive!(Bigint),
+            InferTy::Float => primitive!(Float),
+            InferTy::String => primitive!(String),
+            InferTy::Bool => primitive!(Bool),
+            InferTy::Null => primitive!(Null),
+            InferTy::Uint8Array => primitive!(Uint8Array),
+            InferTy::Type => primitive!(Type),
+            InferTy::Resource => primitive!(Resource),
+            InferTy::PromptAst => primitive!(PromptAst),
+            InferTy::Unknown => primitive!(Unknown),
+            InferTy::Never => primitive!(Never),
+            InferTy::Error => primitive!(Error),
+            kind => Self::intern_in_pool(kind),
+        }
+    }
+
+    fn intern_in_pool(kind: InferTy) -> Ty {
         let data = TyData {
             flags: compute_flags(&kind),
             kind,
         };
-        let mut pool = pool().lock().expect("ty intern pool poisoned");
+        let mut pool = pool(&data).lock().expect("ty intern pool poisoned");
         if let Some(existing) = pool.get(&data) {
             return Ty(Arc::clone(existing));
         }
@@ -170,7 +203,7 @@ impl Drop for Ty {
         // freed after the guard is released (this handle still holds it), so
         // child handles' recursive drops never run under the pool lock.
         if Arc::strong_count(&self.0) == 2 {
-            let mut pool = pool().lock().expect("ty intern pool poisoned");
+            let mut pool = pool(&self.0).lock().expect("ty intern pool poisoned");
             if Arc::strong_count(&self.0) == 2 {
                 pool.remove(&*self.0);
             }
@@ -217,9 +250,17 @@ impl std::fmt::Debug for Ty {
     }
 }
 
-fn pool() -> &'static Mutex<HashSet<Arc<TyData>>> {
-    static POOL: OnceLock<Mutex<HashSet<Arc<TyData>>>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(HashSet::new()))
+/// Equal kinds always select the same shard: their child handles are already
+/// canonical, so hashing a kind visits only this node and its child pointers.
+/// This preserves global pointer identity without forcing unrelated compiler
+/// workers through one lock. Eviction uses the same selection as insertion.
+fn pool(data: &TyData) -> &'static Mutex<HashSet<Arc<TyData>>> {
+    const SHARDS: usize = 64;
+    static POOL: OnceLock<[Mutex<HashSet<Arc<TyData>>>; SHARDS]> = OnceLock::new();
+    let shards = POOL.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashSet::new())));
+    let mut hasher = rustc_hash::FxHasher::default();
+    data.hash(&mut hasher);
+    &shards[hasher.finish() as usize % SHARDS]
 }
 
 // -- Kind ---------------------------------------------------------------------
@@ -236,14 +277,6 @@ impl InferFunctionParamTy {
             name,
             ty,
             mode: FunctionParamMode::Required,
-        }
-    }
-
-    pub fn optional(name: Option<Name>, ty: Ty) -> InferFunctionParamTy {
-        InferFunctionParamTy {
-            name,
-            ty,
-            mode: FunctionParamMode::Optional,
         }
     }
 }
@@ -325,11 +358,9 @@ pub fn for_each_child(kind: &InferTy, mut visit: impl FnMut(&Ty)) {
         | InferTy::Literal(..)
         | InferTy::Enum(..)
         | InferTy::EnumVariant(..)
-        | InferTy::RustType
         | InferTy::Type
         | InferTy::Resource
         | InferTy::PromptAst
-        | InferTy::Void
         | InferTy::TypeAlias(..)
         | InferTy::TypeVar(..)
         | InferTy::Unknown
@@ -346,7 +377,7 @@ pub fn for_each_child(kind: &InferTy, mut visit: impl FnMut(&Ty)) {
             visit(key);
             visit(value);
         }
-        InferTy::Union(members) => members.iter().for_each(visit),
+        InferTy::Union(members) | InferTy::Tuple(members) => members.iter().for_each(visit),
         InferTy::Function {
             params,
             ret,
@@ -393,11 +424,9 @@ impl InferTy {
             | InferTy::Literal(..)
             | InferTy::Enum(..)
             | InferTy::EnumVariant(..)
-            | InferTy::RustType
             | InferTy::Type
             | InferTy::Resource
             | InferTy::PromptAst
-            | InferTy::Void
             | InferTy::TypeAlias(..)
             | InferTy::TypeVar(..)
             | InferTy::Unknown
@@ -421,6 +450,7 @@ impl InferTy {
                 value: f(value),
             },
             InferTy::Union(members) => InferTy::Union(members.iter().map(&mut f).collect()),
+            InferTy::Tuple(elements) => InferTy::Tuple(elements.iter().map(&mut f).collect()),
             InferTy::Function {
                 params,
                 ret,
@@ -511,6 +541,7 @@ impl Ty {
                 value: Ty::from_plain(value),
             },
             crate::Ty::Union(members) => InferTy::Union(interned_all(members)),
+            crate::Ty::Tuple(elements) => InferTy::Tuple(interned_all(elements)),
             crate::Ty::Function {
                 params,
                 ret,
@@ -530,11 +561,9 @@ impl Ty {
             crate::Ty::Future(value, error) => {
                 InferTy::Future(Ty::from_plain(value), Ty::from_plain(error))
             }
-            crate::Ty::RustType => InferTy::RustType,
             crate::Ty::Type => InferTy::Type,
             crate::Ty::Resource => InferTy::Resource,
             crate::Ty::PromptAst => InferTy::PromptAst,
-            crate::Ty::Void => InferTy::Void,
             crate::Ty::TypeAlias(name) => InferTy::TypeAlias(name.clone()),
             crate::Ty::TypeVar(param) => InferTy::TypeVar(param.clone()),
             crate::Ty::AssociatedTypeProjection {
@@ -604,6 +633,7 @@ impl Ty {
                 value: Box::new(value.to_plain_closed()),
             },
             InferTy::Union(members) => crate::Ty::Union(plain_all(members)),
+            InferTy::Tuple(elements) => crate::Ty::Tuple(plain_all(elements)),
             InferTy::Function {
                 params,
                 ret,
@@ -624,11 +654,9 @@ impl Ty {
                 Box::new(value.to_plain_closed()),
                 Box::new(error.to_plain_closed()),
             ),
-            InferTy::RustType => crate::Ty::RustType,
             InferTy::Type => crate::Ty::Type,
             InferTy::Resource => crate::Ty::Resource,
             InferTy::PromptAst => crate::Ty::PromptAst,
-            InferTy::Void => crate::Ty::Void,
             InferTy::TypeAlias(name) => crate::Ty::TypeAlias(name.clone()),
             InferTy::TypeVar(param) => crate::Ty::TypeVar(param.clone()),
             InferTy::AssociatedTypeProjection {
@@ -995,10 +1023,6 @@ impl Ty {
         Ty::intern(InferTy::Int)
     }
 
-    pub fn float() -> Ty {
-        Ty::intern(InferTy::Float)
-    }
-
     pub fn string() -> Ty {
         Ty::intern(InferTy::String)
     }
@@ -1015,10 +1039,6 @@ impl Ty {
         Ty::intern(InferTy::Never)
     }
 
-    pub fn void() -> Ty {
-        Ty::intern(InferTy::Void)
-    }
-
     pub fn error() -> Ty {
         Ty::intern(InferTy::Error)
     }
@@ -1033,6 +1053,10 @@ impl Ty {
 
     pub fn union(members: impl IntoIterator<Item = Ty>) -> Ty {
         Ty::intern(InferTy::Union(members.into_iter().collect()))
+    }
+
+    pub fn tuple(elements: impl IntoIterator<Item = Ty>) -> Ty {
+        Ty::intern(InferTy::Tuple(elements.into_iter().collect()))
     }
 
     /// `T?` is a flat `T | null` union.
@@ -1099,11 +1123,9 @@ mod tests {
                 throws: Box::new(P::Never),
             },
             P::Future(Box::new(int()), Box::new(P::Never)),
-            P::RustType,
             P::Type,
             P::Resource,
             P::PromptAst,
-            P::Void,
             P::TypeAlias(name()),
             P::TypeVar(ParamTy::new(0, Name::new("T"))),
             P::AssociatedTypeProjection {
@@ -1114,6 +1136,7 @@ mod tests {
             P::Unknown,
             P::Never,
             P::Error,
+            P::Tuple(Box::new([int(), P::String])),
         ]
     }
 
@@ -1233,7 +1256,116 @@ mod tests {
             flags: compute_flags(kind),
             kind: kind.clone(),
         };
-        pool().lock().unwrap().contains(&data)
+        pool(&data).lock().unwrap().contains(&data)
+    }
+
+    #[test]
+    fn primitive_singletons_preserve_identity_without_live_callers() {
+        for kind in [
+            InferTy::Int,
+            InferTy::Bigint,
+            InferTy::Float,
+            InferTy::String,
+            InferTy::Bool,
+            InferTy::Null,
+            InferTy::Uint8Array,
+            InferTy::Type,
+            InferTy::Resource,
+            InferTy::PromptAst,
+            InferTy::Unknown,
+            InferTy::Never,
+            InferTy::Error,
+        ] {
+            let first = Ty::intern(kind.clone());
+            let identity = Arc::downgrade(&first.0);
+            drop(first);
+            let retained = identity
+                .upgrade()
+                .expect("primitive singleton remains alive");
+            let second = Ty::intern(kind.clone());
+            assert!(Arc::ptr_eq(&retained, &second.0), "{kind:?}");
+            assert_eq!(second.flags(), compute_flags(&kind));
+        }
+        assert_eq!(Ty::int(), Ty::intern(InferTy::Int));
+        assert_eq!(Ty::error(), Ty::intern(InferTy::Error));
+        assert_eq!(Ty::from_plain(&crate::Ty::String), Ty::string());
+    }
+
+    #[test]
+    fn concurrent_primitive_interning_preserves_identity() {
+        let barrier = std::sync::Barrier::new(8);
+        let types = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let first = Ty::int();
+                        for _ in 0..128 {
+                            assert_eq!(first, Ty::intern(InferTy::Int));
+                        }
+                        first
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(types.iter().all(|ty| ty == &types[0]));
+    }
+
+    #[test]
+    fn concurrent_compound_interning_preserves_identity() {
+        fn compound() -> Ty {
+            Ty::list(Ty::union([
+                Ty::int(),
+                Ty::intern(InferTy::Literal(
+                    Literal::String("concurrent-compound-interning-probe".into()),
+                    Freshness::Regular,
+                )),
+            ]))
+        }
+        let barrier = std::sync::Barrier::new(8);
+        let types = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let first = compound();
+                        for _ in 0..128 {
+                            assert_eq!(first, compound());
+                        }
+                        first
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(types.iter().all(|ty| ty == &types[0]));
+    }
+
+    #[test]
+    fn dropping_parent_evicts_its_unreferenced_children() {
+        let child = Ty::intern(InferTy::Literal(
+            Literal::String("interned-nested-eviction-probe".into()),
+            Freshness::Regular,
+        ));
+        let child_identity = Arc::downgrade(&child.0);
+        let parent = Ty::list(child);
+        let parent_identity = Arc::downgrade(&parent.0);
+        drop(parent);
+        assert!(
+            parent_identity.upgrade().is_none(),
+            "parent must be evicted"
+        );
+        assert!(
+            child_identity.upgrade().is_none(),
+            "child must be evicted after parent"
+        );
     }
 
     #[test]

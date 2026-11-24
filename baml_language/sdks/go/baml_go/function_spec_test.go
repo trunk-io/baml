@@ -1,6 +1,7 @@
 package baml_go
 
 import (
+	"context"
 	"testing"
 
 	"github.com/boundaryml/baml-go/internal/cffi"
@@ -8,7 +9,7 @@ import (
 
 func TestEventCallbackInputUsesTheHostCallableABI(t *testing.T) {
 	var received Value
-	input := EventCallbackInput(func(value Value) { received = value })
+	input := EventCallbackInput(func(_ context.Context, value Value) { received = value })
 	transaction := &inputTransaction{}
 	encoded, err := input.encodeValue(transaction)
 	if err != nil {
@@ -18,6 +19,17 @@ func TestEventCallbackInputUsesTheHostCallableABI(t *testing.T) {
 	handle := encoded.GetHandle()
 	if handle == nil || handle.GetHandleType() != cffi.BamlHandleType_HOST_VALUE_CALLABLE {
 		t.Fatalf("event callback encoded as %#v", encoded.GetValue())
+	}
+	// `on_event` declares no throws, so its throws is an open effect: a
+	// panicking listener must surface as a catchable error, not a violation of
+	// a `never` contract.
+	wantType := FunctionBAMLType(
+		[]FunctionParamBAMLType{{Type: UnknownBAMLType()}},
+		PrimitiveBAMLType(NullType),
+		UnknownBAMLType(),
+	)
+	if stated := encoded.GetValueType(); stated == nil || !(BAMLType{value: stated}).Equal(wantType) {
+		t.Fatalf("event callback stated %#v; want %#v", stated, wantType.value)
 	}
 	callable, ok := lookupHostCallable(handle.GetKey())
 	if !ok {

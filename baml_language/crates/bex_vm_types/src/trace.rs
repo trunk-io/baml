@@ -18,6 +18,11 @@ impl SpanId {
     pub fn new(scope: RecordingId, local: TelemetryId) -> Self {
         Self { scope, local }
     }
+
+    /// Return the recording-local ID only when it belongs to `scope`.
+    pub fn local_in(&self, scope: RecordingId) -> Option<TelemetryId> {
+        (self.scope == scope).then_some(self.local)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,10 +41,19 @@ pub struct TraceOptionsData {
 }
 
 #[derive(Debug)]
+struct ReservationState {
+    attached: AtomicBool,
+    materialized: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ReservedSpanData {
     pub options: TraceOptionsData,
     pub id: SpanId,
-    attached: AtomicBool,
+    state: Arc<ReservationState>,
+    // Only the runtime can derive this authority after a successful entry claim.
+    // Raw aliases share state, but never gain this bit by observing attachment.
+    forwarded_claim: bool,
 }
 
 impl ReservedSpanData {
@@ -48,7 +62,11 @@ impl ReservedSpanData {
         Self {
             options,
             id: SpanId::new(scope, allocate_telemetry_id()),
-            attached: AtomicBool::new(false),
+            state: Arc::new(ReservationState {
+                attached: AtomicBool::new(false),
+                materialized: AtomicBool::new(false),
+            }),
+            forwarded_claim: false,
         }
     }
 
@@ -56,10 +74,100 @@ impl ReservedSpanData {
         if self.id.scope != scope {
             return Err(ReservationError::WrongScope);
         }
-        self.attached
+        self.state
+            .attached
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| self.id.local)
             .map_err(|_| ReservationError::AlreadyAttached)
+    }
+
+    /// Explicit continuation of a successful claim. Does not mutate the user's
+    /// reservation options and never duplicates attachment/materialization state.
+    #[must_use]
+    pub fn claimed_view(&self, options: TraceOptionsData) -> Self {
+        assert!(
+            self.state.attached.load(Ordering::Acquire),
+            "claim must precede forwarding"
+        );
+        Self {
+            options,
+            id: self.id,
+            state: self.state.clone(),
+            forwarded_claim: true,
+        }
+    }
+
+    pub fn is_forwarded_claim(&self) -> bool {
+        self.forwarded_claim
+    }
+
+    /// Identity of the shared claim, not merely its externally visible span ID.
+    pub fn shares_claim(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Raw aliases still fail attach; only an explicit internal view continues it.
+    pub fn enter(&self, scope: RecordingId) -> Result<TelemetryId, ReservationError> {
+        if self.forwarded_claim {
+            self.id.local_in(scope).ok_or(ReservationError::WrongScope)
+        } else {
+            self.attach(scope)
+        }
+    }
+
+    /// Span creation consumes the existing claim's one creation opportunity,
+    /// independently of the earlier public attachment boundary.
+    pub fn materialize(&self, scope: RecordingId) -> Result<TelemetryId, &'static str> {
+        let id = self
+            .id
+            .local_in(scope)
+            .ok_or("reservation belongs to another runtime")?;
+        if !self.forwarded_claim {
+            return Err("span creation requires an explicitly forwarded reservation claim");
+        }
+        self.state
+            .materialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| id)
+            .map_err(|_| "reservation claim already created a span")
+    }
+
+    /// Preparation verifies ownership/liveness without claiming the span.
+    pub fn validate(&self, scope: RecordingId) -> Result<(), ReservationError> {
+        if self.id.scope != scope {
+            return Err(ReservationError::WrongScope);
+        }
+        if !self.forwarded_claim && self.state.attached.load(Ordering::Acquire) {
+            return Err(ReservationError::AlreadyAttached);
+        }
+        Ok(())
+    }
+}
+
+impl TraceOptionsData {
+    /// What the options keep alive: a context patch, shared with every span
+    /// that carries it.
+    fn measure_into(&self, meter: &mut crate::Meter) {
+        if let Some(context) = &self.context {
+            meter.shared(context, |meter| {
+                meter.bytes(context.distinct_id.as_ref().map_or(0, String::capacity));
+                for (key, value) in &context.metadata {
+                    meter.bytes(key.capacity() + size_of_val(value));
+                }
+            });
+        }
+    }
+}
+
+impl crate::BexRustData for TraceOptionsData {
+    fn measure(&self, meter: &mut crate::Meter) {
+        self.measure_into(meter);
+    }
+}
+
+impl crate::BexRustData for ReservedSpanData {
+    fn measure(&self, meter: &mut crate::Meter) {
+        self.options.measure_into(meter);
     }
 }
 
@@ -78,7 +186,7 @@ mod tests {
             error: None,
             context: None,
         };
-        let scope = RecordingId::generate();
+        let scope = btel_types::new_recording_id();
         let reserved = ReservedSpanData::new(scope, options.clone());
         assert_eq!(options.mode, Some(InvocationMode::Hidden));
         assert_eq!(reserved.options.mode, Some(InvocationMode::Span));
@@ -97,7 +205,7 @@ mod tests {
 
     #[test]
     fn reservation_attachment_is_shared_across_threads() {
-        let recording = RecordingId::generate();
+        let recording = btel_types::new_recording_id();
         let reservation = Arc::new(ReservedSpanData::new(
             recording,
             TraceOptionsData::default(),
@@ -122,9 +230,61 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_preserves_effective_options_and_claim_without_reclaiming() {
+        let scope = btel_types::new_recording_id();
+        let raw = ReservedSpanData::new(scope, TraceOptionsData::default());
+        let raw_alias = raw.clone();
+        let id = raw.enter(scope).unwrap();
+        let effective = TraceOptionsData {
+            inputs: Some(true),
+            ..raw.options.clone()
+        };
+        let forwarded = raw.claimed_view(effective);
+        assert_eq!(raw.options.inputs, None);
+        assert_eq!(forwarded.options.inputs, Some(true));
+        assert_eq!(
+            raw_alias.enter(scope),
+            Err(ReservationError::AlreadyAttached)
+        );
+        assert_eq!(forwarded.enter(scope), Ok(id));
+        assert_eq!(forwarded.enter(scope), Ok(id));
+        assert!(raw.materialize(scope).is_err());
+        assert_eq!(forwarded.materialize(scope), Ok(id));
+        assert!(forwarded.materialize(scope).is_err());
+    }
+
+    #[test]
+    fn forwarded_aliases_create_only_one_span() {
+        let scope = btel_types::new_recording_id();
+        let raw = ReservedSpanData::new(scope, TraceOptionsData::default());
+        raw.enter(scope).unwrap();
+        let first = raw.claimed_view(raw.options.clone());
+        let second = raw.claimed_view(raw.options.clone());
+        let winners = std::thread::scope(|threads| {
+            let a = threads.spawn(|| usize::from(first.materialize(scope).is_ok()));
+            let b = threads.spawn(|| usize::from(second.materialize(scope).is_ok()));
+            a.join().unwrap() + b.join().unwrap()
+        });
+        assert_eq!(winners, 1);
+        assert_eq!(
+            first.enter(btel_types::new_recording_id()),
+            Err(ReservationError::WrongScope)
+        );
+    }
+
+    #[test]
+    fn failed_setup_does_not_release_entry_claim() {
+        let scope = btel_types::new_recording_id();
+        let raw = ReservedSpanData::new(scope, TraceOptionsData::default());
+        raw.enter(scope).unwrap();
+        drop(raw.claimed_view(raw.options.clone()));
+        assert_eq!(raw.enter(scope), Err(ReservationError::AlreadyAttached));
+    }
+
+    #[test]
     fn span_identity_includes_recording_scope_and_local_id() {
-        let scope = RecordingId::generate();
-        let other_scope = RecordingId::generate();
+        let scope = btel_types::new_recording_id();
+        let other_scope = btel_types::new_recording_id();
         let local = allocate_telemetry_id();
         let id = SpanId::new(scope, local);
         assert_eq!(id, SpanId::new(scope, local));
@@ -134,10 +294,10 @@ mod tests {
 
     #[test]
     fn wrong_runtime_does_not_consume_reservation() {
-        let scope = RecordingId::generate();
+        let scope = btel_types::new_recording_id();
         let reservation = ReservedSpanData::new(scope, TraceOptionsData::default());
         assert_eq!(
-            reservation.attach(RecordingId::generate()),
+            reservation.attach(btel_types::new_recording_id()),
             Err(ReservationError::WrongScope)
         );
         let local = reservation.attach(scope).unwrap();
@@ -147,4 +307,51 @@ mod tests {
             Err(ReservationError::AlreadyAttached)
         );
     }
+}
+
+/// Lexical definition and wrapper site, independent of request data and object
+/// addresses. Adapters must distinguish explicitly stacked wrapper sites.
+#[derive(Clone, Debug)]
+pub struct HostDefinition {
+    pub language: String,
+    pub module: String,
+    pub qualified_name: String,
+    pub source_file: String,
+    pub definition_line: u32,
+    pub wrapper_line: u32,
+    pub display_name: String,
+}
+
+pub type HostDefinitionKey = (String, String, String, String, u32, u32);
+
+impl HostDefinition {
+    pub fn key(&self) -> HostDefinitionKey {
+        (
+            self.language.clone(),
+            self.module.clone(),
+            self.qualified_name.clone(),
+            self.source_file.clone(),
+            self.definition_line,
+            self.wrapper_line,
+        )
+    }
+}
+
+/// A native source coordinate, interned independently of display names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HostCallSite {
+    pub source_file: String,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostMarker {
+    pub definition: HostDefinition,
+    pub options: TraceOptionsData,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HostCallOptions {
+    pub options: TraceOptionsData,
+    pub reserved_id: Option<TelemetryId>,
 }

@@ -47,6 +47,12 @@ function chat_get_weather(city: string) -> string {
     answer
 }
 
+/// The usage a chat turn billed under the chat client's provider id and the
+/// model it reports.
+function _chat_usage(turn: ai.ModelTurn) -> ai.events.Usage? {
+    ai.events.usage_for(ai.events.call_usage(turn.calls), ai.events.ModelKey { provider: "openai-chat", model: turn.resolved_model?.model })
+}
+
 // A turn input below the runner: no SAP, no journal, no toolbox.
 function _chat_input(question: string) -> ai.ModelTurnInput {
     let spec = ChatEcho@spec(question);
@@ -70,7 +76,8 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
                     ai.content.Text { text: "checking" },
                     ai.content.ToolUse { id: "call_1", name: "chat_get_weather", args: args },
                 ],
-                client_id: "openai-chat/gpt-4o-mini",
+                resolved_model: ai.events.ModelKey { provider: "openai-chat", model: "gpt-4o-mini" },
+                requested_model: "gpt-4o-mini",
             },
             ai.events.ToolCompleted.new("call_1", "sunny in SF"),
         ],
@@ -115,6 +122,8 @@ function _chat_failure_label(error: ai.errors.RaisedInClient) -> string {
         let f: ai.errors.InvalidRequest => `InvalidRequest/${f.status_code ?? -1}/${f.retry_safety()}`,
         let f: ai.errors.NetworkFailure => `NetworkFailure/${f.retry_safety()}`,
         let f: ai.errors.ParseFailed => "ParseFailed",
+        let f: ai.errors.InvalidResponse => "InvalidResponse",
+        let f: ai.errors.ProviderError => "ProviderError",
         _ => "other",
     }
 }
@@ -149,7 +158,7 @@ function chat_openai_request_shape() -> string {
                 _chat_top_keys(body),
                 turn.terminal_text() ?? "-",
                 `${turn.stop_reason}`,
-                `${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}/${turn.usage?.cached_input_tokens ?? -1}/${turn.usage?.reasoning_tokens ?? -1}`,
+                `${_chat_usage(turn)?.input_tokens ?? -1}/${_chat_usage(turn)?.output_tokens ?? -1}/${_chat_usage(turn)?.cached_input_tokens ?? -1}/${_chat_usage(turn)?.reasoning_tokens ?? -1}`,
             ].join("|")
         },
     )
@@ -343,7 +352,7 @@ test "chat_tools_and_journal_replay" {
 
 // `tool_calls` on the response become `ai.content.ToolUse` blocks with parsed
 // arguments — net-new behaviour, neither Rust implementation parsed them.
-function chat_parses_tool_calls() -> string {
+function chat_parses_tool_calls() -> json {
     let canned = "{\"id\":\"chatcmpl-2\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}";
     root.llm_mock.mock_json_serve(
         [root.llm_mock.MockResponse.ok(canned)],
@@ -352,14 +361,14 @@ function chat_parses_tool_calls() -> string {
             let turn = cl.invoke(_chat_input("weather?"));
             let uses = turn.tool_uses();
             let use = uses.at(0);
-            [
-                uses.length().to_string(),
-                use?.id ?? "-",
-                use?.name ?? "-",
-                baml.json.stringify(baml.json.to_json(use?.args)),
-                `${turn.stop_reason}`,
-                turn.terminal_text() ?? "no-text",
-            ].join("|")
+            {
+                "count": uses.length(),
+                "id": use?.id,
+                "name": use?.name,
+                "args": baml.json.from(use?.args),
+                "stop_reason": `${turn.stop_reason}`,
+                "text": turn.terminal_text(),
+            }
         },
     )
 }
@@ -367,7 +376,14 @@ function chat_parses_tool_calls() -> string {
 test "chat_parses_tool_calls" {
     assert.equal(
         chat_parses_tool_calls(),
-        "1|call_9|chat_get_weather|{\"city\":\"Paris\"}|ToolUse|no-text",
+        {
+            "count": 1,
+            "id": "call_9",
+            "name": "chat_get_weather",
+            "args": { "city": "Paris" },
+            "stop_reason": "ToolUse",
+            "text": null,
+        },
     )
 }
 
@@ -425,7 +441,7 @@ function chat_generic_collapses_text() -> string {
                 sent.header("authorization") ?? "absent",
                 baml.json.path<string>(body, ".model"),
                 baml.json.path<string>(body, ".messages[0].content").trim(),
-                cl.id(),
+                cl.requested_model(),
             ].join("|")
         },
     )
@@ -434,7 +450,7 @@ function chat_generic_collapses_text() -> string {
 test "chat_generic_collapses_text" {
     assert.equal(
         chat_generic_collapses_text(),
-        "absent|qwen3|You are terse.|openai-generic/qwen3",
+        "absent|qwen3|You are terse.|qwen3",
     )
 }
 
@@ -477,12 +493,12 @@ function _issue_4589_answer() -> string {
 }
 
 function _issue_4589_chat_response() -> string {
-    let answer = baml.json.stringify(baml.json.to_json(_issue_4589_answer()));
+    let answer = baml.json.stringify(_issue_4589_answer());
     `{"id":"chatcmpl-4589","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":${answer}},"finish_reason":"stop"}]}`
 }
 
 function _issue_4589_responses_response() -> string {
-    let answer = baml.json.stringify(baml.json.to_json(_issue_4589_answer()));
+    let answer = baml.json.stringify(_issue_4589_answer());
     `{"id":"resp-4589","model":"m","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":${answer}}]}]}`
 }
 
@@ -599,7 +615,7 @@ function chat_azure_url_auth_and_max_tokens() -> string {
                 sent.header("api-key") ?? "-",
                 sent.header("authorization") ?? "absent",
                 `${baml.json.path<int>(sent.json(), ".max_tokens")}`,
-                cl.id(),
+                cl.requested_model(),
             ].join("|")
         },
     )
@@ -608,7 +624,7 @@ function chat_azure_url_auth_and_max_tokens() -> string {
 test "chat_azure_url_auth_and_max_tokens" {
     assert.equal(
         chat_azure_url_auth_and_max_tokens(),
-        "/chat/completions|api-version=2024-10-21|azure-key|absent|4096|azure/gpt-4o",
+        "/chat/completions|api-version=2024-10-21|azure-key|absent|4096|gpt-4o",
     )
 }
 
@@ -631,31 +647,32 @@ test "chat_azure_deployment_url" {
     )
 }
 
-// An Azure deployment is almost always named after the model it serves, so an
-// unset `deployment_id` falls back to `model`. Without that the `"azure/…"`
-// shorthand — which can only carry a model — could never name a deployment.
-function chat_azure_deployment_defaults_to_model() -> string {
+// `deployment_id` never defaults to `model`: a deployment is named whatever its
+// creator chose, so without base_url or deployment_id there is nothing to call.
+function chat_azure_requires_deployment() -> string {
     let cl = openai.AzureClient.new(model = "gpt-4o", resource_name = "my-resource");
-    cl.compat().base_url
+    cl.resolved_base_url() catch (e) {
+        ai.errors.InvalidRequest => `${e.provider}|${e.detail}`,
+    }
 }
 
-test "chat_azure_deployment_defaults_to_model" {
+test "chat_azure_requires_deployment" {
     assert.equal(
-        chat_azure_deployment_defaults_to_model(),
-        "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
+        chat_azure_requires_deployment(),
+        "azure|openai.AzureClient needs a deployment: set deployment_id to the deployment's name, or base_url to its full URL",
     )
 }
 
-// With no base_url, no resource_name and no `AZURE_OPENAI_ENDPOINT`, the client
-// cannot send — and the error has to name the endpoint variable, because that
-// is the one the `"azure/<model>"` shorthand expects the deployment to come
-// from. It is a TYPED `ai.errors.InvalidRequest`, so an `ai.Fallback` can skip
-// this member rather than abort (see `chat_fallback_skips_misconfigured_member`).
+// With a deployment_id but no resource_name and no `AZURE_OPENAI_ENDPOINT`, the
+// client cannot send — and the error names the endpoint variable, the one the
+// official Azure SDKs read. It is a TYPED `ai.errors.InvalidRequest`, so an
+// `ai.Fallback` can skip this member rather than abort (see
+// `chat_fallback_skips_misconfigured_member`).
 //
 // A corpus test cannot set environment variables, so the env rung itself is
 // covered by the message naming it plus the URL composition asserted above.
 function chat_azure_missing_endpoint_names_env() -> string {
-    let cl = openai.AzureClient.new(model = "gpt-4o");
+    let cl = openai.AzureClient.new(model = "gpt-4o", deployment_id = "gpt-4o");
     cl.resolved_base_url() catch (e) {
         ai.errors.InvalidRequest => `${e.provider}|${e.detail}`,
     }
@@ -710,7 +727,7 @@ test "chat_generic_config_error_survives_normalize" {
 }
 
 function chat_azure_config_error_survives_normalize() -> string {
-    openai.AzureClient.new(model = "gpt-4o").resolved_base_url() catch_all (e) {
+    openai.AzureClient.new(model = "gpt-4o", deployment_id = "gpt-4o").resolved_base_url() catch_all (e) {
         _ => _config_failure_class(e),
     }
 }
@@ -815,13 +832,13 @@ test "chat_azure_skips_default_max_tokens" {
 // only under it, and sys_llm's `:11434` default 404s on every call.
 function chat_ollama_defaults() -> string {
     let cl = openai.OllamaClient.new(model = "llama3.2");
-    `${cl.resolved_base_url()}|${cl.id()}|${cl.resolved_api_key() ?? "none"}`
+    `${cl.resolved_base_url()}|${cl.requested_model()}|${cl.resolved_api_key() ?? "none"}`
 }
 
 test "chat_ollama_defaults" {
     assert.equal(
         chat_ollama_defaults(),
-        "http://localhost:11434/v1|ollama/llama3.2|none",
+        "http://localhost:11434/v1|llama3.2|none",
     )
 }
 
@@ -864,7 +881,7 @@ function chat_openrouter_request_shape() -> string {
                 sent.header("http-referer") ?? "-",
                 sent.header("x-title") ?? "-",
                 baml.json.path<string>(sent.json(), ".model"),
-                cl.id(),
+                cl.requested_model(),
             ].join("|")
         },
     )
@@ -873,25 +890,25 @@ function chat_openrouter_request_shape() -> string {
 test "chat_openrouter_request_shape" {
     assert.equal(
         chat_openrouter_request_shape(),
-        "Bearer or-key|https://myapp.com|My App|openai/gpt-4o-mini|openrouter/openai/gpt-4o-mini",
+        "Bearer or-key|https://myapp.com|My App|openai/gpt-4o-mini|openai/gpt-4o-mini",
     )
 }
 
 // Every wrapper's default base URL and identity, in one place.
 function chat_client_identities() -> string {
     [
-        openai.ChatClient.new(model = "m").id(),
-        openai.GenericClient.new(model = "m").id(),
-        openai.AzureClient.new(model = "m").id(),
-        openai.OllamaClient.new(model = "m").id(),
-        openai.OpenRouterClient.new(model = "m").id(),
+        openai.ChatClient.new(model = "m").requested_model(),
+        openai.GenericClient.new(model = "m").requested_model(),
+        openai.AzureClient.new(model = "m").requested_model(),
+        openai.OllamaClient.new(model = "m").requested_model(),
+        openai.OpenRouterClient.new(model = "m").requested_model(),
     ].join(" ")
 }
 
 test "chat_client_identities" {
     assert.equal(
         chat_client_identities(),
-        "openai-chat/m openai-generic/m azure/m ollama/m openrouter/m",
+        "m m m m m",
     )
 }
 
@@ -932,7 +949,7 @@ function chat_classifies_http_errors() -> string {
 test "chat_classifies_http_errors" {
     assert.equal(
         chat_classifies_http_errors(),
-        "InvalidRequest/400/Safe|RateLimited/Safe|NetworkFailure/Safe|ParseFailed",
+        "InvalidRequest/400/Safe|RateLimited/Safe|NetworkFailure/Safe|InvalidResponse",
     )
 }
 
@@ -995,7 +1012,7 @@ function chat_sse_decodes_text_and_usage() -> string {
                 deltas.join(","),
                 turn.terminal_text() ?? "-",
                 `${turn.stop_reason}`,
-                `${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}`,
+                `${_chat_usage(turn)?.input_tokens ?? -1}/${_chat_usage(turn)?.output_tokens ?? -1}`,
                 _chat_top_keys(sent.json()),
                 `${baml.json.path_or<bool>(sent.json(), ".stream_options.include_usage", false)}`,
             ].join("|")
@@ -1011,17 +1028,17 @@ test "chat_sse_decodes_text_and_usage" {
 }
 
 // A streamed turn reports the cache split a non-streamed one does:
-// prompt_tokens counts the cached share too.
+// prompt_tokens counts the cached share and the cache writes too.
 function chat_sse_usage_splits_the_cache() -> string {
     root.llm_mock.mock_sse_serve(
         [
             root.llm_mock.sse_data(`{"id":"c","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}`),
-            root.llm_mock.sse_data(`{"id":"c","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":5}}}`),
+            root.llm_mock.sse_data(`{"id":"c","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":150},"completion_tokens_details":{"reasoning_tokens":5}}}`),
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
             let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
-            let u = cl.invoke_stream(_chat_input("Say pong.")).final_turn().usage;
+            let u = _chat_usage(cl.invoke_stream(_chat_input("Say pong.")).final_turn());
             `${u?.input_tokens ?? -1}/${u?.cached_input_tokens ?? -1}/${u?.cache_write_input_tokens ?? -1}/${u?.uncached_input_tokens ?? -1}/${u?.output_tokens ?? -1}/${u?.reasoning_tokens ?? -1}`
         },
     )
@@ -1029,7 +1046,7 @@ function chat_sse_usage_splits_the_cache() -> string {
 
 test "chat_sse_usage_splits_the_cache" {
     // input/cached/cache writes/uncached/output/reasoning
-    assert.equal(chat_sse_usage_splits_the_cache(), "1000/800/-1/200/20/5")
+    assert.equal(chat_sse_usage_splits_the_cache(), "1000/800/150/50/20/5")
 }
 
 // The total request deadline remains active after visible deltas arrive and
@@ -1186,7 +1203,7 @@ test "chat_generic_stream_ttft_allows_prompt_first_event" {
 // `ai.stream.Event` cannot carry them to the runner yet (PLAN §6), so they
 // are buffered in the decoder and readable when the turn ends — this drives the
 // decoder over a real SSE connection and asserts the assembled call.
-function chat_sse_assembles_tool_calls() -> string {
+function chat_sse_assembles_tool_calls() -> json {
     root.llm_mock.mock_sse_serve(
         [
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
@@ -1229,13 +1246,13 @@ function chat_sse_assembles_tool_calls() -> string {
             sse.close();
             let uses = decoder.tool_uses();
             let use = uses.at(0);
-            [
-                uses.length().to_string(),
-                use?.id ?? "-",
-                use?.name ?? "-",
-                baml.json.stringify(baml.json.to_json(use?.args)),
-                stops.join(","),
-            ].join("|")
+            {
+                "count": uses.length(),
+                "id": use?.id,
+                "name": use?.name,
+                "args": baml.json.from(use?.args),
+                "stops": baml.json.from(stops),
+            }
         },
     )
 }
@@ -1243,7 +1260,13 @@ function chat_sse_assembles_tool_calls() -> string {
 test "chat_sse_assembles_tool_calls" {
     assert.equal(
         chat_sse_assembles_tool_calls(),
-        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|ToolUse",
+        {
+            "count": 1,
+            "id": "call_7",
+            "name": "chat_get_weather",
+            "args": { "city": "Paris" },
+            "stops": ["ToolUse"],
+        },
     )
 }
 
@@ -1333,6 +1356,31 @@ test "chat_pdf_url_is_inlined" {
     )
 }
 
+// A PDF read from a file holds its content and the file's base name, never
+// the path: the filename sent is that name.
+function chat_pdf_from_file_is_named() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let doc = baml.media.Pdf.from_file_content("/reports/2026/q3.pdf", "JVBERi0xLjQ=", null);
+            let _ = cl.invoke(_chat_doc_input(doc));
+            let body = mock.last_request().json();
+            [
+                baml.json.path<string>(body, ".messages[0].content[1].file.filename"),
+                baml.json.path<string>(body, ".messages[0].content[1].file.file_data"),
+            ].join("|")
+        },
+    )
+}
+
+test "chat_pdf_from_file_is_named" {
+    assert.equal(
+        chat_pdf_from_file_is_named(),
+        "q3.pdf|data:application/pdf;base64,JVBERi0xLjQ=",
+    )
+}
+
 // An already-inline PDF takes the same path, and a scheme the client cannot
 // fetch is a typed configuration error rather than a blank `file_data`.
 function chat_pdf_base64_and_unfetchable() -> string {
@@ -1370,12 +1418,16 @@ test "chat_pdf_base64_and_unfetchable" {
 // DATA (`"default": null`, a nullable union member), not an unset option, and
 // pruning it changes the schema the model is shown and breaks strict-schema
 // servers. The null-pruning pass must not walk into it.
-function chat_tool_schema_keeps_nulls() -> string {
+function chat_tool_schema_keeps_nulls() -> json {
     root.llm_mock.mock_json_serve(
         [root.llm_mock.MockResponse.ok(_chat_ok_body())],
         (mock: root.llm_mock.MockJsonServer) -> {
-            let schema = baml.json.from_string<map<string, unknown>>(
-                `{"type":"object","properties":{"x":{"type":["string","null"],"default":null}},"required":[]}`,
+            let schema = baml.json.to<map<string, unknown>>(
+                {
+                    "type": "object",
+                    "properties": { "x": { "type": ["string", "null"], "default": null } },
+                    "required": [],
+                },
             );
             let spec = ChatEcho@spec("hi");
             let input = ai.ModelTurnInput {
@@ -1395,28 +1447,22 @@ function chat_tool_schema_keeps_nulls() -> string {
             };
             let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
             let _ = cl.invoke(input);
-            let params = baml.json.path<json>(
-                mock.last_request().json(),
-                ".tools[0].function.parameters",
-            );
-            match (params) {
-                let object: map<string, json> => {
-                    let properties = baml.json.path<json>(params, ".properties.x");
-                    match (properties) {
-                        let field: map<string, json> => {
-                            `${field.has("default")}|${baml.json.stringify(field.get("default"))}`
-                        },
-                        _ => "not-an-object",
-                    }
-                },
-                _ => "not-an-object",
-            }
+            baml.json.path<json>(mock.last_request().json(), ".tools[0].function.parameters")
         },
     )
 }
 
 test "chat_tool_schema_keeps_nulls" {
-    assert.equal(chat_tool_schema_keeps_nulls(), "true|null")
+    // Deep equality tells a `null`-valued key from an absent one, so this
+    // fails if `"default": null` was pruned.
+    assert.equal(
+        chat_tool_schema_keeps_nulls(),
+        {
+            "type": "object",
+            "properties": { "x": { "type": ["string", "null"], "default": null } },
+            "required": [],
+        },
+    )
 }
 
 // `data: [DONE]` is chat completions' explicit terminator. A connection that
@@ -1464,14 +1510,14 @@ test "chat_terminated_stream_still_completes" {
     assert.equal(chat_terminated_stream_still_completes(), "ok")
 }
 
-// A message's authored metadata is a per-part provider directive on this family
-// (OpenAI `prompt_cache_breakpoint`, OpenRouter's Anthropic-style
-// `cache_control`). It rides on the message's LAST content part, forwarded
-// verbatim — and a message carrying one never collapses to a bare string, which
-// would drop it.
+// A `${cache(args)}` in the prompt is a cache breakpoint on this family:
+// `prompt_cache_breakpoint: args` on the content part BEFORE the delimiter.
+// OpenAI and Azure OpenAI send it; a message carrying one never collapses to a
+// bare string, which would drop it. Every other OpenAI-compatible client drops
+// the delimiter and sends the prompt as if it were not there.
 function ChatCached(question: string) -> string {
     client: "openai/gpt-4o-mini"
-    prompt: `${ai.Role { name: "system", metadata: { "prompt_cache_breakpoint": { "type": "enabled" } } }}Follow the rules.${role("user")}${question}`
+    prompt: `${role("system")}Follow the rules.${cache({ "mode": "explicit" })}${role("user")}Stable. ${cache({ "mode": "explicit" })}${question}`
 }
 
 function _chat_cached_input() -> ai.ModelTurnInput {
@@ -1484,68 +1530,87 @@ function _chat_cached_input() -> ai.ModelTurnInput {
     }
 }
 
-function chat_metadata_rides_last_content_part() -> string {
+function chat_cache_delimiter_is_a_breakpoint_on_the_part_before() -> json[] {
     root.llm_mock.mock_json_serve(
         [
+            root.llm_mock.MockResponse.ok(_chat_ok_body()),
             root.llm_mock.MockResponse.ok(_chat_ok_body()),
             root.llm_mock.MockResponse.ok(_chat_ok_body()),
         ],
         (mock: root.llm_mock.MockJsonServer) -> {
             let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
             let _ = cl.invoke(_chat_cached_input());
-            let body = mock.last_request().json();
-            // The collapsing wrapper must not swallow the directive either.
-            let collapsing = openai.GenericClient.new(
-                model = "qwen3",
+            let openai_messages = baml.json.path<json>(mock.last_request().json(), ".messages");
+            let azure = openai.AzureClient.new(
+                model = "gpt-deployment",
+                api_key = "k",
                 base_url = mock.base_url(),
             );
-            let _ = collapsing.invoke(_chat_cached_input());
-            let collapsed = mock.last_request().json();
-            [
-                baml.json.path<string>(body, ".messages[0].content[0].type"),
-                baml.json.path<string>(body, ".messages[0].content[0].text").trim(),
-                baml.json.path<string>(
-                    body,
-                    ".messages[0].content[0].prompt_cache_breakpoint.type",
-                ),
-                baml.json.path_or<string>(
-                    body,
-                    ".messages[1].content[0].prompt_cache_breakpoint.type",
-                    "absent",
-                ),
-                baml.json.path<string>(
-                    collapsed,
-                    ".messages[0].content[0].prompt_cache_breakpoint.type",
-                ),
-            ].join("|")
+            let _ = azure.invoke(_chat_cached_input());
+            let azure_messages = baml.json.path<json>(mock.last_request().json(), ".messages");
+            // A generic OpenAI-compatible server is not known to take the
+            // field: the delimiters are dropped, and the all-text messages
+            // collapse to bare strings exactly as they would without them.
+            let generic = openai.GenericClient.new(model = "qwen3", base_url = mock.base_url());
+            let _ = generic.invoke(_chat_cached_input());
+            let generic_messages = baml.json.path<json>(mock.last_request().json(), ".messages");
+            [openai_messages, azure_messages, generic_messages]
         },
     )
 }
 
-test "chat_metadata_rides_last_content_part" {
-    assert.equal(
-        chat_metadata_rides_last_content_part(),
-        "text|Follow the rules.|enabled|absent|enabled",
-    )
+test "chat_cache_delimiter_is_a_breakpoint_on_the_part_before" {
+    let got = chat_cache_delimiter_is_a_breakpoint_on_the_part_before();
+    let marked: json = [
+        {
+            "role": "system",
+            "content": [
+                { "type": "text", "text": "Follow the rules.", "prompt_cache_breakpoint": { "mode": "explicit" } },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Stable.", "prompt_cache_breakpoint": { "mode": "explicit" } },
+                { "type": "text", "text": "hi" },
+            ],
+        },
+    ];
+    // openai.ChatClient, and openai.AzureClient the same
+    assert.equal(got[0], marked);
+    assert.equal(got[1], marked);
+    let collapsed: json = [
+        { "role": "system", "content": "Follow the rules." },
+        { "role": "user", "content": "Stable. hi" },
+    ];
+    assert.equal(got[2], collapsed)
 }
 
-// "Forwarded verbatim" includes an explicitly authored `null`. A directive is
-// the caller telling the endpoint something; `null` is a thing to say (it is
-// how OpenRouter turns a cache breakpoint OFF for one message), and it is NOT
-// the same as omitting the key. The body's null-pruning pass exists to drop the
-// CLIENT's unset options — it must not reach into an authored directive, which
-// is why the directives ride a parked, opaque subtree until after the prune.
-function ChatCachedNull(question: string) -> string {
+// `args` is sent AS WRITTEN, which includes a null nested inside it. The
+// body's null-pruning pass exists to drop the CLIENT's unset options — it must
+// not reach into `args`, which is why the breakpoint rides a parked, opaque
+// subtree until after the prune. A delimiter with nothing before it in its
+// message sends no breakpoint. One with null `args` takes the client's default,
+// which this client's model (GPT-5.5 or earlier) does not have: it is as if it
+// were not written.
+function ChatCacheArgs(args: json) -> string {
     client: "openai/gpt-4o-mini"
-    prompt: `${ai.Role { name: "system", metadata: { "cache_control": null, "keep": "yes" } }}Follow the rules.${role("user")}${question}`
+    prompt: `${role("system")}${cache({ "mode": "explicit" })}Rules.${role("user")}Stable.${cache(args)} Variable.`
 }
 
-function chat_authored_null_directive_survives_pruning() -> string {
+class ChatCacheArgsRequest {
+    system: json,
+    stable: json,
+    // whether the reserved parking key reached the wire
+    parked: bool,
+}
+
+function _chat_cache_args(args: json) -> ChatCacheArgsRequest {
     root.llm_mock.mock_json_serve(
         [root.llm_mock.MockResponse.ok(_chat_ok_body())],
         (mock: root.llm_mock.MockJsonServer) -> {
             let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
-            let spec = ChatCachedNull@spec("hi");
+            let spec = ChatCacheArgs@spec(args);
             let _ = cl.invoke(
                 ai.ModelTurnInput {
                     prompt: spec.prompt_template,
@@ -1556,23 +1621,180 @@ function chat_authored_null_directive_survives_pruning() -> string {
             );
             let raw = mock.last_request().body;
             let body = mock.last_request().json();
-            [
-                // the authored null is ON the wire ...
-                `null_kept=${raw.includes(`"cache_control":null`)}`,
-                // ... alongside its non-null sibling ...
-                baml.json.path<string>(body, ".messages[0].content[0].keep"),
-                // ... and the reserved parking key never reaches it.
-                `parked=${raw.includes("__baml_directives")}`,
-            ].join("|")
+            ChatCacheArgsRequest {
+                system: baml.json.path<json>(body, ".messages[0].content"),
+                stable: baml.json.path<json>(body, ".messages[1].content[0]"),
+                parked: raw.includes("__baml_directives"),
+            }
         },
     )
 }
 
-test "chat_authored_null_directive_survives_pruning" {
-    assert.equal(
-        chat_authored_null_directive_survives_pruning(),
-        "null_kept=true|yes|parked=false",
+test "chat_cache_delimiter_args_as_written" {
+    let rules: json = [{ "type": "text", "text": "Rules." }];
+
+    let args: json = { "mode": "explicit", "ttl": null };
+    let explicit = _chat_cache_args(args);
+    assert.equal(explicit.system, rules);
+    let marked: json = {
+        "type": "text",
+        "text": "Stable.",
+        "prompt_cache_breakpoint": { "mode": "explicit", "ttl": null },
+    };
+    assert.equal(explicit.stable, marked);
+    assert.equal(explicit.parked, false);
+
+    let nulled = _chat_cache_args(null);
+    assert.equal(nulled.system, rules);
+    let unmarked: json = { "type": "text", "text": "Stable. Variable." };
+    assert.equal(nulled.stable, unmarked);
+    assert.equal(nulled.parked, false)
+}
+
+// `${cache()}` takes the client's default: `{"mode": "explicit"}`, the one value
+// `prompt_cache_breakpoint` accepts, on GPT-5.6 and later. Every earlier model
+// answers 400 to the field, so those get no default and the delimiter sends
+// nothing. The list names the OLD families; a model it does not know is
+// treated as new. Azure judges its `model` the same way.
+function chat_cache_default_by_model() -> map<string, json> {
+    let models = [
+        "gpt-5.6-luna",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+        "some-future-model",
+        "gpt-5.5",
+        "gpt-5.5-pro-2026-04-23",
+        "gpt-5-mini",
+        "gpt-5",
+        "gpt-4o-mini-2024-07-18",
+        "gpt-4.1",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo",
+        "o4-mini",
+        "o3",
+        "chat-latest",
+        "ft:gpt-4.1-mini-2025-04-14:acme:support:abc123",
+        "ft:gpt-5.6-luna:acme:support:abc123",
+        // Bedrock's ids for OpenAI models
+        "openai.gpt-5.5",
+        "openai.gpt-5.6-luna",
+    ];
+    let out: map<string, json> = {};
+    for (let model in models) {
+        let chat: ai.Client = openai.ChatClient.new(model = model, api_key = "k");
+        let responses: ai.Client = openai.ResponsesClient.new(model = model, api_key = "k");
+        let azure: ai.Client = openai.AzureClient.new(model = model, api_key = "k");
+        // the three clients share one list
+        assert.equal(chat.default_cache_args(), responses.default_cache_args());
+        assert.equal(chat.default_cache_args(), azure.default_cache_args());
+        let _ = out.set(model, chat.default_cache_args());
+    }
+    out
+}
+
+test "chat_cache_default_by_model" {
+    let expected: map<string, json> = {
+        "gpt-5.6-luna": { "mode": "explicit" },
+        "gpt-6-sol": { "mode": "explicit" },
+        "gpt-6.1-sol": { "mode": "explicit" },
+        "some-future-model": { "mode": "explicit" },
+        "gpt-5.5": null,
+        "gpt-5.5-pro-2026-04-23": null,
+        "gpt-5-mini": null,
+        "gpt-5": null,
+        "gpt-4o-mini-2024-07-18": null,
+        "gpt-4.1": null,
+        "gpt-4-turbo": null,
+        "gpt-3.5-turbo": null,
+        "o4-mini": null,
+        "o3": null,
+        "chat-latest": null,
+        "ft:gpt-4.1-mini-2025-04-14:acme:support:abc123": null,
+        "ft:gpt-5.6-luna:acme:support:abc123": { "mode": "explicit" },
+        "openai.gpt-5.5": null,
+        "openai.gpt-5.6-luna": { "mode": "explicit" },
+    };
+    assert.equal(chat_cache_default_by_model(), expected)
+}
+
+function ChatCacheDefault(question: string) -> string {
+    client: "openai/gpt-4o-mini"
+    prompt: `${role("system")}Follow the rules.${cache()}${role("user")}${question}`
+}
+
+function _chat_default_system(cl: ai.Client) -> json {
+    let spec = ChatCacheDefault@spec("hi");
+    let request = cl.render(
+        ai.ModelTurnInput {
+            prompt: spec.prompt_template,
+            journal: ai.Journal { log: [] },
+            toolbox: spec.tools(),
+            output_type: spec.output_type(),
+        },
+    );
+    baml.json.path<json>(baml.json.parse(request.body), ".messages[0].content")
+}
+
+test "chat_cache_default_args" {
+    let marked: json = [
+        { "type": "text", "text": "Follow the rules.", "prompt_cache_breakpoint": { "mode": "explicit" } },
+    ];
+    let unmarked: json = [{ "type": "text", "text": "Follow the rules." }];
+    assert.equal(_chat_default_system(openai.ChatClient.new(model = "gpt-5.6-luna", api_key = "k")), marked);
+    assert.equal(_chat_default_system(openai.ChatClient.new(model = "gpt-5.5", api_key = "k")), unmarked);
+    let azure_new = openai.AzureClient.new(
+        model = "gpt-5.6-luna",
+        api_key = "k",
+        base_url = "http://localhost:1234/openai/deployments/gpt-5.6-luna",
+    );
+    assert.equal(_chat_default_system(azure_new), marked);
+    let azure_old = openai.AzureClient.new(
+        model = "gpt-5.5",
+        api_key = "k",
+        base_url = "http://localhost:1234/openai/deployments/gpt-5.5",
+    );
+    assert.equal(_chat_default_system(azure_old), unmarked)
+}
+
+// Role metadata is not forwarded onto a content part any more: a key there
+// (a `cache_control`, say) no longer reaches the endpoint, where OpenAI
+// rejected it.
+function ChatRoleMetadata(question: string) -> string {
+    client: "openai/gpt-4o-mini"
+    prompt: `${role("system", metadata = { "cache_control": { "type": "ephemeral" } })}Follow the rules.${role("user")}${question}`
+}
+
+function chat_role_metadata_is_not_forwarded() -> json {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let spec = ChatRoleMetadata@spec("hi");
+            let journal = ai.Journal {
+                log: [
+                    ai.events.UserMessage.of(["more"], metadata = { "cache_control": { "type": "ephemeral" } }),
+                ],
+            };
+            let _ = cl.invoke(
+                ai.ModelTurnInput {
+                    prompt: spec.prompt_template,
+                    journal: journal,
+                    toolbox: spec.tools(),
+                    output_type: spec.output_type(),
+                },
+            );
+            baml.json.path<json>(mock.last_request().json(), ".messages")
+        },
     )
+}
+
+test "chat_role_metadata_is_not_forwarded" {
+    let expected: json = [
+        { "role": "system", "content": [{ "type": "text", "text": "Follow the rules." }] },
+        { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+        { "role": "user", "content": "more" },
+    ];
+    assert.equal(chat_role_metadata_is_not_forwarded(), expected)
 }
 
 // Ollama's OpenAI-compatible endpoint cannot read an image URL ("Base64 encoded
@@ -1660,7 +1882,7 @@ function chat_bad_tool_arguments_throw() -> string {
                     return _chat_failure_label(e);
                 },
             };
-            baml.json.stringify(baml.json.to_json(turn.tool_uses().at(0)?.args))
+            baml.json.stringify(turn.tool_uses().at(0)?.args)
         },
     )
 }
@@ -1715,7 +1937,7 @@ function chat_stream_rejects_corrupt_chunk() -> string {
 }
 
 test "chat_stream_rejects_corrupt_chunk" {
-    assert.equal(chat_stream_rejects_corrupt_chunk(), "ParseFailed")
+    assert.equal(chat_stream_rejects_corrupt_chunk(), "InvalidResponse")
 }
 
 // A non-JSON keepalive between chunks is still skipped.
@@ -1814,7 +2036,7 @@ function live_openrouter_answers() -> bool {
 
 testset "live" with testing.Sequential() {
     // Always registered, so a keyless `--profile live -i openai_chat` still
-    // selects something (an empty selection exits 5).
+    // selects something.
     test "preconditions" {
         assert.is_true(true)
     }

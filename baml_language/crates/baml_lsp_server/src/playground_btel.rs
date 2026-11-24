@@ -6,8 +6,9 @@
 //! index is reused across requests. All of it is blocking work: callers run
 //! it on a blocking thread, never on the async executor.
 //!
-//! An execution is a root call: a future span without a parent. It opens
-//! with the spans below it, found through `parent_span_id`: its futures
+//! An execution is a root call: a future span without a parent, excluding
+//! runtime GC roots. It opens with the spans below it, found through
+//! `parent_span_id`: its futures
 //! (timeline lanes) and its retained calls with their captured values, and
 //! the errors those calls ended with. Calling contexts come from the
 //! profiler, which exists only once the process that ran the call ended.
@@ -22,13 +23,15 @@ use std::{
 use baml_query_btel::{Index, IndexOptions, QueryRequest, QueryResult, SqlParam};
 use serde_json::{Value, json};
 
-/// Rows the list shows; the newest root calls first.
+/// Rows the list shows; the newest root calls first. Runtime GC pauses are
+/// independent roots, but are not playground executions.
 const LIST_SQL: &str = "
 SELECT a.span_id, a.span_name, s.status, a.start_time, s.duration, p.status
 FROM span_announcements a
 LEFT JOIN spans s ON s.span_id = a.span_id
 LEFT JOIN processes p ON p.process_id = a.process_id
 WHERE a.span_type = 'future' AND a.parent_span_id IS NULL
+  AND (a.span_name IS NULL OR a.span_name <> 'baml.gc')
 ORDER BY a.start_time DESC
 LIMIT 200";
 
@@ -115,35 +118,29 @@ fn chunked(
     Ok(rows)
 }
 
+/// Only projects under a served workspace root are readable. `served` is
+/// what the playground serves when the request arrives: the projects under
+/// the command line's folders and under the folders the editor announces.
+fn served_project(project: &str, served: &[PathBuf]) -> Result<PathBuf, TelemetryError> {
+    let path = std::fs::canonicalize(project)
+        .map_err(|e| TelemetryError::failed(format!("{project}: {e}")))?;
+    let served = served
+        .iter()
+        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| path.starts_with(root)));
+    if !served {
+        return Err(TelemetryError::failed(format!(
+            "{project} is not a workspace served by this playground"
+        )));
+    }
+    Ok(path)
+}
+
+#[derive(Default)]
 pub struct PlaygroundTelemetry {
-    workspace_roots: Arc<[PathBuf]>,
     indexes: Mutex<HashMap<PathBuf, Arc<Mutex<Index>>>>,
 }
 
 impl PlaygroundTelemetry {
-    pub fn new(workspace_roots: Arc<[PathBuf]>) -> Self {
-        Self {
-            workspace_roots,
-            indexes: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Only projects under a served workspace root are readable.
-    fn project(&self, project: &str) -> Result<PathBuf, TelemetryError> {
-        let path = std::fs::canonicalize(project)
-            .map_err(|e| TelemetryError::failed(format!("{project}: {e}")))?;
-        let served = self
-            .workspace_roots
-            .iter()
-            .any(|root| std::fs::canonicalize(root).is_ok_and(|root| path.starts_with(root)));
-        if !served {
-            return Err(TelemetryError::failed(format!(
-                "{project} is not a workspace served by this playground"
-            )));
-        }
-        Ok(path)
-    }
-
     fn index(&self, project: &Path) -> Result<Option<Arc<Mutex<Index>>>, TelemetryError> {
         if let Some(index) = self.indexes.lock().expect("index table").get(project) {
             return Ok(Some(Arc::clone(index)));
@@ -169,9 +166,10 @@ impl PlaygroundTelemetry {
     fn with_index<T>(
         &self,
         project: &str,
+        served: &[PathBuf],
         read: impl FnOnce(&mut Index) -> Result<T, TelemetryError>,
     ) -> Result<Option<T>, TelemetryError> {
-        let project = self.project(project)?;
+        let project = served_project(project, served)?;
         let Some(index) = self.index(&project)? else {
             return Ok(None);
         };
@@ -192,8 +190,12 @@ impl PlaygroundTelemetry {
     }
 
     /// Execution list and whether the project has no recordings yet.
-    pub fn list_executions(&self, project: &str) -> Result<(Vec<Value>, bool), TelemetryError> {
-        match self.with_index(project, |index| run(index, LIST_SQL, Vec::new()))? {
+    pub fn list_executions(
+        &self,
+        project: &str,
+        served: &[PathBuf],
+    ) -> Result<(Vec<Value>, bool), TelemetryError> {
+        match self.with_index(project, served, |index| run(index, LIST_SQL, Vec::new()))? {
             None => Ok((Vec::new(), true)),
             Some(result) => Ok((
                 result.rows.iter().map(|row| execution(row)).collect(),
@@ -208,10 +210,11 @@ impl PlaygroundTelemetry {
     pub fn open_execution(
         &self,
         project: &str,
+        served: &[PathBuf],
         execution_id: &str,
         current_source: Option<[u8; 32]>,
     ) -> Result<Value, TelemetryError> {
-        let Some(opened) = self.with_index(project, |index| {
+        let Some(opened) = self.with_index(project, served, |index| {
             // The root and every span below it, one level per query.
             let mut spans = chunked(index, &[execution_id.to_owned()], |n| {
                 tree_sql("span_id", n)
@@ -436,7 +439,7 @@ fn thread(
 /// A captured value's UI state from `baml_value_state` and its rendering.
 fn captured(state: Option<&str>, value: &Value) -> (&'static str, Value) {
     match (state, value) {
-        (Some("present" | "null" | "omitted"), value) => {
+        (Some("present" | "null" | "omitted" | "redacted"), value) => {
             ("available", Value::String(value.to_string()))
         }
         (Some("capture_pending"), _) => ("lost:pending", Value::Null),

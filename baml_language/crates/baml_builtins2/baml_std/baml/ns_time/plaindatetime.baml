@@ -102,7 +102,7 @@ class PlainDateTime {
         $rust_function
     }
 
-    implements baml.ToString {
+    implements root.ToString {
         /// Serializes to ISO 8601 with no offset suffix:
         /// `1979-05-27T07:32:00`. A negative year carries a leading `-`.
         ///
@@ -211,7 +211,10 @@ class PlainDateTime {
                                             _iana: timezone,
                                         }
                                     } else {
-                                        throw AmbiguousTimeError { message: "wall-clock time is ambiguous or skipped in timezone " + timezone }
+                                        throw AmbiguousTimeError {
+                                            message: "wall-clock time is ambiguous or skipped in timezone "
+                                                + timezone,
+                                        };
                                     }
                                 },
                             }
@@ -343,7 +346,7 @@ class PlainDateTime {
         $rust_function
     }
 
-    implements baml.FromJson {
+    implements root.FromJson {
         /// Decodes a `PlainDateTime` from a JSON string, accepting exactly what
         /// `PlainDateTime.parse` accepts.
         ///
@@ -352,22 +355,48 @@ class PlainDateTime {
         /// - `baml.json.DecodeError` if the value is not a string, or is a
         ///   string `PlainDateTime.parse` rejects — including an offset-bearing
         ///   timestamp, which belongs to `ZonedDateTime` or `Instant`.
-        function from_json(j: baml.json.json) -> Self throws baml.json.DecodeError {
+        function from_json(j: root.json.json) -> Self throws root.json.DecodeError {
             match (j) {
                 string => {
                     PlainDateTime.parse(j) catch (_) {
                         root.errors.ParseError { message } => {
-                            throw baml.json.DecodeError { message: message, path: "" }
+                            throw root.json.DecodeError {
+                                message: message,
+                                path: "",
+                            };
                         },
                     }
                 },
                 _ => {
-                    throw baml.json.DecodeError { message: "Expected zoneless ISO 8601 string", path: "" }
+                    throw root.json.DecodeError {
+                        message: "Expected zoneless ISO 8601 string",
+                        path: "",
+                    };
                 },
             }
         }
     }
-    implements baml.ToJson {
+    implements root.FromLlmOutput {
+        type Shape = string;
+
+        /// Builds a `PlainDateTime` from a date and time a model wrote, accepting exactly what
+        /// `PlainDateTime.parse` accepts.
+        ///
+        /// # Throws
+        ///
+        /// - `baml.json.DecodeError` if `PlainDateTime.parse` rejects the string.
+        function from_llm_output(shape: string) -> Self throws root.json.DecodeError {
+            PlainDateTime.parse(shape) catch (_) {
+                root.errors.ParseError { message } => {
+                    throw root.json.DecodeError {
+                        message: message,
+                        path: "",
+                    };
+                },
+            }
+        }
+    }
+    implements root.ToJson {
         /// Encodes `self` as the same zoneless ISO 8601 string `to_string`
         /// produces.
         ///
@@ -376,22 +405,26 @@ class PlainDateTime {
         /// - `baml.json.SerializationError` if the year is outside ±9999. The
         ///   same failure panics in `to_string`: a serializer is called with a
         ///   caller standing by to react, so it gets the error channel.
-        function to_json(self) -> baml.json.json throws baml.json.SerializationError {
+        function to_json(self) -> root.json.json throws root.json.SerializationError {
             self._to_string_impl() catch (_) {
                 root.errors.InvalidArgument { message } => {
-                    throw baml.json.SerializationError {
+                    throw root.json.SerializationError {
                         message: message,
                         path: "",
                         reason: "unserializable",
-                    }
+                    };
                 },
             }
         }
     }
+
+    @@description(
+        "An ISO 8601 date and time with no timezone, for example 1979-05-27T07:32:00",
+    )
 }
 
 implement root.ops.Add<Duration> for PlainDateTime {
-    type Output = PlainDateTime
+    type Output = PlainDateTime;
     /// Advances the wall-clock reading by `other`.
     ///
     /// Pure civil arithmetic: no timezone is consulted, so adding 24 hours
@@ -403,24 +436,24 @@ implement root.ops.Add<Duration> for PlainDateTime {
     /// value whose accessors and `to_string` then fail.
     function add(self, other: Duration) -> PlainDateTime {
         PlainDateTime {
-            _nanoseconds: self._nanoseconds + other._nanoseconds
+            _nanoseconds: self._nanoseconds + other._nanoseconds,
         }
     }
 }
 
 implement root.ops.Subtract<Duration> for PlainDateTime {
-    type Output = PlainDateTime
+    type Output = PlainDateTime;
     /// Rewinds the wall-clock reading by `other`. Civil arithmetic, with the
     /// same caveats as `PlainDateTime + Duration`.
     function sub(self, other: Duration) -> PlainDateTime {
         PlainDateTime {
-            _nanoseconds: self._nanoseconds - other._nanoseconds
+            _nanoseconds: self._nanoseconds - other._nanoseconds,
         }
     }
 }
 
 implement root.ops.Subtract<PlainDateTime> for PlainDateTime {
-    type Output = Duration
+    type Output = Duration;
     /// The signed gap from `other` to `self`, read off the clock face: positive
     /// when `self` is the later reading, negative when it is the earlier.
     ///
@@ -429,7 +462,7 @@ implement root.ops.Subtract<PlainDateTime> for PlainDateTime {
     /// readings sit in the same UTC offset.
     function sub(self, other: PlainDateTime) -> Duration {
         Duration {
-            _nanoseconds: self._nanoseconds - other._nanoseconds
+            _nanoseconds: self._nanoseconds - other._nanoseconds,
         }
     }
 }

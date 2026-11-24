@@ -2,19 +2,20 @@
 source: crates/baml_tests/src/corpus.rs
 ---
 === MIR2 ===
-fn user.fixtures.llm_quoted_prompt.QuotedPrompt(topic: string, client: null | ai.Client, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never)) -> string {
+fn user.fixtures.llm_quoted_prompt.QuotedPrompt(topic: string, client: null | ai.Client, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never)) -> string {
     // Locals:
     let _0: string // _0 // return
     let _1: string // topic // param
     let _2: null | ai.Client // client // param
-    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never) // on_event // param
+    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never) // on_event // param
     let _4: bool
     let _5: bool
     let _6: ai.RunResult<string>
     let _7: ai.Agent
     let _8: reflect.Type
     let _9: ai.FunctionSpec<string>
-    let _10: reflect.Type
+    let _10: trace.Options | trace.ReservedSpan
+    let _11: reflect.Type
 
     bb0: {
         _4 = copy _2 == const <omitted>;
@@ -46,16 +47,20 @@ fn user.fixtures.llm_quoted_prompt.QuotedPrompt(topic: string, client: null | ai
     }
 
     bb6: {
-        _10 = load_type(string);
-        _6 = virtual_call run as ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure><copy _10>(copy _7, copy _9) -> [bb7];
+        _10 = call const fn trace._passthrough() -> [bb7];
     }
 
     bb7: {
-        _0 = copy _6.0;
-        goto -> bb8;
+        _11 = load_type(string);
+        _6 = virtual_call run as ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure><copy _11>(copy _7, copy _9, copy _10) -> [bb8];
     }
 
     bb8: {
+        _0 = copy _6.0;
+        goto -> bb9;
+    }
+
+    bb9: {
         return;
     }
 }
@@ -135,34 +140,41 @@ fn user.fixtures.llm_quoted_prompt.QuotedPrompt@spec(topic: string) -> ai.Functi
     let _0: ai.FunctionSpec<string> // _0 // return
     let _1: string // topic // param
     let _2: map<string, unknown>
-    let _3: (ai.OutputFormat) -> ai.Prompt throws ai.errors.PromptRenderError
-    let _4: ai.tools.Toolbox
-    let _5: ai.tools.Tool[]
-    let _6: ai.Client
-    let _7: (string, string) -> null | ai.Client throws never
-    let _8: string[]
-    let _9: reflect.Type
+    let _3: map<string, unknown>
+    let _4: unknown
+    let _5: (ai.OutputFormat) -> ai.Prompt throws ai.errors.PromptRenderError
+    let _6: ai.tools.Toolbox
+    let _7: ai.tools.Tool[]
+    let _8: ai.Client
+    let _9: (string, string) -> null | ai.Client throws never
+    let _10: string[]
+    let _11: reflect.Type
 
     bb0: {
-        _2 = { const "topic": copy _1 }: map<string, unknown>;
-        _3 = make_closure lambda[0]();
-        _5 = []: ai.tools.Tool[];
-        _4 = call const fn ai.tools.Toolbox.new(copy _5) -> [bb1];
+        _3 = {  }: map<string, unknown>;
+        _4 = call const fn baml.Map.set(copy _3, const "topic", copy _1) -> [bb1];
     }
 
     bb1: {
-        _7 = make_closure lambda[1]();
-        _8 = [const "openai", const "openai-chat", const "openai-images", const "azure", const "ollama", const "openrouter", const "anthropic", const "typesafeai", const "google", const "vertex", const "bedrock", const "ai-gateway-images", const "claude-code"]: string[];
-        _9 = load_type(never);
-        _6 = call const fn ai.clients.resolve<copy _9>(const item user.fixtures.llm_quoted_prompt.QuotedPromptClient, copy _7, copy _8) -> [bb2];
+        _2 = copy _3;
+        _5 = make_closure lambda[0]();
+        _7 = []: ai.tools.Tool[];
+        _6 = call const fn ai.tools.Toolbox.new(copy _7) -> [bb2];
     }
 
     bb2: {
-        _0 = ai.FunctionSpec<string> { const "QuotedPrompt", copy _2, copy _3, copy _4, copy _6 };
-        goto -> bb3;
+        _9 = make_closure lambda[1]();
+        _10 = [const "openai", const "openai-chat", const "openai-decisions", const "openai-images", const "ollama", const "openrouter", const "anthropic", const "typesafeai", const "google", const "vertex", const "bedrock", const "ai-gateway-images", const "claude-code"]: string[];
+        _11 = load_type(never);
+        _8 = call const fn ai.clients.resolve<copy _11>(const item user.fixtures.llm_quoted_prompt.QuotedPromptClient, copy _9, copy _10) -> [bb3];
     }
 
     bb3: {
+        _0 = ai.FunctionSpec<string> { const "QuotedPrompt", const fn user.fixtures.llm_quoted_prompt.QuotedPrompt, copy _2, copy _5, copy _6, copy _8 };
+        goto -> bb4;
+    }
+
+    bb4: {
         return;
     }
 }
@@ -189,8 +201,9 @@ fn .<lambda(QuotedPrompt@spec, 0)>( __spec_output_format: ai.OutputFormat) -> ai
     let _16: baml.TaggedString
     let _17: unknown[]
     let _18: baml.TaggedString
-    let _19: ai.errors.PromptRenderError
-    let _20: never
+    let _19: bool
+    let _20: ai.errors.PromptRenderError
+    let _21: never
 
     bb0 [unwind bb3]: {
         _5 = []: string[];
@@ -220,13 +233,18 @@ fn .<lambda(QuotedPrompt@spec, 0)>( __spec_output_format: ai.OutputFormat) -> ai
     }
 
     bb3 [landing _2, _3] [handling bb3]: {
-        throw_if_panic copy _2 with copy _3 -> bb4;
+        _19 = is_type_tag(copy _2, PANIC);
+        branch copy _19 -> [bb5, bb4];
     }
 
     bb4 [handling bb3]: {
-        _20 = copy _2;
-        _19 = ai.errors.PromptRenderError { const "prompt template rendering threw", copy _20 };
-        throw copy _19;
+        _21 = copy _2;
+        _20 = ai.errors.PromptRenderError { const "prompt template rendering threw", copy _21 };
+        throw copy _20;
+    }
+
+    bb5 [handling bb3]: {
+        rethrow copy _2 with copy _3;
     }
 }
 
@@ -261,12 +279,12 @@ fn .<lambda(QuotedPrompt@spec, 1)>(prefix: string, model: string) -> null | ai.C
     }
 
     bb2: {
-        _5 = is_type(copy _1, "openai-images");
+        _5 = is_type(copy _1, "openai-decisions");
         branch copy _5 -> [bb24, bb3];
     }
 
     bb3: {
-        _6 = is_type(copy _1, "azure");
+        _6 = is_type(copy _1, "openai-images");
         branch copy _6 -> [bb23, bb4];
     }
 
@@ -341,7 +359,7 @@ fn .<lambda(QuotedPrompt@spec, 1)>(prefix: string, model: string) -> null | ai.C
     }
 
     bb19: {
-        _0 = call const fn typesafeai.Client.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+        _0 = call const fn typesafeai.Client.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
     bb20: {
@@ -357,19 +375,19 @@ fn .<lambda(QuotedPrompt@spec, 1)>(prefix: string, model: string) -> null | ai.C
     }
 
     bb23: {
-        _0 = call const fn openai.AzureClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
-    }
-
-    bb24: {
         _0 = call const fn openai.ImageClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
+    bb24: {
+        _0 = call const fn openai.DecisionsClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+    }
+
     bb25: {
-        _0 = call const fn openai.ChatClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+        _0 = call const fn openai.ChatClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
     bb26: {
-        _0 = call const fn openai.ResponsesClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+        _0 = call const fn openai.ResponsesClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
     bb27: {
@@ -377,16 +395,19 @@ fn .<lambda(QuotedPrompt@spec, 1)>(prefix: string, model: string) -> null | ai.C
     }
 }
 
-fn user.fixtures.llm_quoted_prompt.QuotedPrompt@stream(topic: string, client: null | ai.stream.StreamingClient, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never)) -> ai.stream.Stream<string> {
+fn user.fixtures.llm_quoted_prompt.QuotedPrompt@stream(topic: string, client: null | ai.stream.StreamingClient, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never)) -> ai.stream.Stream<string> {
     // Locals:
     let _0: ai.stream.Stream<string> // _0 // return
     let _1: string // topic // param
     let _2: null | ai.stream.StreamingClient // client // param
-    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never) // on_event // param
+    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never) // on_event // param
     let _4: bool
     let _5: bool
     let _6: ai.FunctionSpec<string>
-    let _7: reflect.Type
+    let _7: null | ai.stream.StreamingClient
+    let _8: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws unknown)
+    let _9: trace.Options | trace.ReservedSpan
+    let _10: reflect.Type
 
     bb0: {
         _4 = copy _2 == const <omitted>;
@@ -413,28 +434,35 @@ fn user.fixtures.llm_quoted_prompt.QuotedPrompt@stream(topic: string, client: nu
     }
 
     bb5: {
-        _7 = load_type(string);
-        _0 = call const fn ai.stream.from_spec<copy _7>(copy _6, copy _2, copy _3) -> [bb6];
+        _7 = copy _2;
+        _8 = copy _3;
+        _9 = call const fn trace._passthrough() -> [bb6];
     }
 
     bb6: {
+        _10 = load_type(string);
+        _0 = call const fn ai.stream.from_spec<copy _10>(copy _6, copy _7, copy _8, copy _9) -> [bb7];
+    }
+
+    bb7: {
         return;
     }
 }
 
-fn user.fixtures.llm_quoted_prompt.BacktickPrompt(topic: string, client: null | ai.Client, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never)) -> string {
+fn user.fixtures.llm_quoted_prompt.BacktickPrompt(topic: string, client: null | ai.Client, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never)) -> string {
     // Locals:
     let _0: string // _0 // return
     let _1: string // topic // param
     let _2: null | ai.Client // client // param
-    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never) // on_event // param
+    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never) // on_event // param
     let _4: bool
     let _5: bool
     let _6: ai.RunResult<string>
     let _7: ai.Agent
     let _8: reflect.Type
     let _9: ai.FunctionSpec<string>
-    let _10: reflect.Type
+    let _10: trace.Options | trace.ReservedSpan
+    let _11: reflect.Type
 
     bb0: {
         _4 = copy _2 == const <omitted>;
@@ -466,16 +494,20 @@ fn user.fixtures.llm_quoted_prompt.BacktickPrompt(topic: string, client: null | 
     }
 
     bb6: {
-        _10 = load_type(string);
-        _6 = virtual_call run as ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure><copy _10>(copy _7, copy _9) -> [bb7];
+        _10 = call const fn trace._passthrough() -> [bb7];
     }
 
     bb7: {
-        _0 = copy _6.0;
-        goto -> bb8;
+        _11 = load_type(string);
+        _6 = virtual_call run as ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure><copy _11>(copy _7, copy _9, copy _10) -> [bb8];
     }
 
     bb8: {
+        _0 = copy _6.0;
+        goto -> bb9;
+    }
+
+    bb9: {
         return;
     }
 }
@@ -555,36 +587,43 @@ fn user.fixtures.llm_quoted_prompt.BacktickPrompt@spec(topic: string) -> ai.Func
     let _0: ai.FunctionSpec<string> // _0 // return
     let _1: string // topic // param [captured]
     let _2: map<string, unknown>
-    let _3: string
-    let _4: (ai.OutputFormat) -> ai.Prompt throws ai.errors.PromptRenderError
-    let _5: ai.tools.Toolbox
-    let _6: ai.tools.Tool[]
-    let _7: ai.Client
-    let _8: (string, string) -> null | ai.Client throws never
-    let _9: string[]
-    let _10: reflect.Type
+    let _3: map<string, unknown>
+    let _4: string
+    let _5: unknown
+    let _6: (ai.OutputFormat) -> ai.Prompt throws ai.errors.PromptRenderError
+    let _7: ai.tools.Toolbox
+    let _8: ai.tools.Tool[]
+    let _9: ai.Client
+    let _10: (string, string) -> null | ai.Client throws never
+    let _11: string[]
+    let _12: reflect.Type
 
     bb0: {
-        _3 = copy *_1;
-        _2 = { const "topic": copy _3 }: map<string, unknown>;
-        _4 = make_closure lambda[0](copy _1);
-        _6 = []: ai.tools.Tool[];
-        _5 = call const fn ai.tools.Toolbox.new(copy _6) -> [bb1];
+        _3 = {  }: map<string, unknown>;
+        _4 = copy *_1;
+        _5 = call const fn baml.Map.set(copy _3, const "topic", copy _4) -> [bb1];
     }
 
     bb1: {
-        _8 = make_closure lambda[1]();
-        _9 = [const "openai", const "openai-chat", const "openai-images", const "azure", const "ollama", const "openrouter", const "anthropic", const "typesafeai", const "google", const "vertex", const "bedrock", const "ai-gateway-images", const "claude-code"]: string[];
-        _10 = load_type(never);
-        _7 = call const fn ai.clients.resolve<copy _10>(const item user.fixtures.llm_quoted_prompt.QuotedPromptClient, copy _8, copy _9) -> [bb2];
+        _2 = copy _3;
+        _6 = make_closure lambda[0](copy _1);
+        _8 = []: ai.tools.Tool[];
+        _7 = call const fn ai.tools.Toolbox.new(copy _8) -> [bb2];
     }
 
     bb2: {
-        _0 = ai.FunctionSpec<string> { const "BacktickPrompt", copy _2, copy _4, copy _5, copy _7 };
-        goto -> bb3;
+        _10 = make_closure lambda[1]();
+        _11 = [const "openai", const "openai-chat", const "openai-decisions", const "openai-images", const "ollama", const "openrouter", const "anthropic", const "typesafeai", const "google", const "vertex", const "bedrock", const "ai-gateway-images", const "claude-code"]: string[];
+        _12 = load_type(never);
+        _9 = call const fn ai.clients.resolve<copy _12>(const item user.fixtures.llm_quoted_prompt.QuotedPromptClient, copy _10, copy _11) -> [bb3];
     }
 
     bb3: {
+        _0 = ai.FunctionSpec<string> { const "BacktickPrompt", const fn user.fixtures.llm_quoted_prompt.BacktickPrompt, copy _2, copy _6, copy _7, copy _9 };
+        goto -> bb4;
+    }
+
+    bb4: {
         return;
     }
 }
@@ -628,8 +667,9 @@ fn .<lambda(BacktickPrompt@spec, 0)>( __spec_output_format: ai.OutputFormat) -> 
     let _33: baml.TaggedString
     let _34: unknown[]
     let _35: baml.TaggedString
-    let _36: ai.errors.PromptRenderError
-    let _37: never
+    let _36: bool
+    let _37: ai.errors.PromptRenderError
+    let _38: never
 
     bb0 [unwind bb8]: {
         _4 = ai.internal.SpecCtx { copy _1 };
@@ -693,13 +733,18 @@ fn .<lambda(BacktickPrompt@spec, 0)>( __spec_output_format: ai.OutputFormat) -> 
     }
 
     bb8 [landing _2, _3] [handling bb8]: {
-        throw_if_panic copy _2 with copy _3 -> bb9;
+        _36 = is_type_tag(copy _2, PANIC);
+        branch copy _36 -> [bb10, bb9];
     }
 
     bb9 [handling bb8]: {
-        _37 = copy _2;
-        _36 = ai.errors.PromptRenderError { const "prompt template rendering threw", copy _37 };
-        throw copy _36;
+        _38 = copy _2;
+        _37 = ai.errors.PromptRenderError { const "prompt template rendering threw", copy _38 };
+        throw copy _37;
+    }
+
+    bb10 [handling bb8]: {
+        rethrow copy _2 with copy _3;
     }
 }
 
@@ -734,12 +779,12 @@ fn .<lambda(BacktickPrompt@spec, 1)>(prefix: string, model: string) -> null | ai
     }
 
     bb2: {
-        _5 = is_type(copy _1, "openai-images");
+        _5 = is_type(copy _1, "openai-decisions");
         branch copy _5 -> [bb24, bb3];
     }
 
     bb3: {
-        _6 = is_type(copy _1, "azure");
+        _6 = is_type(copy _1, "openai-images");
         branch copy _6 -> [bb23, bb4];
     }
 
@@ -814,7 +859,7 @@ fn .<lambda(BacktickPrompt@spec, 1)>(prefix: string, model: string) -> null | ai
     }
 
     bb19: {
-        _0 = call const fn typesafeai.Client.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+        _0 = call const fn typesafeai.Client.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
     bb20: {
@@ -830,19 +875,19 @@ fn .<lambda(BacktickPrompt@spec, 1)>(prefix: string, model: string) -> null | ai
     }
 
     bb23: {
-        _0 = call const fn openai.AzureClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
-    }
-
-    bb24: {
         _0 = call const fn openai.ImageClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
+    bb24: {
+        _0 = call const fn openai.DecisionsClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+    }
+
     bb25: {
-        _0 = call const fn openai.ChatClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+        _0 = call const fn openai.ChatClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
     bb26: {
-        _0 = call const fn openai.ResponsesClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
+        _0 = call const fn openai.ResponsesClient.new(copy _2, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>, const <omitted>) -> [bb27];
     }
 
     bb27: {
@@ -850,16 +895,19 @@ fn .<lambda(BacktickPrompt@spec, 1)>(prefix: string, model: string) -> null | ai
     }
 }
 
-fn user.fixtures.llm_quoted_prompt.BacktickPrompt@stream(topic: string, client: null | ai.stream.StreamingClient, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never)) -> ai.stream.Stream<string> {
+fn user.fixtures.llm_quoted_prompt.BacktickPrompt@stream(topic: string, client: null | ai.stream.StreamingClient, on_event: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never)) -> ai.stream.Stream<string> {
     // Locals:
     let _0: ai.stream.Stream<string> // _0 // return
     let _1: string // topic // param
     let _2: null | ai.stream.StreamingClient // client // param
-    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.LLMCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.Usage | ai.events.UserMessage) -> void throws never) // on_event // param
+    let _3: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws never) // on_event // param
     let _4: bool
     let _5: bool
     let _6: ai.FunctionSpec<string>
-    let _7: reflect.Type
+    let _7: null | ai.stream.StreamingClient
+    let _8: null | ((ai.events.AssistantMessage | ai.events.FinalProduced | ai.events.ModelCall | ai.events.RunStarted | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.ToolRequested | ai.events.UserMessage) -> null throws unknown)
+    let _9: trace.Options | trace.ReservedSpan
+    let _10: reflect.Type
 
     bb0: {
         _4 = copy _2 == const <omitted>;
@@ -886,11 +934,17 @@ fn user.fixtures.llm_quoted_prompt.BacktickPrompt@stream(topic: string, client: 
     }
 
     bb5: {
-        _7 = load_type(string);
-        _0 = call const fn ai.stream.from_spec<copy _7>(copy _6, copy _2, copy _3) -> [bb6];
+        _7 = copy _2;
+        _8 = copy _3;
+        _9 = call const fn trace._passthrough() -> [bb6];
     }
 
     bb6: {
+        _10 = load_type(string);
+        _0 = call const fn ai.stream.from_spec<copy _10>(copy _6, copy _7, copy _8, copy _9) -> [bb7];
+    }
+
+    bb7: {
         return;
     }
 }

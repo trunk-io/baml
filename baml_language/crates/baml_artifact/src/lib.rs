@@ -71,7 +71,86 @@ pub const MAGIC: &[u8; 8] = b"BAMLART\0";
 /// the executable is its position; its name is display metadata), so every
 /// serialized program changed shape. The identity-keyed unit format that
 /// produces them (`baml_linker_types`) rides the same version.
-pub const FORMAT_VERSION: u32 = 12;
+///
+/// Version 13 adds a shared native implementation descriptor to each structural
+/// interface, used when no explicit implementation applies.
+///
+/// Version 14 adds publisher-owned telemetry policy to the packed dispatch envelope.
+///
+/// Version 16 carries declared trace-hook opcodes and compact continuation metadata.
+///
+/// Version 17: BEP-079's unit type. The type family lost `Void` (Borsh
+/// discriminant 22, now reserved): `void` is a spelling of `null`, and an
+/// artifact carrying the retired discriminant no longer decodes.
+///
+/// Version 18: a pooled `Class` carries its finalizer as a position in its
+/// method table (`cleanup: Option<usize>`) where it carried a `has_cleanup`
+/// flag, so the collector reads the method off the class and resolves no
+/// name; and a pooled `Class`, `Enum`, `Interface` and `TypeAlias` carries
+/// its path inside its package (`path`) where it used to carry a
+/// package-qualified name (`name`): a declaration's name is put together from
+/// its package's display name when one is wanted, so no serialized
+/// declaration states which package it belongs to or what that package is
+/// called. An interface's dependency table names a language package by
+/// identity (`Locator::Prelude(LangPackage)`) rather than by an edge name;
+/// a `ProgramPackage` carries its `PackageKind` (`Language(LangPackage)` or
+/// `Ordinary`) and each of its edges an `EdgeKind` (`Dependency` or
+/// `ReExported`).
+///
+/// Version 19: `SatisfiesBound` and `BoundMismatch` (the run-time bound check
+/// of `let type T extends I = …`) appended to the instruction set.
+///
+/// Version 20: `BoundMismatch` removed from the end of the instruction set. A
+/// bounded `let type` must have an `else` block, so a missed bound never
+/// throws.
+///
+/// Version 21 adds pass-through tracing strategy to serialized function metadata.
+///
+/// Version 22: the `ThrowIfPanic` instruction is gone. A catch's wildcard
+/// arm that does not trap panics is now entered after an `IsType` test
+/// against the `PANIC` pseudo-tag (`baml_type::typetag::PANIC`), so the
+/// discriminants of every opcode declared after `TypeTag` shifted down by
+/// one.
+///
+/// Version 23: `FunctionMeta::Llm` lost its `client` string and marks every
+/// LLM function, including one whose client is an expression.
+///
+/// Version 24 adds the publisher's `http_bodies` setting to the telemetry
+/// policy in the packed dispatch envelope.
+///
+/// Version 25: appended `MakeGenericBoundMethod` to the instruction/opcode
+/// sets — a bound method whose frame type arguments the reference site
+/// supplies (`default.m` as a value inside an `implements` block).
+///
+/// Version 26: a `Class` carries its `declared_crossing`, how an instance
+/// crosses the host boundary.
+///
+/// Version 27: appended `ConcatStrings` to the instruction/opcode sets, which
+/// joins a chain of string `+` in one step.
+///
+/// Version 28 replaces the embedded telemetry build-token registration with the
+/// publisher's API key in the packed dispatch envelope.
+///
+/// Version 29: a `Class` and each of its fields carry `redact`, whether
+/// telemetry records a redaction in place of the value (`@@trace.redact`,
+/// `@trace.redact`).
+///
+/// Version 30: a class field and an enum variant carry their `@json`
+/// attributes.
+///
+/// Version 31: a package interface opens with the package's claimed identity
+/// and the compiler version, both covered by its digest, and a
+/// `ProgramPackage` carries the package's `metadata` (BEP-085).
+///
+/// Version 32: an interface's exported class row holds a body that is either
+/// the class's fields or the `@@rust_type` kind of the Rust-owned state in
+/// their place, so a dependent refuses a literal of such a class.
+///
+/// Version 33: the packed dispatch envelope carries the heap collection
+/// policy (`[pack.gc]`) and the variables that may override it.
+/// Version 34: a `ProgramPackage` carries the record of the build that
+/// produced it, and the artifact telemetry policy `omit_source` (BEP-088).
+pub const FORMAT_VERSION: u32 = 34;
 
 /// Git commit this crate was built from (`BAML_GIT_SHA`, else the checkout's
 /// HEAD), or empty when neither was available.
@@ -124,6 +203,10 @@ pub enum ArtifactKind {
     Program,
     PackageInterface,
     PackedProgram,
+    /// The declared surface a generated SDK embeds beside its bytecode
+    /// (`baml_sdkgen_types::ProgramDescriptor`). Never written to an
+    /// artifact header; it only names the payload in embedded-decode errors.
+    ProgramDescriptor,
 }
 
 impl ArtifactKind {
@@ -132,12 +215,15 @@ impl ArtifactKind {
             Self::Program => "generated bytecode",
             Self::PackageInterface => "package interface",
             Self::PackedProgram => "packed program",
+            Self::ProgramDescriptor => "program descriptor",
         }
     }
 
     const fn remediation(self) -> &'static str {
         match self {
-            Self::Program => "regenerate baml_sdk and rebuild the bridge from the same commit",
+            Self::Program | Self::ProgramDescriptor => {
+                "regenerate baml_sdk and rebuild the bridge from the same commit"
+            }
             Self::PackageInterface => {
                 "recompile the package and runtime with the same BAML toolchain"
             }
@@ -247,11 +333,19 @@ fn decode_embedded_within(
 
 /// Serialize `value` and wrap it in a versioned artifact envelope.
 pub fn encode<T: BorshSerialize>(kind: ArtifactKind, value: &T) -> Result<Vec<u8>, Error> {
+    encode_with_digest(kind, value).map(|(artifact, _)| artifact)
+}
+
+/// Encode an artifact and return its content digest, including authenticated metadata.
+pub fn encode_with_digest<T: BorshSerialize>(
+    kind: ArtifactKind,
+    value: &T,
+) -> Result<(Vec<u8>, Hash), Error> {
     let payload = borsh::to_vec(value).map_err(|error| Error::Encode {
         kind,
         message: error.to_string(),
     })?;
-    encode_payload(kind, &payload)
+    encode_payload_with_metadata(FORMAT_VERSION, BUILD_FINGERPRINT, kind, &payload)
 }
 
 /// Encode a value with an explicit artifact format for cross-crate skew tests.
@@ -267,11 +361,13 @@ pub fn encode_with_format_for_test<T: BorshSerialize>(
         message: error.to_string(),
     })?;
     encode_payload_with_metadata(artifact_format, BUILD_FINGERPRINT, kind, &payload)
+        .map(|(artifact, _)| artifact)
 }
 
 /// Wrap an already-serialized payload in a versioned artifact envelope.
 pub fn encode_payload(kind: ArtifactKind, payload: &[u8]) -> Result<Vec<u8>, Error> {
     encode_payload_with_metadata(FORMAT_VERSION, BUILD_FINGERPRINT, kind, payload)
+        .map(|(artifact, _)| artifact)
 }
 
 fn encode_payload_with_metadata(
@@ -279,7 +375,7 @@ fn encode_payload_with_metadata(
     build_fingerprint: &str,
     kind: ArtifactKind,
     payload: &[u8],
-) -> Result<Vec<u8>, Error> {
+) -> Result<(Vec<u8>, Hash), Error> {
     let payload_len = u64::try_from(payload.len()).map_err(|error| Error::Encode {
         kind,
         message: error.to_string(),
@@ -314,7 +410,7 @@ fn encode_payload_with_metadata(
     artifact.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
     artifact.extend_from_slice(&header_bytes);
     artifact.extend_from_slice(payload);
-    Ok(artifact)
+    Ok((artifact, header.payload_hash))
 }
 
 /// Hash the canonical Borsh encoding of the authenticated metadata followed by
@@ -340,11 +436,20 @@ fn authenticated_hash(
 
 /// Validate and deserialize an artifact payload.
 pub fn decode<T: BorshDeserialize>(kind: ArtifactKind, bytes: &[u8]) -> Result<T, Error> {
-    let payload = decode_payload(kind, bytes)?;
-    T::try_from_slice(payload).map_err(|error| Error::Decode {
+    decode_with_digest(kind, bytes).map(|(value, _)| value)
+}
+
+/// Decode an artifact and return its validated content digest, including authenticated metadata.
+pub fn decode_with_digest<T: BorshDeserialize>(
+    kind: ArtifactKind,
+    bytes: &[u8],
+) -> Result<(T, Hash), Error> {
+    let (payload, digest) = decode_payload_with_digest(kind, bytes)?;
+    let value = T::try_from_slice(payload).map_err(|error| Error::Decode {
         kind,
         message: error.to_string(),
-    })
+    })?;
+    Ok((value, digest))
 }
 
 /// The sha256 of an artifact's validated payload — the identity of WHAT the
@@ -359,6 +464,10 @@ pub fn payload_digest(kind: ArtifactKind, bytes: &[u8]) -> Result<[u8; 32], Erro
 
 /// Validate an artifact and borrow its raw payload.
 pub fn decode_payload(kind: ArtifactKind, bytes: &[u8]) -> Result<&[u8], Error> {
+    decode_payload_with_digest(kind, bytes).map(|(payload, _)| payload)
+}
+
+fn decode_payload_with_digest(kind: ArtifactKind, bytes: &[u8]) -> Result<(&[u8], Hash), Error> {
     if bytes.len() < PREFIX_LEN {
         return Err(Error::Truncated { kind });
     }
@@ -441,12 +550,31 @@ pub fn decode_payload(kind: ArtifactKind, bytes: &[u8]) -> Result<&[u8], Error> 
             actual: header.kind,
         });
     }
-    Ok(payload)
+    Ok((payload, header.payload_hash))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_digest_round_trips_and_identifies_payload() {
+        let (artifact, digest) = encode_with_digest(ArtifactKind::Program, &7_u32).unwrap();
+        let (decoded, loaded_digest) =
+            decode_with_digest::<u32>(ArtifactKind::Program, &artifact).unwrap();
+        assert_eq!(decoded, 7);
+        assert_eq!(digest, loaded_digest);
+        assert_eq!(artifact, encode(ArtifactKind::Program, &7_u32).unwrap());
+        let (_, changed_digest) = encode_with_digest(ArtifactKind::Program, &8_u32).unwrap();
+        assert_ne!(digest, changed_digest);
+
+        let mut corrupt = artifact;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            decode_with_digest::<u32>(ArtifactKind::Program, &corrupt),
+            Err(Error::InvalidPayloadHash { .. })
+        ));
+    }
 
     #[test]
     fn payload_digest_is_the_payload_hash_alone() {
@@ -510,7 +638,7 @@ mod tests {
     #[test]
     fn version_skew_has_actionable_message() {
         let payload = borsh::to_vec(&7_u32).unwrap();
-        let artifact = encode_payload_with_metadata(
+        let (artifact, _) = encode_payload_with_metadata(
             FORMAT_VERSION + 1,
             BUILD_FINGERPRINT,
             ArtifactKind::Program,
@@ -531,7 +659,7 @@ mod tests {
     #[test]
     fn build_skew_follows_the_channel_policy() {
         let payload = borsh::to_vec(&7_u32).unwrap();
-        let artifact = encode_payload_with_metadata(
+        let (artifact, _) = encode_payload_with_metadata(
             FORMAT_VERSION,
             "different-build-fingerprint",
             ArtifactKind::Program,

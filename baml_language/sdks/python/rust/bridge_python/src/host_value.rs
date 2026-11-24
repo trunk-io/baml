@@ -1,12 +1,13 @@
 //! Per-process Python host-value registry.
 //!
 //! When Python passes a callable as an argument to a BAML function, the
-//! inbound encoder (in `proto.py`) calls [`register_host_callable`] to
-//! obtain a `u64` key and emits `InboundValue::Handle{key, HOST_VALUE_CALLABLE}`.
-//! Rust's `inbound_to_external` decoder constructs a
-//! `BexExternalValue::HostValue(Arc<HostValueArc>)`; the engine binds it to
-//! an `Object::HostClosure`; later when BAML invokes it, the
-//! `call_host_value` sysop fires a `HostDispatchFn` via the bridge_cffi
+//! inbound encoder (`crate::encode`) calls [`register_callable`] with the
+//! function type of the slot, obtains a `u64` key and emits
+//! `InboundValue::Handle{key, HOST_VALUE_CALLABLE}` with that function type
+//! stated in `value_type`. Rust's `inbound_to_external` decoder constructs a
+//! `BexExternalValue::HostCallable`; the engine binds it to an
+//! `Object::HostClosure` of that type; later when BAML invokes it, the
+//! `_call_host_value` sysop fires a `HostDispatchFn` via the bridge_cffi
 //! global, which lands here in [`host_dispatch_callback`].
 //!
 //! The dispatch callback:
@@ -14,192 +15,294 @@
 //! 2. Decodes the `BamlOutboundValue` args into Python values via
 //!    `baml_bridge.proto._decode_value_holder` (already a list shape).
 //! 3. Invokes the callable. If the return is a coroutine, runs it to
-//!    completion on a fresh `asyncio` event loop. The dispatch runs on a
-//!    spawned tokio task (see [`host_dispatch_callback`]), so blocking that
-//!    task to drive the coroutine to completion does not stall the engine,
-//!    which concurrently awaits the call's completion.
-//! 4. Encodes the result into `InboundValue` bytes via
-//!    `baml_bridge.proto.encode_call_args`-style serialization, then calls
-//!    `bridge_cffi::complete_host_call(call_id, 0, ptr, len)`.
+//!    completion on the originating SDK entry's application loop (async
+//!    entry) or a bridge-owned loop with copied application context (sync
+//!    entry). Synchronous callbacks run on the originating Python thread.
+//! 4. Encodes the result against the return type of the slot the callable
+//!    was bound to and completes the call with it
+//!    (`bridge_cffi::complete_host_call`, a `HostCallCompletion`).
 //! 5. On any Python exception, branches on the exception type:
-//!    - A `baml_bridge.errors.BamlError` carrying a codegenned BAML value
-//!      is unwrapped (`.value`) and encoded as that real BAML class
-//!      (preserves catch matching against user-declared throws).
+//!    - A `baml_bridge.errors.BamlError` or `BamlPanic` carrying a BAML
+//!      value is unwrapped (`.value`) and encoded against the slot's throws
+//!      type, so a BAML `catch (e: MyError)` matches it; a panic value is a
+//!      panic whatever the slot declares.
 //!    - Anything else (native `ValueError`, `KeyError`, ...) is registered
-//!      in the process-global host-value table and encoded as a
-//!      `baml.errors.HostCallable` Instance whose `_handle` field
-//!      references the original Python exception object so the BAML→host
-//!      decoder on the same runtime can rehydrate it on round-trip.
+//!      in the process-global host-value table and completes the call as
+//!      the host's own exception: the engine builds the
+//!      `baml.errors.HostCallable` whose `_handle` references the original
+//!      Python exception object, so the BAML→host decoder on the same
+//!      runtime can rehydrate it on round-trip.
 //!
-//!    The encoded `InboundValue` rides `complete_host_call(call_id, 1,
-//!    ptr, len)`; the engine's `materialize_host_throw` runs the
-//!    declared-throws contract check against the surrounding callable's
-//!    `E` and either re-injects the value as a catchable BAML throw or
-//!    escalates to a `HostContractViolation` panic.
+//!    The engine holds both to the callable's declared throws type and
+//!    builds every panic itself.
 //!
-//! When the engine drops the last Rust clone of the `HostValueArc`,
-//! [`host_release_callback`] fires and removes the registry entry — the
-//! Python callable's refcount drops to zero and the GC reclaims it.
+//! Each registry key counts its references: one per send to the engine, and
+//! one per `BamlPyHandle` Python holds for it. The engine gives its
+//! references back through [`host_release_callback`]; at the last one the
+//! entry is removed and the Python object's refcount drops.
 
-use std::sync::LazyLock;
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex, PoisonError},
+};
 
 use bridge_cffi::complete_host_call;
-use bridge_ctypes::baml_bridge::cffi::{
-    BamlHandle, BamlHandleType, BamlTy, BamlTyClass, InboundClassValue, InboundMapEntry,
-    InboundValue, baml_ty::Ty as BamlTyVariant, inbound_map_entry::Key as InboundMapKey,
-    inbound_value::Value as InboundValueVariant,
+use bridge_ctypes::{
+    HostKey, Released, TableKey, WireHandle,
+    baml_bridge::cffi::{
+        BamlHandleType, BamlOutboundValue, BamlToHostCall, HostCallCompletion,
+        baml_outbound_value::Value as OutboundValue,
+    },
 };
+use bridge_encode::{BridgeFault, Completion, Encoded};
 use prost::Message;
 use pyo3::{
     Bound, Py, PyAny, PyResult, Python,
     prelude::*,
-    types::{PyAnyMethods, PyDict, PyList, PyModule, PyTuple},
+    types::{PyAnyMethods, PyDict, PyModule, PyTuple},
 };
 use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
-/// Process-wide table of Python callables that have been handed to BAML.
-///
-/// The key is a freshly-allocated `u64` (never 0). Removal happens in
-/// [`host_release_callback`] when Rust drops its last clone of the
-/// corresponding `HostValueArc`.
-static REGISTRY: LazyLock<bridge_ctypes::HostValueRegistry<Py<PyAny>>> =
-    LazyLock::new(bridge_ctypes::HostValueRegistry::default);
-
-/// Insert a Python callable into the registry and return its key.
-///
-/// Exposed to Python as `baml_py.register_host_callable(callable) -> int`.
-/// Called from the inbound encoder in `baml_bridge.proto` whenever a Python
-/// callable appears as a kwarg.
-#[gen_stub_pyfunction]
-#[pyfunction]
-pub fn register_host_callable(callable: Py<PyAny>) -> u64 {
-    REGISTRY.insert(callable)
+/// A Python object handed to BAML: a callable bound to a function slot, or an
+/// opaque object (a thrown exception) referenced by handle.
+struct Registered {
+    object: Py<PyAny>,
+    /// The function type of the slot a callable was bound to. Its result and
+    /// thrown value are encoded against this. `None` for opaque objects.
+    signature: Option<bex_project::WireTy>,
 }
 
-/// Insert an arbitrary host Python object into the registry and return its key.
+/// Process-wide table of Python objects that have been handed to BAML.
+///
+/// The key is the engine's reference to the object (never 0). Each key counts
+/// the references to it that are out: one per send of the key to the engine
+/// (given back by [`host_release_callback`], or by a rollback that never sent
+/// it) and one per `BamlPyHandle` Python holds for it. The object is dropped
+/// when the last one is given back.
+static REGISTRY: LazyLock<bridge_ctypes::HostValueRegistry<Registered>> =
+    LazyLock::new(bridge_ctypes::HostValueRegistry::default);
+
+/// The signature of each host call in flight, by callback id, from dispatch
+/// until its result or error is encoded.
+static CALLBACK_SIGNATURES: LazyLock<Mutex<HashMap<u32, Option<bex_project::WireTy>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// BUG: a completion whose call has no stored signature (or one that is not a
+// function type) is a bridge invariant violation; both completion paths
+// currently fall back to encoding against `unknown` instead of completing
+// the call as a bridge failure.
+pub(crate) fn take_callback_signature(call_id: u32) -> Option<bex_project::WireTy> {
+    CALLBACK_SIGNATURES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&call_id)
+        .flatten()
+}
+
+/// Insert a Python callable into the registry, bound to `signature`, and
+/// return its key, holding the one reference the send it is registered for
+/// takes. `marker` is the host marker when the callable was defined through
+/// the instrumentation surface.
+pub(crate) fn register_callable(
+    callable: Py<PyAny>,
+    marker: Option<std::sync::Arc<bex_project::HostMarker>>,
+    signature: bex_project::WireTy,
+) -> PyResult<HostKey> {
+    let descriptor =
+        bridge_cffi::host_instrumentation::registration_marker(marker.as_ref(), "python");
+    let key = REGISTRY.insert(Registered {
+        object: callable,
+        signature: Some(signature),
+    });
+    bex_project::HostValueArc::register_annotation(key, descriptor);
+    Ok(key)
+}
+
+/// How many Python objects BAML currently holds through the registry. For
+/// tests that check every reference to a registered object was given back.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn _host_value_registry_len() -> usize {
+    REGISTRY.len()
+}
+
+/// Insert an arbitrary host Python object into the registry and return its
+/// key, holding the one reference the send it is registered for takes.
 ///
 /// The host-throw path uses this to register the originating native
 /// exception so the BAML→host decoder on the same runtime can resolve
 /// the `_handle` slot of a `baml.errors.HostCallable` back to the
 /// original Python object on round-trip. The table is shared with
-/// callable entries (keys are globally unique), and the same
-/// `host_release_callback` releases either kind on last-Arc-drop.
-fn register_host_opaque(value: Py<PyAny>) -> u64 {
-    REGISTRY.insert(value)
+/// callable entries (keys are globally unique).
+fn register_host_opaque(value: Py<PyAny>) -> HostKey {
+    REGISTRY.insert(Registered {
+        object: value,
+        signature: None,
+    })
 }
 
-/// Remove and drop the registry entry for `host_value_key` (if present).
-///
-/// Shared by the engine-driven release path ([`host_release_callback`]) and
-/// the encoder's rollback path ([`release_host_callable`]). Dropping the
-/// `Py<PyAny>` requires the GIL.
-fn drop_registry_entry(host_value_key: u64) {
-    let popped: Option<Py<PyAny>> = match REGISTRY.lock() {
-        Ok(mut t) => t.remove(&host_value_key),
-        Err(e) => {
-            // Poisoning means an earlier panic occurred while holding the
-            // lock; the table is in an unknown state. Don't try to mutate
-            // it (could double-drop the `Py<PyAny>` without the GIL), but
-            // log so the originating panic is attributable instead of
-            // being swallowed silently. We accept the entry leak: the
-            // engine has already dropped its `Arc<HostValueArc>` (we're
-            // on the release path), and a poisoned global registry
-            // implies the process is in a failing state anyway.
-            log::warn!(
-                "host-callable registry mutex poisoned during release of key \
-                 {host_value_key}: {e}; entry leaked"
-            );
-            return;
+/// Take one more reference to `key`, which must still be registered: for a
+/// send of a key Python received, or a `BamlPyHandle` that holds it.
+pub(crate) fn send_again(key: HostKey) -> PyResult<()> {
+    REGISTRY
+        .send_again(key)
+        .map_err(|dead| pyo3::exceptions::PyRuntimeError::new_err(dead.to_string()))
+}
+
+/// Give back `count` references to `key`. At the last one the entry is
+/// removed, and its Python object dropped under the GIL, outside the
+/// registry lock.
+pub(crate) fn release(key: HostKey, count: u64) {
+    match REGISTRY.release(key, count) {
+        Released::Held => {}
+        Released::Last(entry) => {
+            bex_project::HostValueArc::discard_annotation(key);
+            if let Some(entry) = entry {
+                // Attaching the GIL is required to drop a `Py<PyAny>`.
+                Python::attach(|_py| drop(entry));
+            }
         }
-    };
-    if let Some(py_obj) = popped {
-        // Attaching the GIL is required to drop a `Py<PyAny>`.
-        Python::attach(|_py| drop(py_obj));
+        Released::Unknown => {
+            log::warn!("released {count} reference(s) to unregistered host value {key}");
+        }
     }
 }
 
-/// Drop the Python callable associated with `host_value_key`.
-///
-/// Fires when the last Rust clone of the corresponding `HostValueArc` is
-/// dropped — see `bex_external_types::host_value::host_release_dispatch`.
-pub extern "C" fn host_release_callback(host_value_key: u64) {
-    drop_registry_entry(host_value_key);
+/// Give back the references the engine held to a host value: it fires when
+/// the engine's identity for the key drops (see
+/// `bex_external_types::host_value::host_release_dispatch`), or when a
+/// request that carried the key is refused.
+pub extern "C" fn host_release_callback(host_value_key: u64, count: u64) {
+    match HostKey::new(host_value_key) {
+        Some(key) => release(key, count),
+        None => log::warn!("released {count} reference(s) to host value key 0"),
+    }
 }
 
-/// Look up the host-registered Python object referenced by a
-/// `BamlPyHandle` whose `handle_type` is `HOST_VALUE_CALLABLE` /
-/// `HOST_VALUE_OPAQUE`, returning a fresh strong reference if the entry
-/// is still live. Used by the outbound error decoder in
-/// `baml_bridge.proto` to rehydrate a `baml.errors.HostCallable` thrown
-/// by BAML back to the original Python exception object on same-host
-/// round-trip.
+/// The host-registered Python object a `BamlPyHandle` of `handle_type`
+/// `HOST_VALUE_CALLABLE` / `HOST_VALUE_OPAQUE` references, as a fresh strong
+/// reference. Used by the outbound error decoder in `baml_bridge.proto` to
+/// rehydrate a `baml.errors.HostCallable` thrown by BAML back to the original
+/// Python exception object.
 ///
-/// Returns `None` if the handle is the wrong kind, the entry has been
-/// released (last `HostValueArc` clone already dropped), or the key
-/// never existed in this runtime's registry (cross-runtime handle):
-/// callers should fall back to a metadata-built exception in that case.
+/// A handle to a host value holds its key, so this is `None` only for a
+/// handle of another kind.
 #[gen_stub_pyfunction]
 #[pyfunction]
 pub fn lookup_host_value(
     py: Python<'_>,
     handle: &crate::py_handle::BamlPyHandle,
 ) -> Option<Py<PyAny>> {
-    use bridge_ctypes::baml_bridge::cffi::BamlHandleType;
-    let ht_i32 = i32::try_from(handle.handle_type).ok()?;
-    if ht_i32 != BamlHandleType::HostValueCallable as i32
-        && ht_i32 != BamlHandleType::HostValueOpaque as i32
-    {
+    let WireHandle::Host(key, _) = handle.wire_handle().ok()? else {
         return None;
-    }
-    let table = match REGISTRY.lock() {
-        Ok(t) => t,
-        Err(e) => {
-            // Poisoned: an earlier panic happened while holding the lock.
-            // Return None (caller falls back to a metadata-built
-            // exception) but log so the originating panic is attributable
-            // instead of vanishing into an identity-loss bug report.
-            log::warn!(
-                "host-callable registry mutex poisoned during lookup of key \
-                 {}: {e}; rehydration will fall back to metadata",
-                handle.handle_key
-            );
-            return None;
-        }
     };
-    table.get(&handle.handle_key).map(|obj| obj.clone_ref(py))
+    // The GIL is already held: a reference is counted under the lock, never
+    // acquired there.
+    REGISTRY.with(key, |entry| entry.object.clone_ref(py))
 }
 
-/// Release a host callable the inbound encoder registered but never handed to
-/// the engine — the encode-error rollback path.
-///
-/// Exposed to Python as `baml_py.release_host_callable(key)`. When
-/// `encode_call_args` registers a callable for an early kwarg and then a
-/// later kwarg fails to encode, the `CallFunctionArgs` is never sent, so the
-/// engine never decodes — and so never releases — that key. Without this the
-/// registry entry (holding a strong ref to the user callable) would leak for
-/// the life of the process. The encoder calls this for every key it
-/// registered during a failed encode.
-#[gen_stub_pyfunction]
-#[pyfunction]
-pub fn release_host_callable(host_value_key: u64) {
-    drop_registry_entry(host_value_key);
+/// Travels with queued/running work, independently of its BAML waiter. Python
+/// explicitly finishes it after task exit; dropping an abandoned queue item
+/// also releases its undecoded wire arguments and native execution lease.
+#[pyo3::pyclass]
+pub(crate) struct HostExecutionLease {
+    call_id: u32,
+    args: Option<Vec<u8>>,
+    frame: Option<Box<bridge_ctypes::OwnedHostInvocation>>,
+    execution: Option<sys_native::host_dispatch::HostExecutionGuard>,
+}
+
+impl HostExecutionLease {
+    fn new(
+        call_id: u32,
+        args: Vec<u8>,
+        frame: bridge_ctypes::OwnedHostInvocation,
+        execution: sys_native::host_dispatch::HostExecutionGuard,
+    ) -> Self {
+        Self {
+            call_id,
+            args: Some(args),
+            frame: Some(Box::new(frame)),
+            execution: Some(execution),
+        }
+    }
+}
+
+#[pyo3::pymethods]
+impl HostExecutionLease {
+    fn start(&mut self) -> bool {
+        if sys_native::host_dispatch::start_execution(self.call_id).is_none() {
+            return false;
+        }
+        self.args = None; // The decoder owns untransferred wire references.
+        true
+    }
+
+    fn frame(&self) -> PyResult<(crate::py_handle::BamlPyHandle, Vec<u8>)> {
+        let frame = self
+            .frame
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("callback already exited"))?;
+        let key =
+            crate::py_handle::handle_clone(frame.0.effective_state, "callback invocation capture")?;
+        let state =
+            crate::py_handle::BamlPyHandle::new(key, BamlHandleType::InvocationState as u64);
+        let cancel = frame.0.cancel.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "callback has no effective cancellation token",
+            )
+        })?;
+        Ok((
+            state,
+            bridge_cffi::control_projection::clone_outbound(cancel)
+                .map_err(crate::errors::bridge_error_to_sdk_panic)?
+                .encode_to_vec(),
+        ))
+    }
+
+    fn finish(&mut self) {
+        if let Some(args) = self.args.take() {
+            discard_host_call_args(&args);
+        }
+        drop(self.frame.take());
+        drop(self.execution.take());
+    }
+}
+
+impl Drop for HostExecutionLease {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// Dispatch a BAML→host call into Python.
 ///
-/// `args` is a protobuf-encoded `BamlOutboundValue` whose variant is a
-/// `BamlValueList` (see `sys_native::host_impls::call_host_value` —
-/// args are wrapped as `BexExternalValue::Array` before encoding).
-#[expect(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "C ABI entry point: pointer validity is the caller's contract, documented \
-              alongside the registered HostDispatchFn signature in bridge_cffi"
-)]
-pub extern "C" fn host_dispatch_callback(
+/// The borrowed V2 `HostInvocation` carries application arguments, effective
+/// invocation state, cancellation, the absolute deadline, and host context.
+pub(crate) extern "C" fn host_dispatch_callback(request: *const u8, length: usize) {
+    if request.is_null() || length > isize::MAX as usize {
+        return;
+    }
+    // SAFETY: V2 dispatch borrows runtime-owned bytes for this call.
+    let bytes = unsafe { std::slice::from_raw_parts(request, length) };
+    let frame = match bridge_cffi::invocation_protocol::decode_host_invocation(bytes) {
+        Ok(frame) => bridge_ctypes::OwnedHostInvocation(frame),
+        Err(_) => return,
+    };
+    let call_id = frame.0.callback_id;
+    let key = frame.0.host_value_key;
+    let args = frame.0.application_args.clone();
+    catch_dispatch_panic(call_id, || {
+        dispatch_host_callable(key, call_id, args.as_ptr(), args.len(), frame)
+    });
+}
+
+fn dispatch_host_callable(
     host_value_key: u64,
     call_id: u32,
     args: *const u8,
     length: usize,
+    frame: bridge_ctypes::OwnedHostInvocation,
 ) {
     // Copy the wire bytes into a Vec — the dispatch task may outlive the
     // caller's stack frame, and we need a `'static` slice anyway.
@@ -207,82 +310,50 @@ pub extern "C" fn host_dispatch_callback(
         Vec::new()
     } else {
         // SAFETY: the engine guarantees `args` is valid for `length` bytes
-        // for the duration of this call (see `host_dispatch::fire_dispatch`).
+        // for the duration of this call (see `host_dispatch::fire_dispatch_v2`).
         unsafe { std::slice::from_raw_parts(args, length) }.to_vec()
     };
 
-    // We're called on a tokio worker from the engine's sysop dispatch (see
-    // `sys_native::host_dispatch::fire_dispatch`). Spawn a task so the
-    // dispatch callback returns promptly and the engine can continue
-    // making progress on other work while Python runs.
-    //
-    // The Python encode/decode and the user callable invocation happen
-    // inside this task with the GIL held. Async user callables are run
-    // to completion on a freshly-created asyncio loop inside the task —
-    // we do not currently integrate with a Python event loop running
-    // concurrently in another thread.
-    // Resolve the callable *before* spawning so a missing entry (or a
-    // poisoned registry mutex) surfaces as `BridgeFailure` — an
-    // infrastructure fault — instead of an opaque `HostCallable` wrapping
-    // a `PyKeyError`. The bridge knowing about a handle the dispatcher
-    // can no longer find is a bug in the bridge, not a user error.
-    // Mirrors `bridge_typescript::host_dispatch_callback`'s pre-spawn lookup.
-    //
-    // The `Py<PyAny>` is `Send + Sync` and survives moving into the
-    // spawned task without holding the GIL; it's only re-attached inside
-    // `dispatch_in_python` to invoke the callable.
-    let callable: Py<PyAny> = match Python::attach(|py| -> Result<Py<PyAny>, String> {
-        let table = REGISTRY
-            .lock()
-            .map_err(|e| format!("host-callable registry mutex poisoned: {e}"))?;
-        match table.get(&host_value_key) {
-            Some(c) => Ok(c.clone_ref(py)),
-            None => Err(format!(
-                "no host callable registered for key {host_value_key}"
-            )),
+    let Some(execution) = sys_native::host_dispatch::retain_execution(call_id) else {
+        discard_host_call_args(&bytes);
+        sys_native::host_dispatch::finish_abi_execution(call_id);
+        return;
+    };
+
+    // Resolve registration before handing execution to the SDK entry's queue
+    // or application loop. Registration holds only the callable, never its
+    // parent, thread, Context or loop. Missing registry entries are bridge
+    // failures rather than user-code exceptions.
+    let registered = Python::attach(|py| {
+        HostKey::new(host_value_key).and_then(|key| {
+            REGISTRY.with(key, |entry| {
+                (entry.object.clone_ref(py), entry.signature.clone())
+            })
+        })
+    });
+    let callable: Py<PyAny> = match registered {
+        Some((callable, signature)) => {
+            // The result is encoded against the slot's signature once the
+            // callable returns; keep it by callback id until then.
+            CALLBACK_SIGNATURES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(call_id, signature);
+            callable
         }
-    }) {
-        Ok(c) => c,
-        Err(message) => {
+        None => {
+            let message = format!("no host callable registered for key {host_value_key}");
+            discard_host_call_args(&bytes);
             send_dispatch_bridge_failure(call_id, message);
             return;
         }
     };
 
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        // No tokio runtime is active — complete synchronously with an
-        // error so the engine doesn't wedge on the in-flight call table.
-        // This is an infrastructure fault (the bridge can't even schedule
-        // the dispatch), not a user error → BridgeFailure → SdkPanic.
-        send_dispatch_bridge_failure(
-            call_id,
-            "host_dispatch_callback called outside a tokio runtime context".to_string(),
-        );
-        return;
-    };
-    handle.spawn(async move {
-        // A Rust-level *panic* (not a `PyErr`) inside `dispatch_in_python`
-        // would unwind out of this task and silently drop the in-flight
-        // `call_id`, leaving the engine awaiting it forever (there is no
-        // timeout). Catch the unwind and complete the call with an error so
-        // the engine always makes progress. `AssertUnwindSafe` is sound here:
-        // on a caught panic we touch no state that the panic could have left
-        // logically inconsistent — we only read `call_id` (a `Copy` `u32`)
-        // and emit a fresh error payload. The normal `PyErr` path inside
-        // `dispatch_in_python` is unaffected: it returns `Err(_)` and
-        // completes the call itself, so `catch_unwind` sees `Ok(())`.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_in_python(callable, call_id, bytes);
-        }));
-        if let Err(panic) = outcome {
-            let detail = panic_message(&panic);
-            // A caught Rust-level panic in the dispatch task is a bridge
-            // bug, not a user-callable exception → BridgeFailure → SdkPanic.
-            send_dispatch_bridge_failure(
-                call_id,
-                format!("host callable dispatch panicked: {detail}"),
-            );
-        }
+    crate::callback_dispatch::route(crate::callback_dispatch::Dispatch {
+        callable,
+        call_id,
+        execution: HostExecutionLease::new(call_id, bytes.clone(), frame, execution),
+        args: bytes,
     });
 }
 
@@ -299,35 +370,251 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Synchronous (under-GIL) helper called from the dispatch task. The
-/// `callable` was resolved from the registry before the spawn so its
-/// presence is guaranteed (missing-key faults surface as `BridgeFailure`
-/// earlier in `host_dispatch_callback`).
-fn dispatch_in_python(callable: Py<PyAny>, call_id: u32, args_bytes: Vec<u8>) {
-    let result = Python::attach(|py| -> PyResult<Vec<u8>> {
-        // Decode the engine-side `BamlToHostCall` into the callable's
-        // positional args + supplied-optional kwargs.
-        let (positional, kwargs) = decode_args(py, &args_bytes)?;
-
-        // Invoke the user callable: required args positionally, supplied
-        // optionals by keyword. Omitted optionals are absent, so the callable's
-        // own defaults apply.
-        let result_obj = callable.call(py, &positional, Some(&kwargs))?;
-
-        // If the callable returned a coroutine (async function), run it to
-        // completion on a fresh asyncio loop. Sync callables fall through.
-        let final_result = run_if_coroutine(py, result_obj)?;
-
-        // Encode the result as an `InboundValue` via `baml_bridge.proto`.
-        encode_result_inbound(py, final_result)
-    });
-
-    match result {
-        Ok(bytes) => send_dispatch_success(call_id, &bytes),
-        Err(py_err) => Python::attach(|py| {
-            send_dispatch_error_from_pyerr(call_id, py, &py_err);
-        }),
+/// Service a sync entry's dispatch on its calling Python thread. An async
+/// result runs on a bridge-owned loop with the caller's current Context copied
+/// explicitly; the caller may already be blocking an application loop.
+pub(crate) fn dispatch_sync(dispatch: crate::callback_dispatch::Dispatch) {
+    let call_id = dispatch.call_id;
+    let mut execution = Some(dispatch.execution);
+    if !execution.as_mut().unwrap().start() {
+        // Cancelled before it ran: nothing is encoded, so the signature kept
+        // for the result is let go here.
+        drop(take_callback_signature(call_id));
+        return;
     }
+    catch_dispatch_panic(call_id, || {
+        let result = Python::attach(|py| -> PyResult<()> {
+            let frame = execution.as_ref().unwrap().frame()?;
+            let value = PyModule::import(py, "baml_bridge._dispatch")?
+                .getattr("_invoke_with_frame")?
+                .call1((dispatch.callable, dispatch.args, frame))?
+                .unbind();
+            let is_coroutine: bool = PyModule::import(py, "asyncio")?
+                .getattr("iscoroutine")?
+                .call1((value.bind(py),))?
+                .extract()?;
+            if !is_coroutine {
+                complete_with_value(py, call_id, value.bind(py));
+                return Ok(());
+            }
+            let context = PyModule::import(py, "contextvars")?
+                .getattr("copy_context")?
+                .call0()?
+                .unbind();
+            let rt = bridge_cffi::get_tokio_runtime()
+                .map_err(crate::errors::bridge_error_to_sdk_panic)?;
+            let execution = execution.take();
+            rt.spawn_blocking(move || {
+                let _execution = execution;
+                catch_dispatch_panic(call_id, || {
+                    let result = Python::attach(|py| -> PyResult<()> {
+                        let runner = PyModule::import(py, "baml_bridge._dispatch")?
+                            .getattr("_run_sync_coroutine")?;
+                        let value = context
+                            .bind(py)
+                            .call_method1("run", (runner, call_id, value.bind(py)))?
+                            .unbind();
+                        complete_with_value(py, call_id, value.bind(py));
+                        Ok(())
+                    });
+                    complete_dispatch_result(call_id, result);
+                })
+            });
+            Ok(())
+        });
+        complete_dispatch_result(call_id, result);
+    });
+}
+
+fn catch_dispatch_panic(call_id: u32, action: impl FnOnce()) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+        send_dispatch_bridge_failure(
+            call_id,
+            format!("host callable dispatch panicked: {}", panic_message(&panic)),
+        );
+    }
+}
+
+/// A dispatch that raised before its callable's value could be completed
+/// with: the error is the call's result.
+fn complete_dispatch_result(call_id: u32, result: PyResult<()>) {
+    if let Err(error) = result {
+        Python::attach(|py| send_dispatch_error_from_pyerr(call_id, py, &error));
+    }
+}
+
+/// Private Python scheduler entrypoints. Decoding, callable invocation and
+/// result encoding run on the selected Python thread, with the original error
+/// object preserved by the existing host-value transport.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn _invoke_host_callable(
+    py: Python<'_>,
+    callable: Py<PyAny>,
+    args: Vec<u8>,
+) -> PyResult<Py<PyAny>> {
+    let (positional, kwargs) = decode_args(py, &args)?;
+    callable.call(py, &positional, Some(&kwargs))
+}
+
+/// Connect cancellation to the task's actual owning loop. If cancellation
+/// already removed this dispatch, Python must not start its body. The hook
+/// keeps the loop alive independently of the SDK entry's environment guard.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn _register_host_call_execution(
+    py: Python<'_>,
+    call_id: u32,
+    event_loop: Py<PyAny>,
+) -> PyResult<bool> {
+    let cancel = PyModule::import(py, "baml_bridge._dispatch")?
+        .getattr("_cancel_dispatch")?
+        .unbind();
+    Ok(sys_native::host_dispatch::set_cancellation_hook(
+        call_id,
+        move || {
+            catch_dispatch_panic(call_id, || {
+                Python::attach(|py| {
+                    if let Err(error) = event_loop
+                        .bind(py)
+                        .call_method1("call_soon_threadsafe", (cancel.bind(py), call_id))
+                    {
+                        // A closed application loop cannot service cancellation;
+                        // eviction has already ended the engine's waiter.
+                        log::warn!("could not cancel Python host call {call_id}: {error}");
+                    }
+                });
+            });
+        },
+    ))
+}
+
+/// Release wire owners of callbacks that never started, without materializing
+/// application classes or invoking Python validators. A host value is the
+/// engine's reference, not an owner of this frame's: only its pin is.
+pub(crate) fn discard_host_call_args(args: &[u8]) {
+    fn discard(value: BamlOutboundValue) {
+        match value.value {
+            Some(OutboundValue::HandleValue(handle)) => {
+                let owned = match WireHandle::try_from(&handle) {
+                    Ok(WireHandle::Engine(key)) => Some(key),
+                    Ok(WireHandle::Host(..)) => TableKey::new(handle.pin),
+                    Err(_) => None,
+                };
+                if let Some(key) = owned {
+                    let _ = bridge_cffi::handle_cffi::release_handle(key.get());
+                }
+            }
+            Some(OutboundValue::ListValue(list)) => {
+                for value in list.items {
+                    discard(value);
+                }
+            }
+            Some(OutboundValue::TupleValue(tuple)) => {
+                for value in tuple.items {
+                    discard(value);
+                }
+            }
+            Some(OutboundValue::MapValue(map)) => {
+                for entry in map.entries {
+                    if let Some(value) = entry.value {
+                        discard(value);
+                    }
+                }
+            }
+            Some(OutboundValue::ClassValue(class)) => {
+                for field in class.fields {
+                    if let Some(value) = field.value {
+                        discard(value);
+                    }
+                }
+            }
+            Some(OutboundValue::UnionVariantValue(union)) => {
+                if let Some(value) = union.value {
+                    discard(*value);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(call) = BamlToHostCall::decode(args) {
+        for arg in call.args {
+            if let Some(value) = arg.value {
+                discard(value);
+            }
+        }
+    }
+    bex_project::host_release_dispatch::drain();
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn _discard_host_call_args(args: Vec<u8>) {
+    discard_host_call_args(&args);
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn _complete_host_call_success(py: Python<'_>, call_id: u32, value: Py<PyAny>) {
+    catch_dispatch_panic(call_id, || complete_with_value(py, call_id, value.bind(py)));
+}
+
+/// Complete `call_id` with the value its callable returned, encoded against
+/// the return type of the slot the callable was bound to.
+fn complete_with_value(py: Python<'_>, call_id: u32, value: &Bound<'_, PyAny>) {
+    let observation = bridge_cffi::host_instrumentation::callback(call_id).map(|owner| {
+        let outcome = btel_types::InvocationOutcome::Ok;
+        let capture = owner
+            .wants_value(outcome)
+            .then(|| crate::host_capture::capture(value));
+        (owner, capture)
+    });
+    let ret = match take_callback_signature(call_id) {
+        Some(bex_project::WireTy::Function { ret, .. }) => *ret,
+        Some(_) | None => bex_project::WireTy::Unknown,
+    };
+    let completion = crate::encode::encode_result(py, value, &ret);
+    // The outcome the engine sees, for the caller's instrumentation: a
+    // value that completes the call as a panic is an error in the trace,
+    // whatever the callable returned.
+    match &completion {
+        Completion::Wire(_) => {
+            if let Some((owner, capture)) = observation {
+                owner.observe(btel_types::InvocationOutcome::Ok, capture);
+            }
+        }
+        Completion::HostError(_) => {}
+        Completion::ContractViolation(error) => observe_dispatch_error(
+            call_id,
+            py,
+            &pyo3::exceptions::PyTypeError::new_err(error.to_string()),
+        ),
+        Completion::BridgeFailure(fault) => {
+            let message = match fault {
+                BridgeFault::Value(error) => error.to_string(),
+                BridgeFault::Host(error) => error.to_string(),
+            };
+            observe_dispatch_error(
+                call_id,
+                py,
+                &pyo3::exceptions::PyTypeError::new_err(message),
+            );
+        }
+    }
+    match completion.into_wire(Encoded::Returned) {
+        Ok(wire) => complete(call_id, &wire),
+        // The callable's own code raised while its result was read: the
+        // error it threw, as any exception a callable raises.
+        Err(error) => send_dispatch_error_from_pyerr(call_id, py, &error),
+    }
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn _complete_host_call_error(py: Python<'_>, call_id: u32, error: Py<PyAny>) {
+    catch_dispatch_panic(call_id, || {
+        send_dispatch_error_from_pyerr(call_id, py, &pyo3::PyErr::from_value(error.into_bound(py)));
+    });
 }
 
 /// Decode the protobuf `BamlToHostCall` into the callable's positional args
@@ -342,182 +629,33 @@ fn decode_args<'py>(
     py: Python<'py>,
     bytes: &[u8],
 ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
-    let outbound_pb2 = PyModule::import(py, "baml_bridge.cffi.v1.baml_outbound_pb2")?;
-    let proto = PyModule::import(py, "baml_bridge.proto")?;
-    let type_map = proto.getattr("get_type_map")?.call0()?;
-    let decode_value = proto.getattr("decode_value")?;
-
-    let to_host_call = outbound_pb2.getattr("BamlToHostCall")?.call0()?;
-    to_host_call.call_method1("ParseFromString", (bytes,))?;
-
-    let mut positional_items: Vec<Bound<'py, PyAny>> = Vec::new();
-    let kwargs = PyDict::new(py);
-    for arg in to_host_call.getattr("args")?.try_iter()? {
-        let arg = arg?;
-        let value = decode_value.call1((arg.getattr("value")?, &type_map))?;
-        if arg.getattr("is_optional_arg")?.extract::<bool>()? {
-            let name: String = arg.getattr("arg_name")?.extract()?;
-            kwargs.set_item(name, value)?;
-        } else {
-            positional_items.push(value);
-        }
-    }
-    let positional = PyTuple::new(py, positional_items)?;
-
-    Ok((positional, kwargs))
+    let decoder = PyModule::import(py, "baml_bridge.proto")
+        .and_then(|proto| proto.getattr("_decode_host_call_args"))
+        .inspect_err(|_| discard_host_call_args(bytes))?;
+    // The decoder releases any individual references that did not reach a
+    // host wrapper, including failures partway through a nested argument.
+    decoder.call1((bytes,))?.extract()
 }
 
-/// If `value` is a coroutine, run it to completion on a fresh asyncio loop
-/// and return the resolved result. Otherwise return `value` unchanged.
-fn run_if_coroutine(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let bound = value.bind(py);
-    let asyncio = PyModule::import(py, "asyncio")?;
-    let is_coro: bool = asyncio.getattr("iscoroutine")?.call1((bound,))?.extract()?;
-    if !is_coro {
-        return Ok(value);
-    }
-    // Run the coroutine to completion on a new event loop in the current
-    // thread. The bridge is on a tokio worker — Python sees a fresh loop
-    // dedicated to this dispatch only.
-    let new_loop = asyncio.getattr("new_event_loop")?.call0()?;
-    let set_event_loop = asyncio.getattr("set_event_loop")?;
-    let result = (|| -> PyResult<Py<PyAny>> {
-        // Install the fresh loop as this thread's current loop for the run.
-        // Coroutines (and libraries they use) commonly reach for the ambient
-        // loop via `asyncio.get_event_loop()`/`ensure_future()`; on a non-main
-        // thread with no loop set that raises "no current event loop in thread"
-        // or binds work to an unrelated loop. Installing it first makes the
-        // running loop and the thread's current loop agree.
-        set_event_loop.call1((&new_loop,))?;
-        Ok(new_loop
-            .call_method1("run_until_complete", (bound,))?
-            .unbind())
-    })();
-    // Close the loop and clear it as the thread's current loop regardless of
-    // success/error. tokio reuses worker threads, so a leftover (now-closed)
-    // current loop would poison the next dispatch that lands on this thread.
-    let _ = new_loop.call_method0("close");
-    let _ = set_event_loop.call1((py.None(),));
-    result
-}
-
-/// Encode `value` as an `InboundValue` protobuf using
-/// `baml_bridge.proto._set_inbound_value`, then serialize to bytes.
-fn encode_result_inbound(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<u8>> {
-    let inbound_pb2 = PyModule::import(py, "baml_bridge.cffi.v1.baml_inbound_pb2")?;
-    let proto = PyModule::import(py, "baml_bridge.proto")?;
-    let holder = inbound_pb2.getattr("InboundValue")?.call0()?;
-    // Track both ownership kinds created while encoding: host callables in the
-    // Python registry and ordinary HANDLE_TABLE keys cloned for wire transfer.
-    // If a later nested value fails, the engine never receives the bytes and
-    // cannot release/drain either kind. Mirrors `encode_call_args`.
-    let registered = pyo3::types::PyList::empty(py);
-    let cloned_handles = pyo3::types::PyList::empty(py);
-    let kwargs_dict = pyo3::types::PyDict::new(py);
-    kwargs_dict.set_item("kwarg_name", "<host-callable result>")?;
-    kwargs_dict.set_item("registered", &registered)?;
-    kwargs_dict.set_item("cloned_handles", &cloned_handles)?;
-
-    let encoded = (|| -> PyResult<Vec<u8>> {
-        proto
-            .getattr("_set_inbound_value")?
-            .call((&holder, value), Some(&kwargs_dict))?;
-        holder.call_method0("SerializeToString")?.extract()
-    })();
-
-    if encoded.is_err() {
-        rollback_failed_encode(&registered, &cloned_handles);
-    }
-    encoded
-}
-
-fn rollback_failed_encode(registered: &Bound<'_, PyList>, cloned_handles: &Bound<'_, PyList>) {
-    for item in registered.iter() {
-        if let Ok(key) = item.extract::<u64>() {
-            release_host_callable(key);
-        }
-    }
-    for item in cloned_handles.iter() {
-        if let Ok(key) = item.extract::<u64>() {
-            let _ = bridge_cffi::handle_cffi::release_handle(key);
-        }
-    }
-}
-
-/// Send a `complete_host_call` success with the given `InboundValue`-encoded
-/// payload. `complete_host_call` is `extern "C"` but not `unsafe` — the
-/// invariants documented on its declaration (valid-for-length bytes) are
-/// satisfied by `bytes`'s slice contract.
-fn send_dispatch_success(call_id: u32, bytes: &[u8]) {
-    complete_host_call(call_id, 0, bytes.as_ptr() as *const i8, bytes.len());
-}
-
-/// Build an `InboundValue` carrying a `baml.errors.HostCallable` Instance.
-/// `handle_key` references the originating native exception in the
-/// process-global registry (set by [`register_host_opaque`]); the BAML
-/// class's `_handle` field carries it as a `BamlHandle` of type
-/// `HOST_VALUE_OPAQUE` so a same-host decoder can rehydrate the exact
-/// Python exception object on round-trip. The remaining
-/// `class_name` / `message` / `language` / `traceback` fields are
-/// metadata for debugging/printing/user convenience and do not
-/// participate in error matching or rehydration.
-fn build_host_callable_inbound(
-    class_name: &str,
-    message: &str,
-    traceback: Option<&str>,
-    handle_key: u64,
-) -> InboundValue {
-    fn string_field(key: &str, value: &str) -> InboundMapEntry {
-        InboundMapEntry {
-            key: Some(InboundMapKey::StringKey(key.to_string())),
-            value: Some(InboundValue {
-                value_type: None,
-                value: Some(InboundValueVariant::StringValue(value.to_string())),
-            }),
-        }
-    }
-    let handle_field = InboundMapEntry {
-        key: Some(InboundMapKey::StringKey("_handle".to_string())),
-        value: Some(InboundValue {
-            value_type: None,
-            value: Some(InboundValueVariant::Handle(BamlHandle {
-                key: handle_key,
-                handle_type: BamlHandleType::HostValueOpaque as i32,
-            })),
-        }),
-    };
-    let mut fields = vec![
-        string_field("message", message),
-        string_field("class_name", class_name),
-        string_field("language", "python"),
-    ];
-    if let Some(tb) = traceback {
-        fields.push(string_field("traceback", tb));
-    }
-    fields.push(handle_field);
-    InboundValue {
-        value_type: Some(BamlTy {
-            ty: Some(BamlTyVariant::ClassTy(BamlTyClass {
-                name: "baml.errors.HostCallable".to_string(),
-                type_args: vec![],
-            })),
-        }),
-        value: Some(InboundValueVariant::ClassValue(InboundClassValue {
-            fields,
-        })),
-    }
+/// Complete `call_id` with what its callable did. `complete_host_call` is
+/// `extern "C"` but not `unsafe` — the invariants documented on its
+/// declaration (valid-for-length bytes) are satisfied by the slice contract.
+fn complete(call_id: u32, completion: &HostCallCompletion) {
+    let bytes = completion.encode_to_vec();
+    complete_host_call(call_id, bytes.as_ptr() as *const i8, bytes.len());
 }
 
 /// Complete an in-flight host call with `VmInternalError::BridgeFailure` —
 /// the engine surfaces this as `baml.panics.SdkPanic` to the host SDK.
 ///
-/// Use for *bridge-layer* faults: no tokio runtime when the dispatch fires,
+/// Use for *bridge-layer* faults: unavailable callback execution environment,
 /// a caught Rust panic inside the dispatch task, or a missing registry
 /// entry (the engine knows about a handle the bridge no longer has). These
 /// are infrastructure bugs, not user-code exceptions, so they must not
 /// surface as catchable `BamlError(HostCallable(...))`. Mirrors the
 /// `send_dispatch_error_*` family in `bridge_typescript`.
-fn send_dispatch_bridge_failure(call_id: u32, message: String) {
+pub(crate) fn send_dispatch_bridge_failure(call_id: u32, message: String) {
+    drop(take_callback_signature(call_id));
     sys_native::host_dispatch::complete_with_error(
         call_id,
         sys_native::OpError::new(
@@ -528,27 +666,28 @@ fn send_dispatch_bridge_failure(call_id: u32, message: String) {
 }
 
 /// If `py_err` is a `baml_bridge.errors.BamlError` *or* `BamlPanic` carrying
-/// a codegenned BAML value, encode the unwrapped value (`e.value`) as an
-/// `InboundValue` — preserving its real BAML class identity so the BAML
-/// caller can `catch (e: MyError)` and read fields just like a BAML-thrown
-/// error. `BamlPanic.value` is normally a `baml.panics.*` class; the
-/// engine's namespace-based routing turns that back into a panic on the
-/// BAML side. (`BamlPanic` is a `BaseException`, not a `BamlError`
-/// subclass, so it must be checked separately.)
+/// a BAML value, the completion that throws the unwrapped value (`e.value`),
+/// encoded against the throws type of the slot the callable was bound to, so
+/// the BAML caller can `catch (e: MyError)` and read fields just like a
+/// BAML-thrown error. A `BamlPanic.value` is a `baml.panics.*` instance,
+/// which the engine throws as a panic whatever the slot declares.
+/// (`BamlPanic` is a `BaseException`, not a `BamlError` subclass, so it must
+/// be checked separately.)
 ///
 /// Returns `Ok(None)` for:
-/// - any other exception type — caller falls back to the opaque
-///   `baml.errors.HostCallable` path;
-/// - `BamlError(value=None)` / `BamlPanic(value=None)` — encoding `None`
-///   would emit BAML `null`, which fails contract check for any concrete
-///   `E` and produces a nonsensical `null` throw under `E=unknown`; the
-///   opaque path always produces a well-formed `HostCallable` instance the
-///   engine can route.
+/// - any other exception type — the caller completes the call as the host's
+///   own exception;
+/// - `BamlError(value=None)` / `BamlPanic(value=None)` — a bare wrapper
+///   carries no BAML value to throw.
 ///
-/// An `Err(_)` here (proto module missing, `_set_inbound_value` rejected
-/// the value) is also collapsed to the opaque path by the caller — the
-/// call always completes, even if the BAML-class identity is lost.
-fn try_encode_baml_error_throw(py: Python<'_>, py_err: &pyo3::PyErr) -> PyResult<Option<Vec<u8>>> {
+/// An `Err(_)` here (errors module missing, the host's own exception while
+/// the value was read) is also collapsed to the host-exception path by the
+/// caller — the call always completes.
+fn try_encode_baml_error_throw(
+    py: Python<'_>,
+    call_id: u32,
+    py_err: &pyo3::PyErr,
+) -> PyResult<Option<HostCallCompletion>> {
     let errors_mod = match PyModule::import(py, "baml_bridge.errors") {
         Ok(m) => m,
         // Defensive: missing module would be a packaging bug. Fall through.
@@ -564,37 +703,29 @@ fn try_encode_baml_error_throw(py: Python<'_>, py_err: &pyo3::PyErr) -> PyResult
     }
 
     // Unwrap the underlying value (the codegenned BAML pydantic model /
-    // enum / primitive) and run it through the same encoder used for
-    // host-call success results. `_set_inbound_value` already knows how
-    // to map a pydantic instance to `InboundValue.Class(name=<BAML FQN>,
-    // fields=…)` via `get_type_map().py_type_to_baml_type(type(value))`.
+    // enum / primitive) and encode it against the throws type of the slot
+    // the callable was bound to, the same way a result is encoded against
+    // the return type.
     let inner = exc_value.getattr("value")?;
     if inner.is_none() {
         // `BamlError(value=None)` is a bare wrapper — emit nothing here;
         // the caller will fall through to the opaque path.
         return Ok(None);
     }
-    let inbound_pb2 = PyModule::import(py, "baml_bridge.cffi.v1.baml_inbound_pb2")?;
-    let proto = PyModule::import(py, "baml_bridge.proto")?;
-    let holder = inbound_pb2.getattr("InboundValue")?.call0()?;
-    let registered = pyo3::types::PyList::empty(py);
-    let cloned_handles = pyo3::types::PyList::empty(py);
-    let kwargs_dict = pyo3::types::PyDict::new(py);
-    kwargs_dict.set_item("kwarg_name", "<host-callable throw>")?;
-    kwargs_dict.set_item("registered", &registered)?;
-    kwargs_dict.set_item("cloned_handles", &cloned_handles)?;
-
-    let encoded = (|| -> PyResult<Vec<u8>> {
-        proto
-            .getattr("_set_inbound_value")?
-            .call((&holder, &inner), Some(&kwargs_dict))?;
-        holder.call_method0("SerializeToString")?.extract()
-    })();
-
-    if encoded.is_err() {
-        rollback_failed_encode(&registered, &cloned_handles);
-    }
-    encoded.map(Some)
+    // A `baml.panics.*` value is a panic whatever the callable declares, so
+    // it is encoded against `unknown` rather than the declared throws type,
+    // which would refuse it as a contract violation before the engine's
+    // panic exemption applies. The signature is taken either way: the call
+    // is ending.
+    let signature = take_callback_signature(call_id);
+    let throws = match signature {
+        _ if is_baml_panic => bex_project::WireTy::Unknown,
+        Some(bex_project::WireTy::Function { throws, .. }) => *throws,
+        Some(_) | None => bex_project::WireTy::Unknown,
+    };
+    crate::encode::encode_result(py, &inner, &throws)
+        .into_wire(Encoded::Thrown)
+        .map(Some)
 }
 
 /// Encode a Python exception as an `InboundValue` and send via
@@ -607,10 +738,45 @@ fn try_encode_baml_error_throw(py: Python<'_>, py_err: &pyo3::PyErr) -> PyResult
 ///   opaque `baml.errors.HostCallable` Instance carrying the four
 ///   metadata fields.
 fn send_dispatch_error_from_pyerr(call_id: u32, py: Python<'_>, py_err: &pyo3::PyErr) {
-    if let Ok(Some(bytes)) = try_encode_baml_error_throw(py, py_err) {
-        complete_host_call(call_id, 1, bytes.as_ptr() as *const i8, bytes.len());
+    observe_dispatch_error(call_id, py, py_err);
+
+    if let Ok(Some(completion)) = try_encode_baml_error_throw(py, call_id, py_err) {
+        complete(call_id, &completion);
         return;
     }
+    send_dispatch_error_opaque(call_id, py, py_err);
+}
+
+/// Report a failed dispatch to the instrumentation owner of `call_id`, if any.
+fn observe_dispatch_error(call_id: u32, py: Python<'_>, py_err: &pyo3::PyErr) {
+    if let Some(owner) = bridge_cffi::host_instrumentation::callback(call_id) {
+        let cancelled = PyModule::import(py, "asyncio")
+            .and_then(|module| module.getattr("CancelledError"))
+            .is_ok_and(|kind| py_err.matches(py, kind).unwrap_or(false));
+        let outcome = if cancelled {
+            btel_types::InvocationOutcome::Cancelled
+        } else {
+            btel_types::InvocationOutcome::Errored
+        };
+        let capture = if owner.wants_value(outcome) {
+            PyModule::import(py, "baml_bridge._instrumentation")
+                .and_then(|module| module.getattr("_exception_capture"))
+                .and_then(|capture| capture.call1((py_err.value(py),)))
+                .ok()
+                .map(|value| crate::host_capture::capture(&value))
+        } else {
+            None
+        };
+        owner.observe(outcome, capture);
+    }
+}
+
+/// Complete `call_id` as the host's own exception: `py_err`'s identity and a
+/// handle to the exception object itself, from which the engine builds the
+/// `baml.errors.HostCallable`.
+fn send_dispatch_error_opaque(call_id: u32, py: Python<'_>, py_err: &pyo3::PyErr) {
+    // The host's own exception is encoded against nothing.
+    drop(take_callback_signature(call_id));
 
     let class_name = py_err
         .get_type(py)
@@ -625,11 +791,10 @@ fn send_dispatch_error_from_pyerr(call_id: u32, py: Python<'_>, py_err: &pyo3::P
     // resolve `_handle` back to the original `ValueError`/`KeyError`/...
     // object on round-trip.
     let handle_key = register_host_opaque(py_err.value(py).clone().unbind().into_any());
-
-    let bytes =
-        build_host_callable_inbound(&class_name, &message, traceback.as_deref(), handle_key)
-            .encode_to_vec();
-    complete_host_call(call_id, 1, bytes.as_ptr() as *const i8, bytes.len());
+    complete(
+        call_id,
+        &bridge_encode::raised(message, class_name, "python", traceback, handle_key),
+    );
 }
 
 /// Best-effort: format a Python traceback via the `traceback` stdlib

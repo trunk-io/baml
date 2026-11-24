@@ -2,24 +2,32 @@
 //! Attributes "don't exist"
 //! Union / Optional / Null invariance guaranteed
 
+mod descriptor;
+pub use baml_type::json_tags;
 mod embedded_bytecode;
 mod errors;
 mod generator_fields;
+mod naming;
 mod output_writer;
 mod routing;
+mod skip_warning;
 mod string_literal;
 mod symbols;
 mod ty;
 mod type_queries;
+pub use baml_type::ClassCrossing;
+pub use descriptor::*;
 pub use embedded_bytecode::embedded_bytecode_base64;
 pub use errors::*;
 pub use generator_fields::*;
+pub use naming::{Candidate, Case, allocate_distinct, allocate_one};
 pub use output_writer::*;
-pub use routing::namespace_segments;
+pub use routing::{dependency_root_segments, namespace_segments};
+pub use skip_warning::SkipWarning;
 pub use string_literal::quoted_string;
 pub use symbols::*;
 pub use ty::*;
-pub use type_queries::public_interface_tokens;
+pub use type_queries::{is_nullable, public_interface_tokens};
 
 /// Macro to define an askama template function with less boilerplate.
 ///

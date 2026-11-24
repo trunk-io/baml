@@ -1,10 +1,9 @@
 // Handle-backed stdlib resources — port of python_pydantic2
 // `roundtrip_tests/test_handles.py`. All symbols are stdlib pkg `baml`.
 //
-// The load-bearing property: opaque `$rust_type` handles round-trip —
-// a File's cursor state persists across separate host→engine FFI
-// calls because the same engine-side resource rides back in as a
-// cloned handle key.
+// The load-bearing property: a reference to an engine instance round-trips —
+// a File's cursor state persists across separate host→engine FFI calls
+// because each call receives the same engine instance back.
 import XCTest
 import Foundation
 import Baml
@@ -19,25 +18,25 @@ final class TestHandles: XCTestCase {
         let img = Baml.baml.media.Image(
             _data: try BamlMedia.fromBase64(.image, pngB64, mimeType: "image/png")
         )
-        XCTAssertEqual(try img.mime_type(), "image/png")
-        XCTAssertEqual(try img.base64(), pngB64)
+        XCTAssertEqual(try img.mime_type_sync(), "image/png")
+        XCTAssertEqual(try img.base64_sync(), pngB64)
     }
 
     func test_handles_open_file_returns_file_handle() throws {
         let path = try makeTempFile(contents: "0123456789")
-        let f = try Baml.baml.fs.open(path: path, mode: "r")
-        try f.close()
+        let f = try Baml.baml.fs.open_sync(path: path, mode: "r")
+        try f.close_sync()
     }
 
     func test_handles_file_cursor_state_persists_across_calls() throws {
         let path = try makeTempFile(contents: "0123456789")
-        let f = try Baml.baml.fs.open(path: path, mode: "r")
-        XCTAssertEqual(try f.seek_from(whence: "current", offset: 3), 3)
-        XCTAssertEqual(try f.seek_from(whence: "current", offset: 3), 6)
-        XCTAssertEqual(try f.seek_from(whence: "start", offset: 0), 0)
-        XCTAssertEqual(try f.seek_from(whence: "current", offset: 2), 2)
-        XCTAssertEqual(try f.text(), "23456789")
-        try f.close()
+        let f = try Baml.baml.fs.open_sync(path: path, mode: "r")
+        XCTAssertEqual(try f.seek_from_sync(whence: "current", offset: 3), 3)
+        XCTAssertEqual(try f.seek_from_sync(whence: "current", offset: 3), 6)
+        XCTAssertEqual(try f.seek_from_sync(whence: "start", offset: 0), 0)
+        XCTAssertEqual(try f.seek_from_sync(whence: "current", offset: 2), 2)
+        XCTAssertEqual(try f.text_sync(), "23456789")
+        try f.close_sync()
     }
 
     private func makeTempFile(contents: String) throws -> String {

@@ -63,8 +63,8 @@ pub const TS_KEYWORDS_YAML: &str = include_str!("../keyword_docs/ts_keywords.yam
 
 mod language_docs;
 pub use language_docs::{
-    LanguageTopic, TypescriptCrosswalkTopic, has_describe_topic, language_topic, language_topics,
-    typescript_crosswalk_topic, typescript_crosswalk_topics,
+    LanguageTopic, TypescriptCrosswalkTopic, has_describe_topic, language_topic,
+    typescript_crosswalk_topic,
 };
 
 /// Builtin registration macro: package, relative virtual path, filesystem include path.
@@ -103,25 +103,69 @@ macro_rules! manifest {
     };
 }
 
-/// Every builtin package's manifest. One entry per package directory; the
-/// files of a package listed here are the [`ALL`] entries with that
-/// `package`.
-pub const MANIFESTS: &[BuiltinManifest] = &[
-    manifest!("baml"),
-    manifest!("log"),
-    manifest!("reflect"),
-    manifest!("testing"),
-    manifest!("assert"),
-    manifest!("trace"),
-    manifest!("ai"),
-    manifest!("openai"),
-    manifest!("anthropic"),
-    manifest!("typesafeai"),
-    manifest!("google"),
-    manifest!("claude_code"),
-    manifest!("aws"),
-    manifest!("vercel"),
-];
+/// Declares the builtin packages once and derives every per-package table
+/// from that single list.
+///
+/// The name tables are separate constants rather than projections of [`ALL`]
+/// or [`MANIFESTS`] on purpose: `ALL` embeds every stdlib source file, so
+/// reading package names off it would link the whole stdlib text into
+/// binaries (like the pack host) that only need the names.
+macro_rules! stdlib_packages {
+    ($($pkg:literal),+ $(,)?) => {
+        /// Every builtin package's manifest. One entry per package directory,
+        /// in the order the packages first appear in [`ALL`]; the files of a
+        /// package listed here are the `ALL` entries with that `package`.
+        pub const MANIFESTS: &[BuiltinManifest] = &[$(manifest!($pkg)),+];
+
+        /// The standard-library / builtin package names, in [`MANIFESTS`]
+        /// order.
+        ///
+        /// This is the single authoritative answer to "which packages ship as
+        /// builtins"; a test keeps it equal to the packages contributing files
+        /// to [`ALL`], in first-appearance order.
+        ///
+        /// Every such package is a compiler-build constant (no user file can
+        /// contribute to it), so each one's typed `PackageInterface` is a pure
+        /// function of stdlib source + compiler code. That is the soundness
+        /// foundation for caching it under the compiler fingerprint and seeding
+        /// it back (B-694). Callers that serialize per-package data key it in a
+        /// sorted map, so the order here never leaks into stored bytes.
+        pub const STDLIB_PACKAGE_NAMES: &[&str] = &[$($pkg),+];
+
+        /// Every name a dependency edge may not use: the builtin packages
+        /// (their names are language-fixed edges every package already has),
+        /// the two source-level qualifiers `root` (the package's own root
+        /// namespace) and `env` (environment variables), and, for now,
+        /// [`RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY`].
+        ///
+        /// This is the single source of truth shared by the compiler's edge
+        /// validation and runtime reflection's mount-alias check, so both
+        /// reject exactly the same names.
+        pub const RESERVED_EDGE_NAMES: &[&str] = &[
+            $($pkg,)+
+            "root",
+            "env",
+            RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY,
+        ];
+    };
+}
+
+stdlib_packages!(
+    "baml",
+    "reflect",
+    "trace",
+    "testing",
+    "assert",
+    "log",
+    "ai",
+    "openai",
+    "anthropic",
+    "typesafeai",
+    "google",
+    "aws",
+    "vercel",
+    "claude_code",
+);
 
 /// All builtin `.baml` files, in registration order. Namespaces derived from
 /// `ns_*` folder segments in `relative_path`.
@@ -130,6 +174,7 @@ pub const ALL: &[BuiltinFile] = &[
     builtin!("baml", "containers.baml"),
     builtin!("baml", "sortable.baml"),
     builtin!("baml", "conversions.baml"),
+    builtin!("baml", "hashing.baml"),
     builtin!("baml", "core.baml"),
     builtin!("baml", "int.baml"),
     builtin!("baml", "bigint.baml"),
@@ -153,7 +198,10 @@ pub const ALL: &[BuiltinFile] = &[
     builtin!("baml", "ns_events/events.baml"),
     builtin!("baml", "ns_sys/sys.baml"),
     builtin!("baml", "ns_fs/fs.baml"),
+    builtin!("baml", "ns_path/path.baml"),
+    builtin!("baml", "ns_archive/archive.baml"),
     builtin!("baml", "ns_glob/glob.baml"),
+    builtin!("baml", "ns_hash/hash.baml"),
     builtin!("baml", "ns_net/net.baml"),
     builtin!("baml", "ns_media/media.baml"),
     builtin!("baml", "ns_regex/regex.baml"),
@@ -166,6 +214,7 @@ pub const ALL: &[BuiltinFile] = &[
     builtin!("baml", "ns_iter/iter.baml"),
     builtin!("baml", "ns_future/future.baml"),
     builtin!("baml", "ns_spawn/spawn.baml"),
+    builtin!("baml", "ns_sync/sync.baml"),
     builtin!("baml", "ns_host/host.baml"),
     builtin!("baml", "ns_time/duration.baml"),
     builtin!("baml", "ns_time/instant.baml"),
@@ -187,14 +236,10 @@ pub const ALL: &[BuiltinFile] = &[
     // --- reflect package ---
     builtin!("reflect", "reflect.baml"),
     builtin!("reflect", "type.baml"),
+    builtin!("reflect", "kinds.baml"),
     builtin!("reflect", "ns_class/class.baml"),
     builtin!("reflect", "ns_enum/enum.baml"),
-    builtin!("reflect", "ns_union/union.baml"),
-    builtin!("reflect", "ns_literal/literal.baml"),
-    builtin!("reflect", "ns_array/array.baml"),
-    builtin!("reflect", "ns_map/map.baml"),
     builtin!("reflect", "ns_interface/interface.baml"),
-    builtin!("reflect", "ns_primitive/primitive.baml"),
     builtin!("reflect", "ns_function/function.baml"),
     builtin!("reflect", "ns_errors/errors.baml"),
     // --- trace package ---
@@ -239,6 +284,8 @@ pub const ALL: &[BuiltinFile] = &[
     // lives here; the render-context classes sit in ai/context.baml.
     builtin!("ai", "ns_internal/prompt.baml"),
     // --- provider client packages ---
+    builtin!("openai", "decisions.baml"),
+    builtin!("openai", "ns_internal/ns_decisions/decisions.baml"),
     builtin!("openai", "responses.baml"),
     builtin!("openai", "ns_internal/responses.baml"),
     builtin!("openai", "chat.baml"),
@@ -249,6 +296,7 @@ pub const ALL: &[BuiltinFile] = &[
     builtin!("openai", "images.baml"),
     builtin!("openai", "ns_internal/chat.baml"),
     builtin!("openai", "ns_internal/images.baml"),
+    builtin!("openai", "ns_internal/structured.baml"),
     builtin!("anthropic", "messages.baml"),
     builtin!("typesafeai", "client.baml"),
     builtin!("typesafeai", "ns_internal/jev.baml"),
@@ -265,60 +313,11 @@ pub const ALL: &[BuiltinFile] = &[
     builtin!("vercel", "ns_internal/images.baml"),
     builtin!("claude_code", "cli.baml"),
     builtin!("claude_code", "ns_internal/cli.baml"),
+    builtin!("claude_code", "ns_internal/content.baml"),
     // ai.mcp: MCP servers as ordinary ai tools (part of the ai package).
     builtin!("ai", "ns_mcp/mcp.baml"),
     builtin!("ai", "ns_internal/mcp.baml"),
 ];
-
-/// The distinct standard-library / builtin package names, derived from the
-/// embedded manifest [`ALL`] in first-appearance order.
-///
-/// This is the single authoritative answer to "which packages ship as
-/// builtins": a package is a stdlib package iff it contributes at least one
-/// file to `ALL` (i.e. it has a `<builtin>/<package>/…` source). There is no
-/// hand-maintained parallel list to keep in sync — adding a package to `ALL`
-/// automatically enrolls it here.
-///
-/// Every such package is a compiler-build constant (no user file can contribute
-/// to it), so each one's typed `PackageInterface` is a pure function of stdlib
-/// source + compiler code — the soundness foundation for caching it under the
-/// compiler fingerprint and seeding it back (B-694). Callers that serialize
-/// per-package data key it in a sorted map, so the first-appearance iteration
-/// order here never leaks into stored bytes.
-pub fn stdlib_package_names() -> &'static [&'static str] {
-    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names = Vec::new();
-        for file in ALL {
-            if !names.contains(&file.package) {
-                names.push(file.package);
-            }
-        }
-        names
-    })
-}
-
-/// Every name a dependency edge may not use, in stable first-appearance
-/// order: the builtin packages (their names are language-fixed edges every
-/// package already has), the two source-level qualifiers `root` (the
-/// package's own root namespace) and `env` (environment variables), and, for
-/// now, [`RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY`].
-///
-/// This is the single source of truth shared by the compiler's edge
-/// validation and runtime reflection's mount-alias check, so both reject
-/// exactly the same names.
-pub fn reserved_edge_names() -> &'static [&'static str] {
-    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names = stdlib_package_names().to_vec();
-        names.extend([
-            "root",
-            "env",
-            RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY,
-        ]);
-        names
-    })
-}
 
 /// `user`, reserved as an edge name ONLY to paper over a runtime limitation,
 /// and to be released the moment that limitation is gone.
@@ -344,12 +343,14 @@ mod package_inventory_tests {
     use super::*;
 
     #[test]
-    fn manifests_match_registered_packages() {
-        let mut packages = stdlib_package_names().to_vec();
-        let mut manifests: Vec<_> = MANIFESTS.iter().map(|manifest| manifest.package).collect();
-        packages.sort_unstable();
-        manifests.sort_unstable();
-        assert_eq!(manifests, packages);
+    fn manifests_match_registered_packages_in_first_appearance_order() {
+        let mut registered = Vec::new();
+        for file in ALL {
+            if !registered.contains(&file.package) {
+                registered.push(file.package);
+            }
+        }
+        assert_eq!(STDLIB_PACKAGE_NAMES, registered.as_slice());
     }
 
     #[test]
@@ -364,7 +365,7 @@ mod package_inventory_tests {
             "../../../../typescript2/app-developer-docs/content-data/reference/stdlib-packages.yaml"
         ))
         .expect("valid developer docs package inventory");
-        let mut packages = stdlib_package_names().to_vec();
+        let mut packages = STDLIB_PACKAGE_NAMES.to_vec();
         docs.packages.sort_unstable();
         packages.sort_unstable();
         assert_eq!(
@@ -386,7 +387,7 @@ mod reserved_edge_name_tests {
     #[test]
     fn user_is_reserved_only_while_the_wire_codec_claims_that_spelling() {
         assert!(
-            reserved_edge_names().contains(&RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY),
+            RESERVED_EDGE_NAMES.contains(&RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY),
             "the edge name is unreserved while the wire codec still claims the spelling"
         );
         assert_eq!(
@@ -397,12 +398,7 @@ mod reserved_edge_name_tests {
             "the wire codec no longer fuses this spelling into the artifact's own \
              package, so the reservation is dead weight: delete \
              RESERVED_USER_EDGE_UNTIL_WIRE_CARRIES_IDENTITY and drop it from \
-             reserved_edge_names"
+             RESERVED_EDGE_NAMES"
         );
     }
 }
-
-mod adt;
-mod media;
-pub use adt::*;
-pub use media::{MediaContent, MediaValue};

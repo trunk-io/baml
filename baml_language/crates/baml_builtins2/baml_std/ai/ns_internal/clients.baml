@@ -6,10 +6,10 @@
 /// `providers` maps a prefix and model to the constructed client, or `null`
 /// for an unknown prefix, and `prefixes` lists every prefix it knows (for
 /// error messages). This package cannot build either: every provider package
-/// implements `root.Client`, so `ai` sits below them in the package graph. The
+/// implements `ai.Client`, so `ai` sits below them in the package graph. The
 /// compiler synthesizes both from its own provider table (the same one a
 /// literal `client "provider/model"` lowers through) at each
-/// `root.clients.resolve` call.
+/// `ai.clients.resolve` call.
 function _from_shorthand(
     shorthand: string,
     providers: (string, string) -> root.Client?,
@@ -21,13 +21,22 @@ function _from_shorthand(
         let model = shorthand.slice(index + 1, shorthand.length());
         if let built: root.Client = providers(prefix, model) {
             built
+        } else if (prefix == "azure") {
+            // The compiler rejects a literal `"azure/…"` the same way
+            // (`AZURE_SHORTHAND_REMOVED` in `lower_cst.rs`).
+            throw root.errors.InvalidRequest {
+                provider: "ai.clients",
+                status_code: null,
+                detail: `client "${shorthand}": there is no "azure/<model>" shorthand: an Azure request goes to a deployment, which a model name does not identify; build openai.AzureClient.new(model = "${model}", deployment_id = ..., resource_name = ...)`,
+                raw_body: null,
+            };
         } else {
             throw root.errors.InvalidRequest {
                 provider: "ai.clients",
                 status_code: null,
                 detail: `no builtin provider for prefix "${prefix}" in client "${shorthand}"; valid prefixes are ${prefixes.join(", ")} (for any other OpenAI-compatible endpoint, build openai.GenericClient.new(base_url = ..., model = "${model}"))`,
                 raw_body: null,
-            }
+            };
         }
     } else {
         throw root.errors.InvalidRequest {
@@ -35,6 +44,6 @@ function _from_shorthand(
             status_code: null,
             detail: `client "${shorthand}" is not a "provider/model" string (no "/"); valid prefixes are ${prefixes.join(", ")}`,
             raw_body: null,
-        }
+        };
     }
 }

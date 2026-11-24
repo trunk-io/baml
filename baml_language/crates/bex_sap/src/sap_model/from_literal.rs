@@ -9,11 +9,11 @@ use crate::{
     },
     sap_model::{
         AnnotatedField, ArrayTy, BamlArray, BamlBigint, BamlBool, BamlClass, BamlEnum, BamlFloat,
-        BamlInt, BamlMap, BamlNull, BamlPrimitive, BamlStreamState, BamlString, BamlValue,
-        BigintLiteralTy, BigintTy, BoolLiteralTy, BoolTy, ClassTy, DefaultValue, EnumTy,
+        BamlInt, BamlMap, BamlNull, BamlPrimitive, BamlStreamState, BamlString, BamlTuple,
+        BamlValue, BigintLiteralTy, BigintTy, BoolLiteralTy, BoolTy, ClassTy, DefaultValue, EnumTy,
         EnumVariantTy, FloatTy, IntLiteralTy, IntTy, LiteralTy, MapTy, MediaTy, NullTy,
-        PrimitiveTy, StreamStateTy, StringLiteralTy, StringTy, TyResolvedRef, TypeIdent,
-        TypeName as _, TypeValue, UnionTy,
+        PrimitiveTy, ShapedTy, StreamStateTy, StringLiteralTy, StringTy, TupleTy, TyResolvedRef,
+        TypeIdent, TypeName as _, TypeValue, UnionTy,
     },
 };
 
@@ -292,6 +292,44 @@ where
     }
 }
 
+impl<'s, 'v, 't, N: TypeIdent> FromLiteral<'s, 'v, 't, N> for TupleTy<'t, N>
+where
+    't: 's,
+    's: 'v,
+{
+    fn from_literal(
+        &'t self,
+        literal: &DefaultValue<N>,
+        ctx: &ParsingContext<'s, 'v, 't, N>,
+    ) -> Result<Self::Value, ParsingError> {
+        let mismatch = || {
+            ctx.error_internal(format!(
+                "attribute literal must match the type: {}",
+                self.type_name()
+            ))
+        };
+        let DefaultValue::Tuple(defaults) = literal else {
+            return Err(mismatch());
+        };
+        if defaults.len() != self.items.len() {
+            return Err(mismatch());
+        }
+        let mut items = Vec::with_capacity(self.items.len());
+        for (i, (item_ty, default)) in self.items.iter().zip(defaults).enumerate() {
+            let ctx = ctx.enter_scope(crate::deserializer::coercer::ScopeStep::Index(i));
+            let ty = ctx
+                .db
+                .resolve(item_ty)
+                .map_err(|ident| ctx.error_type_resolution(ident))?;
+            let value = ty
+                .from_literal(default, &ctx)
+                .map_err(|e| mismatch().with_cause(e))?;
+            items.push(BamlValueWithFlags::new(value, DeserializerMeta::new(ty)));
+        }
+        Ok(BamlTuple { value: items })
+    }
+}
+
 impl<'s, 'v, 't, N: TypeIdent> FromLiteral<'s, 'v, 't, N> for MapTy<'t, N>
 where
     't: 's,
@@ -496,6 +534,24 @@ where
     }
 }
 
+/// A shaped type has no default (`never`), so no literal builds one.
+impl<'s, 'v, 't, N: TypeIdent> FromLiteral<'s, 'v, 't, N> for ShapedTy<'t, N>
+where
+    't: 's,
+    's: 'v,
+{
+    fn from_literal(
+        &'t self,
+        _literal: &DefaultValue<N>,
+        ctx: &ParsingContext<'s, 'v, 't, N>,
+    ) -> Result<Self::Value, ParsingError> {
+        Err(ctx.error_internal(format!(
+            "no attribute literal builds `{}`, which is built from what a model writes",
+            self.name
+        )))
+    }
+}
+
 /// Inherent method for `TyResolvedRef` dispatch, taking `self` by value (Copy)
 /// instead of `&'t self`. This avoids the lifetime issue where `resolve` returns
 /// a local `TyResolvedRef` that can't satisfy `&'t self` in the `FromLiteral` trait.
@@ -574,6 +630,7 @@ where
                 .map(BamlPrimitive::Bool)
                 .map(BamlValue::from),
             TyResolvedRef::Array(ty) => ty.from_literal(literal, ctx).map(BamlValue::Array),
+            TyResolvedRef::Tuple(ty) => ty.from_literal(literal, ctx).map(BamlValue::Tuple),
             TyResolvedRef::Map(ty) => ty.from_literal(literal, ctx).map(BamlValue::Map),
             TyResolvedRef::Class(ty) => ty.from_literal(literal, ctx).map(BamlValue::Class),
             TyResolvedRef::Enum(ty) => ty.from_literal(literal, ctx).map(BamlValue::Enum),
@@ -582,6 +639,7 @@ where
             TyResolvedRef::StreamState(ty) => {
                 ty.from_literal(literal, ctx).map(BamlValue::StreamState)
             }
+            TyResolvedRef::Shaped(ty) => ty.from_literal(literal, ctx).map(BamlValue::Shaped),
         }
     }
 }

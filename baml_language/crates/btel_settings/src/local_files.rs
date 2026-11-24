@@ -2,7 +2,7 @@
 use std::num::NonZeroUsize;
 
 /// Standard recording directory relative to the CLI-resolved BAML project root.
-/// Packed binaries without a project root use the current user's home directory.
+/// User-level recordings instead resolve `btel/recordings` beneath the BAML home.
 /// Each recording gets its own ID directory beneath this path.
 pub const RECORDINGS_DIRECTORY: &str = ".baml/btel/recordings";
 
@@ -24,8 +24,13 @@ impl Default for LocalDeliveryConfig {
     }
 }
 
-/// Project root (CLI) or home directory (packed executables), shared across recordings.
+/// CAS directory relative to the BAML project root, shared across recordings.
+/// User-level recordings instead resolve `btel/cas` beneath the BAML home.
 /// Local delivery appends the blob format version before the digest shards.
 pub const CAS_DIRECTORY: &str = ".baml/btel/cas";
 /// Writer buffering for scalar-heavy snapshot blobs; does not constrain capture size.
 pub const CAS_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+/// Blob IDs one local CAS writer remembers as in place, so a blob that repeats
+/// across captures (a shared payload, the unchanged elements of a list) costs
+/// no filesystem check. Forgetting them at capacity costs checks, never blobs.
+pub const KNOWN_BLOB_IDS: usize = 65_536;

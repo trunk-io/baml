@@ -42,8 +42,10 @@ pub mod io {
 // ============================================================================
 // Every `$rust_io_function` in the ns_* .baml files is used by
 // `baml_builtins2_codegen` to generate the `RuntimeIo` trait (in
-// `sys_types::runtime_io`). RuntimeIo is a flat, typed async interface to all
+// `sys_types::runtime_io`). RuntimeIo is a flat, typed async interface to the
 // sys-ops -- no VM plumbing (BexHeap, SysOpContext, CallId) in its signatures.
+// A `@@rust_type` instance's operations are methods of its resource trait
+// instead; the trait's docs name every sys-op it leaves out.
 // Crates like `sys_auth` take `&dyn RuntimeIo` to call into the runtime IO
 // layer (HTTP, env, filesystem, shell) without coupling to the VM.
 //
@@ -75,8 +77,8 @@ mod io_adapter {
     pub use bex_external_types::BexExternalAdt;
     pub use bex_heap::{BexValue, HeapPermitManager};
     pub use sys_types::{
-        AsBexExternalValue, BexExternalValue, BexHeap, CallId, SysOpContext, SysOpFn, SysOpResult,
-        runtime_io::*,
+        AsBexExternalValue, BexExternalValue, BexHeap, CallId, OpValue, SysOpContext, SysOpFn,
+        SysOpResult, runtime_io::*,
     };
 
     use super::io::SysOps;
@@ -93,8 +95,8 @@ pub use io_adapter::build_runtime_io;
 // only remaining caller of these two pieces.
 // ============================================================================
 
+mod json_defs;
 pub mod output_format;
-pub mod sap;
 
 // ============================================================================
 // Blanket IO LLM implementation
@@ -150,58 +152,93 @@ fn llm_function_lookup_error(
     }
 }
 
-/// Blanket impl — schema-aligned parsing, backing both public `baml.sap.parse`
-/// and incremental `ai.stream.Stream` parsing.
-///
-impl<T> io::IoClassAiOutputFormat for T {
-    #[allow(clippy::too_many_arguments)]
-    fn _render(
-        &self,
-        _heap: &std::sync::Arc<BexHeap>,
-        _call_id: CallId,
-        output_format: io::owned::ai::OutputFormat,
-        prefix: io::BexExternalValue,
-        or_splitter: io::BexExternalValue,
-        enum_value_prefix: io::BexExternalValue,
-        hoisted_class_prefix: io::BexExternalValue,
-        always_hoist_enums: io::BexExternalValue,
-        quote_class_fields: io::BexExternalValue,
-        hoist_classes: io::BexExternalValue,
-        map_style: io::BexExternalValue,
-        render_null_as: io::BexExternalValue,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<String> {
-        render_output_format_with_op(
-            &output_format,
-            prefix,
-            or_splitter,
-            enum_value_prefix,
-            hoisted_class_prefix,
-            always_hoist_enums,
-            quote_class_fields,
-            hoist_classes,
-            map_style,
-            render_null_as,
-        )
-    }
-}
-
 // ============================================================================
 // `baml.json.schema` — provider-neutral JSON Schema lowering
 // ============================================================================
 
 impl<T> io::IoNamespaceJson for T {
-    fn schema(
+    fn _schema(
         &self,
         _heap: &std::sync::Arc<BexHeap>,
         _call_id: CallId,
         t: ::sys_types::SapTy,
+        aliased: bool,
         ctx: &SysOpContext,
     ) -> SysOpOutput<BexExternalValue> {
-        match schema::json_schema(&t, ctx) {
+        match schema::json_schema(&t, ctx, ::sys_types::JsonNaming::new(aliased)) {
             Ok(value) => SysOpOutput::ok(schema::json_to_bex(value)),
             Err(message) => SysOpOutput::err(VmBamlError::Unsupported { message }),
         }
+    }
+}
+
+// ============================================================================
+// `baml.future` — reading a running task's stack
+// ============================================================================
+
+/// Blanket impl: the engine answers `baml.future._task_stack` and
+/// `_task_report` itself, since they need every task paused; a provider never
+/// sees them.
+impl<T> io::IoNamespaceFuture for T {
+    fn _task_report(
+        &self,
+        _heap: &std::sync::Arc<BexHeap>,
+        _call_id: CallId,
+        _future_id: i64,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "task report".to_string(),
+            message: "only the engine can read a task's stack".to_string(),
+        })
+    }
+
+    fn _task_stack(
+        &self,
+        _heap: &std::sync::Arc<BexHeap>,
+        _call_id: CallId,
+        _future_id: i64,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<Option<BexExternalValue>> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "task report".to_string(),
+            message: "only the engine can read a task's stack".to_string(),
+        })
+    }
+}
+
+// ============================================================================
+// `baml.sync` — waiting for a contended `atomic` key or `Semaphore` slot
+// ============================================================================
+
+/// Blanket impl: the wait is the same on every host. Dropping the future
+/// (the task was cancelled) withdraws the task from the lock's queue.
+impl<T> io::IoNamespaceSync for T {
+    fn _wait(
+        &self,
+        _heap: &std::sync::Arc<BexHeap>,
+        _call_id: CallId,
+        ticket: io::owned::sync::Ticket,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        let waiter = ticket;
+        SysOpOutput::async_op(async move {
+            waiter.granted().await;
+            Ok(())
+        })
+    }
+
+    fn _wait_permit(
+        &self,
+        _heap: &std::sync::Arc<BexHeap>,
+        _call_id: CallId,
+        permit: io::owned::sync::Permit,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        SysOpOutput::async_op(async move {
+            permit.wait().await;
+            Ok(())
+        })
     }
 }
 
@@ -209,18 +246,22 @@ mod schema {
     use std::collections::HashSet;
 
     use ::sys_types::SapTy;
+    use baml_type::json_inhabit::{JsonInhabitance, JsonStatus};
     use bex_external_types::BexExternalValue;
+    use indexmap::IndexMap;
     use serde_json::{Value, json};
-    use sys_types::SysOpContext;
+    use sys_types::{JsonNaming, SysOpContext};
+
+    use crate::json_defs::{ContextDefs, Reader, llm_shape, llm_shape_hint, map_keys};
 
     /// The stdlib `baml.json.json` alias as value metadata.
     ///
     /// `BexExternalValue` tags its containers with a declared type rather than
     /// a lane type; `baml.json.json` is compiled, so it has a real qualified
     /// name and this conversion is total.
-    fn json_alias_ty() -> baml_type::RuntimeTy {
-        baml_type::RuntimeTy::TypeAlias(baml_type::TypeName::from_dotted_path(
-            baml_base::qualified_name::BAML_JSON_JSON,
+    fn json_alias_ty<L: Clone>() -> baml_type::WireTy<L> {
+        baml_type::RealizedTy::TypeAlias(baml_type::WireHead::Static(
+            baml_type::TypeName::from_dotted_path(baml_base::qualified_name::BAML_JSON_JSON),
         ))
     }
 
@@ -238,7 +279,7 @@ mod schema {
                 items: items.into_iter().map(json_to_bex).collect(),
             },
             Value::Object(entries) => BexExternalValue::Map {
-                key_type: baml_type::RuntimeTy::string(),
+                key_type: baml_type::RealizedTy::string(),
                 value_type: json_alias_ty(),
                 entries: entries
                     .into_iter()
@@ -248,28 +289,55 @@ mod schema {
         }
     }
 
-    pub(super) fn json_schema(ty: &SapTy, ctx: &SysOpContext) -> Result<Value, String> {
+    pub(super) fn json_schema(
+        ty: &SapTy,
+        ctx: &SysOpContext,
+        naming: JsonNaming,
+    ) -> Result<Value, String> {
+        let defs = ContextDefs {
+            ctx,
+            reader: Reader::Schema,
+        };
+        let analysis = JsonInhabitance::of(ty, &defs, naming).map_err(|e| e.error)?;
+        match analysis.status(ty) {
+            JsonStatus::Json => {}
+            JsonStatus::NoJson => {
+                return Err(format!(
+                    "json_schema: no value of `{ty}` has a JSON form: {}",
+                    analysis.witness(ty).reason()
+                ));
+            }
+            JsonStatus::Empty => {
+                return Err(format!("json_schema: `{ty}` has no values"));
+            }
+        }
+
         let mut builder = SchemaBuilder {
             ctx,
+            naming,
+            analysis: &analysis,
+            keys: IndexMap::new(),
             definitions: serde_json::Map::new(),
             building: HashSet::new(),
             referenced: HashSet::new(),
+            shaping: HashSet::new(),
         };
 
-        let (mut root, root_class_key) = match ty {
-            SapTy::Class(name, _) => {
-                let key = definition_key(name);
-                builder.building.insert(key.clone());
-                let schema = builder.class_object(name)?;
-                builder.building.remove(&key);
-                (schema, Some(key))
+        let (mut root, root_class) = match ty {
+            SapTy::Class(head, _) if llm_shape(ctx, ty).is_none() => {
+                let id = DefId::Class(head.clone());
+                builder.building.insert(id.clone());
+                let schema = builder.definition(&id)?;
+                builder.building.remove(&id);
+                (schema, Some(id))
             }
-            _ => (builder.ty_schema(ty)?, None),
+            _ => (builder.emit(ty)?, None),
         };
 
-        if let Some(key) = root_class_key
-            && builder.referenced.contains(&key)
+        if let Some(id) = root_class
+            && builder.referenced.contains(&id)
         {
+            let key = builder.definition_key(&id);
             builder.definitions.insert(key, root.clone());
         }
 
@@ -282,175 +350,509 @@ mod schema {
         Ok(root)
     }
 
-    struct SchemaBuilder<'a> {
-        ctx: &'a SysOpContext,
-        definitions: serde_json::Map<String, Value>,
-        building: HashSet<String>,
-        referenced: HashSet<String>,
+    /// Whether a value of `ty` can hold media anywhere a model's JSON answer
+    /// fills: in a union member, a list element, a map value, a class field
+    /// that is not `@skip`, or behind a recursive alias. A `@skip` field is not
+    /// in the JSON, so its value never comes from the model, and neither is a
+    /// member with no JSON form, which `baml.json.schema` drops. Backs
+    /// `ai.internal.reaches_media`.
+    pub(super) fn reaches_media(ty: &SapTy, ctx: &SysOpContext) -> Result<bool, String> {
+        fn walk(
+            ty: &SapTy,
+            ctx: &SysOpContext,
+            analysis: &JsonInhabitance<::sys_types::DefKey>,
+            seen: &mut HashSet<DefId>,
+        ) -> bool {
+            if analysis.status(ty) != JsonStatus::Json {
+                return false;
+            }
+            if let Some(shape) = llm_shape(ctx, ty) {
+                return seen.insert(DefId::Shaped(ty.clone())) && walk(shape, ctx, analysis, seen);
+            }
+            match ty {
+                SapTy::Media(_) => true,
+                SapTy::Union(members) => members
+                    .iter()
+                    .any(|member| walk(member, ctx, analysis, seen)),
+                SapTy::List(inner) | SapTy::Map { value: inner, .. } => {
+                    walk(inner, ctx, analysis, seen)
+                }
+                SapTy::Tuple(elements) => elements
+                    .iter()
+                    .any(|element| walk(element, ctx, analysis, seen)),
+                SapTy::Class(head, _) => {
+                    if !seen.insert(DefId::Class(head.clone())) {
+                        return false;
+                    }
+                    find_class_definition(ctx, head).is_some_and(|class_def| {
+                        let sys_types::ClassDefinitionBody::Fields(fields) = &class_def.body else {
+                            return false;
+                        };
+                        fields
+                            .iter()
+                            .filter(|field| !field.skip)
+                            .any(|field| walk(&field.field_type, ctx, analysis, seen))
+                    })
+                }
+                SapTy::TypeAlias(head) => {
+                    if !seen.insert(DefId::Alias(head.clone())) {
+                        return false;
+                    }
+                    find_type_alias_definition(ctx, head)
+                        .is_some_and(|target| walk(target, ctx, analysis, seen))
+                }
+                _ => false,
+            }
+        }
+        let defs = ContextDefs {
+            ctx,
+            reader: Reader::Schema,
+        };
+        let analysis = JsonInhabitance::of(ty, &defs, JsonNaming::Aliased).map_err(|e| e.error)?;
+        Ok(walk(ty, ctx, &analysis, &mut HashSet::new()))
     }
 
-    impl SchemaBuilder<'_> {
-        fn ty_schema(&mut self, ty: &SapTy) -> Result<Value, String> {
+    /// The decimal form a `bigint` takes in JSON: a string, because a JSON
+    /// number past 2^53 loses precision in most parsers. The decoder also
+    /// takes a leading `+`, leading zeros, and a JSON number; the schema asks
+    /// for the canonical form only.
+    const BIGINT_PATTERN: &str = "^-?(0|[1-9][0-9]*)$";
+
+    /// A class or recursive alias, which the schema reaches by `$ref`, or a
+    /// type a model writes as its `baml.FromLlmOutput` shape, which a walk
+    /// enters once.
+    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+    enum DefId {
+        Class(::sys_types::DefKey),
+        Alias(::sys_types::DefKey),
+        Shaped(SapTy),
+    }
+
+    /// Whether a field of type `ty` may be absent from a JSON object, as the
+    /// decoder reads it: `null` is a value of the type, and stands in for it.
+    fn may_be_absent(ty: &SapTy, ctx: &SysOpContext) -> bool {
+        baml_type::accepts_null::accepts_null(ty.as_ty(), &|head| {
+            find_type_alias_definition(ctx, head).map(|target| target.as_ty().clone())
+        })
+    }
+
+    fn literal_schema(lit: &baml_base::Literal) -> Value {
+        use baml_base::Literal;
+        match lit {
+            Literal::Int(i) => json!({ "type": "integer", "const": i }),
+            Literal::Bigint(n) => json!({ "type": "string", "const": n.to_string() }),
+            Literal::String(s) => json!({ "type": "string", "const": s }),
+            Literal::Bool(b) => json!({ "type": "boolean", "const": b }),
+            Literal::Float(_) => unreachable!("the schema reader rejects a float literal"),
+        }
+    }
+
+    /// The string `enum` of the variants JSON names, or `None` when it names
+    /// none.
+    fn enum_schema(enum_def: &sys_types::EnumDefinition, naming: JsonNaming) -> Option<Value> {
+        let variants: Vec<Value> = shown_variants(enum_def, naming)
+            .map(|(key, _)| json!(key))
+            .collect();
+        if variants.is_empty() {
+            return None;
+        }
+        let mut schema = json!({ "type": "string", "enum": variants });
+        describe(&mut schema, enum_documentation(enum_def, naming));
+        Some(schema)
+    }
+
+    /// The variants JSON names under `naming`, each with its string.
+    fn shown_variants(
+        enum_def: &sys_types::EnumDefinition,
+        naming: JsonNaming,
+    ) -> impl Iterator<Item = (&str, &sys_types::EnumVariantDefinition)> {
+        enum_def
+            .declared_variants
+            .iter()
+            .filter(move |variant| naming.shows(variant.skip))
+            .map(move |variant| {
+                (
+                    naming.key(
+                        &variant.name,
+                        variant.alias.as_deref(),
+                        variant.json_rename.as_deref(),
+                    ),
+                    variant,
+                )
+            })
+    }
+
+    /// The tagged object a media value takes in JSON, as `baml.json` writes
+    /// and reads it. `source` is never `file`: a file is read when the value is
+    /// built, so JSON carries its content.
+    fn media_schema(kind: baml_type::MediaKind) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "const": kind.tag_str() },
+                "source": { "type": "string", "enum": ["url", "base64"] },
+                "value": { "type": "string" },
+                "mime": { "type": ["string", "null"] },
+                "name": { "type": "string" },
+            },
+            "required": ["kind", "source", "value", "mime"],
+        })
+    }
+
+    struct SchemaBuilder<'a, 'b> {
+        ctx: &'a SysOpContext,
+        naming: JsonNaming,
+        analysis: &'b JsonInhabitance<::sys_types::DefKey>,
+        /// The `$defs` key of each definition emitted so far.
+        keys: IndexMap<DefId, String>,
+        definitions: serde_json::Map<String, Value>,
+        building: HashSet<DefId>,
+        referenced: HashSet<DefId>,
+        /// The shaped types whose shapes are being emitted, to refuse a shape
+        /// that holds its own type with no class in between.
+        shaping: HashSet<SapTy>,
+    }
+
+    impl SchemaBuilder<'_, '_> {
+        /// The schema of `ty`, a `Json` type: the values with a JSON form,
+        /// every member with none dropped.
+        fn emit(&mut self, ty: &SapTy) -> Result<Value, String> {
+            debug_assert_eq!(self.analysis.status(ty), JsonStatus::Json);
+            if let Some(shape) = llm_shape(self.ctx, ty) {
+                return self.shaped(ty, shape);
+            }
             match ty {
-                SapTy::Int | SapTy::Bigint => Ok(json!({ "type": "integer" })),
+                SapTy::Union(members) => {
+                    let mut flat = Vec::new();
+                    baml_type::json_inhabit::flatten_union(members, &mut flat);
+                    self.union_schema(&flat)
+                }
+                SapTy::List(inner) => Ok(match self.analysis.status(inner) {
+                    JsonStatus::Json => json!({ "type": "array", "items": self.emit(inner)? }),
+                    JsonStatus::Empty => json!({ "type": "array", "maxItems": 0 }),
+                    JsonStatus::NoJson => unreachable!("a list of `NoJson` is `NoJson`"),
+                }),
+                SapTy::Tuple(elements) => {
+                    let prefix_items = elements
+                        .iter()
+                        .map(|element| self.emit(element))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(json!({
+                        "type": "array",
+                        "prefixItems": prefix_items,
+                        "items": false,
+                        "minItems": elements.len(),
+                        "maxItems": elements.len(),
+                    }))
+                }
+                SapTy::Map { key, value } => {
+                    let keys = map_keys(key)?;
+                    let mut schema = match self.analysis.status(value) {
+                        JsonStatus::Json => json!({
+                            "type": "object",
+                            "additionalProperties": self.emit(value)?,
+                        }),
+                        JsonStatus::Empty => {
+                            json!({ "type": "object", "additionalProperties": false })
+                        }
+                        JsonStatus::NoJson => unreachable!("a map of `NoJson` is `NoJson`"),
+                    };
+                    if let (Some(keys), Value::Object(object)) = (keys, &mut schema) {
+                        object.insert("propertyNames".to_string(), json!({ "enum": keys }));
+                    }
+                    Ok(schema)
+                }
+                SapTy::Class(head, _) => self.reference(&DefId::Class(head.clone())),
+                SapTy::TypeAlias(head) => self.reference(&DefId::Alias(head.clone())),
+                SapTy::Int => Ok(json!({
+                    "type": "integer",
+                    "minimum": baml_type::Int63::MIN.get(),
+                    "maximum": baml_type::Int63::MAX.get(),
+                })),
+                SapTy::Bigint => Ok(json!({ "type": "string", "pattern": BIGINT_PATTERN })),
                 SapTy::Float => Ok(json!({ "type": "number" })),
                 SapTy::String => Ok(json!({ "type": "string" })),
                 SapTy::Bool => Ok(json!({ "type": "boolean" })),
                 SapTy::Null => Ok(json!({ "type": "null" })),
-                SapTy::Uint8Array => Ok(json!({ "type": "string" })),
-                SapTy::Literal(lit, _) => Ok(Self::literal_schema(lit)),
-                SapTy::List(inner) => Ok(json!({
-                    "type": "array",
-                    "items": self.ty_schema(inner)?,
-                })),
-                SapTy::Map { value, .. } => Ok(json!({
-                    "type": "object",
-                    "additionalProperties": self.ty_schema(value)?,
-                })),
-                SapTy::Union(members) => self.union_schema(members),
-                SapTy::Enum(name) => Self::enum_schema(name, self.ctx),
-                SapTy::Class(name, _) => self.class_ref(name),
-                SapTy::TypeAlias(name) => self.type_alias_ref(name),
-                SapTy::Unknown => Ok(json!({})),
-                other => Err(format!(
-                    "json_schema: no JSON Schema representation for `{other}`"
-                )),
-            }
-        }
-
-        fn literal_schema(lit: &baml_base::Literal) -> Value {
-            use baml_base::Literal;
-            match lit {
-                Literal::Int(i) => json!({ "type": "integer", "const": i }),
-                Literal::Bigint(n) => json!({ "type": "integer", "const": n.to_string() }),
-                Literal::Float(s) => {
-                    json!({ "type": "number", "const": s.parse::<f64>().unwrap_or(0.0) })
+                SapTy::Literal(lit, _) => Ok(literal_schema(lit)),
+                SapTy::Enum(head) => {
+                    let enum_def = find_enum_definition(self.ctx, head).ok_or_else(|| {
+                        format!("json_schema: unknown enum `{}`", head.display_name())
+                    })?;
+                    enum_schema(enum_def, self.naming).ok_or_else(|| {
+                        unreachable!("an enum that names no variant has no JSON form")
+                    })
                 }
-                Literal::String(s) => json!({ "type": "string", "const": s }),
-                Literal::Bool(b) => json!({ "type": "boolean", "const": b }),
+                SapTy::EnumVariant(head, name) => {
+                    let variant = find_enum_definition(self.ctx, head)
+                        .and_then(|enum_def| {
+                            enum_def
+                                .declared_variants
+                                .iter()
+                                .find(|variant| variant.name == name.as_str())
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "json_schema: enum `{}` has no variant `{name}`",
+                                head.display_name()
+                            )
+                        })?;
+                    Ok(json!({
+                        "type": "string",
+                        "const": self.naming.key(
+                            &variant.name,
+                            variant.alias.as_deref(),
+                            variant.json_rename.as_deref(),
+                        ),
+                    }))
+                }
+                SapTy::Media(kind) => Ok(media_schema(*kind)),
+                _ => unreachable!("`{ty}` has no JSON form, so it is never emitted"),
             }
         }
 
-        fn union_schema(&mut self, members: &[SapTy]) -> Result<Value, String> {
-            let has_null = members.iter().any(SapTy::is_null);
-            let non_null: Vec<&SapTy> = members.iter().filter(|m| !m.is_null()).collect();
-            if non_null.is_empty() {
-                return Ok(json!({ "type": "null" }));
+        /// The schema of `shape`, what a model writes in place of `ty`, with
+        /// the `@@description` of `ty` as its `description`.
+        fn shaped(&mut self, ty: &SapTy, shape: &SapTy) -> Result<Value, String> {
+            if !self.shaping.insert(ty.clone()) {
+                return Err(format!(
+                    "json_schema: the `baml.FromLlmOutput` shape of `{ty}` holds `{ty}` itself"
+                ));
             }
-            let mut schemas = non_null
-                .iter()
-                .map(|member| self.ty_schema(member))
+            let schema = self.emit(shape);
+            self.shaping.remove(ty);
+            let mut schema = schema?;
+            describe(&mut schema, llm_shape_hint(self.ctx, ty));
+            Ok(schema)
+        }
+
+        fn union_schema(&mut self, members: &[&SapTy]) -> Result<Value, String> {
+            let mut has_null = false;
+            let mut kept = Vec::new();
+            for member in members {
+                if member.is_null() {
+                    has_null = true;
+                } else if self.analysis.status(member) == JsonStatus::Json {
+                    kept.push(*member);
+                }
+            }
+            let mut schemas = kept
+                .into_iter()
+                .map(|member| self.emit(member))
                 .collect::<Result<Vec<_>, _>>()?;
-            if schemas.len() == 1 {
-                let base = schemas.pop().unwrap_or_else(|| json!({}));
-                return Ok(if has_null {
-                    Self::with_null(base)
-                } else {
-                    base
-                });
-            }
-            if has_null {
-                schemas.push(json!({ "type": "null" }));
-            }
-            Ok(json!({ "anyOf": schemas }))
-        }
-
-        fn with_null(base: Value) -> Value {
-            if let Value::Object(mut object) = base {
-                if let Some(Value::String(kind)) = object.get("type") {
-                    let widened = json!([kind, "null"]);
-                    object.insert("type".to_string(), widened);
-                    return Value::Object(object);
+            match (schemas.len(), has_null) {
+                (0, _) => Ok(json!({ "type": "null" })),
+                (1, true) => Ok(with_null(schemas.remove(0))),
+                (1, false) => Ok(schemas.remove(0)),
+                (_, has_null) => {
+                    if has_null {
+                        schemas.push(json!({ "type": "null" }));
+                    }
+                    Ok(json!({ "anyOf": schemas }))
                 }
-                return json!({ "anyOf": [Value::Object(object), { "type": "null" }] });
             }
-            json!({ "anyOf": [base, { "type": "null" }] })
         }
 
-        fn enum_schema(head: &::sys_types::DefKey, ctx: &SysOpContext) -> Result<Value, String> {
-            let enum_def = find_enum_definition(ctx, head)
-                .ok_or_else(|| format!("json_schema: unknown enum `{}`", head.display_name()))?;
-            let variants: Vec<Value> = enum_def
-                .variants
-                .iter()
-                .map(|variant| {
-                    json!(
-                        variant
-                            .alias
-                            .clone()
-                            .unwrap_or_else(|| variant.name.clone())
-                    )
-                })
-                .collect();
-            Ok(json!({ "type": "string", "enum": variants }))
-        }
-
-        fn class_ref(&mut self, head: &::sys_types::DefKey) -> Result<Value, String> {
-            let key = definition_key(head);
-            self.referenced.insert(key.clone());
-
-            if !self.definitions.contains_key(&key) && !self.building.contains(&key) {
-                self.building.insert(key.clone());
-                let definition = self.class_object(head)?;
-                self.building.remove(&key);
+        fn reference(&mut self, id: &DefId) -> Result<Value, String> {
+            self.referenced.insert(id.clone());
+            let key = self.definition_key(id);
+            if !self.definitions.contains_key(&key) && !self.building.contains(id) {
+                self.building.insert(id.clone());
+                // A shape that holds its own type through this definition
+                // ends at the `$ref` back to it, so the shapes being emitted
+                // around it cannot recur through it.
+                let shaping = std::mem::take(&mut self.shaping);
+                let definition = self.definition(id);
+                self.shaping = shaping;
+                let definition = definition?;
+                self.building.remove(id);
                 self.definitions.insert(key.clone(), definition);
             }
-
             Ok(json!({ "$ref": format!("#/$defs/{}", json_pointer_escape(&key)) }))
         }
 
-        fn type_alias_ref(&mut self, head: &::sys_types::DefKey) -> Result<Value, String> {
-            let key = definition_key(head);
-            self.referenced.insert(key.clone());
+        /// The `$defs` key of a definition: its name, so the schema reads well
+        /// to a model. Two definitions with one name (runtime-built classes,
+        /// say) get distinct keys, the later one a `_<n>` suffix, so a `$ref`
+        /// never reaches the wrong one.
+        fn definition_key(&mut self, id: &DefId) -> String {
+            if let Some(key) = self.keys.get(id) {
+                return key.clone();
+            }
+            let name = match id {
+                DefId::Class(head) | DefId::Alias(head) => head.display_name().to_string(),
+                DefId::Shaped(ty) => ty.to_string(),
+            };
+            let taken = |candidate: &str| self.keys.values().any(|key| key == candidate);
+            let mut key = name.clone();
+            let mut n = 2;
+            while taken(&key) {
+                key = format!("{name}_{n}");
+                n += 1;
+            }
+            self.keys.insert(id.clone(), key.clone());
+            key
+        }
 
-            if !self.definitions.contains_key(&key) && !self.building.contains(&key) {
-                let target = find_type_alias_definition(self.ctx, head)
-                    .cloned()
-                    .ok_or_else(|| {
+        fn definition(&mut self, id: &DefId) -> Result<Value, String> {
+            match id {
+                DefId::Shaped(ty) => Err(format!(
+                    "json_schema: `{ty}` is written as its shape, never by reference"
+                )),
+                DefId::Class(head) => self.class_object(head),
+                DefId::Alias(head) => {
+                    let target = find_type_alias_definition(self.ctx, head).ok_or_else(|| {
                         format!("json_schema: unknown type alias `{}`", head.display_name())
                     })?;
-                self.building.insert(key.clone());
-                let definition = self.ty_schema(&target)?;
-                self.building.remove(&key);
-                self.definitions.insert(key.clone(), definition);
+                    self.emit(target)
+                }
             }
-
-            Ok(json!({ "$ref": format!("#/$defs/{}", json_pointer_escape(&key)) }))
         }
 
         fn class_object(&mut self, head: &::sys_types::DefKey) -> Result<Value, String> {
             let class_def = find_class_definition(self.ctx, head)
-                .ok_or_else(|| format!("json_schema: unknown class `{}`", head.display_name()))?
-                .clone();
+                .ok_or_else(|| format!("json_schema: unknown class `{}`", head.display_name()))?;
 
+            let sys_types::ClassDefinitionBody::Fields(class_fields) = &class_def.body else {
+                return Err(format!(
+                    "json_schema: `{}` has no JSON form",
+                    head.display_name()
+                ));
+            };
+            let naming = self.naming;
+            // A `@json.fallback` class is any object it does not recognize,
+            // and a `@json.flatten` field is the keys no field names.
+            let fallback = class_fields.iter().any(|field| field.json_fallback);
+            let flatten = class_fields.iter().any(|field| field.json_flatten);
             let mut properties = serde_json::Map::new();
             let mut required = Vec::new();
-            for field in &class_def.fields {
-                if field.skip {
-                    continue;
+            for field in class_fields.iter().filter(|field| {
+                naming.shows(field.skip) && !field.json_flatten && !field.json_fallback
+            }) {
+                let key = naming.key(
+                    &field.name,
+                    field.alias.as_deref(),
+                    field.json_rename.as_deref(),
+                );
+                let mut property = self.emit(&field.field_type)?;
+                // A fallback class's literals name its tag: any value of the
+                // tag's kind is one, which is what makes it the fallback.
+                if fallback && let Some(tag) = property.as_object_mut() {
+                    let kind = tag.remove("const").map(|value| match value {
+                        Value::Bool(_) => "boolean",
+                        Value::Number(_) => "number",
+                        _ => "string",
+                    });
+                    if let Some(kind) = kind {
+                        tag.insert("type".to_string(), json!(kind));
+                    }
                 }
-                let prop_name = field.alias.clone().unwrap_or_else(|| field.name.clone());
-                properties.insert(prop_name.clone(), self.ty_schema(&field.field_type)?);
-                if !(field.field_type.is_nullable_union() || field.field_type.is_null()) {
-                    required.push(json!(prop_name));
+                describe(
+                    &mut property,
+                    documentation(field.description.as_deref(), field.docstring.as_deref()),
+                );
+                properties.insert(key.to_string(), property);
+                if !may_be_absent(&field.field_type, self.ctx) {
+                    required.push(json!(key));
                 }
             }
 
-            Ok(json!({
+            let mut object = json!({
                 "type": "object",
                 "properties": properties,
                 "required": required,
-            }))
+            });
+            if flatten || fallback {
+                object["additionalProperties"] = json!(true);
+            }
+            describe(
+                &mut object,
+                documentation(
+                    class_def.description.as_deref(),
+                    class_def.docstring.as_deref(),
+                ),
+            );
+            Ok(object)
         }
     }
 
-    /// The `$defs` key a type is published under in the emitted JSON schema.
-    ///
-    /// An output label, so it is the head's *name* — the schema is read by a
-    /// model, not by us. Identity lookups go through the definition tables,
-    /// which are keyed by the head itself.
-    fn definition_key(head: &::sys_types::DefKey) -> String {
-        head.display_name().to_string()
+    /// Widens a schema to accept `null`. A plain `type` becomes a type
+    /// list. `enum` and `const` restrict the value whatever `type` says:
+    /// an `enum` also gains a `null` member, and a `const`, which has room
+    /// for one value only, becomes one side of an `anyOf`.
+    fn with_null(base: Value) -> Value {
+        if let Value::Object(mut object) = base {
+            if !object.contains_key("const")
+                && let Some(Value::String(kind)) = object.get("type")
+            {
+                let widened = json!([kind, "null"]);
+                object.insert("type".to_string(), widened);
+                if let Some(Value::Array(values)) = object.get_mut("enum") {
+                    values.push(Value::Null);
+                }
+                return Value::Object(object);
+            }
+            return json!({ "anyOf": [Value::Object(object), { "type": "null" }] });
+        }
+        json!({ "anyOf": [base, { "type": "null" }] })
+    }
+
+    /// A declaration's documentation as the output format shows it: its
+    /// `@description`, then its `///` docstring, each trimmed. `None` when both
+    /// are blank.
+    fn documentation(description: Option<&str>, docstring: Option<&str>) -> Option<String> {
+        let docs = [description, docstring]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|docs| !docs.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!docs.is_empty()).then_some(docs)
+    }
+
+    /// What an enum's schema says about it: the enum's own documentation, then
+    /// one `- <variant>: <documentation>` line per documented variant, the form
+    /// the output format lists them in. JSON Schema has no description per
+    /// `enum` value, so the variants' documentation goes here.
+    fn enum_documentation(
+        enum_def: &sys_types::EnumDefinition,
+        naming: JsonNaming,
+    ) -> Option<String> {
+        let variants = shown_variants(enum_def, naming)
+            .filter_map(|(key, variant)| {
+                let docs = variant.rendered_description()?;
+                Some(format!("- {key}: {docs}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sections = [
+            documentation(
+                enum_def.description.as_deref(),
+                enum_def.docstring.as_deref(),
+            ),
+            (!variants.is_empty()).then_some(variants),
+        ];
+        let text = sections
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Sets `documentation` as the schema's `description`. A schema that
+    /// already has one (an enum that documents its variants) keeps it, after
+    /// `documentation`.
+    fn describe(schema: &mut Value, documentation: Option<String>) {
+        let (Some(documentation), Value::Object(object)) = (documentation, schema) else {
+            return;
+        };
+        let description = match object.get("description").and_then(Value::as_str) {
+            Some(existing) => format!("{documentation}\n\n{existing}"),
+            None => documentation,
+        };
+        object.insert("description".to_string(), Value::String(description));
     }
 
     fn json_pointer_escape(value: &str) -> String {
@@ -495,7 +897,7 @@ mod schema {
         use serde_json::json;
         use sys_types::{
             ClassDefinition, ClassFieldDefinition, DefKey, EnumDefinition, EnumVariantDefinition,
-            SapTy as RuntimeTy, SysOpContext,
+            JsonNaming, SapTy as RuntimeTy, SysOpContext,
         };
 
         use super::json_schema;
@@ -540,6 +942,9 @@ mod schema {
                 docstring: None,
                 alias: None,
                 skip: false,
+                json_rename: None,
+                json_flatten: false,
+                json_fallback: false,
                 stream_done: false,
                 must_exist: false,
             }
@@ -551,7 +956,7 @@ mod schema {
                 description: None,
                 docstring: None,
                 alias: None,
-                fields,
+                body: sys_types::ClassDefinitionBody::Fields(fields),
                 stream_done: false,
             }
         }
@@ -570,7 +975,8 @@ mod schema {
             let mut ctx = SysOpContext::empty();
             ctx.class_definitions = Arc::new(classes);
 
-            let schema = json_schema(&class_ty(&node), &ctx).expect("schema should lower");
+            let schema = json_schema(&class_ty(&node), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
             assert_eq!(schema["type"], "object");
             assert_eq!(
                 schema["properties"]["next"]["anyOf"][0]["$ref"],
@@ -595,7 +1001,8 @@ mod schema {
             let mut ctx = SysOpContext::empty();
             ctx.class_definitions = Arc::new(classes);
 
-            let schema = json_schema(&class_ty(&a), &ctx).expect("schema should lower");
+            let schema =
+                json_schema(&class_ty(&a), &ctx, JsonNaming::Aliased).expect("schema should lower");
             assert_eq!(schema["properties"]["b"]["$ref"], "#/$defs/pkg.B");
             assert_eq!(
                 schema["$defs"]["pkg.B"]["properties"]["a"]["anyOf"][0]["$ref"],
@@ -609,9 +1016,72 @@ mod schema {
             let schema = json_schema(
                 &RuntimeTy::optional(RuntimeTy::string()),
                 &SysOpContext::empty(),
+                JsonNaming::Aliased,
             )
             .expect("schema should lower");
             assert_eq!(schema, json!({ "type": ["string", "null"] }));
+        }
+
+        #[test]
+        fn tuple_is_a_fixed_length_array() {
+            let schema = json_schema(
+                &RuntimeTy::Tuple(Box::new([RuntimeTy::int(), RuntimeTy::string()])),
+                &SysOpContext::empty(),
+                JsonNaming::Aliased,
+            )
+            .expect("schema should lower");
+            assert_eq!(
+                schema,
+                json!({
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "integer",
+                            "minimum": baml_type::Int63::MIN.get(),
+                            "maximum": baml_type::Int63::MAX.get(),
+                        },
+                        { "type": "string" },
+                    ],
+                    "items": false,
+                    "minItems": 2,
+                    "maxItems": 2,
+                })
+            );
+        }
+
+        #[test]
+        fn tuple_elements_reference_classes_and_nest() {
+            let point = type_name("pkg.Point");
+            let mut classes = indexmap::IndexMap::new();
+            classes.insert(
+                key(&point),
+                class_definition(&point, vec![field("x", RuntimeTy::int())]),
+            );
+            let mut ctx = SysOpContext::empty();
+            ctx.class_definitions = Arc::new(classes);
+
+            let target = RuntimeTy::list(RuntimeTy::Tuple(Box::new([
+                class_ty(&point),
+                RuntimeTy::optional(RuntimeTy::Tuple(Box::new([RuntimeTy::bool()]))),
+            ])));
+            let schema =
+                json_schema(&target, &ctx, JsonNaming::Aliased).expect("schema should lower");
+            let tuple = &schema["items"];
+            assert_eq!(tuple["minItems"], 2);
+            assert_eq!(tuple["maxItems"], 2);
+            assert_eq!(tuple["items"], false);
+            assert_eq!(tuple["prefixItems"][0]["$ref"], "#/$defs/pkg.Point");
+            assert_eq!(
+                tuple["prefixItems"][1],
+                json!({
+                    "type": ["array", "null"],
+                    "prefixItems": [{ "type": "boolean" }],
+                    "items": false,
+                    "minItems": 1,
+                    "maxItems": 1,
+                })
+            );
+            assert_eq!(schema["$defs"]["pkg.Point"]["type"], "object");
         }
 
         #[test]
@@ -630,7 +1100,8 @@ mod schema {
             let mut ctx = SysOpContext::empty();
             ctx.class_definitions = Arc::new(classes);
 
-            let schema = json_schema(&class_ty(&holder), &ctx).expect("schema should lower");
+            let schema = json_schema(&class_ty(&holder), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
             assert_eq!(schema["properties"]["value"]["$ref"], "#/$defs/pkg.A~1B~0C");
             assert_eq!(schema["$defs"]["pkg.A/B~C"]["type"], "object");
         }
@@ -646,18 +1117,22 @@ mod schema {
                     description: None,
                     docstring: None,
                     alias: None,
-                    variants: vec![
+                    declared_variants: vec![
                         EnumVariantDefinition {
                             name: "Ready".to_string(),
                             description: None,
                             docstring: None,
                             alias: Some("ready-now".to_string()),
+                            skip: false,
+                            json_rename: None,
                         },
                         EnumVariantDefinition {
                             name: "Done".to_string(),
                             description: None,
                             docstring: None,
                             alias: None,
+                            skip: false,
+                            json_rename: None,
                         },
                     ],
                 },
@@ -665,11 +1140,228 @@ mod schema {
             let mut ctx = SysOpContext::empty();
             ctx.enum_definitions = Arc::new(enums);
 
-            let schema =
-                json_schema(&RuntimeTy::Enum(key(&status)), &ctx).expect("schema should lower");
+            let schema = json_schema(&RuntimeTy::Enum(key(&status)), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
             assert_eq!(
                 schema,
                 json!({ "type": "string", "enum": ["ready-now", "Done"] })
+            );
+        }
+
+        fn documented(mut field: ClassFieldDefinition, description: &str) -> ClassFieldDefinition {
+            field.description = Some(description.to_string());
+            field
+        }
+
+        fn variant(name: &str, description: Option<&str>) -> EnumVariantDefinition {
+            EnumVariantDefinition {
+                name: name.to_string(),
+                description: description.map(str::to_string),
+                docstring: None,
+                alias: None,
+                skip: false,
+                json_rename: None,
+            }
+        }
+
+        /// `GymType`, documented at the enum and on two of its three variants.
+        fn gym_type_enum() -> EnumDefinition {
+            EnumDefinition {
+                name: "GymType".to_string(),
+                description: Some("The kind of place the user trains in.".to_string()),
+                docstring: None,
+                alias: None,
+                declared_variants: vec![
+                    variant("COMMERCIAL", Some("Commercial gym")),
+                    EnumVariantDefinition {
+                        docstring: Some("A gym at home.".to_string()),
+                        alias: Some("garage".to_string()),
+                        ..variant("GARAGE", Some("Garage gym"))
+                    },
+                    variant("CUSTOM", None),
+                ],
+            }
+        }
+
+        #[test]
+        fn class_and_field_descriptions_reach_the_schema() {
+            let gym = type_name("pkg.Gym");
+            let owner = type_name("pkg.Owner");
+            let mut classes = indexmap::IndexMap::new();
+            classes.insert(
+                key(&gym),
+                ClassDefinition {
+                    description: Some("A gym to save for the user.".to_string()),
+                    docstring: Some("Saved per user.".to_string()),
+                    ..class_definition(
+                        &gym,
+                        vec![
+                            ClassFieldDefinition {
+                                docstring: Some("Shown on the card.".to_string()),
+                                ..documented(field("name", RuntimeTy::string()), "Short gym name.")
+                            },
+                            documented(field("owner", class_ty(&owner)), "Who owns it."),
+                            field("capacity", RuntimeTy::int()),
+                        ],
+                    )
+                },
+            );
+            classes.insert(
+                key(&owner),
+                ClassDefinition {
+                    description: Some("A HYBRD user.".to_string()),
+                    ..class_definition(&owner, vec![field("id", RuntimeTy::string())])
+                },
+            );
+            let mut ctx = SysOpContext::empty();
+            ctx.class_definitions = Arc::new(classes);
+
+            let schema = json_schema(&class_ty(&gym), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
+            assert_eq!(
+                schema["description"],
+                "A gym to save for the user.\nSaved per user."
+            );
+            assert_eq!(
+                schema["properties"]["name"],
+                json!({ "type": "string", "description": "Short gym name.\nShown on the card." })
+            );
+            assert_eq!(
+                schema["properties"]["owner"],
+                json!({ "$ref": "#/$defs/pkg.Owner", "description": "Who owns it." })
+            );
+            assert_eq!(
+                schema["properties"]["capacity"],
+                json!({
+                    "type": "integer",
+                    "minimum": baml_type::Int63::MIN.get(),
+                    "maximum": baml_type::Int63::MAX.get(),
+                })
+            );
+            assert_eq!(schema["$defs"]["pkg.Owner"]["description"], "A HYBRD user.");
+        }
+
+        #[test]
+        fn blank_descriptions_add_nothing() {
+            let gym = type_name("pkg.Gym");
+            let mut classes = indexmap::IndexMap::new();
+            classes.insert(
+                key(&gym),
+                ClassDefinition {
+                    description: Some("  ".to_string()),
+                    ..class_definition(
+                        &gym,
+                        vec![documented(field("name", RuntimeTy::string()), "\n")],
+                    )
+                },
+            );
+            let mut ctx = SysOpContext::empty();
+            ctx.class_definitions = Arc::new(classes);
+
+            let schema = json_schema(&class_ty(&gym), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
+            assert_eq!(
+                schema,
+                json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"],
+                })
+            );
+        }
+
+        #[test]
+        fn enum_descriptions_document_the_variants() {
+            let gym_type = type_name("pkg.GymType");
+            let mut enums = indexmap::IndexMap::new();
+            enums.insert(key(&gym_type), gym_type_enum());
+            let mut ctx = SysOpContext::empty();
+            ctx.enum_definitions = Arc::new(enums);
+
+            let schema = json_schema(&RuntimeTy::Enum(key(&gym_type)), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
+            assert_eq!(
+                schema,
+                json!({
+                    "type": "string",
+                    "enum": ["COMMERCIAL", "garage", "CUSTOM"],
+                    "description": "The kind of place the user trains in.\n\n- COMMERCIAL: Commercial gym\n- garage: Garage gym A gym at home.",
+                })
+            );
+        }
+
+        #[test]
+        fn a_field_description_precedes_its_enum_documentation() {
+            let gym = type_name("pkg.Gym");
+            let gym_type = type_name("pkg.GymType");
+            let mut classes = indexmap::IndexMap::new();
+            classes.insert(
+                key(&gym),
+                class_definition(
+                    &gym,
+                    vec![documented(
+                        field(
+                            "gym_type",
+                            RuntimeTy::optional(RuntimeTy::Enum(key(&gym_type))),
+                        ),
+                        "Where the user trains.",
+                    )],
+                ),
+            );
+            let mut enums = indexmap::IndexMap::new();
+            enums.insert(
+                key(&gym_type),
+                EnumDefinition {
+                    description: None,
+                    ..gym_type_enum()
+                },
+            );
+            let mut ctx = SysOpContext::empty();
+            ctx.class_definitions = Arc::new(classes);
+            ctx.enum_definitions = Arc::new(enums);
+
+            let schema = json_schema(&class_ty(&gym), &ctx, JsonNaming::Aliased)
+                .expect("schema should lower");
+            assert_eq!(
+                schema["properties"]["gym_type"],
+                json!({
+                    "type": ["string", "null"],
+                    "enum": ["COMMERCIAL", "garage", "CUSTOM", null],
+                    "description": "Where the user trains.\n\n- COMMERCIAL: Commercial gym\n- garage: Garage gym A gym at home.",
+                })
+            );
+        }
+
+        #[test]
+        fn nullable_enum_and_literal_accept_null() {
+            let gym_type = type_name("pkg.GymType");
+            let mut enums = indexmap::IndexMap::new();
+            enums.insert(key(&gym_type), gym_type_enum());
+            let mut ctx = SysOpContext::empty();
+            ctx.enum_definitions = Arc::new(enums);
+
+            let nullable_enum = json_schema(
+                &RuntimeTy::optional(RuntimeTy::Enum(key(&gym_type))),
+                &ctx,
+                JsonNaming::Aliased,
+            )
+            .expect("schema should lower");
+            assert_eq!(nullable_enum["type"], json!(["string", "null"]));
+            assert_eq!(
+                nullable_enum["enum"],
+                json!(["COMMERCIAL", "garage", "CUSTOM", null])
+            );
+
+            let literal = RuntimeTy::Literal(
+                baml_type::Literal::String("auto".to_string()),
+                baml_type::Freshness::Regular,
+            );
+            let nullable_literal =
+                json_schema(&RuntimeTy::optional(literal), &ctx, JsonNaming::Aliased)
+                    .expect("schema should lower");
+            assert_eq!(
+                nullable_literal,
+                json!({ "anyOf": [{ "type": "string", "const": "auto" }, { "type": "null" }] })
             );
         }
 
@@ -691,7 +1383,8 @@ mod schema {
             let mut ctx = SysOpContext::empty();
             ctx.type_alias_definitions = Arc::new(aliases);
 
-            let schema = json_schema(&json_alias, &ctx).expect("schema should lower");
+            let schema =
+                json_schema(&json_alias, &ctx, JsonNaming::Aliased).expect("schema should lower");
             assert_eq!(schema["$ref"], "#/$defs/baml.json.json");
             let definition = &schema["$defs"]["baml.json.json"];
             assert_eq!(
@@ -723,6 +1416,14 @@ pub fn render_output_format_op(
     SysOpOutput::ok(crate::output_format::render_output_format(return_type, ctx))
 }
 
+/// `ai.internal.reaches_media`: whether a value of `t` can hold media anywhere.
+pub fn reaches_media_op(t: &::sys_types::SapTy, ctx: &SysOpContext) -> SysOpOutput<bool> {
+    match schema::reaches_media(t, ctx) {
+        Ok(reaches) => SysOpOutput::ok(reaches),
+        Err(message) => SysOpOutput::err(VmBamlError::Unsupported { message }),
+    }
+}
+
 /// BEP-049 section 10 (M5b.2): build the opaque schema handle `Context._output_format`
 /// carries; `output_format(...)` renders it with caller options.
 pub fn build_output_format_op(
@@ -730,161 +1431,7 @@ pub fn build_output_format_op(
     ctx: &SysOpContext,
 ) -> SysOpOutput<io::owned::ai::OutputFormat> {
     let content = crate::output_format::build_output_format_content(return_type, ctx);
-    SysOpOutput::ok(wrap_output_format(std::sync::Arc::new(content)))
-}
-
-fn output_format_option_value(value: io::BexExternalValue) -> io::BexExternalValue {
-    match value {
-        io::BexExternalValue::Union { value, .. } => output_format_option_value(*value),
-        value => value,
-    }
-}
-
-/// The `output_format` options are declared as literal unions in
-/// `ai/context.baml`, so the type checker already rejects every value this
-/// would report. Reaching it means the wire value disagrees with the declared
-/// parameter type — an engine inconsistency, not a caller error.
-fn invalid_output_format_option(name: &str, value: &io::BexExternalValue) -> VmRustFnError {
-    VmInternalError::BridgeFailure {
-        message: format!("invalid internal value for output_format option `{name}`: {value:?}"),
-    }
-    .into()
-}
-
-fn is_output_format_default(value: &io::BexExternalValue) -> bool {
-    matches!(
-        value,
-        io::BexExternalValue::Variant {
-            variant_name,
-            ..
-        } if variant_name == "Auto"
-    )
-}
-
-fn output_format_string_setting(
-    name: &str,
-    value: io::BexExternalValue,
-    null_is_never: bool,
-) -> Result<crate::output_format::RenderSetting<String>, VmRustFnError> {
-    use crate::output_format::RenderSetting;
-
-    let value = output_format_option_value(value);
-    match value {
-        io::BexExternalValue::String(value) => Ok(RenderSetting::Always(value.to_string())),
-        io::BexExternalValue::Null if null_is_never => Ok(RenderSetting::Never),
-        io::BexExternalValue::Null => Ok(RenderSetting::Auto),
-        value if is_output_format_default(&value) => Ok(RenderSetting::Auto),
-        value => Err(invalid_output_format_option(name, &value)),
-    }
-}
-
-fn output_format_bool_setting(
-    name: &str,
-    value: io::BexExternalValue,
-) -> Result<crate::output_format::RenderSetting<bool>, VmRustFnError> {
-    use crate::output_format::RenderSetting;
-
-    let value = output_format_option_value(value);
-    match value {
-        io::BexExternalValue::Bool(value) => Ok(RenderSetting::Always(value)),
-        value if is_output_format_default(&value) => Ok(RenderSetting::Auto),
-        value => Err(invalid_output_format_option(name, &value)),
-    }
-}
-
-fn output_format_hoist_classes(
-    value: io::BexExternalValue,
-) -> Result<crate::output_format::HoistClasses, VmRustFnError> {
-    use crate::output_format::HoistClasses;
-
-    let value = output_format_option_value(value);
-    match value {
-        io::BexExternalValue::Bool(true) => Ok(HoistClasses::All),
-        io::BexExternalValue::Bool(false) => Ok(HoistClasses::Auto),
-        io::BexExternalValue::String(value) if value.as_str() == "auto" => Ok(HoistClasses::Auto),
-        io::BexExternalValue::Array { items, .. } => items
-            .into_iter()
-            .map(|item| match output_format_option_value(item) {
-                io::BexExternalValue::String(value) => Ok(value.to_string()),
-                value => Err(invalid_output_format_option("hoist_classes", &value)),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(HoistClasses::Subset),
-        value if is_output_format_default(&value) => Ok(HoistClasses::Auto),
-        value => Err(invalid_output_format_option("hoist_classes", &value)),
-    }
-}
-
-fn output_format_map_style(
-    value: io::BexExternalValue,
-) -> Result<crate::output_format::MapStyle, VmRustFnError> {
-    use crate::output_format::MapStyle;
-
-    let value = output_format_option_value(value);
-    match value {
-        io::BexExternalValue::String(value) if value.as_str() == "angle" => {
-            Ok(MapStyle::TypeParameters)
-        }
-        io::BexExternalValue::String(value) if value.as_str() == "object" => {
-            Ok(MapStyle::ObjectLiteral)
-        }
-        value if is_output_format_default(&value) => Ok(MapStyle::default()),
-        value => Err(invalid_output_format_option("map_style", &value)),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn render_output_format_with_op(
-    output_format: &io::owned::ai::OutputFormat,
-    prefix: io::BexExternalValue,
-    or_splitter: io::BexExternalValue,
-    enum_value_prefix: io::BexExternalValue,
-    hoisted_class_prefix: io::BexExternalValue,
-    always_hoist_enums: io::BexExternalValue,
-    quote_class_fields: io::BexExternalValue,
-    hoist_classes: io::BexExternalValue,
-    map_style: io::BexExternalValue,
-    render_null_as: io::BexExternalValue,
-) -> SysOpOutput<String> {
-    let options: Result<crate::output_format::RenderOptions, VmRustFnError> = (|| {
-        Ok(crate::output_format::RenderOptions {
-            prefix: output_format_string_setting("prefix", prefix, true)?,
-            or_splitter: output_format_string_setting("or_splitter", or_splitter, false)?,
-            enum_value_prefix: output_format_string_setting(
-                "enum_value_prefix",
-                enum_value_prefix,
-                true,
-            )?,
-            hoisted_class_prefix: output_format_string_setting(
-                "hoisted_class_prefix",
-                hoisted_class_prefix,
-                true,
-            )?,
-            hoist_classes: output_format_hoist_classes(hoist_classes)?,
-            always_hoist_enums: output_format_bool_setting(
-                "always_hoist_enums",
-                always_hoist_enums,
-            )?,
-            map_style: output_format_map_style(map_style)?,
-            quote_class_fields: output_format_bool_setting(
-                "quote_class_fields",
-                quote_class_fields,
-            )?,
-            render_null_as: output_format_string_setting("render_null_as", render_null_as, false)?,
-        })
-    })();
-
-    let options = match options {
-        Ok(options) => options,
-        Err(error) => return SysOpOutput::err(error),
-    };
-    let content = unwrap_output_format(output_format);
-    match crate::output_format::render_output_format_content(&content, &options) {
-        Ok(rendered) => SysOpOutput::ok(rendered),
-        Err(error) => SysOpOutput::err(VmBamlError::RenderPrompt {
-            message: error.to_string(),
-        }),
-    }
+    SysOpOutput::ok(std::sync::Arc::new(content))
 }
 
 /// Look up an LLM function's declared return type by name.
@@ -897,106 +1444,6 @@ pub fn get_return_type_op(
         return SysOpOutput::err(llm_function_lookup_error(function_name, &outcome));
     };
     SysOpOutput::ok(info.return_type.clone())
-}
-
-/// Blanket impl — schema-aligned parsing, backing both public `baml.sap.parse`
-/// and incremental `ai.stream.Stream` parsing. All three are free functions
-/// (see `ns_sap/sap.baml`), so each carries its own `T` type-arg operand; the
-/// cache already holds the compiled model, so the two parse entry points
-/// ignore theirs.
-impl<T> io::IoClassSapParseCache for T {
-    fn _parse_final(
-        &self,
-        _heap: &std::sync::Arc<BexHeap>,
-        _call_id: CallId,
-        cache: io::owned::sap::ParseCache,
-        json: String,
-        _type_arg_0: ::sys_types::SapTy,
-        ctx: &SysOpContext,
-    ) -> SysOpOutput<BexExternalValue> {
-        let Ok(sap) = cache._data.clone().downcast::<crate::sap::SapParseCache>() else {
-            return SysOpOutput::err(VmInternalError::RustTypeError {
-                expected: std::any::TypeId::of::<crate::sap::SapParseCache>(),
-                got: cache._data.type_id(),
-            });
-        };
-        SysOpOutput::Ready(
-            crate::sap::execute_sap_parse_final(&json, &sap, ctx).map_err(VmRustFnError::from),
-        )
-    }
-
-    fn _parse_partial(
-        &self,
-        _heap: &std::sync::Arc<BexHeap>,
-        _call_id: CallId,
-        cache: io::owned::sap::ParseCache,
-        json: String,
-        _type_arg_0: ::sys_types::SapTy,
-        ctx: &SysOpContext,
-    ) -> SysOpOutput<BexExternalValue> {
-        let Ok(sap) = cache._data.clone().downcast::<crate::sap::SapParseCache>() else {
-            return SysOpOutput::err(VmInternalError::RustTypeError {
-                expected: std::any::TypeId::of::<crate::sap::SapParseCache>(),
-                got: cache._data.type_id(),
-            });
-        };
-        let result = match crate::sap::execute_sap_parse_partial(&json, &sap, ctx) {
-            Ok(Some(value)) => Ok(value),
-            Ok(None) => Ok(BexExternalValue::instance(
-                "baml.sap._NoYield",
-                ::indexmap::IndexMap::new(),
-            )),
-            Err(e) => Err(VmRustFnError::from(e)),
-        };
-        SysOpOutput::Ready(result)
-    }
-}
-
-impl<T> io::IoNamespaceSap for T {
-    fn _new_parse_cache(
-        &self,
-        _heap: &std::sync::Arc<BexHeap>,
-        _call_id: CallId,
-        target: ::sys_types::SapTy,
-        ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::sap::ParseCache> {
-        let compiled = match ::bex_sap::CompiledSapModel::from_sys_op_context(ctx, target) {
-            Ok(compiled) => compiled,
-            Err(e) => {
-                // `_new_parse_cache` declares `throws never`, and the type
-                // arguments that reach it come from the caller's own
-                // `parse<T>` — a `T` schema-aligned parsing cannot model is
-                // a program bug, not a recoverable condition, so it panics.
-                return SysOpOutput::err(VmPanic::UserPanic {
-                    message: format!("schema-aligned parsing cannot model this type: {e}"),
-                });
-            }
-        };
-        let sap = crate::sap::SapParseCache::new(compiled);
-        let data: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(sap);
-        SysOpOutput::ok(io::owned::sap::ParseCache { _data: data })
-    }
-}
-
-/// Wrap an `OutputFormatContent` into the generated `owned::ai::OutputFormat` handle.
-fn wrap_output_format(
-    content: std::sync::Arc<crate::output_format::OutputFormatContent>,
-) -> io::owned::ai::OutputFormat {
-    io::owned::ai::OutputFormat {
-        _data: content as std::sync::Arc<dyn std::any::Any + Send + Sync>,
-    }
-}
-
-/// Unwrap a generated `owned::ai::OutputFormat` handle back to its `OutputFormatContent`.
-#[allow(clippy::used_underscore_binding)]
-fn unwrap_output_format(
-    owned: &io::owned::ai::OutputFormat,
-) -> std::sync::Arc<crate::output_format::OutputFormatContent> {
-    owned
-        ._data
-        .clone()
-        .downcast::<crate::output_format::OutputFormatContent>()
-        .expect("OutputFormat._data downcast failed: expected Arc<OutputFormatContent>. This indicates a bug in wrap_output_format or a type mismatch.")
 }
 
 // ============================================================================
@@ -1047,74 +1494,70 @@ impl io::IoClassReflectSession for DefaultIoOps {
 
 impl io::IoNamespaceReflect for DefaultIoOps {}
 
-impl io::IoClassFsFile for DefaultIoOps {
-    fn read(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: io::owned::fs::File,
-        _n: i64,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<Vec<u8>>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: io::owned::fs::File,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn seek_from(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: io::owned::fs::File,
-        _whence: BexExternalValue,
-        _offset: i64,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn write_some(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: io::owned::fs::File,
-        _data: Vec<u8>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn flush(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _f: io::owned::fs::File,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
 impl io::IoNamespaceFs for DefaultIoOps {
+    fn metadata(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<io::owned::fs::Metadata> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "fs".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn rename(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _source: String,
+        _destination: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "fs".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn canonicalize(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "fs".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn write_atomic(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _content: Vec<u8>,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "fs".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn lock(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _timeout_ms: i64,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<io::owned::fs::Lock> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "fs".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
     fn open(
         &self,
         _h: &Arc<BexHeap>,
@@ -1292,30 +1735,6 @@ impl io::IoNamespaceFs for DefaultIoOps {
 }
 
 impl io::IoClassHttpResponse for DefaultIoOps {
-    fn text(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _r: io::owned::http::Response,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<String> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn bytes(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _r: io::owned::http::Response,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Vec<u8>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
     fn new(
         &self,
         _h: &Arc<BexHeap>,
@@ -1338,31 +1757,6 @@ impl io::IoClassHttpResponse for DefaultIoOps {
         _headers: indexmap::IndexMap<String, String>,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<io::owned::http::Response> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn write(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _r: io::owned::http::Response,
-        _data: Vec<u8>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn end(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _r: io::owned::http::Response,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "http".to_string(),
             message: "Operation not supported on this platform".to_string(),
@@ -1406,42 +1800,17 @@ impl io::IoClassHttpServer for DefaultIoOps {
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
-        _server: io::owned::http::Server,
+        _state: io::owned::http::ServerState,
         _handler: bex_external_types::Handle,
         _websocket: bex_external_types::Handle,
-        _tls_config: Option<io::owned::http::TlsConfig>,
+        _tls_keys: Option<io::owned::http::TlsKeys>,
+        _allow_tls1_2: bool,
+        _tls_handshake_timeout_nanos: Arc<num_bigint::BigInt>,
         _allow_http1: bool,
         _allow_http2: bool,
         _max_body_size: i64,
         _max_connections: i64,
         _header_read_timeout_nanos: Arc<num_bigint::BigInt>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
-impl io::IoClassHttpSseStream for DefaultIoOps {
-    fn next(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::http::SseStream,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<String>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "http".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::http::SseStream,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
@@ -1496,50 +1865,6 @@ impl io::IoNamespaceHttp for DefaultIoOps {
     }
 }
 
-impl io::IoClassWsWebSocket for DefaultIoOps {
-    fn send(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _websocket: io::owned::ws::WebSocket,
-        _data: BexExternalValue,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "websocket".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn next(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _websocket: io::owned::ws::WebSocket,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<BexExternalValue> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "websocket".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _websocket: io::owned::ws::WebSocket,
-        _code: i64,
-        _reason: String,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "websocket".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
 impl io::IoNamespaceWs for DefaultIoOps {
     fn _connect(
         &self,
@@ -1571,44 +1896,6 @@ impl io::IoClassNetTcpStream for DefaultIoOps {
             message: "Operation not supported on this platform".to_string(),
         })
     }
-    fn read(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::net::TcpStream,
-        _limit: i64,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<Vec<u8>>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn write_some(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::net::TcpStream,
-        _data: Vec<u8>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::net::TcpStream,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
 }
 
 impl io::IoClassNetTcpListener for DefaultIoOps {
@@ -1624,30 +1911,6 @@ impl io::IoClassNetTcpListener for DefaultIoOps {
             message: "Operation not supported on this platform".to_string(),
         })
     }
-    fn accept(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _l: io::owned::net::TcpListener,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::net::TcpStream> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _l: io::owned::net::TcpListener,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
 }
 
 impl io::IoClassNetUdpSocket for DefaultIoOps {
@@ -1658,46 +1921,6 @@ impl io::IoClassNetUdpSocket for DefaultIoOps {
         _addr: String,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<io::owned::net::UdpSocket> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn _send_to(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::net::UdpSocket,
-        _data: Vec<u8>,
-        _addr: String,
-        _timeout_nanos: Arc<num_bigint::BigInt>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn _recv_from(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::net::UdpSocket,
-        _timeout_nanos: Arc<num_bigint::BigInt>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::net::Datagram> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "network".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _s: io::owned::net::UdpSocket,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "network".to_string(),
             message: "Operation not supported on this platform".to_string(),
@@ -1785,116 +2008,74 @@ impl io::IoNamespaceIo for DefaultIoOps {
     }
 }
 
-impl io::IoClassSysProcess for DefaultIoOps {
-    fn wait(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _process: io::owned::sys::Process,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::sys::ProcessExit> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn kill(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _process: io::owned::sys::Process,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _process: io::owned::sys::Process,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::ok(())
-    }
-}
-
-impl io::IoClassSysReadPipe for DefaultIoOps {
-    fn read(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _readpipe: io::owned::sys::ReadPipe,
-        _limit: i64,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Option<Vec<u8>>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _readpipe: io::owned::sys::ReadPipe,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
-impl io::IoClassSysWritePipe for DefaultIoOps {
-    fn write_some(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _writepipe: io::owned::sys::WritePipe,
-        _data: Vec<u8>,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<i64> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn flush(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _writepipe: io::owned::sys::WritePipe,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn close(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _writepipe: io::owned::sys::WritePipe,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<()> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "process".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
 impl io::IoNamespaceSys for DefaultIoOps {
+    fn host_info(
+        &self,
+        _: &Arc<BexHeap>,
+        _: CallId,
+        _: &SysOpContext,
+    ) -> SysOpOutput<io::owned::sys::HostInfo> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "host information".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+
+    fn current_dir(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "sys".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn current_exe(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "sys".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn home_dir(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<Option<String>> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "sys".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn platform(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "sys".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn host_target(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "sys".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
     fn collect_garbage(
         &self,
         _h: &Arc<BexHeap>,
@@ -1906,55 +2087,55 @@ impl io::IoNamespaceSys for DefaultIoOps {
         SysOpOutput::ok(())
     }
 
-    fn exec(
+    fn _run(
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
         _program: String,
-        _args: Option<Vec<String>>,
-        _options: Option<io::owned::sys::ProcessOptions>,
+        _args: Vec<String>,
+        _options: io::owned::sys::ProcessOptions,
         _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::sys::ShellOutput> {
+    ) -> SysOpOutput<io::owned::sys::ProcessOutput> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "process".to_string(),
             message: "Operation not supported on this platform".to_string(),
         })
     }
 
-    fn start_process(
+    fn _subprocess(
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
         _program: String,
-        _args: Option<Vec<String>>,
-        _options: Option<io::owned::sys::ProcessOptions>,
+        _args: Vec<String>,
+        _options: io::owned::sys::ProcessOptions,
         _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::sys::Process> {
+    ) -> SysOpOutput<io::owned::sys::Subprocess> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "process".to_string(),
             message: "Operation not supported on this platform".to_string(),
         })
     }
 
-    fn shell(
+    fn _shell(
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
         _command: String,
-        _options: Option<io::owned::sys::ProcessOptions>,
+        _options: io::owned::sys::ProcessOptions,
         _ctx: &SysOpContext,
-    ) -> SysOpOutput<io::owned::sys::ShellOutput> {
+    ) -> SysOpOutput<io::owned::sys::ProcessOutput> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "process".to_string(),
             message: "Operation not supported on this platform".to_string(),
         })
     }
 
-    fn sleep(
+    fn _sleep(
         &self,
         _h: &Arc<BexHeap>,
         _c: CallId,
-        _delay: BexExternalValue,
+        _delay_nanos: Arc<num_bigint::BigInt>,
         _ctx: &SysOpContext,
     ) -> SysOpOutput<()> {
         SysOpOutput::err(VmPanic::HostUnavailable {
@@ -1966,36 +2147,6 @@ impl io::IoNamespaceSys for DefaultIoOps {
     fn pid(&self, _h: &Arc<BexHeap>, _c: CallId, _ctx: &SysOpContext) -> SysOpOutput<i64> {
         SysOpOutput::err(VmPanic::HostUnavailable {
             resource: "process-id".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-}
-
-impl io::IoClassGlobGlob for DefaultIoOps {
-    fn scan(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _glob: io::owned::glob::Glob,
-        _root: BexExternalValue,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<Vec<String>> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
-            message: "Operation not supported on this platform".to_string(),
-        })
-    }
-
-    fn matches(
-        &self,
-        _h: &Arc<BexHeap>,
-        _c: CallId,
-        _glob: io::owned::glob::Glob,
-        _path: String,
-        _ctx: &SysOpContext,
-    ) -> SysOpOutput<bool> {
-        SysOpOutput::err(VmPanic::HostUnavailable {
-            resource: "filesystem".to_string(),
             message: "Operation not supported on this platform".to_string(),
         })
     }
@@ -2017,7 +2168,7 @@ impl io::IoNamespaceGlob for DefaultIoOps {
 }
 
 impl io::IoNamespaceHost for DefaultIoOps {
-    fn call_host_value(
+    fn _call_host_value(
         &self,
         _heap: &Arc<BexHeap>,
         _call_id: CallId,
@@ -2132,6 +2283,15 @@ impl io::IoNamespaceAiInternal for DefaultIoOps {
         ctx: &SysOpContext,
     ) -> SysOpOutput<io::owned::ai::OutputFormat> {
         build_output_format_op(&return_type, ctx)
+    }
+    fn reaches_media(
+        &self,
+        _h: &Arc<BexHeap>,
+        _c: CallId,
+        t: ::sys_types::SapTy,
+        ctx: &SysOpContext,
+    ) -> SysOpOutput<bool> {
+        reaches_media_op(&t, ctx)
     }
     fn get_return_type(
         &self,
@@ -2318,12 +2478,43 @@ impl IoSysOpsBuilder {
         self
     }
 
-    /// Override the `fs` namespace (including `fs.File` methods) with a pre-built instance.
+    /// Override the `fs` namespace with a pre-built instance. A `fs.File`'s
+    /// methods are its own: whichever instance opened it serves them.
     #[must_use]
     pub fn with_fs_instance(
         mut self,
         instance: Arc<dyn io::IoNamespaceFs + Send + Sync + 'static>,
     ) -> Self {
+        self.inner.baml_fs_metadata = {
+            let t = instance.clone();
+            Arc::new(move |heap, permit, args, ctx, call_id| {
+                t.__glue_baml_fs_metadata(heap, permit, args, ctx, call_id)
+            })
+        };
+        self.inner.baml_fs_rename = {
+            let t = instance.clone();
+            Arc::new(move |heap, permit, args, ctx, call_id| {
+                t.__glue_baml_fs_rename(heap, permit, args, ctx, call_id)
+            })
+        };
+        self.inner.baml_fs_canonicalize = {
+            let t = instance.clone();
+            Arc::new(move |heap, permit, args, ctx, call_id| {
+                t.__glue_baml_fs_canonicalize(heap, permit, args, ctx, call_id)
+            })
+        };
+        self.inner.baml_fs_write_atomic = {
+            let t = instance.clone();
+            Arc::new(move |heap, permit, args, ctx, call_id| {
+                t.__glue_baml_fs_write_atomic(heap, permit, args, ctx, call_id)
+            })
+        };
+        self.inner.baml_fs_lock = {
+            let t = instance.clone();
+            Arc::new(move |heap, permit, args, ctx, call_id| {
+                t.__glue_baml_fs_lock(heap, permit, args, ctx, call_id)
+            })
+        };
         self.inner.baml_fs_open = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
@@ -2364,36 +2555,6 @@ impl IoSysOpsBuilder {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
                 t.__glue_baml_fs_write_bytes(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_fs_root_io_read_for_file_read = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_fs_root_io_read_for_file_read(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_fs_file_close = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_fs_file_close(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_fs_file_seek_from = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_fs_file_seek_from(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_fs_root_io_write_for_file_write_some = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_fs_root_io_write_for_file_write_some(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_fs_root_io_write_for_file_flush = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_fs_root_io_write_for_file_flush(heap, permit, args, ctx, call_id)
             })
         };
         self.inner.baml_fs_read_dir = {
@@ -2438,40 +2599,24 @@ impl IoSysOpsBuilder {
         self
     }
 
-    /// Override the `fs` namespace with a default-constructible type.
-    #[must_use]
-    pub fn with_fs<T: io::IoNamespaceFs + Default + Send + Sync + 'static>(self) -> Self {
-        self.with_fs_instance(Arc::new(T::default()))
-    }
-
-    /// Override the `glob` namespace (including `glob.Glob` methods) with a pre-built instance.
+    /// Override the `glob` namespace with a pre-built instance. A `glob.Glob`'s
+    /// methods are its own: whichever instance compiled it serves them.
     #[must_use]
     pub fn with_glob_instance(
         mut self,
         instance: Arc<dyn io::IoNamespaceGlob + Send + Sync + 'static>,
     ) -> Self {
         self.inner.baml_glob_new = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_glob_new(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_glob_glob_scan = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_glob_glob_scan(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_glob_glob_matches = {
             let t = instance;
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_glob_glob_matches(heap, permit, args, ctx, call_id)
+                t.__glue_baml_glob_new(heap, permit, args, ctx, call_id)
             })
         };
         self
     }
 
-    /// Override the `http` namespace (including `http.Response` methods) with a pre-built instance.
+    /// Override the `http` namespace (the request, response-construction and
+    /// server operations) with a pre-built instance.
     #[must_use]
     pub fn with_http_instance(
         mut self,
@@ -2489,34 +2634,10 @@ impl IoSysOpsBuilder {
                 t.__glue_baml_http__send(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_http_response_text = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_response_text(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_http_response_bytes = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_response_bytes(heap, permit, args, ctx, call_id)
-            })
-        };
         self.inner.baml_http__send_sse = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
                 t.__glue_baml_http__send_sse(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_http_ssestream_next = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_ssestream_next(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_http_ssestream_close = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_ssestream_close(heap, permit, args, ctx, call_id)
             })
         };
         self.inner.baml_http_response_new = {
@@ -2529,18 +2650,6 @@ impl IoSysOpsBuilder {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
                 t.__glue_baml_http_response_new_streaming(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_http_response_write = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_response_write(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_http_response_end = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_response_end(heap, permit, args, ctx, call_id)
             })
         };
         self.inner.baml_http_tlsconfig__new = {
@@ -2566,8 +2675,9 @@ impl IoSysOpsBuilder {
 
     /// Override the non-streaming HTTP client operations only.
     ///
-    /// Installs `_fetch`, `_send`, `Response.text`, and `Response.bytes` while
-    /// leaving SSE, server, TLS, and response-construction slots unsupported.
+    /// Installs `_fetch` and `_send` while leaving SSE, server, TLS, and
+    /// response-construction slots unsupported. A response's body is its own:
+    /// whichever instance sent the request serves its reads.
     #[must_use]
     pub fn with_http_fetch_instance(
         mut self,
@@ -2580,108 +2690,12 @@ impl IoSysOpsBuilder {
             })
         };
         self.inner.baml_http__send = {
-            let t = instance.clone();
+            let t = instance;
             Arc::new(move |heap, permit, args, ctx, call_id| {
                 t.__glue_baml_http__send(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_http_response_text = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_response_text(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_http_response_bytes = {
-            let t = instance;
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_http_response_bytes(heap, permit, args, ctx, call_id)
-            })
-        };
         self
-    }
-
-    /// Override the `net` namespace (`TcpStream` / `TcpListener` / `UdpSocket`
-    /// methods) with a pre-built instance.
-    #[must_use]
-    pub fn with_net_instance(
-        mut self,
-        instance: Arc<dyn io::IoNamespaceNet + Send + Sync + 'static>,
-    ) -> Self {
-        self.inner.baml_net_tcpstream__connect = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_tcpstream__connect(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_root_io_read_for_tcpstream_read = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_root_io_read_for_tcpstream_read(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_root_io_write_for_tcpstream_write_some = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_root_io_write_for_tcpstream_write_some(
-                    heap, permit, args, ctx, call_id,
-                )
-            })
-        };
-        self.inner.baml_net_tcpstream_close = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_tcpstream_close(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_tcplistener_bind = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_tcplistener_bind(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_tcplistener_accept = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_tcplistener_accept(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_tcplistener_close = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_tcplistener_close(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_udpsocket_bind = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_udpsocket_bind(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_udpsocket__send_to = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_udpsocket__send_to(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_udpsocket__recv_from = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_udpsocket__recv_from(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_net_udpsocket_close = {
-            let t = instance;
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_net_udpsocket_close(heap, permit, args, ctx, call_id)
-            })
-        };
-        self
-    }
-
-    /// Override the `net` namespace with a default-constructible type.
-    #[must_use]
-    pub fn with_net<T: io::IoNamespaceNet + Default + Send + Sync + 'static>(self) -> Self {
-        self.with_net_instance(Arc::new(T::default()))
     }
 
     /// Override the `sys` namespace with a pre-built instance.
@@ -2691,80 +2705,64 @@ impl IoSysOpsBuilder {
         mut self,
         instance: Arc<dyn io::IoNamespaceSys + Send + Sync + 'static>,
     ) -> Self {
-        self.inner.baml_sys_process_wait = {
+        self.inner.baml_sys_current_dir = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_process_wait(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys_current_dir(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_process_kill = {
+        self.inner.baml_sys_current_exe = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_process_kill(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys_current_exe(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_process_close = {
+        self.inner.baml_sys_home_dir = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_process_close(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys_home_dir(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_readpipe_close = {
+        self.inner.baml_sys_platform = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_readpipe_close(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys_platform(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_root_io_read_for_readpipe_read = {
+        self.inner.baml_sys_host_target = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_root_io_read_for_readpipe_read(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys_host_target(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_writepipe_close = {
+        self.inner.baml_sys_host_info = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_writepipe_close(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys_host_info(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_root_io_write_for_writepipe_write_some = {
+        self.inner.baml_sys__run = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_root_io_write_for_writepipe_write_some(
-                    heap, permit, args, ctx, call_id,
-                )
+                t.__glue_baml_sys__run(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_root_io_write_for_writepipe_flush = {
+        self.inner.baml_sys__subprocess = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_root_io_write_for_writepipe_flush(
-                    heap, permit, args, ctx, call_id,
-                )
+                t.__glue_baml_sys__subprocess(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_exec = {
+        self.inner.baml_sys__shell = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_exec(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys__shell(heap, permit, args, ctx, call_id)
             })
         };
-        self.inner.baml_sys_start_process = {
+        self.inner.baml_sys__sleep = {
             let t = instance.clone();
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_start_process(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_sys_shell = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_shell(heap, permit, args, ctx, call_id)
-            })
-        };
-        self.inner.baml_sys_sleep = {
-            let t = instance.clone();
-            Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_sys_sleep(heap, permit, args, ctx, call_id)
+                t.__glue_baml_sys__sleep(heap, permit, args, ctx, call_id)
             })
         };
         self.inner.baml_sys_collect_garbage = {
@@ -2782,17 +2780,11 @@ impl IoSysOpsBuilder {
         self
     }
 
-    /// Override the `sys` namespace with a default-constructible type.
-    #[must_use]
-    pub fn with_sys<T: io::IoNamespaceSys + Default + Send + Sync + 'static>(self) -> Self {
-        self.with_sys_instance(Arc::new(T::default()))
-    }
-
     /// Override the `host` namespace (host-callable dispatch) with a pre-built instance.
     ///
     /// Only the WASM bridge uses this builder method: it composes its `SysOps`
     /// here and injects its JS dispatch impl explicitly, wiring the
-    /// [`io::IoNamespaceHost::call_host_value`] sysop to a bridge-specific
+    /// [`io::IoNamespaceHost::_call_host_value`] sysop to a bridge-specific
     /// dispatch implementation that fires the host-language callable. The
     /// native bridges (Python, Node, Go) instead wire dispatch through
     /// `sys_native::NativeSysOps` (passed to [`SysOps::from_impl`]) and never
@@ -2802,10 +2794,10 @@ impl IoSysOpsBuilder {
         mut self,
         instance: Arc<dyn io::IoNamespaceHost + Send + Sync + 'static>,
     ) -> Self {
-        self.inner.baml_host_call_host_value = {
+        self.inner.baml_host__call_host_value = {
             let t = instance;
             Arc::new(move |heap, permit, args, ctx, call_id| {
-                t.__glue_baml_host_call_host_value(heap, permit, args, ctx, call_id)
+                t.__glue_baml_host__call_host_value(heap, permit, args, ctx, call_id)
             })
         };
         self
@@ -2872,6 +2864,103 @@ pub use io::SysOps;
 /// with `baml.panics.HostUnavailable`, then allows selectively overriding
 /// namespaces.
 pub type SysOpsBuilder = IoSysOpsBuilder;
+
+impl io::IoNamespacePath for DefaultIoOps {
+    fn join(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _parts: Vec<String>,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "path".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn parent(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<Option<String>> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "path".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn is_absolute(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<bool> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "path".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn _absolute(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _path: String,
+        _base: Option<String>,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<String> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "path".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+}
+
+impl io::IoNamespaceArchive for DefaultIoOps {
+    fn entries(
+        &self,
+        _: &Arc<BexHeap>,
+        _: CallId,
+        _: Vec<u8>,
+        _: BexExternalValue,
+        _: &SysOpContext,
+    ) -> SysOpOutput<Vec<String>> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "archive".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+
+    fn extract(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _data: Vec<u8>,
+        _format: BexExternalValue,
+        _destination: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<()> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "archive".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+    fn read_file(
+        &self,
+        _heap: &Arc<BexHeap>,
+        _call_id: CallId,
+        _data: Vec<u8>,
+        _format: BexExternalValue,
+        _name: String,
+        _ctx: &SysOpContext,
+    ) -> SysOpOutput<Vec<u8>> {
+        SysOpOutput::err(VmPanic::HostUnavailable {
+            resource: "archive".into(),
+            message: "Operation not supported on this platform".into(),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2943,7 +3032,7 @@ mod tests {
         ));
 
         // Test shell panics with HostUnavailable
-        let result = (ops.baml_sys_shell)(&heap, permit.proof(), vec![], &ctx, CallId::next());
+        let result = (ops.baml_sys__shell)(&heap, permit.proof(), vec![], &ctx, CallId::next());
         assert!(matches!(
             result,
             SysOpResult::Ready(Err(OpError {

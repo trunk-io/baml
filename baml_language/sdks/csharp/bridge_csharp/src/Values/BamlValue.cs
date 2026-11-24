@@ -28,6 +28,7 @@ public enum BamlValueKind : int
     Handle = 13,
     Prompt = 14,
     Type = 15,
+    Tuple = 16,
 }
 
 public enum BamlTypeDescriptorKind : int
@@ -49,6 +50,18 @@ public enum BamlTypeDescriptorKind : int
     Handle = 14,
     Prompt = 15,
     Type = 16,
+    /// <summary>
+    /// A type the SDK has no projection for, which a value's type can still
+    /// name: the interface of a <c>Shape[]</c>, the function type of a list
+    /// of closures, or a declaration the runtime created. Two opaque
+    /// descriptors are equal exactly when they are spelled alike; a runtime
+    /// declaration is spelled by a reference (the engine's one key for it)
+    /// or, beside a value, by a display label only.
+    /// </summary>
+    Opaque = 17,
+    /// <summary>The type no value has, as the item type of an empty <c>never[]</c>.</summary>
+    Never = 18,
+    Tuple = 19,
 }
 
 /// <summary>
@@ -355,6 +368,30 @@ public sealed class BamlValue : IEquatable<BamlValue>
             return true;
         }
 
+        if (BamlDynamicCodecRegistry.TryDecodeCarriedTuple(this, out result))
+        {
+            return true;
+        }
+
+        if (((value.Kind == PrimitiveCarrierKind.Tuple && value.TupleTypeMetadata is null)
+                || value.Kind == PrimitiveCarrierKind.List)
+            && BamlDynamicCodecRegistry.TryDecodeTupleShape(this, out result))
+        {
+            return true;
+        }
+
+        if (BamlDynamicCodecRegistry.TryDecodeTupleJoinList(this, out result))
+        {
+            return true;
+        }
+
+        if (value.Kind == PrimitiveCarrierKind.Tuple
+            && typeof(T) == typeof(IReadOnlyList<BamlValue>))
+        {
+            result = (T)(object)ReadTupleValues();
+            return true;
+        }
+
         Type requestedType = typeof(T);
         Type canonicalType = Nullable.GetUnderlyingType(requestedType) ?? requestedType;
         if (type.Alias is not null || type.Literal is not null)
@@ -389,6 +426,16 @@ public sealed class BamlValue : IEquatable<BamlValue>
         if (TryGet(out T? result))
         {
             return result!;
+        }
+
+        if (value.Kind == PrimitiveCarrierKind.Tuple
+            && value.ReadTuple().Count is var arity and > BamlValueLimits.MaxNativeTupleArity)
+        {
+            throw Mapping(
+                typeof(T),
+                "$",
+                $"A BAML tuple with {arity} slots has no C# tuple projection; a C# tuple holds at most {BamlValueLimits.MaxNativeTupleArity} slots.",
+                "BamlValue.TryGetTupleItems or IReadOnlyList<BamlValue>");
         }
 
         if (Kind == BamlValueKind.Null
@@ -455,6 +502,18 @@ public sealed class BamlValue : IEquatable<BamlValue>
         }
 
         fields = null;
+        return false;
+    }
+
+    public bool TryGetTupleItems([NotNullWhen(true)] out IReadOnlyList<BamlValue>? items)
+    {
+        if (value.Kind == PrimitiveCarrierKind.Tuple)
+        {
+            items = ReadTupleValues();
+            return true;
+        }
+
+        items = null;
         return false;
     }
 
@@ -627,6 +686,7 @@ public sealed class BamlValue : IEquatable<BamlValue>
         PrimitiveCarrierKind.Prompt => BamlValueKind.Prompt,
         PrimitiveCarrierKind.Type => BamlValueKind.Type,
         PrimitiveCarrierKind.Handle => BamlValueKind.Handle,
+        PrimitiveCarrierKind.Tuple => BamlValueKind.Tuple,
         _ => throw new BamlProtocolException(
             "The managed bridge encountered an unsupported BAML value kind.",
             $"Generated carrier kind {kind} has no public BamlValueKind."),
@@ -651,6 +711,7 @@ public sealed class BamlValue : IEquatable<BamlValue>
             PrimitiveCarrierKind.Bytes => left.ReadBytes().AsSpan().SequenceEqual(right.ReadBytes()),
             PrimitiveCarrierKind.BigInt => left.ReadBigInt() == right.ReadBigInt(),
             PrimitiveCarrierKind.List => SequenceEquals(left.ReadList(), right.ReadList()),
+            PrimitiveCarrierKind.Tuple => SequenceEquals(left.ReadTuple(), right.ReadTuple()),
             PrimitiveCarrierKind.Map => MapEquals(left.ReadMapEntries(), right.ReadMapEntries()),
             PrimitiveCarrierKind.Class =>
                 StringComparer.Ordinal.Equals(
@@ -742,6 +803,12 @@ public sealed class BamlValue : IEquatable<BamlValue>
                     AddValueHash(ref hash, item);
                 }
                 break;
+            case PrimitiveCarrierKind.Tuple:
+                foreach (BamlGeneratedValue item in value.ReadTuple())
+                {
+                    AddValueHash(ref hash, item);
+                }
+                break;
             case PrimitiveCarrierKind.Map:
                 foreach ((string key, BamlGeneratedValue item) in value.ReadMapEntries()
                     .OrderBy(pair => pair.Key, StringComparer.Ordinal))
@@ -784,6 +851,10 @@ public sealed class BamlValue : IEquatable<BamlValue>
 
     internal IReadOnlyList<BamlValue> ReadListValues() =>
         value.ReadList().Select(item => new BamlValue(item, promptRegistry)).ToArray();
+
+    internal IReadOnlyList<BamlValue> ReadTupleValues() =>
+        Array.AsReadOnly(
+            value.ReadTuple().Select(item => new BamlValue(item, promptRegistry)).ToArray());
 
     internal IReadOnlyList<KeyValuePair<string, BamlValue>> ReadMapValues() =>
         value.ReadMapEntries()
@@ -870,13 +941,18 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
 {
     private readonly IReadOnlyList<BamlTypeDescriptor> arguments;
 
+    // An opaque type's canonical wire encoding: its identity, compared byte for
+    // byte, with no structure published.
+    private readonly byte[]? opaque;
+
     private BamlTypeDescriptor(
         BamlTypeDescriptorKind kind,
         string? fqn = null,
         IEnumerable<BamlTypeDescriptor>? arguments = null,
         bool isNullable = false,
         string? alias = null,
-        string? literal = null)
+        string? literal = null,
+        byte[]? opaque = null)
     {
         Kind = kind;
         Fqn = fqn;
@@ -884,6 +960,7 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
         IsNullable = isNullable;
         Alias = alias;
         Literal = literal;
+        this.opaque = opaque;
     }
 
     public BamlTypeDescriptorKind Kind { get; }
@@ -905,7 +982,8 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
         && arguments.SequenceEqual(other.arguments)
         && IsNullable == other.IsNullable
         && StringComparer.Ordinal.Equals(Alias, other.Alias)
-        && StringComparer.Ordinal.Equals(Literal, other.Literal);
+        && StringComparer.Ordinal.Equals(Literal, other.Literal)
+        && (opaque ?? []).AsSpan().SequenceEqual(other.opaque ?? []);
 
     public override bool Equals(object? obj) =>
         obj is BamlTypeDescriptor other && Equals(other);
@@ -922,6 +1000,7 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
         hash.Add(IsNullable);
         hash.Add(Alias, StringComparer.Ordinal);
         hash.Add(Literal, StringComparer.Ordinal);
+        hash.AddBytes(opaque ?? []);
         return hash.ToHashCode();
     }
 
@@ -942,6 +1021,9 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
             PrimitiveCarrierKind.List => new(
                 BamlTypeDescriptorKind.List,
                 arguments: [FromMetadata(value.ItemTypeMetadata)]),
+            PrimitiveCarrierKind.Tuple => value.TupleTypeMetadata is { Length: > 0 } tuple
+                ? FromMetadata(tuple)
+                : Leaf(BamlTypeDescriptorKind.Tuple),
             PrimitiveCarrierKind.Map => new(
                 BamlTypeDescriptorKind.Map,
                 arguments:
@@ -1011,11 +1093,21 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
                 BamlTyPrimitiveKind.BamlTyPrimitiveBytes => Leaf(BamlTypeDescriptorKind.Bytes),
                 _ => throw UnsupportedType(type),
             },
-            BamlTy.TyOneofCase.ClassTy => Nominal(
-                BamlTypeDescriptorKind.Class,
-                type.ClassTy.Name,
-                type.ClassTy.TypeArgs.Select(item => FromWire(item, budget, depth + 1))),
-            BamlTy.TyOneofCase.Enum => Nominal(BamlTypeDescriptorKind.Enum, type.Enum.Name),
+            BamlTy.TyOneofCase.ClassTy => type.ClassTy.HeadCase switch
+            {
+                BamlTyClass.HeadOneofCase.Live or BamlTyClass.HeadOneofCase.AnonymousLabel =>
+                    Unnamed(type),
+                _ => Nominal(
+                    BamlTypeDescriptorKind.Class,
+                    type.ClassTy.Name,
+                    type.ClassTy.TypeArgs.Select(item => FromWire(item, budget, depth + 1))),
+            },
+            BamlTy.TyOneofCase.Enum => type.Enum.HeadCase switch
+            {
+                BamlTyEnum.HeadOneofCase.Live or BamlTyEnum.HeadOneofCase.AnonymousLabel =>
+                    Unnamed(type),
+                _ => Nominal(BamlTypeDescriptorKind.Enum, type.Enum.Name),
+            },
             BamlTy.TyOneofCase.List => new(
                 BamlTypeDescriptorKind.List,
                 arguments: [FromWire(type.List.Item, budget, depth + 1)]),
@@ -1026,6 +1118,10 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
                     FromWire(type.Map.Key, budget, depth + 1),
                     FromWire(type.Map.Value, budget, depth + 1),
                 ]),
+            BamlTy.TyOneofCase.Tuple => new(
+                BamlTypeDescriptorKind.Tuple,
+                arguments: type.Tuple.Items.Select(
+                    item => FromWire(item, budget, depth + 1))),
             BamlTy.TyOneofCase.Optional =>
                 FromWire(type.Optional.Inner, budget, depth + 1).WithNullable(),
             BamlTy.TyOneofCase.Union => new(
@@ -1033,19 +1129,35 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
                 arguments: type.Union.Options.Select(
                     item => FromWire(item, budget, depth + 1))),
             BamlTy.TyOneofCase.Literal => FromLiteral(type.Literal),
-            BamlTy.TyOneofCase.TypeAlias => CreateAlias(
-                type.TypeAlias.Name,
-                type.TypeAlias.TypeArgs.Select(
-                    item => FromWire(item, budget, depth + 1))),
+            BamlTy.TyOneofCase.TypeAlias => type.TypeAlias.HeadCase switch
+            {
+                BamlTyTypeAlias.HeadOneofCase.Live or BamlTyTypeAlias.HeadOneofCase.AnonymousLabel =>
+                    Unnamed(type),
+                _ => CreateAlias(
+                    type.TypeAlias.Name,
+                    type.TypeAlias.TypeArgs.Select(
+                        item => FromWire(item, budget, depth + 1))),
+            },
             BamlTy.TyOneofCase.Unknown => Leaf(BamlTypeDescriptorKind.Unknown),
             BamlTy.TyOneofCase.Media => Leaf(BamlTypeDescriptorKind.Media),
-            BamlTy.TyOneofCase.EnumVariant => Nominal(
-                BamlTypeDescriptorKind.Enum,
-                type.EnumVariant.Name,
-                literal: type.EnumVariant.Variant),
+            BamlTy.TyOneofCase.EnumVariant => type.EnumVariant.HeadCase switch
+            {
+                BamlTyEnumVariant.HeadOneofCase.Live or BamlTyEnumVariant.HeadOneofCase.AnonymousLabel =>
+                    Unnamed(type),
+                _ => Nominal(
+                    BamlTypeDescriptorKind.Enum,
+                    type.EnumVariant.Name,
+                    literal: type.EnumVariant.Variant),
+            },
             BamlTy.TyOneofCase.Resource => Leaf(BamlTypeDescriptorKind.Handle),
             BamlTy.TyOneofCase.PromptAst => Leaf(BamlTypeDescriptorKind.Prompt),
             BamlTy.TyOneofCase.MetaType => Leaf(BamlTypeDescriptorKind.Type),
+            // An element type may name an interface or a function type though
+            // no value has one; the SDK projects neither, so it keeps the
+            // type's identity only. Re-sending reads the original type bytes.
+            BamlTy.TyOneofCase.Interface or BamlTy.TyOneofCase.Function =>
+                new(BamlTypeDescriptorKind.Opaque, opaque: type.ToByteArray()),
+            BamlTy.TyOneofCase.Never => Leaf(BamlTypeDescriptorKind.Never),
             _ => throw UnsupportedType(type),
         };
     }
@@ -1079,14 +1191,27 @@ public sealed class BamlTypeDescriptor : IEquatable<BamlTypeDescriptor>
         arguments,
         isNullable: true,
         Alias,
-        Literal);
+        Literal,
+        opaque);
 
     private static BamlTypeDescriptor Leaf(BamlTypeDescriptorKind kind) => new(kind);
+
+    // A runtime declaration has no name to project: its descriptor keeps the
+    // wire spelling (a `live` key, or a display label) as its identity only.
+    private static BamlTypeDescriptor Unnamed(BamlTy type) =>
+        new(BamlTypeDescriptorKind.Opaque, opaque: type.ToByteArray());
 
     internal static BamlTypeDescriptor CreateHandle(
         string fqn,
         IEnumerable<BamlTypeDescriptor>? arguments = null) =>
         Nominal(BamlTypeDescriptorKind.Handle, fqn, arguments);
+
+    /// <summary>
+    /// A handle to an instance of a runtime declaration, identified by the
+    /// type annotation it arrived with; it has no name.
+    /// </summary>
+    internal static BamlTypeDescriptor CreateUnnamedHandle(byte[] annotation) =>
+        new(BamlTypeDescriptorKind.Handle, opaque: annotation);
 
     private static BamlTypeDescriptor Nominal(
         BamlTypeDescriptorKind kind,

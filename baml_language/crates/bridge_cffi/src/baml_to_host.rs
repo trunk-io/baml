@@ -3,8 +3,8 @@
 //! `BamlOutboundResult` envelope.
 //!
 //! The whole classify-and-encode lives here, in the bridge — not in bex.
-//! Every adapter (the C ABI, Wasm, PyO3, napi, JNI) calls [`prepare_call`] and
-//! then [`invoke_prepared`], so argument decoding, target pinning, the
+//! Every adapter (the C ABI, Wasm, PyO3, napi, JNI) calls [`decode_invocation_request`] and
+//! then [`execute_invocation`], so argument decoding, target pinning, the
 //! `catch_unwind` → `SdkPanic` boundary and the error/panic routing are
 //! defined exactly once. Every result — ok value, thrown error, panic, and
 //! pre-call host-boundary failure — leaves the bridge as one envelope; there is
@@ -24,12 +24,12 @@ use bex_project::{
     UnhandledSpawnError,
 };
 use bridge_ctypes::{
-    CffiHandleTableEntry, CffiHandleTableOptions, HANDLE_TABLE,
+    CffiHandleTableEntry, CffiHandleTableOptions, HANDLE_TABLE, InboundOwners, TableKey,
     baml_bridge::cffi::{
         BamlOutboundError, BamlOutboundPanic, BamlOutboundResult, CallFunctionArgs,
         baml_outbound_result, call_function_args::CallTarget,
     },
-    external_to_outbound, kwargs_to_bex_values,
+    external_to_outbound,
 };
 use futures::future::FutureExt;
 use indexmap::IndexMap;
@@ -266,7 +266,9 @@ pub fn error_to_outbound(err: BridgeError) -> Vec<u8> {
         | BridgeError::FunctionHandleTypeArgs
         | BridgeError::FunctionNotFound { .. }
         | BridgeError::MissingArgument { .. }
-        | BridgeError::InvalidCallId) => infra_error_arm(
+        | BridgeError::InvalidCallId
+        | BridgeError::UnknownCallAllocation(_)
+        | BridgeError::InvocationProtocol(_)) => infra_error_arm(
             message_instance(INVALID_ARGUMENT_CLASS, err.to_string()),
             &options,
         ),
@@ -311,50 +313,242 @@ pub fn panic_to_outbound(panic_info: &(dyn std::any::Any + Send)) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// A decoded `CallFunctionArgs` whose target is already pinned.
+/// Adapter input with an owning runtime and a pinned callable target.
+///
+/// This is a request, not the engine's fully bound `PreparedInvocation`.
 ///
 /// Every adapter yields to an executor between decoding a call and running
 /// it. The SDK may release the callable's handle-table key in that gap, so a
 /// handle target is resolved to its heap [`Handle`](bex_project::Handle) here,
-/// while the key is known to be live, and the prepared call keeps that pin
+/// while the key is known to be live, and the request keeps that pin
 /// until the engine has run it.
-pub struct PreparedCall {
-    target: PreparedTarget,
+pub struct InvocationRequest {
+    runtime: Arc<dyn Bex>,
+    _allocation: crate::call_allocation::SubmittedCall,
+    target: InvocationTarget,
     args: BexArgs,
     context: FunctionCallContext,
 }
 
-enum PreparedTarget {
+impl InvocationRequest {
+    /// Python's generated streaming entry retains the originating function
+    /// invocation instead of recording its short-lived handle constructor.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn retain_stream(
+        &mut self,
+    ) -> Result<(bex_project::HostInvocation, u64), BridgeError> {
+        let InvocationTarget::Named(name) = &self.target else {
+            return Err(BridgeError::InvocationProtocol(
+                "stream entry must be named".into(),
+            ));
+        };
+        if !name.ends_with("@stream") {
+            return Err(BridgeError::InvocationProtocol(
+                "expected an LLM stream companion".into(),
+            ));
+        }
+        let capture_inputs = self
+            .context
+            .trace_reservation
+            .as_ref()
+            .map(|reservation| &reservation.options)
+            .or(self.context.trace_options.as_ref())
+            .is_some_and(|options| options.inputs == Some(true));
+        let inputs = capture_inputs.then(|| {
+            bex_project::capture_callback_inputs(&BexExternalValue::Map {
+                entries: self
+                    .args
+                    .required
+                    .iter()
+                    .chain(&self.args.optional)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                key_type: bex_project::WireTy::String,
+                value_type: bex_project::WireTy::Unknown,
+            })
+        });
+        let execution = Arc::clone(&self.runtime)
+            .begin_stream_invocation(name, &self.context, inputs.as_ref())
+            .await?;
+        self.context.inherited_state = Some(execution.inherited_state());
+        self.context.trace_options = Some(bex_project::TraceOptionsData {
+            mode: Some(btel_types::InvocationMode::Hidden),
+            ..Default::default()
+        });
+        self.context.trace_reservation = None;
+        let key = HANDLE_TABLE.insert(CffiHandleTableEntry::InvocationState(
+            bridge_ctypes::InvocationStateHandle {
+                owner: Arc::clone(&self.runtime),
+                state: execution.inherited_state(),
+            },
+        ));
+        Ok((execution, key.get()))
+    }
+
+    /// Identity of the SDK entry, used by adapters to route callbacks to that
+    /// entry's execution environment. The target remains pinned and private.
+    pub fn host_call_id(&self) -> u64 {
+        self.context.host_call_id.0
+    }
+}
+
+enum InvocationTarget {
     Named(String),
     Callable(bex_project::Handle),
 }
 
-/// Decode `CallFunctionArgs` bytes into a [`PreparedCall`].
-pub fn prepare_call(bytes: &[u8]) -> Result<PreparedCall, BridgeError> {
-    let call = CallFunctionArgs::decode(bytes).map_err(bridge_ctypes::CtypesError::from)?;
-    if call.call_id == 0 {
+/// Decode and retain an SDK request without starting runtime execution.
+///
+/// The engine resolves named targets and finishes argument/type preparation
+/// before constructing its own `PreparedInvocation` and attempting admission.
+pub fn decode_invocation_request(bytes: &[u8]) -> Result<InvocationRequest, BridgeError> {
+    // Identify and consume the allocation before control validation. Every
+    // preparation failure then retires its original runtime through this lease.
+    let mut request = CallFunctionArgs::default();
+    // Keep the parsed prefix on failure so a malformed trailing field cannot
+    // strand an identified allocation or already-parsed argument owners.
+    let decoded = request
+        .merge(bytes)
+        .map_err(bridge_ctypes::CtypesError::from);
+    // Input values transfer their wire owners at submission, even if controls
+    // or preparation fail before value decoding: one journal for the request
+    // records every transfer first and releases whatever a refusal leaves.
+    // Borrowed control/target keys are not transfers and are not journaled.
+    // Every part is walked whatever an earlier part's fault, so a refused
+    // request still releases the transfers of the parts after the fault.
+    let mut owners = InboundOwners::new(&HANDLE_TABLE);
+    let kwargs_collected = owners.collect_entries(&request.kwargs);
+    let type_args_collected = owners.collect_type_args(&request.type_args);
+    let cancel_collected = match request.invocation.as_ref().and_then(|o| o.cancel.as_ref()) {
+        Some(cancel) => owners.collect(cancel),
+        None => Ok(()),
+    };
+    let collected = kwargs_collected
+        .and(type_args_collected)
+        .and(cancel_collected);
+    if request.call_id == 0 {
+        decoded?;
         return Err(BridgeError::InvalidCallId);
     }
+    let allocation = crate::CALL_ALLOCATIONS.submit(request.call_id)?;
+    decoded?;
+    collected?;
+    let runtime = allocation.owner().clone();
+    let call = crate::invocation_protocol::decode_call(bytes)?;
     let target = call.call_target.ok_or(BridgeError::MissingCallTarget)?;
     if matches!(target, CallTarget::FunctionHandle(_)) && !call.type_args.is_empty() {
         return Err(BridgeError::FunctionHandleTypeArgs);
     }
-    let type_args = bridge_ctypes::proto_ty_args_to_named(&call.type_args)?;
-    let context = crate::function_call_context_builder(bex_project::CallId(call.call_id))
-        .with_type_args(type_args.type_args)
-        .with_type_defs(type_args.type_defs)
-        .build();
-    let kwargs = kwargs_to_bex_values(call.kwargs, &HANDLE_TABLE)?;
+    // A runtime declaration a type argument names arrives by the host's row
+    // to it, drained here like any transfer the request carries.
+    let type_args = owners.decode_type_args(&call.type_args)?;
+    let mut builder = allocation.context_builder().with_type_args(type_args);
+    let controls = call.invocation.expect("validated controls");
+    builder = builder.with_host_environment(controls.host_environment);
+    if let Some(deadline) = controls.deadline_ns {
+        builder = builder.with_deadline_ns(deadline);
+    }
+    if let Some(inherited_state) = TableKey::new(controls.inherited_state) {
+        let entry = HANDLE_TABLE.resolve(inherited_state).ok_or_else(|| {
+            BridgeError::InvocationProtocol("inherited state is no longer live".into())
+        })?;
+        let CffiHandleTableEntry::InvocationState(state) = &*entry else {
+            return Err(BridgeError::InvocationProtocol(
+                "inherited state needs an invocation-state handle".into(),
+            ));
+        };
+        if !Arc::ptr_eq(&runtime, &state.owner) {
+            return Err(BridgeError::InvocationProtocol(
+                "inherited state belongs to a different runtime".into(),
+            ));
+        }
+        builder = builder.with_inherited_state(state.state.clone());
+    }
+    if let Some(cancel) = request
+        .invocation
+        .as_mut()
+        .and_then(|options| options.cancel.take())
+    {
+        let value = owners.decode(cancel)?;
+        builder = builder.with_cancel_values(vec![value]);
+    }
+    if let Some(trace) = controls.trace {
+        use bridge_ctypes::baml_bridge::cffi::{
+            TraceMode, trace_metadata_value::Value, trace_selection::Selection,
+        };
+        match trace.selection.expect("validated trace selection") {
+            Selection::Reservation(key) => {
+                let entry = TableKey::new(key)
+                    .and_then(|key| HANDLE_TABLE.resolve(key))
+                    .ok_or_else(|| {
+                        BridgeError::InvocationProtocol(
+                            "trace reservation is no longer live".into(),
+                        )
+                    })?;
+                let CffiHandleTableEntry::TraceReservation(reservation) = &*entry else {
+                    return Err(BridgeError::InvocationProtocol(
+                        "trace reservation needs a reservation handle".into(),
+                    ));
+                };
+                if !Arc::ptr_eq(&runtime, &reservation.owner) {
+                    return Err(BridgeError::InvocationProtocol(
+                        "trace reservation belongs to a different runtime".into(),
+                    ));
+                }
+                builder = builder.with_trace_reservation(reservation.reservation.clone());
+            }
+            Selection::Options(options) => {
+                use btel_types::context::{ContextPatch, ContextValue};
+                let patch = ContextPatch {
+                    distinct_id: options.distinct_id,
+                    metadata: options
+                        .metadata
+                        .into_iter()
+                        .map(|(key, value)| {
+                            (
+                                key,
+                                match value.value.expect("validated metadata") {
+                                    Value::StringValue(value) => Some(ContextValue::String(value)),
+                                    Value::IntValue(value) => Some(ContextValue::Int(value)),
+                                    Value::FloatValue(value) => Some(ContextValue::Float(value)),
+                                    Value::BoolValue(value) => Some(ContextValue::Bool(value)),
+                                    Value::Remove(_) => None,
+                                },
+                            )
+                        })
+                        .collect(),
+                };
+                builder = builder.with_trace_options(bex_project::TraceOptionsData {
+                    mode: options.mode.map(|mode| {
+                        match TraceMode::try_from(mode).expect("validated trace mode") {
+                            TraceMode::Hidden => btel_types::InvocationMode::Hidden,
+                            TraceMode::Timing => btel_types::InvocationMode::Timing,
+                            TraceMode::Span => btel_types::InvocationMode::Span,
+                            TraceMode::Unspecified => unreachable!("validated trace mode"),
+                        }
+                    }),
+                    inputs: options.inputs,
+                    output: options.output,
+                    error: options.error,
+                    context: (!patch.is_empty()).then(|| Arc::new(patch)),
+                });
+            }
+        }
+    }
+    let context = runtime.bind_invocation_context(builder.build())?;
+    let kwargs = owners.decode_entries(std::mem::take(&mut request.kwargs))?;
 
     let (target, args) = match target {
-        CallTarget::FunctionName(name) => (PreparedTarget::Named(name), kwargs.into()),
+        CallTarget::FunctionName(name) => (InvocationTarget::Named(name), kwargs.into()),
         CallTarget::FunctionHandle(key) => {
-            let entry = HANDLE_TABLE.resolve(key).ok_or_else(|| {
-                BridgeError::Internal("callable handle is no longer live".to_string())
-            })?;
-            let CffiHandleTableEntry::Adt(bex_project::BexExternalAdt::TaggedHeapHandle {
+            let entry = TableKey::new(key)
+                .and_then(|key| HANDLE_TABLE.resolve(key))
+                .ok_or_else(|| {
+                    BridgeError::Internal("callable handle is no longer live".to_string())
+                })?;
+            let CffiHandleTableEntry::Adt(bridge_ctypes::TableAdt::TaggedHeapHandle {
                 kind: bex_project::TaggedHeapHandleKind::Callable,
-                ty: bex_project::RuntimeTy::Function { params, .. },
+                ty: bex_project::AnnotationTy::Function { params, .. },
                 heap_handle,
             }) = &*entry
             else {
@@ -372,17 +566,19 @@ pub fn prepare_call(bytes: &[u8]) -> Result<PreparedCall, BridgeError> {
                 )
             });
             let args = partition_callable_args(key, params, kwargs.into_iter().collect())?;
-            (PreparedTarget::Callable(heap_handle.clone()), args)
+            (InvocationTarget::Callable(heap_handle.clone()), args)
         }
     };
-    Ok(PreparedCall {
+    Ok(InvocationRequest {
+        runtime,
+        _allocation: allocation,
         target,
         args,
         context,
     })
 }
 
-/// Run a [`PreparedCall`] and encode the result as `BamlOutboundResult` bytes.
+/// Run an [`InvocationRequest`] and encode the result as `BamlOutboundResult` bytes.
 ///
 /// The `catch_unwind` boundary wraps the engine call so a Rust panic surfaces
 /// as a `baml.panics.SdkPanic` ⇒ `BamlOutboundPanic` (a catchable `BamlPanic`
@@ -391,17 +587,21 @@ pub fn prepare_call(bytes: &[u8]) -> Result<PreparedCall, BridgeError> {
 /// point keeps its own outer `catch_unwind` for that (encoding via
 /// [`panic_to_outbound`]), and the PyO3 glue lets it become pyo3's
 /// `PanicException`.
-pub async fn invoke_prepared(runtime: Arc<dyn Bex>, call: PreparedCall) -> Vec<u8> {
+pub async fn execute_invocation(call: InvocationRequest) -> Vec<u8> {
     let options = CffiHandleTableOptions::for_wire();
-    let _route = crate::register_active_call_runtime(call.context.host_call_id.0, &runtime);
+    let InvocationRequest {
+        runtime,
+        _allocation,
+        target,
+        args,
+        context,
+    } = call;
 
     let caught = AssertUnwindSafe(async move {
-        match call.target {
-            PreparedTarget::Named(name) => {
-                runtime.call_function(&name, call.args, call.context).await
-            }
-            PreparedTarget::Callable(handle) => {
-                runtime.call_callable(handle, call.args, call.context).await
+        match target {
+            InvocationTarget::Named(name) => runtime.call_function(&name, args, context).await,
+            InvocationTarget::Callable(handle) => {
+                runtime.call_callable(handle, args, context).await
             }
         }
     })

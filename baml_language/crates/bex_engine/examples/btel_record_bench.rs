@@ -1,7 +1,7 @@
 //! Fixed-work recording benchmark, run by `tools/btel_query_bench.py`.
 //!
 //! `MODE WORKLOAD ROOTS PROJECT [PAYLOAD_BYTES] [TARGET_BYTES]`. Records into
-//! `PROJECT/.baml/btel` exactly like `baml run`, so `baml query --from PROJECT`
+//! `PROJECT/.baml/btel` exactly like `baml run`, so `baml query --project-dir PROJECT`
 //! reads the result. Uses only engine APIs that also exist on the base commit,
 //! so the same file measures the recorder before and after this branch.
 //! Adapted from the archived SQLite-recorder experiment's harness.
@@ -50,7 +50,15 @@ fn usage() -> (f64, u64) {
     let micros = u32::try_from(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec)
         .expect("two sub-second microsecond counts fit in u32");
     let cpu = usage.ru_utime.tv_sec as f64 + usage.ru_stime.tv_sec as f64 + f64::from(micros) / 1e6;
-    (cpu, usage.ru_maxrss as u64 * 1024)
+    // `ru_maxrss` is bytes on Apple platforms and kilobytes elsewhere
+    // (`man getrusage`).
+    let peak_rss = u64::try_from(usage.ru_maxrss).expect("peak RSS is not negative");
+    let peak_rss_bytes = if cfg!(target_vendor = "apple") {
+        peak_rss
+    } else {
+        peak_rss * 1024
+    };
+    (cpu, peak_rss_bytes)
 }
 
 /// Not measured without `getrusage`.
@@ -131,12 +139,12 @@ async fn main() {
     let mut program = baml_db::testing::compile_source(&source);
     for object in &mut program.objects.0 {
         if let bex_vm_types::Object::Function(function) = object
-            && function.name.rsplit('.').next() == Some("capture")
+            && function
+                .declared_name()
+                .is_some_and(|declared| declared == "capture")
         {
             // Real VM input/output capture without network/LLM noise.
-            function.body_meta = Some(bex_vm_types::FunctionMeta::Llm {
-                client: "benchmark".into(),
-            });
+            function.body_meta = Some(bex_vm_types::FunctionMeta::Llm);
         }
     }
     let startup = Instant::now();
@@ -196,9 +204,7 @@ async fn main() {
         };
         assert_eq!(result, BexExternalValue::Int(expected));
         if (i + 1) % 8 == 0 {
-            engine
-                .collect_garbage(bex_heap::CollectionLevel::Major)
-                .await;
+            engine.collect_garbage().await;
         }
     }
     let execution_s = start.elapsed().as_secs_f64();

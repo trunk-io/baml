@@ -6,9 +6,9 @@
 //! CST `Option` handling in one layer so everything downstream gets clean
 //! typed data and can be constructed directly in tests without parsing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
-use baml_base::{Name, TypePath};
+use baml_base::{Name, Path};
 use la_arena::{Arena, Idx};
 use text_size::TextRange;
 
@@ -40,7 +40,7 @@ pub struct RawAttributeArg {
 pub enum TypeExprKind {
     /// Named type path: `User`, `baml.http.Request`, `Stream<T>`
     Path {
-        segments: Vec<Name>,
+        path: Path,
         /// Generic type arguments (e.g., `<T>` in `Stream<T>`). Empty for non-generic paths.
         generic_args: Vec<TypeExpr>,
         /// Named associated type bindings in type positions, e.g. `Iterator<Item = int>`.
@@ -60,8 +60,6 @@ pub enum TypeExprKind {
     Bool,
     Null,
     Never,
-    /// The `void` type — valid only as a function return type.
-    Void,
     /// `Uint8Array` (binary data) type
     Uint8Array,
     /// Media types
@@ -85,6 +83,9 @@ pub enum TypeExprKind {
     Union {
         variants: Vec<TypeExpr>,
     },
+    Tuple {
+        elements: Vec<TypeExpr>,
+    },
     /// Literal types in unions: `"user"`, `200`, `3.14`, `true`.
     Literal {
         value: baml_base::Literal,
@@ -101,8 +102,6 @@ pub enum TypeExprKind {
     Unknown,
     /// The `type` meta-type keyword
     Type,
-    /// `$rust_type` — opaque Rust-managed state field type.
-    Rust,
     /// Error recovery sentinel
     Error,
     /// No type was written at this slot (an omitted annotation), as distinct
@@ -221,6 +220,11 @@ impl TypeExpr {
                     variant.collect_spans(out);
                 }
             }
+            TypeExprKind::Tuple { elements } => {
+                for element in elements {
+                    element.collect_spans(out);
+                }
+            }
             TypeExprKind::Function {
                 params,
                 ret,
@@ -243,8 +247,6 @@ impl TypeExpr {
             | TypeExprKind::Null
             | TypeExprKind::Uint8Array
             | TypeExprKind::Never
-            | TypeExprKind::Void
-            | TypeExprKind::Rust
             | TypeExprKind::Literal { .. }
             | TypeExprKind::Media { .. }
             | TypeExprKind::Unknown
@@ -283,17 +285,17 @@ impl std::fmt::Display for TypeExprKind {
 
         match self {
             TypeExprKind::Path {
-                segments,
+                path,
                 generic_args,
                 associated_type_bindings,
                 ..
             } => {
-                let path = segments
+                let dotted = path
                     .iter()
                     .map(smol_str::SmolStr::as_str)
                     .collect::<Vec<_>>()
                     .join(".");
-                write!(f, "{path}")?;
+                write!(f, "{dotted}")?;
                 if !generic_args.is_empty() || !associated_type_bindings.is_empty() {
                     write!(f, "<")?;
                     let mut first = true;
@@ -335,7 +337,6 @@ impl std::fmt::Display for TypeExprKind {
             TypeExprKind::Bool => write!(f, "bool"),
             TypeExprKind::Null => write!(f, "null"),
             TypeExprKind::Never => write!(f, "never"),
-            TypeExprKind::Void => write!(f, "void"),
             TypeExprKind::Uint8Array => write!(f, "uint8array"),
             TypeExprKind::Media { kind, .. } => write!(f, "{}", format!("{kind:?}").to_lowercase()),
             TypeExprKind::Optional { inner, .. } => {
@@ -359,6 +360,19 @@ impl std::fmt::Display for TypeExprKind {
                     }
                 }
                 Ok(())
+            }
+            TypeExprKind::Tuple { elements } => {
+                write!(f, "(")?;
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                if elements.len() == 1 {
+                    write!(f, ",")?;
+                }
+                write!(f, ")")
             }
             TypeExprKind::Literal { value, .. } => write!(f, "{value}"),
             TypeExprKind::Function {
@@ -392,7 +406,6 @@ impl std::fmt::Display for TypeExprKind {
             }
             TypeExprKind::Unknown => write!(f, "unknown"),
             TypeExprKind::Type => write!(f, "reflect.Type"),
-            TypeExprKind::Rust => write!(f, "$rust_type"),
             TypeExprKind::Error => write!(f, "error"),
             TypeExprKind::Missing => write!(f, "?"),
             TypeExprKind::Infer => write!(f, "_"),
@@ -432,6 +445,7 @@ pub struct AssociatedTypeBinding {
 pub struct GenericParam {
     pub name: Name,
     pub bounds: Vec<TypeExpr>,
+    pub name_span: TextRange,
 }
 
 // ── Expression Bodies ───────────────────────────────────────────
@@ -458,6 +472,12 @@ pub struct ExprBody {
     pub catch_arms: Arena<CatchArm>,
     /// Type annotations on let bindings etc.
     pub type_annotations: Arena<TypeExpr>,
+    /// Every `${expr}` a tagged template hands its tag as a value, in source
+    /// order. A tag takes its values as they are, so what holds of them is
+    /// checked here rather than at a parameter; and an LLM function's
+    /// `prompt:` is flattened in place with no [`Expr::Template`] of its own
+    /// to find them through.
+    pub tag_values: Vec<ExprId>,
     /// Root expression of the function body.
     pub root_expr: Option<ExprId>,
 }
@@ -471,6 +491,7 @@ impl Default for ExprBody {
             match_arms: Arena::new(),
             catch_arms: Arena::new(),
             type_annotations: Arena::new(),
+            tag_values: Vec::new(),
             root_expr: None,
         }
     }
@@ -589,10 +610,74 @@ impl ExprBody {
                     format!("{}`…`", self.display_expr_inner(*tag, depth + 1))
                 }
             },
+            Expr::Tuple { elements } => {
+                let elems: Vec<_> = elements
+                    .iter()
+                    .map(|e| self.display_expr_inner(*e, depth + 1))
+                    .collect();
+                match elems.as_slice() {
+                    [only] => format!("({only},)"),
+                    _ => format!("({})", elems.join(", ")),
+                }
+            }
             Expr::Literal(lit) => lit.to_string(),
             Expr::Null => "null".to_string(),
             _ => "...".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod display_expr_tests {
+    use super::*;
+
+    fn path(body: &mut ExprBody, name: &str) -> ExprId {
+        body.exprs
+            .alloc(Expr::Path(Path::new(vec![Name::new(name)])))
+    }
+
+    fn int(body: &mut ExprBody, value: i64) -> ExprId {
+        body.exprs.alloc(Expr::Literal(Literal::Int(value)))
+    }
+
+    #[test]
+    fn tuples_and_tuple_access_render_as_source() {
+        let mut body = ExprBody::default();
+        let a = path(&mut body, "a");
+        let b = path(&mut body, "b");
+        let pair = body.exprs.alloc(Expr::Tuple {
+            elements: vec![a, b],
+        });
+        let single = body.exprs.alloc(Expr::Tuple { elements: vec![a] });
+        assert_eq!(body.display_expr(pair), "(a, b)");
+        assert_eq!(body.display_expr(single), "(a,)");
+
+        let zero = int(&mut body, 0);
+        let one = int(&mut body, 1);
+        let first = body.exprs.alloc(Expr::Index {
+            base: single,
+            index: zero,
+        });
+        let nested = body.exprs.alloc(Expr::Index {
+            base: first,
+            index: one,
+        });
+        assert_eq!(body.display_expr(nested), "(a,)[0][1]");
+
+        let t = path(&mut body, "t");
+        let i = path(&mut body, "i");
+        let sum = body.exprs.alloc(Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        let computed = body.exprs.alloc(Expr::Index {
+            base: t,
+            index: sum,
+        });
+        assert_eq!(body.display_expr(computed), "t[i + 1]");
+        let optional = body.exprs.alloc(Expr::OptionalIndex { base: t, index: i });
+        assert_eq!(body.display_expr(optional), "t?.[i]");
     }
 }
 
@@ -611,10 +696,10 @@ pub struct AstSourceMap {
     /// than highlight the binding, so the two spans cannot be the same
     /// entry. Absent for binds the compiler synthesizes, which have no name
     /// token to point at.
-    pub bind_name_spans: HashMap<PatId, TextRange>,
-    /// The NAME token of each body `type T = …` binding, as distinct from its
+    pub bind_name_spans: BTreeMap<PatId, TextRange>,
+    /// The NAME token of each body `let type T = …` binding, as distinct from its
     /// statement's span. Absent when the statement has no name token.
-    pub type_binding_name_spans: HashMap<StmtId, TextRange>,
+    pub type_binding_name_spans: BTreeMap<StmtId, TextRange>,
     pub match_arm_spans: Arena<TextRange>,
     pub type_annotation_spans: Arena<TextRange>,
     pub catch_arm_spans: Arena<TextRange>,
@@ -623,18 +708,18 @@ pub struct AstSourceMap {
     /// receiver, differing only in how the receiver is written, so both
     /// record it here — an editor asking "what name is at this offset"
     /// must not have to know which spelling produced it.
-    pub member_access_member_spans: HashMap<ExprId, TextRange>,
+    pub member_access_member_spans: BTreeMap<ExprId, TextRange>,
     /// For multi-segment `Path` expressions, per-segment spans.
     /// `path_segment_spans[expr_id][i]` is the `TextRange` of `segments[i]`.
-    pub path_segment_spans: HashMap<ExprId, Vec<TextRange>>,
+    pub path_segment_spans: BTreeMap<ExprId, Vec<TextRange>>,
     /// For labeled call arguments, the span of the label name keyed by
     /// `(call_expr_id, argument_expr_id)`.
-    pub call_arg_label_spans: HashMap<(ExprId, ExprId), TextRange>,
+    pub call_arg_label_spans: BTreeMap<(ExprId, ExprId), TextRange>,
     /// For object-constructor fields, the span of the field name keyed by
     /// `(object_expr_id, value_expr_id)`.
-    pub object_field_name_spans: HashMap<(ExprId, ExprId), TextRange>,
+    pub object_field_name_spans: BTreeMap<(ExprId, ExprId), TextRange>,
     /// For lambda expressions, the spans of their parameter names in declaration order.
-    pub lambda_parameter_spans: HashMap<ExprId, Vec<TextRange>>,
+    pub lambda_parameter_spans: BTreeMap<ExprId, Vec<TextRange>>,
     /// Ids of compiler-synthesized nodes — desugarings that have no
     /// user-written source of their own (e.g. the `string.from(${…})` wrapper
     /// and the concat accumulator that backtick interpolation lowers to). Their
@@ -644,9 +729,9 @@ pub struct AstSourceMap {
     /// uniform replacement for fragile structural heuristics (e.g. comparing a
     /// call's span to its callee's). Populated at the `alloc_*` chokepoints
     /// during lowering, via a scoped "synthesizing" flag.
-    pub synthetic_exprs: HashSet<ExprId>,
-    pub synthetic_stmts: HashSet<StmtId>,
-    pub synthetic_patterns: HashSet<PatId>,
+    pub synthetic_exprs: BTreeSet<ExprId>,
+    pub synthetic_stmts: BTreeSet<StmtId>,
+    pub synthetic_patterns: BTreeSet<PatId>,
 }
 
 impl AstSourceMap {
@@ -655,19 +740,19 @@ impl AstSourceMap {
             expr_spans: Arena::new(),
             stmt_spans: Arena::new(),
             pattern_spans: Arena::new(),
-            bind_name_spans: HashMap::new(),
-            type_binding_name_spans: HashMap::new(),
+            bind_name_spans: BTreeMap::new(),
+            type_binding_name_spans: BTreeMap::new(),
             match_arm_spans: Arena::new(),
             type_annotation_spans: Arena::new(),
             catch_arm_spans: Arena::new(),
-            member_access_member_spans: HashMap::new(),
-            path_segment_spans: HashMap::new(),
-            call_arg_label_spans: HashMap::new(),
-            object_field_name_spans: HashMap::new(),
-            lambda_parameter_spans: HashMap::new(),
-            synthetic_exprs: HashSet::new(),
-            synthetic_stmts: HashSet::new(),
-            synthetic_patterns: HashSet::new(),
+            member_access_member_spans: BTreeMap::new(),
+            path_segment_spans: BTreeMap::new(),
+            call_arg_label_spans: BTreeMap::new(),
+            object_field_name_spans: BTreeMap::new(),
+            lambda_parameter_spans: BTreeMap::new(),
+            synthetic_exprs: BTreeSet::new(),
+            synthetic_stmts: BTreeSet::new(),
+            synthetic_patterns: BTreeSet::new(),
         }
     }
 
@@ -765,7 +850,7 @@ impl AstSourceMap {
         self.bind_name_spans.get(&id).copied()
     }
 
-    /// The name token of a body `type T = …` binding, when it was written.
+    /// The name token of a body `let type T = …` binding, when it was written.
     pub fn type_binding_name_span(&self, id: StmtId) -> Option<TextRange> {
         self.type_binding_name_spans.get(&id).copied()
     }
@@ -796,13 +881,12 @@ impl Default for AstSourceMap {
     }
 }
 
-/// How a property value was written in source.
+/// How a class property value was written in source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PropertySyntax {
-    /// An explicit key/value pair such as `{ "name": value }` or
-    /// `Config { name: value }`.
+    /// An explicit field such as `Config { name: value }`.
     Explicit,
-    /// A shorthand property such as `{ name }` or `Config { name }`.
+    /// A shorthand property such as `Config { name }`.
     Shorthand,
 }
 
@@ -835,24 +919,11 @@ impl ObjectExprField {
 pub struct MapExprEntry {
     pub key: ExprId,
     pub value: ExprId,
-    pub syntax: PropertySyntax,
 }
 
 impl MapExprEntry {
     pub fn explicit(key: ExprId, value: ExprId) -> Self {
-        Self {
-            key,
-            value,
-            syntax: PropertySyntax::Explicit,
-        }
-    }
-
-    pub fn shorthand(key: ExprId, value: ExprId) -> Self {
-        Self {
-            key,
-            value,
-            syntax: PropertySyntax::Shorthand,
-        }
+        Self { key, value }
     }
 }
 
@@ -864,8 +935,9 @@ pub enum Expr {
     /// Stores the fully-resolved bytes (escape sequences already processed).
     ByteStringLiteral(Vec<u8>),
     Null,
-    /// Path expression: `x`, `user.name`, `Status.Active`
-    Path(Vec<Name>),
+    /// Path expression: `x`, `user.name`, `Status.Active` — with who wrote
+    /// it, which decides how its first segment is read.
+    Path(Path),
     /// Generic instantiation as a value: `foo<int>` — a generic callable
     /// referenced with explicit type arguments but NOT called. The result is
     /// the specialized function value (`(int) -> int`). Distinct from
@@ -908,9 +980,11 @@ pub enum Expr {
         scrutinee: ExprId,
         pattern: PatId,
     },
+    /// One protected expression and one handler. Chained catches nest these
+    /// nodes, so a later handler also protects earlier handler bodies.
     Catch {
         base: ExprId,
-        clauses: Vec<CatchClause>,
+        clause: CatchClause,
     },
     Throw {
         value: ExprId,
@@ -950,7 +1024,7 @@ pub enum Expr {
         /// object literal when a type name precedes the brace
         /// (`looks_like_object_constructor`), so a name-less `{ .. }` is a map or
         /// block, never an object literal.
-        type_name: TypePath,
+        type_name: Path,
         /// Explicit generic type args from syntax like `Foo<int> { ... }`.
         /// Empty when no `<...>` was written (e.g. bare `Foo { ... }`).
         type_args: Vec<TypeExpr>,
@@ -958,6 +1032,9 @@ pub enum Expr {
         spreads: Vec<SpreadField>,
     },
     Array {
+        elements: Vec<ExprId>,
+    },
+    Tuple {
         elements: Vec<ExprId>,
     },
     Map {
@@ -1092,6 +1169,19 @@ pub enum TemplateSegment {
     /// A `${expr}` interpolation. The wrapped `ExprId` is the lowered
     /// inner expression (already a block expression per BEP §4).
     Interp(ExprId),
+    /// A `${…}` that produces no value (BEP §4): a block with no final
+    /// expression, or one ending in an `if` with no `else`. It contributes
+    /// nothing to the template, neither text nor a value for a tag, and runs
+    /// for its effects in the template's own scope, so a `let` it makes is
+    /// visible to the segments after it.
+    Effect {
+        /// The interpolation as written. It locates the segment in the
+        /// source and is not itself evaluated.
+        block: ExprId,
+        /// What runs in its place: the block's statements, its final
+        /// expression (if any) last and held to the unit type.
+        stmts: Vec<StmtId>,
+    },
     /// A `${for (let p in c)}...${endfor}` block (iterator form).
     For {
         binding: PatId,
@@ -1143,28 +1233,23 @@ impl CallArg {
     }
 }
 
-/// The right-hand side of a body-level `type T = …;` binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeBindingValue {
-    /// `unreflect(expr)`: the runtime type is the `reflect.Type` value the
-    /// operand evaluates to, evaluated once when the statement runs.
-    Runtime(ExprId),
-    /// A static type: the runtime type is its template, realized in the
-    /// enclosing frame when the statement runs.
-    Static(TypeExpr),
-}
-
 /// Statements — modeled after `Stmt` in `body.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Expr(ExprId),
-    /// `type T = …;` inside a body: bind a rigid, block-scoped type parameter
-    /// `T` for the remainder of the enclosing block. The parameter is opaque
-    /// to static checking either way; only where its runtime type comes from
-    /// differs (see [`TypeBindingValue`]).
+    /// `let type T [extends A & B] = operand [else { … }];` inside a body:
+    /// bind a rigid, block-scoped type parameter `T` for the remainder of the
+    /// enclosing block. Its runtime type is the `reflect.Type` (or
+    /// `reflect.TypeView`) `operand` evaluates to, evaluated once when the
+    /// statement runs. `T` is opaque to static checking apart from its
+    /// `bounds`, which the statement checks at run time: a type that misses
+    /// one runs `else_branch`, which must diverge and which a bounded
+    /// statement must have.
     TypeBinding {
         name: Name,
-        value: TypeBindingValue,
+        operand: ExprId,
+        bounds: Vec<TypeExpr>,
+        else_branch: Option<ExprId>,
     },
     Let {
         /// The binding pattern. A `: T` annotation lives inside the pattern
@@ -1276,7 +1361,10 @@ pub enum Pattern {
     /// Progressive widening like `let x: int: float` is naturally
     /// impossible because `Pattern::Type` doesn't itself have a sub-
     /// pattern slot.
-    Bind { name: Name, subpat: Option<PatId> },
+    Bind {
+        name: Name,
+        subpat: Option<PatId>,
+    },
     /// `pkg.Foo { a, b: <pat>, ... }` — class destructure. `class` is the
     /// dotted path as segments (single-element vec for unqualified names).
     /// Class destructures cannot carry `: T` ascriptions.
@@ -1298,6 +1386,7 @@ pub enum Pattern {
         suffix: Vec<PatId>,
         ascription: Option<TypeExpr>,
     },
+    Tuple(Vec<PatId>),
     /// Bare type expression in pattern position. Subsumes literal patterns
     /// (`42`, `"hi"`, `true`), `null`, enum variants (`Status.Active`),
     /// path types, generics, function types, etc. — anything in `TypeExpr`.
@@ -1398,6 +1487,11 @@ impl Pattern {
                     patterns[*id].collect_bound_names(patterns, out);
                 }
             }
+            Pattern::Tuple(elements) => {
+                for id in elements {
+                    patterns[*id].collect_bound_names(patterns, out);
+                }
+            }
             // Pick any one alternative to report — the uniformity check is
             // the caller's job.
             Pattern::Or(parts) => {
@@ -1416,18 +1510,56 @@ pub struct MatchArm {
     pub body: ExprId,
 }
 
+/// Every catch clause creates its own protected expression and handler. The
+/// three keywords select the [`CatchClauseKind::requires_error_coverage`]
+/// and [`CatchClauseKind::wildcard_traps_panics`] policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CatchClauseKind {
+    /// `catch`: handles the listed errors; the rest keep propagating.
     Catch,
+    /// `catch_all`: must handle every error the protected expression can
+    /// still throw.
     CatchAll,
+    /// `catch_all_panics`: `catch_all`, plus its arms must handle panics,
+    /// which its wildcard arms receive.
     CatchAllPanics,
+}
+
+impl CatchClauseKind {
+    /// The clause keyword as written in source.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            CatchClauseKind::Catch => "catch",
+            CatchClauseKind::CatchAll => "catch_all",
+            CatchClauseKind::CatchAllPanics => "catch_all_panics",
+        }
+    }
+
+    /// Whether the clause's arms must cover every error that reaches it
+    /// (E0062 otherwise). The clause's own arm-body errors may still propagate.
+    pub fn requires_error_coverage(self) -> bool {
+        !matches!(self, CatchClauseKind::Catch)
+    }
+
+    /// Whether a wildcard arm (`_`, a bare `let x`) of this clause receives
+    /// panics. Elsewhere a panic passes over wildcard arms and is only
+    /// caught by an arm that names its type.
+    pub fn wildcard_traps_panics(self) -> bool {
+        matches!(self, CatchClauseKind::CatchAllPanics)
+    }
+
+    /// Whether the clause's arms must also cover every panic (E0062
+    /// otherwise): the boundary promise of `catch_all_panics`.
+    pub fn requires_panic_coverage(self) -> bool {
+        matches!(self, CatchClauseKind::CatchAllPanics)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchClause {
     pub kind: CatchClauseKind,
     pub binding: PatId,
-    /// Optional second binding for the stack trace: `catch (e, st) { ... }`
+    /// Optional second binding for the error context: `catch (e, ctx) { ... }`
     pub stack_trace_binding: Option<PatId>,
     pub arms: Vec<CatchArmId>,
 }
@@ -1469,6 +1601,10 @@ pub enum FunctionOrigin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionMetadata {
+    /// Retain call tracing controls without an automatic invocation span.
+    pub trace_passthrough: bool,
+    /// Source directive (as opposed to compiler-generated metadata), for validation.
+    pub explicit_trace_passthrough: bool,
     pub origin: FunctionOrigin,
     /// Marks compiler/runtime implementation details that are outside BAML's
     /// user-facing language surface.
@@ -1484,6 +1620,8 @@ impl FunctionMetadata {
         Self {
             origin,
             is_language_internal: false,
+            trace_passthrough: false,
+            explicit_trace_passthrough: false,
         }
     }
 
@@ -1491,6 +1629,8 @@ impl FunctionMetadata {
         Self {
             origin,
             is_language_internal: true,
+            trace_passthrough: false,
+            explicit_trace_passthrough: false,
         }
     }
 }
@@ -1616,6 +1756,13 @@ pub enum DeclarativeMeta {
     Llm(LlmBodyDef),
 }
 
+/// A trace hook attached with `/// baml:$trace=path.to.hook`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceHookDirective {
+    pub path: Vec<Name>,
+    pub span: TextRange,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDef {
     pub name: Name,
@@ -1631,13 +1778,69 @@ pub struct FunctionDef {
     pub attributes: Vec<RawAttribute>,
     /// Joined `///` doc-comment lines preceding this declaration.
     pub docstring: Option<std::string::String>,
+    /// The title of the `//#` header line directly above this declaration,
+    /// without its `#`s; the control-flow visualizer labels the function
+    /// with it. `None` for a function without one, or an empty title.
+    pub header_title: Option<std::string::String>,
     /// True when this fn is preceded by a `//baml:tagged_string` marker
     /// comment. BEP-049 §10: such fns are callable as tagged template
     /// tags (a tag name immediately followed by a backtick literal), and
     /// their first parameter must be `body: (...) -> TaggedString`.
     pub is_tagged_template_tag: bool,
+    /// The `//baml:` directives a native function is declared with.
+    pub directives: NativeDirectives,
+    /// Declaration-only trace policy; resolved in the declaration scope.
+    pub trace_hook: Option<TraceHookDirective>,
     pub span: TextRange,
     pub name_span: TextRange,
+}
+
+/// A `//baml:` directive a native function is declared with, read by the
+/// builtin codegen: how its `$rust_function` glue is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeDirective {
+    /// `//baml:mut_self`: the glue takes `&mut self`.
+    MutSelf,
+    /// `//baml:vm`: the glue takes the VM.
+    Vm,
+    /// `//baml:mut_vm`: the glue takes the VM mutably.
+    MutVm,
+    /// `//baml:may_yield`: the glue may yield.
+    MayYield,
+    /// `//baml:fallible`: the glue may fail.
+    Fallible,
+    /// `//baml:local_twin`: the function has a local twin.
+    LocalTwin,
+    /// `//baml:runtime_only`: only the running engine calls the function, as
+    /// it takes state only the runtime builds.
+    RuntimeOnly,
+}
+
+impl NativeDirective {
+    const fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+/// The set of [`NativeDirective`]s written on a function. Each is a fact of
+/// the declaration; the codegen combines them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeDirectives(u8);
+
+impl NativeDirectives {
+    /// No directives.
+    pub const NONE: Self = Self(0);
+
+    /// This set with `directive` in it.
+    #[must_use]
+    pub const fn with(self, directive: NativeDirective) -> Self {
+        Self(self.0 | directive.bit())
+    }
+
+    /// Whether `directive` was written.
+    pub const fn has(self, directive: NativeDirective) -> bool {
+        self.0 & directive.bit() != 0
+    }
 }
 
 /// What produced a [`LambdaDef`], where that changes how TIR types it.
@@ -1773,6 +1976,10 @@ pub struct LlmBodyDef {
     /// desugared spec body's aliased spans. `None` when the prompt was
     /// unusable.
     pub prompt_spans: Option<LlmPromptSpans>,
+    /// The prompt template as written, before it is flattened into the
+    /// `"spec"` companion body. Its `ExprId`s index that body. Empty when the
+    /// spec body was not synthesized.
+    pub prompt_segments: Vec<TemplateSegment>,
     /// True when the function's `tools` field can hold tools at runtime:
     /// any value other than an absent field or a literal empty list (`tools
     /// []`). A non-literal expression (`tools: shared()`) counts as `true`
@@ -1813,8 +2020,6 @@ pub struct ClassDef {
     pub generic_params: Vec<GenericParam>,
     pub fields: Vec<FieldDef>,
     pub methods: Vec<FunctionDef>,
-    /// `implements I { ... }` blocks declared inside the class body (BEP-044).
-    pub implements: Vec<ImplementsBlockDef>,
     pub attributes: Vec<RawAttribute>,
     /// Joined `///` doc-comment lines preceding this declaration.
     pub docstring: Option<std::string::String>,
@@ -1824,8 +2029,8 @@ pub struct ClassDef {
 
 /// Definition of an `interface` declaration (BEP-044).
 ///
-/// Interfaces declare a contract over fields and methods. Classes opt in to
-/// the contract via [`ImplementsBlockDef`] inside the class body.
+/// Interfaces declare a contract over fields and methods. Types opt in to
+/// the contract with an `implements` block ([`ImplementsForDef`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceDef {
     pub name: Name,
@@ -1865,25 +2070,6 @@ pub struct MethodSigDef {
     pub name_span: TextRange,
 }
 
-/// One `implements I { ... }` block inside a class body (BEP-044).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImplementsBlockDef {
-    /// The target interface, captured as a `TypeExpr` so we can accept generic
-    /// parameterization like `implements Container<int>`. The path's first
-    /// segment is the interface name.
-    pub target: TypeExpr,
-    /// Explicit mappings from interface fields to class fields:
-    /// `interface_field as class_field`.
-    pub field_links: Vec<InterfaceFieldLinkDef>,
-    /// Associated type bindings, e.g. `type Item = int`.
-    pub associated_type_bindings: Vec<AssociatedTypeBindingDef>,
-    /// Method overrides / definitions inside this `implements` block.
-    pub methods: Vec<FunctionDef>,
-    /// True when this block came from top-level `implements I for T`.
-    pub is_out_of_body: bool,
-    pub span: TextRange,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceFieldLinkDef {
     pub interface_field: Name,
@@ -1893,7 +2079,23 @@ pub struct InterfaceFieldLinkDef {
     pub class_field_span: TextRange,
 }
 
-/// Top-level `implements I for T { ... }` block (BEP-044).
+/// Where an `implements` block was written. The in-body spelling is
+/// shorthand for the out-of-body one (`TYPE_SYSTEM.md`, "Interface
+/// Implementations"); the origin is kept for the rules that read it — an
+/// interface with fields can only be implemented in-body — and must not
+/// influence resolution, dispatch or coherence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImplOrigin {
+    /// `class C<T> { implements I { … } }`: the block's generics are the
+    /// class's and its for-target is `C<T>`.
+    InBody,
+    /// `implements<…> I for T { … }` at the top level.
+    OutOfBody,
+}
+
+/// An `implements` block (BEP-044), in either spelling: `implements I for T
+/// { ... }` at the top level, or `implements I { ... }` inside the body of
+/// the class it is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImplementsForDef {
     /// Generic type parameters on the implements block, each with its set of
@@ -1910,8 +2112,75 @@ pub struct ImplementsForDef {
     pub associated_type_bindings: Vec<AssociatedTypeBindingDef>,
     /// Method definitions inside the block.
     pub methods: Vec<FunctionDef>,
+    pub origin: ImplOrigin,
     pub span: TextRange,
     pub docstring: Option<String>,
+}
+
+impl ImplementsForDef {
+    /// Whether this block implements for `class` itself; see
+    /// [`impl_is_for_class`].
+    pub fn is_for_class(&self, class: &ClassDef) -> bool {
+        impl_is_for_class(
+            self.origin,
+            self.generic_params.is_empty(),
+            &self.for_target,
+            &class.name,
+        )
+    }
+}
+
+/// Whether an `implements` block with these parts implements for the class
+/// named `class_name` itself: written in its body, or written out-of-body for
+/// exactly that class (no generics on the block, the class named bare). Such a
+/// block's generics are the class's and its for-type is the class applied to
+/// them; everything else is a free implementation with a for-type of its own.
+/// The ONE rule, read by the AST's consumers and by HIR's `class_impls`.
+pub fn impl_is_for_class(
+    origin: ImplOrigin,
+    no_generics: bool,
+    for_target: &TypeExpr,
+    class_name: &Name,
+) -> bool {
+    let TypeExprKind::Path {
+        path, generic_args, ..
+    } = &for_target.kind
+    else {
+        return false;
+    };
+    match origin {
+        ImplOrigin::InBody => path.last() == Some(class_name),
+        ImplOrigin::OutOfBody => {
+            no_generics
+                && generic_args.is_empty()
+                && matches!(path.segments(), [name] if name == class_name)
+        }
+    }
+}
+
+/// The type a class's in-body `implements` blocks are for: the class applied
+/// to its own generic parameters (`C<T, U>`), spanning its name.
+pub fn class_self_type(
+    class_name: &Name,
+    generic_params: &[GenericParam],
+    span: TextRange,
+) -> TypeExpr {
+    TypeExprKind::Path {
+        path: Path::bare(class_name.clone()),
+        generic_args: generic_params
+            .iter()
+            .map(|param| {
+                TypeExprKind::Path {
+                    path: Path::bare(param.name.clone()),
+                    generic_args: Vec::new(),
+                    associated_type_bindings: Vec::new(),
+                }
+                .at(param.name_span)
+            })
+            .collect(),
+        associated_type_bindings: Vec::new(),
+    }
+    .at(span)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1975,14 +2244,23 @@ pub struct TypeAliasDef {
     pub docstring: Option<String>,
 }
 
-/// A top-level let binding. Source `let` declarations and compiler-generated
-/// client bindings share the same `$init` pipeline.
+/// A top-level let binding: a global variable (`const NAME: T = expr;` at file
+/// scope), a compiler-generated client binding (`client Name = expr;`), or a
+/// Session submission's persisted root binding. All three share the `$init`
+/// pipeline: the initializer runs once, before any request, and the binding is
+/// immutable afterwards.
 /// Carries an optional `ExprBody` initializer that flows through TIR type-checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LetDef {
     pub name: Name,
+    /// The written `: T`, when the declaration has one. The binding's type is
+    /// this annotation, which the initializer is checked against; without one
+    /// it is the initializer's own (widened) type.
+    pub type_annotation: Option<TypeExpr>,
     pub initializer: Option<(ExprBody, AstSourceMap)>,
     pub origin: LetOrigin,
+    /// Joined `///` doc-comment lines preceding this declaration.
+    pub docstring: Option<String>,
     pub span: TextRange,
     pub name_span: TextRange,
 }

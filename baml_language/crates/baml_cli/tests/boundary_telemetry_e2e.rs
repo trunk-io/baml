@@ -3,7 +3,7 @@ mod common;
 
 use std::{path::Path, process::Command};
 
-use btel_bcs::{proto::CloudUploadEnvelope, wire::PrepareUploadsRequest};
+use btel_core::upload::{PrepareUploadsRequest, envelope::UploadEnvelope};
 use prost::Message as _;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
@@ -16,23 +16,118 @@ mod cloud_protocol;
 const KEY: &str = "bml_cli_test_key";
 const RECORDINGS: &str = ".baml/btel/recordings";
 
-fn run(project: &Path, boundary_url: &str, telemetry: &str) {
+/// Extract one complete Boundary diagnostic, excluding unrelated command progress.
+fn diagnostic(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<_> = stderr.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| {
+            line.starts_with("error: ")
+                || line.starts_with("warning: Boundary")
+                || line.starts_with("warning: Could not communicate with Boundary")
+        })
+        .unwrap_or_else(|| panic!("missing Boundary diagnostic: {stderr}"));
+    let end = lines[start..]
+        .iter()
+        .position(|line| {
+            matches!(
+                *line,
+                "  Execution cancelled."
+                    | "  Query failed."
+                    | "  Authentication command failed."
+                    | "  Cloud telemetry disabled. Program execution continues."
+            )
+        })
+        .unwrap_or_else(|| panic!("missing Boundary outcome: {stderr}"));
+    assert_eq!(
+        lines.iter().filter(|line| **line == lines[start]).count(),
+        1,
+        "duplicate diagnostic: {stderr}"
+    );
+    lines[start..=start + end].join("\n")
+}
+
+/// Pin credential recovery text for fail-open CLI warnings and fatal query/artifact errors.
+fn assert_api_key_rejection(output: &std::process::Output, endpoint: &str, query: bool) {
+    let actual = diagnostic(output);
+    let prefix = if !query && output.status.success() {
+        "warning"
+    } else {
+        "error"
+    };
+    let local_and_outcome = if query {
+        r#"    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+    } else if output.status.success() {
+        r#"    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off.
+
+  Cloud telemetry disabled. Program execution continues."#
+    } else {
+        r#"    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off.
+
+  Execution cancelled."#
+    };
+    // Saved login storage may be available or unavailable on the host. Every accepted variant
+    // is compared in full; unit tests independently pin each specific saved-login state.
+    let expected = [
+        "Unset BOUNDARY_API_KEY to use your saved Boundary login.",
+        "Unset BOUNDARY_API_KEY, then run `baml cloud auth login`.",
+        "Your saved login could not be read. Unset BOUNDARY_API_KEY, then run `baml cloud auth login` to restore user authentication.",
+    ].map(|login_recovery| format!(r#"{prefix}: Boundary rejected BOUNDARY_API_KEY (401).
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Replace BOUNDARY_API_KEY with a valid API key.
+    • {login_recovery}
+{local_and_outcome}"#));
+    assert!(
+        expected.contains(&actual),
+        "unexpected complete diagnostic:\n{actual}\nexpected one of:\n{}",
+        expected.join("\n---\n")
+    );
+}
+
+/// Pin the permission warning and its nonfatal execution outcome.
+fn assert_ingest_forbidden(output: &std::process::Output, endpoint: &str) {
+    assert_eq!(
+        diagnostic(output),
+        format!(
+            r#"warning: Boundary denied cloud telemetry ingestion (HTTP 403).
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Use a credential with ingestion permission for the selected project and environment.
+    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off.
+
+  Cloud telemetry disabled. Program execution continues."#
+        )
+    );
+}
+
+fn run(project: &Path, boundary_url: &str, telemetry: &str, expected_success: bool) {
+    common::share_build_cache(&project.join("home"));
     let output = Command::new(common::baml_cli())
         .args(["run", "main"])
         .current_dir(project)
-        .env("BOUNDARY_URL", boundary_url)
+        .env("BOUNDARY_API_URL", boundary_url)
         .env("BOUNDARY_API_KEY", KEY)
+        .env("BOUNDARY_PROJECT", "acme/app")
         .env("BAML_TELEMETRY", telemetry)
         .env("BAML_HOME", project.join("home"))
-        .env("BAML_CACHE_DIR", common::shared_cache_dir())
         .env("BAML_CLI_ALLOW_DIRECT", "1")
-        .env("BAML_AGENT_SKILL_CHECK", "off")
+        .env("DEV_BAML_CLI_DISABLE_AGENT_DETECTION", "1")
         .env("DO_NOT_TRACK", "1")
         .output()
         .unwrap();
-    assert!(
+    assert_eq!(
         output.status.success(),
-        "CLI failed:\n{}\n{}",
+        expected_success,
+        "unexpected CLI status:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -82,18 +177,38 @@ fn baml_run_uploads_from_boundary_env() {
                 .respond_with(ResponseTemplate::new(200))
                 .mount(&server)
                 .await;
+            let source_url = format!("{}/build-source", server.uri());
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/publisher/v1/builds$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "upload_required",
+                    "presigned_put_url": source_url,
+                    "expires_at_unix_ms": u64::MAX,
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/build-source$"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
 
-            run(temp.path(), &boundary_url, "medium");
+            run(temp.path(), &boundary_url, "medium", true);
             let requests = server.received_requests().await.unwrap();
             let mut prepares = 0;
             let mut recordings = Vec::new();
+            let mut builds = Vec::new();
+            let mut sources = Vec::new();
             for request in &requests {
                 if request.method == "POST" {
                     assert_eq!(request.headers["authorization"], format!("Bearer {KEY}"));
-                    if request.url.path().ends_with("/uploads:prepare") {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["target"], serde_json::json!({"project": "acme/app"}));
+                    if request.url.path().ends_with("/v1/builds") {
+                        builds.push(body);
+                    } else if request.url.path().ends_with("/uploads:prepare") {
                         prepares += 1;
-                        let prepare: PrepareUploadsRequest =
-                            serde_json::from_slice(&request.body).unwrap();
+                        let prepare: PrepareUploadsRequest = cloud_protocol::prepare(request);
                         assert_eq!(
                             request.headers["idempotency-key"],
                             format!(
@@ -105,11 +220,15 @@ fn baml_run_uploads_from_boundary_env() {
                     } else {
                         assert!(request.url.path().ends_with("/heartbeat"));
                     }
+                } else if request.url.path() == "/build-source" {
+                    assert_eq!(request.method, "PUT");
+                    assert!(!request.headers.contains_key("authorization"));
+                    sources.push(request.body.clone());
                 } else {
                     assert_eq!(request.method, "PUT");
                     assert!(!request.headers.contains_key("authorization"));
                     assert_eq!(request.headers["x-required"], "signed-value");
-                    let envelope = CloudUploadEnvelope::decode(request.body.as_slice()).unwrap();
+                    let envelope = UploadEnvelope::decode(request.body.as_slice()).unwrap();
                     if let Some(bytes) = envelope.recording_file {
                         recordings.push(
                             btel_recorder::proto::RecordingFile::decode(bytes.as_slice()).unwrap(),
@@ -119,6 +238,89 @@ fn baml_run_uploads_from_boundary_env() {
             }
             assert!(prepares > 0, "CLI must prepare cloud uploads");
             assert!(!recordings.is_empty(), "CLI must upload a recording");
+
+            // The run registers its build (BEP-088) and uploads the source
+            // the build's hash was taken over.
+            let [registration] = builds.as_slice() else {
+                panic!("one build registers: {builds:?}");
+            };
+            let [source] = sources.as_slice() else {
+                panic!("one source uploads: {} did", sources.len());
+            };
+            let build = &registration["build"];
+            assert_eq!(build["origin"], "run");
+            assert_eq!(
+                build["compilation_unit_hash"],
+                registration["package"]["compilation_unit_hash"]
+            );
+            assert_eq!(registration["package"]["name"], "pack_e2e");
+            assert!(
+                registration["program"]["static_packages"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&build["compilation_unit_hash"])
+            );
+            {
+                use sha2::Digest as _;
+                assert_eq!(
+                    registration["source"],
+                    serde_json::json!({
+                        "sha256": hex::encode(sha2::Sha256::digest(source)),
+                        "byte_length": source.len(),
+                    })
+                );
+            }
+            let files: std::collections::BTreeMap<String, String> =
+                serde_json::from_slice(source).unwrap();
+            assert_eq!(
+                files.keys().collect::<Vec<_>>(),
+                ["baml_src/main.baml"],
+                "the package's sources, by normalized path"
+            );
+            assert!(files["baml_src/main.baml"].contains("function main() -> int"));
+            assert_eq!(
+                build["source_hash"],
+                hex::encode(
+                    bex_vm_types::identity::package_source_hash(
+                        files
+                            .iter()
+                            .map(|(path, text)| (path.as_str(), text.as_bytes()))
+                    )
+                    .0
+                )
+            );
+
+            // The recording names the program and the build in its header.
+            // BCS gives the build to the spans of the functions whose package
+            // the build produced.
+            let unit = hex::decode(build["compilation_unit_hash"].as_str().unwrap()).unwrap();
+            let build_id = hex::decode(build["build_id"].as_str().unwrap()).unwrap();
+            let mut built_functions = 0;
+            for recording in &recordings {
+                let header = recording.header.as_ref().unwrap();
+                assert_eq!(
+                    header.program_id.as_deref().map(hex::encode).as_deref(),
+                    registration["program"]["program_id"].as_str()
+                );
+                let named = header.build.as_ref().expect("the header names the build");
+                assert_eq!(named.build_id, build_id);
+                assert_eq!(named.compilation_unit_hash, unit);
+                assert_eq!(header.os.as_deref(), Some(std::env::consts::OS));
+                assert_eq!(header.arch.as_deref(), Some(std::env::consts::ARCH));
+                for function in &recording.definitions.as_ref().unwrap().functions {
+                    let Some(
+                        btel_recorder::proto::function_definition::Resolution::Metadata(metadata),
+                    ) = &function.resolution
+                    else {
+                        continue;
+                    };
+                    if metadata.compilation_unit_hash.as_deref() == Some(unit.as_slice()) {
+                        built_functions += 1;
+                    }
+                }
+            }
+            assert!(built_functions > 0, "a function of the built package ran");
+
             for recording in &recordings {
                 let header = recording.header.as_ref().unwrap();
                 assert_eq!(header.host.as_deref(), Some("baml"));
@@ -127,8 +329,8 @@ fn baml_run_uploads_from_boundary_env() {
                     "cloud must omit process arguments"
                 );
                 assert!(
-                    header.source_cas_id.is_some(),
-                    "CLI must include source metadata"
+                    header.source_cas_id.is_none(),
+                    "cloud recordings must omit source metadata"
                 );
             }
             assert!(recordings.iter().any(|recording| {
@@ -139,10 +341,932 @@ fn baml_run_uploads_from_boundary_env() {
             }));
 
             server.reset().await;
-            run(temp.path(), &boundary_url, "off");
+            run(temp.path(), &boundary_url, "off", true);
             assert!(server.received_requests().await.unwrap().is_empty());
-            // Plain HTTP to a non-loopback host is rejected without failing BAML.
-            run(temp.path(), "http://example.invalid/publisher", "medium");
+            // Invalid cloud configuration cancels execution before any request.
+            let output = execute_case(temp.path(), "http://example.invalid/publisher", KEY, &["run", "main"]);
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(diagnostic(&output), r#"error: Boundary configuration is invalid: Boundary API URL must use HTTPS, or HTTP on loopback.
+
+  To continue, choose one:
+    • Fix BOUNDARY_API_URL or boundary.api_url in baml.toml.
+    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off.
+
+  Execution cancelled."#);
             assert!(server.received_requests().await.unwrap().is_empty());
         });
+}
+
+fn execute_case(
+    project: &Path,
+    endpoint: &str,
+    credential: &str,
+    args: &[&str],
+) -> std::process::Output {
+    common::share_build_cache(&project.join("home"));
+    Command::new(common::baml_cli())
+        .args(args)
+        .current_dir(project)
+        .env("BOUNDARY_API_URL", endpoint)
+        .env("BOUNDARY_API_KEY", credential)
+        .env("BOUNDARY_PROJECT", "acme/app")
+        .env("BAML_TELEMETRY", "medium")
+        .env("BAML_HOME", project.join("home"))
+        .env("BAML_CLI_ALLOW_DIRECT", "1")
+        .env("DEV_BAML_CLI_DISABLE_AGENT_DETECTION", "1")
+        .env("DO_NOT_TRACK", "1")
+        .output()
+        .unwrap()
+}
+
+fn fixture(source: &str) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    common::write_project(temp.path(), source);
+    std::fs::create_dir(temp.path().join("home")).unwrap();
+    std::fs::write(
+        temp.path().join("home/config.toml"),
+        "[update]\nauto_check = false\n",
+    )
+    .unwrap();
+    temp
+}
+
+/// Runtime recording is opt-out even when the user has logged in. Exercise both
+/// commands against a live loopback server so an upload or heartbeat is observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_off_prevents_cloud_requests_for_run_and_test() {
+    use sha2::Digest as _;
+
+    let temp = fixture(
+        "function main() -> int { 7 }\ntestset \"smoke\" { test \"ok\" { assert.is_true(true) } }\n",
+    );
+    let home = temp.path().join("home");
+    let server = MockServer::start().await;
+    let endpoint = bcs_api::Endpoint::parse(&server.uri()).unwrap();
+    let file = home.join("login/cache").join(format!(
+        "{}.json",
+        hex::encode(sha2::Sha256::digest(endpoint.as_str().as_bytes()))
+    ));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        file,
+        serde_json::to_vec(&bcs_api::StoredSession {
+            refresh_token: bcs_api::Secret::new("bdry_session_cli_test".into()),
+            caller: bcs_api::auth::Caller {
+                user_id: "test-user".into(),
+                email: "test@example.invalid".into(),
+            },
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    common::share_build_cache(&home);
+    for credential in [None, Some(KEY)] {
+        for level in ["off", "0", "false", "no"] {
+            for args in [&["run", "main"][..], &["test"][..]] {
+                let output = Command::new(common::baml_cli())
+                    .args(args)
+                    .current_dir(temp.path())
+                    .env("BAML_HOME", &home)
+                    .env("BAML_TELEMETRY", level)
+                    .env("BOUNDARY_API_URL", server.uri())
+                    .env("BOUNDARY_PROJECT", "acme/app")
+                    .env_remove("BOUNDARY_API_KEY")
+                    .envs(credential.map(|key| ("BOUNDARY_API_KEY", key)))
+                    .env("BAML_CLI_ALLOW_DIRECT", "1")
+                    .env("DEV_BAML_CLI_DISABLE_AGENT_DETECTION", "1")
+                    .env("DO_NOT_TRACK", "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{credential:?}/{level}/{args:?}: {output:?}"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&output.stderr).contains("warning: Boundary"),
+                    "{output:?}"
+                );
+                assert!(
+                    server.received_requests().await.unwrap().is_empty(),
+                    "{credential:?}/{level}/{args:?}"
+                );
+                assert!(!temp.path().join(RECORDINGS).exists());
+                assert!(!home.join("btel").exists());
+            }
+        }
+    }
+}
+
+/// A late initial refusal must preserve a result already printed by the command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_rejection_warns_even_if_execution_finishes_before_authorization() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    for status in [401, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/heartbeat$"))
+            .respond_with(
+                ResponseTemplate::new(status).set_delay(std::time::Duration::from_millis(300)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = execute_case(temp.path(), &server.uri(), KEY, &["run", "main"]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if status == 401 {
+            assert_api_key_rejection(&output, &server.uri(), false);
+        } else {
+            assert_ingest_forbidden(&output, &server.uri());
+        }
+        assert!(!temp.path().join(RECORDINGS).exists());
+        assert!(!stderr.contains(KEY), "credential leaked: {stderr}");
+        assert!(
+            !stderr.contains("telemetry recording failed:"),
+            "duplicate diagnostic: {stderr}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path().ends_with("/heartbeat"))
+        );
+    }
+}
+
+/// HTTP and transport failures disable recording while preserving stdout and exit status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_connection_failures_warn_without_changing_execution() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    for status in [404, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/heartbeat$"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "code": "TELEMETRY_UNAVAILABLE",
+                    "retryable": status == 503,
+                    "message": "Cloud telemetry is unavailable for this project.",
+                })),
+            )
+            .expect(if status == 503 { 4 } else { 1 })
+            .mount(&server)
+            .await;
+        let output = execute_case(temp.path(), &server.uri(), KEY, &["run", "main"]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+        let error = diagnostic(&output);
+        assert!(
+            error.contains("Cloud telemetry is unavailable for this project."),
+            "{error}"
+        );
+        assert!(
+            error.ends_with("Cloud telemetry disabled. Program execution continues."),
+            "{error}"
+        );
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let output = execute_case(temp.path(), &endpoint, KEY, &["run", "main"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+    assert!(
+        diagnostic(&output).ends_with("Cloud telemetry disabled. Program execution continues.")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_sentinel_records_and_queries_locally_without_boundary_requests() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    let server = MockServer::start().await;
+    let output = execute_case(temp.path(), &server.uri(), "local", &["run", "main"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(temp.path().join(RECORDINGS).exists());
+    let output = execute_case(
+        temp.path(),
+        &server.uri(),
+        "local",
+        &[
+            "query",
+            "SELECT COUNT(*) AS recordings FROM processes",
+            "--output-format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["rows"][0][0].as_i64().unwrap() > 0, "{result}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    // Local selection precedes endpoint validation and saved-login discovery.
+    let output = execute_case(temp.path(), "not-a-boundary-url", "local", &["run", "main"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = execute_case(
+        temp.path(),
+        "not-a-boundary-url",
+        "local",
+        &[
+            "query",
+            "SELECT COUNT(*) FROM processes",
+            "--output-format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let output = execute_case(
+        temp.path(),
+        &server.uri(),
+        "local",
+        &[
+            "cloud",
+            "recordings",
+            "query",
+            "SELECT 1",
+            "--project",
+            "acme/app",
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .find(|line| line.starts_with("error: "))
+            .unwrap(),
+        "error: BOUNDARY_API_KEY=local selects local recordings; unset it to query Boundary Cloud"
+    );
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_query_uses_shared_diagnostics_with_query_specific_recovery() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    for status in [401, 403, 400, 404, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/query$"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("private-server-body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = execute_case(temp.path(), &server.uri(), KEY, &["query", "SELECT 1"]);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let endpoint = server.uri();
+        if status == 401 {
+            assert_api_key_rejection(&output, &endpoint, true);
+        } else {
+            let expected = match status {
+                403 => format!(
+                    r#"error: Boundary denied the cloud query (HTTP 403).
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Use a credential with query permission for the selected project and environment.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+                ),
+                400 => format!(
+                    r#"error: Boundary rejected the cloud query (HTTP 400).
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Check the command inputs and requested project/environment.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+                ),
+                404 => format!(
+                    r#"error: Boundary rejected the cloud query (HTTP 404).
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Check the endpoint and requested project/environment, then retry.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+                ),
+                503 => format!(
+                    r#"error: Boundary rejected the cloud query (HTTP 503).
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Retry the command after Boundary becomes available.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(diagnostic(&output), expected);
+        }
+        assert!(
+            !stderr.contains("caused by:"),
+            "duplicate diagnostic: {stderr}"
+        );
+        assert!(!stderr.contains(KEY), "credential leaked: {stderr}");
+        assert!(
+            !stderr.contains("private-server-body"),
+            "response body leaked: {stderr}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_query_distinguishes_bad_responses_from_connection_failures() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/v1/query$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("private-malformed-response\n", "application/x-ndjson"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = execute_case(temp.path(), &server.uri(), KEY, &["query", "SELECT 1"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let endpoint = server.uri();
+    assert_eq!(
+        diagnostic(&output),
+        format!(
+            r#"error: Boundary returned an invalid response: Invalid cloud query frame.
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Check that the endpoint is a Boundary API compatible with this BAML client.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+        )
+    );
+    assert!(!stderr.contains("private-malformed-response"), "{stderr}");
+
+    let output = execute_case(
+        temp.path(),
+        "http://127.0.0.1:1",
+        KEY,
+        &["query", "SELECT 1"],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        diagnostic(&output),
+        r#"error: Could not communicate with Boundary for the cloud query.
+  Endpoint: http://127.0.0.1:1
+
+  To continue, choose one:
+    • Check the endpoint and network connection, then retry the command.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_query_displays_structured_error_codes_and_optional_messages() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    for message in [
+        Some("Select an environment: this credential can query multiple environments."),
+        None,
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/query$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": "ENVIRONMENT_REQUIRED", "retryable": false, "message": message,
+                "internal": KEY,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = execute_case(temp.path(), &server.uri(), KEY, &["query", "SELECT 1"]);
+        assert!(!output.status.success());
+        let endpoint = server.uri();
+        let expected = if message.is_some() {
+            format!(
+                r#"error: Boundary rejected the cloud query (HTTP 400).
+  Endpoint: {endpoint}
+  Code: ENVIRONMENT_REQUIRED
+  Select an environment: this credential can query multiple environments.
+
+  To continue, choose one:
+    • Select an environment with --env <name> and, when needed, --project <org/project>.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+            )
+        } else {
+            format!(
+                r#"error: Boundary rejected the cloud query (HTTP 400).
+  Endpoint: {endpoint}
+  Code: ENVIRONMENT_REQUIRED
+
+  To continue, choose one:
+    • Select an environment with --env <name> and, when needed, --project <org/project>.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+            )
+        };
+        assert_eq!(diagnostic(&output), expected);
+    }
+}
+
+/// Nonfatal ingestion diagnostics retain the server's public explanation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_telemetry_rejection_preserves_the_public_api_message() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "code": "ACCESS_REQUIRED", "retryable": false,
+            "message": "This credential cannot ingest into the selected environment.",
+            "internal": KEY,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = execute_case(temp.path(), &server.uri(), KEY, &["run", "main"]);
+    assert!(output.status.success(), "{output:?}");
+    let endpoint = server.uri();
+    assert_eq!(
+        diagnostic(&output),
+        format!(
+            r#"warning: Boundary denied cloud telemetry ingestion (HTTP 403).
+  Endpoint: {endpoint}
+  Code: ACCESS_REQUIRED
+  This credential cannot ingest into the selected environment.
+
+  To continue, choose one:
+    • Use a credential with ingestion permission for the selected project and environment.
+    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off.
+
+  Cloud telemetry disabled. Program execution continues."#
+        )
+    );
+}
+
+#[test]
+fn cloud_configuration_errors_share_diagnostics_without_exposing_invalid_url_credentials() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    for args in [&["query", "SELECT 1"][..], &["cloud", "auth", "login"][..]] {
+        let output = execute_case(
+            temp.path(),
+            "https://user:private-password@example.test",
+            KEY,
+            args,
+        );
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = if args[0] == "query" {
+            r#"error: Boundary configuration is invalid: Boundary API URL must be a base URL without credentials, query or fragment.
+
+  To continue, choose one:
+    • Fix BOUNDARY_API_URL or boundary.api_url in baml.toml.
+    • Query local recordings: run `baml local recordings query`.
+
+  Query failed."#
+        } else {
+            r#"error: Boundary configuration is invalid: Boundary API URL must be a base URL without credentials, query or fragment.
+
+  To continue, choose one:
+    • Fix BOUNDARY_API_URL or boundary.api_url in baml.toml.
+
+  Authentication command failed."#
+        };
+        assert_eq!(diagnostic(&output), expected);
+        assert!(!stderr.contains("private-password"), "{stderr}");
+        assert!(!stderr.contains("caused by:"), "{stderr}");
+    }
+}
+
+/// Initial refusal must leave both running main work and rooted children free to complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_session_rejection_allows_running_and_rooted_work_to_finish() {
+    let temp = fixture(
+        r#"
+function main() -> int {
+    baml.io.println("execution-started");
+    let child = spawn with baml.spawn.Root.new() {
+        baml.sys.sleep(baml.time.Duration.from_milliseconds(600n));
+        1
+    };
+    baml.sys.sleep(baml.time.Duration.from_milliseconds(600n));
+    await child;
+    7
+}
+"#,
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(401).set_delay(std::time::Duration::from_millis(50)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = execute_case(
+        temp.path(),
+        &server.uri(),
+        "bdry_session_invalid",
+        &["run", "main"],
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("abandoned"),
+        "rooted work must finish too: {output:?}"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "execution-started\n7\n"
+    );
+    assert_api_key_rejection(&output, &server.uri(), false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_rejection_after_initial_success_does_not_fail_execution() {
+    let temp = fixture("function main() -> int { 7 }\n");
+    for status in [401, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/heartbeat$"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/uploads:prepare$"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = execute_case(temp.path(), &server.uri(), KEY, &["run", "main"]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter(|line| line.starts_with("warning: telemetry recording failed:"))
+                .collect::<Vec<_>>(),
+            [r#"warning: telemetry recording failed: cloud recording delivery: Unauthorized"#]
+        );
+    }
+}
+
+/// Expression evaluation and test execution use the same fail-open recording policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_rejection_preserves_expressions_and_test_runs() {
+    let temp = fixture(
+        "function main() -> int { 7 }\ntestset \"smoke\" { test \"ok\" { assert.is_true(true) } }\n",
+    );
+    for args in [&["run", "-e", "1 + 2"][..], &["test"][..]] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/heartbeat$"))
+            .respond_with(
+                ResponseTemplate::new(403).set_delay(std::time::Duration::from_millis(300)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = execute_case(temp.path(), &server.uri(), KEY, args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert_ingest_forbidden(&output, &server.uri());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_binary_reports_initial_refusal_after_a_fast_main() {
+    common::ensure_built();
+    let temp = fixture("function main() -> int { 7 }\n");
+    std::fs::write(
+        temp.path().join("baml.toml"),
+        "[package]\nname = \"pack_e2e\"\n[pack]\non_initial_telemetry_failure = \"abort\"\n",
+    )
+    .unwrap();
+    let binary = temp.path().join("packed");
+    let packed = execute_case(
+        temp.path(),
+        "http://127.0.0.1:1",
+        KEY,
+        &["pack", "main", "-o", binary.to_str().unwrap()],
+    );
+    assert!(packed.status.success(), "{packed:?}");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(401).set_delay(std::time::Duration::from_millis(300)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = Command::new(binary)
+        .current_dir(temp.path())
+        .env("BOUNDARY_API_URL", server.uri())
+        .env("BOUNDARY_API_KEY", KEY)
+        .env("BOUNDARY_PROJECT", "acme/app")
+        .env("BAML_TELEMETRY", "medium")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_api_key_rejection(&output, &server.uri(), false);
+}
+
+#[test]
+fn invalid_boundary_url_cancels_with_or_without_credentials_unless_local_is_selected() {
+    let temp = tempfile::tempdir().unwrap();
+    common::write_project(temp.path(), "function main() -> int { 7 }\n");
+    let invalid = "not a URL";
+    for manifest_url in [false, true] {
+        for key in [None, Some(KEY), Some("local")] {
+            let manifest = if manifest_url {
+                "[package]\nname = \"invalid-url-test\"\n[boundary]\napi_url = \"not a URL\"\n"
+            } else {
+                "[package]\nname = \"invalid-url-test\"\n"
+            };
+            std::fs::write(temp.path().join("baml.toml"), manifest).unwrap();
+            let mut command = Command::new(common::baml_cli());
+            command
+                .args(["--agent-skill-check", "off", "run", "main"])
+                .current_dir(temp.path())
+                .env("BAML_TELEMETRY", "medium")
+                .env("BAML_HOME", common::shared_baml_home())
+                .env("BAML_CLI_ALLOW_DIRECT", "1")
+                .env("DEV_BAML_CLI_DISABLE_AGENT_DETECTION", "1")
+                .env("DO_NOT_TRACK", "1")
+                .env_remove("BOUNDARY_PROJECT")
+                .env_remove("BOUNDARY_API_KEY")
+                .env_remove("BOUNDARY_API_URL");
+            if !manifest_url {
+                command.env("BOUNDARY_API_URL", invalid);
+            }
+            if let Some(key) = key {
+                command.env("BOUNDARY_API_KEY", key);
+            }
+            let output = command.output().unwrap();
+            if key == Some("local") {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+            } else {
+                assert!(!output.status.success(), "{output:?}");
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+                assert_eq!(
+                    diagnostic(&output),
+                    r#"error: Boundary configuration is invalid: Boundary API URL must be a valid absolute URL.
+
+  To continue, choose one:
+    • Fix BOUNDARY_API_URL or boundary.api_url in baml.toml.
+    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off.
+
+  Execution cancelled."#
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn corrupt_saved_login_errors_for_query_and_execution_but_explicit_local_recording_works() {
+    use sha2::Digest as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    common::write_project(temp.path(), "function main() -> int { 7 }\n");
+    let home = temp.path().join("home");
+    let endpoint = "https://example.com";
+    let file = home.join("login").join("cache").join(format!(
+        "{}.json",
+        hex::encode(sha2::Sha256::digest(endpoint.as_bytes()))
+    ));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{bdry_session_never_print_this").unwrap();
+    std::fs::write(home.join("config.toml"), "[update]\nauto_check = false\n").unwrap();
+
+    for (args, outcome, recovery) in [
+        (
+            ["run", "main"],
+            "Execution cancelled.",
+            r#"    • Record locally: rerun with BOUNDARY_API_KEY=local.
+    • Disable recording: rerun with BAML_TELEMETRY=off."#,
+        ),
+        (
+            ["query", "SELECT 7"],
+            "Query failed.",
+            "    • Query local recordings: run `baml local recordings query`.",
+        ),
+    ] {
+        let output = Command::new(common::baml_cli())
+            .args(["--agent-skill-check", "off"])
+            .args(args)
+            .current_dir(temp.path())
+            .env("BAML_HOME", &home)
+            .env("BAML_CLI_ALLOW_DIRECT", "1")
+            .env("BOUNDARY_API_URL", endpoint)
+            .env("BAML_TELEMETRY", "medium")
+            .env("DO_NOT_TRACK", "1")
+            .env_remove("BOUNDARY_PROJECT")
+            .env_remove("BOUNDARY_API_KEY")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            diagnostic(&output),
+            format!(
+                r#"error: The saved Boundary login in the local credential file at {} is invalid.
+  Endpoint: {endpoint}
+
+  To continue, choose one:
+    • Remove the invalid saved login: run `baml cloud auth logout`, then `baml cloud auth login`.
+    • Set BOUNDARY_API_KEY to a valid API key.
+{recovery}
+
+  {outcome}"#,
+                file.display()
+            )
+        );
+    }
+
+    for (variable, value) in [("BOUNDARY_API_KEY", "local"), ("BAML_TELEMETRY", "off")] {
+        let output = Command::new(common::baml_cli())
+            .args(["--agent-skill-check", "off", "run", "main"])
+            .current_dir(temp.path())
+            .env("BAML_HOME", &home)
+            .env("BAML_CLI_ALLOW_DIRECT", "1")
+            .env("BOUNDARY_API_URL", endpoint)
+            .env("BAML_TELEMETRY", "medium")
+            .env("DO_NOT_TRACK", "1")
+            .env_remove("BOUNDARY_PROJECT")
+            .env_remove("BOUNDARY_API_KEY")
+            .env(variable, value)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+    }
+}
+
+/// Off precedes unused runtime destination validation on cold and cached paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_off_ignores_unused_boundary_configuration() {
+    let server = MockServer::start().await;
+    let temp = fixture(
+        "function main() -> int { 7 }\ntestset \"smoke\" { test \"ok\" { assert.is_true(true) } }\n",
+    );
+    let home = temp.path().join("home");
+    common::share_build_cache(&home);
+    for boundary in [
+        "project = 42\napi_url = false",
+        "project = \"fixture/app\"\napi_url = \"not a URL\"",
+    ] {
+        std::fs::write(
+            temp.path().join("baml.toml"),
+            format!("[package]\nname = \"off_e2e\"\n[boundary]\n{boundary}\n"),
+        )
+        .unwrap();
+        for args in [&["run", "main"][..], &["run", "main"][..], &["test"][..]] {
+            let output = Command::new(common::baml_cli())
+                .args(args)
+                .current_dir(temp.path())
+                .env("BAML_HOME", &home)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("BAML_CLI_ALLOW_DIRECT", "1")
+                .env("DEV_BAML_CLI_DISABLE_AGENT_DETECTION", "1")
+                .env("DO_NOT_TRACK", "1")
+                .env("BAML_TELEMETRY", " FaLsE ")
+                .env("BOUNDARY_API_URL", server.uri())
+                .env("BOUNDARY_API_KEY", KEY)
+                .env("BOUNDARY_PROJECT", "ignored/fixture")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{boundary}/{args:?}: {output:?}");
+            if args[0] == "run" {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+            }
+            assert!(!temp.path().join(RECORDINGS).exists());
+            assert!(!home.join("btel").exists());
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// A package compiled at run time is a build of its own (BEP-088), beside
+/// the program's, and `upload_source = false` keeps the text of both from
+/// Boundary while the builds still register.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_compile_registers_a_dynamic_build_and_opting_out_withholds_source() {
+    use sha2::Digest as _;
+
+    let temp = fixture(
+        r#"function main() -> int throws unknown {
+  let leaf = reflect.Package.compile({"lib.baml": "function leaf() -> int { 1 }"})
+  7
+}
+"#,
+    );
+    let server = MockServer::start().await;
+    let base = server.uri();
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/v1/recordings/[^/]+/uploads:prepare$"))
+        .respond_with({
+            let base = base.clone();
+            move |request: &Request| {
+                ResponseTemplate::new(200).set_body_json(cloud_protocol::response(
+                    request,
+                    &base,
+                    &[],
+                ))
+            }
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/v1/recordings/[^/]+/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/v1/builds$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "upload_required",
+            "presigned_put_url": format!("{base}/build-source"),
+            "expires_at_unix_ms": u64::MAX,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    // What the run registered, by origin, and the sources it uploaded.
+    let run = || async {
+        let before = server.received_requests().await.unwrap().len();
+        let output = execute_case(temp.path(), &base, KEY, &["run", "main"]);
+        assert!(output.status.success(), "{output:?}");
+        let requests = server.received_requests().await.unwrap().split_off(before);
+        let mut builds: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/builds")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        builds.sort_by_key(|build| build["build"]["origin"].as_str().unwrap().to_owned());
+        let sources: Vec<Vec<u8>> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/build-source")
+            .map(|request| request.body.clone())
+            .collect();
+        (builds, sources)
+    };
+
+    let (builds, sources) = run().await;
+    let [dynamic, program] = builds.as_slice() else {
+        panic!("the program's build and the compiled package's: {builds:?}");
+    };
+    assert_eq!(program["build"]["origin"], "run");
+    assert_eq!(dynamic["build"]["origin"], "dynamic");
+    assert_eq!(dynamic["program"], serde_json::json!(null));
+    assert_eq!(dynamic["build"]["git"], serde_json::json!(null));
+    assert_ne!(dynamic["build"]["build_id"], program["build"]["build_id"]);
+    assert_ne!(
+        dynamic["package"]["compilation_unit_hash"],
+        program["package"]["compilation_unit_hash"]
+    );
+    assert_eq!(sources.len(), 2);
+    let compiled = sources
+        .iter()
+        .find(|source| {
+            dynamic["source"]["sha256"] == hex::encode(sha2::Sha256::digest(source)).as_str()
+        })
+        .expect("the compiled package's source uploads");
+    let files: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(compiled).unwrap();
+    assert_eq!(files.keys().collect::<Vec<_>>(), ["lib.baml"]);
+    assert!(files["lib.baml"].contains("function leaf() -> int"));
+
+    std::fs::write(
+        temp.path().join("baml.toml"),
+        "[package]\nname = \"pack_e2e\"\n[boundary]\nupload_source = false\n",
+    )
+    .unwrap();
+    let (builds, sources) = run().await;
+    assert_eq!(
+        builds
+            .iter()
+            .map(|build| (build["build"]["origin"].as_str().unwrap(), &build["source"]))
+            .collect::<Vec<_>>(),
+        [
+            ("dynamic", &serde_json::json!(null)),
+            ("run", &serde_json::json!(null))
+        ]
+    );
+    assert!(sources.is_empty(), "no source leaves an opted-out project");
 }

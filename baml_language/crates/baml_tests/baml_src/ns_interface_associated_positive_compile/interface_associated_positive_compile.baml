@@ -13,8 +13,8 @@ class CycleNode {
 }
 
 test "reflection_bounded_impl_cycle_terminates" {
-    assert.is_true(!reflect.Type.of<CycleNode>().implements(reflect.Type.of<CycleA>()));
-    assert.is_true(!reflect.Type.of<CycleNode>().implements(reflect.Type.of<CycleB>()))
+    assert.is_true(!CycleNode.type().implements(reflect.Type.of<CycleA>()));
+    assert.is_true(!CycleNode.type().implements(reflect.Type.of<CycleB>()))
 }
 
 test "implementor_self_coerces_to_interface_with_associated_bindings_in_return_context" {
@@ -98,7 +98,7 @@ test "default_interface_method_can_thread_associated_error_through_callback" {
                         function next(self) -> R | Done throws E | E2 {
                             match (self.inner.next()) {
                                 Done => Done {},
-                                let value: T => self.f(value),
+                                let value: T => (self.f)(value),
                             }
                         }
                     }

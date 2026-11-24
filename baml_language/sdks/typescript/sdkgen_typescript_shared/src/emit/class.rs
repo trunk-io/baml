@@ -3,9 +3,11 @@
 //! Covers user-code classes and stdlib classes (`baml.http.Response`, …).
 //! Emits `export class` (with fields and a
 //! field-object constructor); the five runtime-owned stdlib types
-//! (media + stream) instead re-export from the configured runtime package.
+//! (media + stream) instead re-export from the configured runtime package,
+//! and a class the engine keeps for itself (`reflect.Package`, …) emits as a
+//! reference with methods alone.
 
-use baml_sdkgen_types::{Name, Ty};
+use baml_sdkgen_types::{ClassCrossing, Name, Ty};
 
 use crate::emit::method::TypeScriptMethodBinding;
 
@@ -19,6 +21,8 @@ pub(crate) struct TypeScriptClass {
     pub(crate) generic_params: Vec<String>,
     /// Joined `///` doc-comment lines from the BAML class declaration.
     pub(crate) docstring: Option<String>,
+    /// How an instance crosses the host boundary.
+    pub(crate) crossing: ClassCrossing,
     /// Class fields, in IR declaration order.
     pub(crate) properties: Vec<TypeScriptClassProperty>,
     /// Static method bindings, fanned out into one entry per emitted line.
@@ -30,6 +34,10 @@ pub(crate) struct TypeScriptClass {
 pub(crate) struct TypeScriptClassProperty {
     pub(crate) name: String,
     pub(crate) ty: Ty,
+    /// The field's type admits `null` (directly or through an alias). Such a
+    /// key is optional (`name?: T | null`): the runtime reads an omitted
+    /// nullable field as `null`.
+    pub(crate) nullable: bool,
     /// Joined `///` doc-comment lines preceding the field.
     pub(crate) docstring: Option<String>,
 }

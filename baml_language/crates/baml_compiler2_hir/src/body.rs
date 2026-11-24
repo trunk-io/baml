@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use baml_compiler2_ast::{AstSourceMap, BuiltinKind, ExprBody, FunctionBodyDef};
+use baml_compiler2_ast::{AstSourceMap, BuiltinKind, Expr, ExprBody, FunctionBodyDef};
 
 use crate::loc::{FunctionLoc, LetLoc};
 
@@ -24,11 +24,31 @@ pub enum FunctionBody {
     Missing,
 }
 
+impl FunctionBody {
+    /// Whether the body ends in a final expression, the value it evaluates
+    /// to. A body that ends in a statement has none, and neither has a
+    /// function with no expression body at all.
+    pub fn has_final_expr(&self) -> bool {
+        match self {
+            FunctionBody::Expr(body) => body.root_expr.is_some_and(|root| {
+                matches!(
+                    body.exprs[root],
+                    Expr::Block {
+                        tail_expr: Some(_),
+                        ..
+                    }
+                )
+            }),
+            FunctionBody::Builtin(_) | FunctionBody::Missing => false,
+        }
+    }
+}
+
 /// Salsa query: semantic function body (no source map).
 ///
 /// Downstream type-checking queries depend on this and will NOT re-run on
 /// whitespace-only file changes (the `ExprBody` arena is span-free).
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn function_body<'db>(db: &'db dyn crate::Db, function: FunctionLoc<'db>) -> Arc<FunctionBody> {
     let file = function.file(db);
     let item_tree = crate::file_item_tree(db, file);
@@ -49,7 +69,7 @@ pub fn function_body<'db>(db: &'db dyn crate::Db, function: FunctionLoc<'db>) ->
 ///
 /// Re-runs on any file change, but because downstream type queries only depend
 /// on `function_body`, they are unaffected by whitespace-only changes.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn function_body_source_map<'db>(
     db: &'db dyn crate::Db,
     function: FunctionLoc<'db>,
@@ -77,7 +97,7 @@ pub enum LetBody {
 ///
 /// Downstream type-checking queries depend on this and will NOT re-run on
 /// whitespace-only file changes (the `ExprBody` arena is span-free).
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn let_body<'db>(db: &'db dyn crate::Db, let_binding: LetLoc<'db>) -> Arc<LetBody> {
     let file = let_binding.file(db);
     let item_tree = crate::file_item_tree(db, file);
@@ -95,7 +115,7 @@ pub fn let_body<'db>(db: &'db dyn crate::Db, let_binding: LetLoc<'db>) -> Arc<Le
 ///
 /// Re-runs on any file change, but because downstream type queries only depend
 /// on `let_body`, they are unaffected by whitespace-only changes.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn let_body_source_map<'db>(
     db: &'db dyn crate::Db,
     let_binding: LetLoc<'db>,
@@ -116,7 +136,7 @@ pub fn let_body_source_map<'db>(
 ///
 /// Lambdas are deliberately not members: a lambda's body lives in its owner's
 /// arena and is typed by the owner's inference pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum BodyOwnerId<'db> {
     Function(FunctionLoc<'db>),
     Let(LetLoc<'db>),

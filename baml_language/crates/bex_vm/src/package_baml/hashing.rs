@@ -1,0 +1,386 @@
+use std::collections::HashSet;
+
+use bex_vm_types::{HeapPtr, Object, RealizedTy, RootHaver, RootVisitor, Value, ValueKind};
+
+use super::{Continuation, ImplResolver, NativeCallResult};
+use crate::{BexVm, VmPanic, errors::VmRustFnError};
+
+enum Work {
+    Value(Value, bool),
+    Exit(HeapPtr),
+    MapEntry(Value, Value),
+    /// The entry's hasher is finished, and the state it replaced is the one
+    /// to restore.
+    FinishMapEntry(Value),
+    FinishMap,
+}
+
+struct HashDriver {
+    state: Value,
+    pending: Vec<Work>,
+    active: HashSet<HeapPtr>,
+    map_hashes: Vec<Vec<u64>>,
+}
+
+fn panic(message: &str) -> NativeCallResult {
+    NativeCallResult::Error(VmRustFnError::Panic(VmPanic::UserPanic {
+        message: message.to_owned(),
+    }))
+}
+
+fn framed(tag: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut result = vec![tag];
+    result.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    result.extend_from_slice(bytes);
+    result
+}
+
+/// The framed hash bytes of a float, by value class: every NaN hashes alike
+/// and `-0.0` hashes as `0.0`, matching float equality (`float_order::eq`).
+fn hash_float(value: f64) -> Vec<u8> {
+    let bits = if value.is_nan() {
+        f64::NAN.to_bits()
+    } else if value == 0.0 {
+        0
+    } else {
+        value.to_bits()
+    };
+    framed(3, &bits.to_le_bytes())
+}
+
+impl HashDriver {
+    /// An instance's own bytes, its class and field count; its fields are
+    /// queued to hash after it, in order.
+    fn instance_bytes(&mut self, vm: &mut BexVm, ptr: HeapPtr) -> Vec<u8> {
+        let instance = vm.get_instance(ptr).expect("an instance pointer");
+        let type_tag = instance.class_object().type_tag.as_i64();
+        let mut bytes = framed(9, &type_tag.to_le_bytes());
+        bytes.extend_from_slice(&(instance.field_len() as u64).to_le_bytes());
+        let fields: Vec<_> = instance.fields().collect();
+        for field in fields.into_iter().rev() {
+            let value = vm.field_to_value(field);
+            self.pending.push(Work::Value(value, true));
+        }
+        bytes
+    }
+
+    fn drive(mut self, vm: &mut BexVm) -> NativeCallResult {
+        while let Some(work) = self.pending.pop() {
+            let bytes = match work {
+                Work::Exit(ptr) => {
+                    self.active.remove(&ptr);
+                    continue;
+                }
+                Work::MapEntry(key, value) => {
+                    let state = super::hasher::new_state(vm);
+                    let previous = std::mem::replace(&mut self.state, state);
+                    self.pending.push(Work::FinishMapEntry(previous));
+                    self.pending.push(Work::Value(value, true));
+                    self.pending.push(Work::Value(key, true));
+                    continue;
+                }
+                Work::FinishMapEntry(previous) => {
+                    let entry = std::mem::replace(&mut self.state, previous);
+                    let hash = match super::hasher::finish_state(vm, entry) {
+                        Ok(hash) => hash,
+                        Err(error) => return error.into(),
+                    };
+                    self.map_hashes
+                        .last_mut()
+                        .expect("map entry belongs to an active map")
+                        .push(hash);
+                    continue;
+                }
+                Work::FinishMap => {
+                    let mut hashes = self.map_hashes.pop().expect("active map hash frame");
+                    hashes.sort_unstable();
+                    let mut bytes = Vec::with_capacity(hashes.len() * 8);
+                    for hash in hashes {
+                        bytes.extend_from_slice(&hash.to_le_bytes());
+                    }
+                    framed(8, &bytes)
+                }
+                Work::Value(value, dispatch) => {
+                    if let Some(ptr) = value.as_object_ptr() {
+                        if !self.active.insert(ptr) {
+                            return panic("Cannot hash a cyclic value");
+                        }
+                        self.pending.push(Work::Exit(ptr));
+                        if let Object::Cell(cell) = vm.get_object(ptr) {
+                            self.pending.push(Work::Value(cell.load(), dispatch));
+                            continue;
+                        }
+                    }
+                    if dispatch {
+                        let Some(ty) = vm.value_concrete_ty(value).map(RealizedTy::from) else {
+                            return panic("Value does not implement baml.Hash");
+                        };
+                        let Some(head) = vm.lang_head(crate::lang_items::BAML_HASH) else {
+                            return panic("baml.Hash is unavailable");
+                        };
+                        let resolver = ImplResolver::for_value(vm, value);
+                        let Some(implementation) = resolver.resolve_implementation(&ty, head, &[])
+                        else {
+                            return panic("Value does not implement baml.Hash");
+                        };
+                        if let super::resolve::ResolvedInterfaceImpl::Explicit { rule, .. } =
+                            &implementation
+                        {
+                            let method = match resolver.rule_method_impl(rule, "hash") {
+                                Ok(method) => method,
+                                Err(error) => return error.into(),
+                            };
+                            if !method.is_default {
+                                let (callee, type_args) =
+                                    match resolver.implementation_method(&implementation, "hash") {
+                                        Ok(method) => method,
+                                        Err(error) => return error.into(),
+                                    };
+                                return NativeCallResult::YieldToCall {
+                                    callee,
+                                    args: vec![value, self.state],
+                                    type_args,
+                                    continuation: Box::new(self),
+                                };
+                            }
+                        }
+                    }
+                    match value.kind() {
+                        ValueKind::Null => vec![0],
+                        ValueKind::Int(value) => framed(1, &value.to_le_bytes()),
+                        ValueKind::Bool(value) => vec![2, u8::from(value)],
+                        ValueKind::OmittedArg => return panic("Cannot hash an omitted argument"),
+                        ValueKind::Float(value) => hash_float(value),
+                        ValueKind::Object(ptr) => match vm.get_object(ptr) {
+                            Object::Float(value) => hash_float(*value),
+                            Object::Bigint(value) => framed(4, &value.to_signed_bytes_le()),
+                            Object::String(value) => framed(5, value.as_bytes()),
+                            Object::Uint8Array(value) => framed(6, &value.lock()),
+                            Object::Array(array) => {
+                                let values = array.data.lock().to_vec();
+                                let bytes = framed(7, &(values.len() as u64).to_le_bytes());
+                                self.pending.extend(
+                                    values
+                                        .into_iter()
+                                        .rev()
+                                        .map(|value| Work::Value(value, true)),
+                                );
+                                bytes
+                            }
+                            Object::Map(map) => {
+                                let entries = map.snapshot_entries();
+                                self.map_hashes.push(Vec::with_capacity(entries.len()));
+                                self.pending.push(Work::FinishMap);
+                                for (key, value) in entries.into_iter().rev() {
+                                    self.pending.push(Work::MapEntry(key, value));
+                                }
+                                continue;
+                            }
+                            Object::Instance => self.instance_bytes(vm, ptr),
+                            Object::Variant(variant) => {
+                                let Object::Enum(enm) = vm.get_object(variant.enm) else {
+                                    return panic("Invalid enum while hashing");
+                                };
+                                let mut bytes = framed(10, &enm.type_tag.as_i64().to_le_bytes());
+                                bytes.extend_from_slice(&(variant.index as u64).to_le_bytes());
+                                bytes
+                            }
+                            // A `@@rust_type` class hashes only through an
+                            // explicit implementation (the checker refuses a
+                            // structural hash of one), so no kind hashes here.
+                            Object::RustInstance(instance) => match &instance.payload {
+                                bex_vm_types::RustPayload::Foreign(_)
+                                | bex_vm_types::RustPayload::DefaultHasher(_)
+                                | bex_vm_types::RustPayload::Sha256(_)
+                                | bex_vm_types::RustPayload::Aes256GcmSiv(_)
+                                | bex_vm_types::RustPayload::Aes128GcmSiv(_)
+                                | bex_vm_types::RustPayload::ChaCha20Poly1305(_)
+                                | bex_vm_types::RustPayload::XChaCha20Poly1305(_)
+                                | bex_vm_types::RustPayload::Regex(_)
+                                | bex_vm_types::RustPayload::CsvRecord(_)
+                                | bex_vm_types::RustPayload::Semaphore(_)
+                                | bex_vm_types::RustPayload::Permit(_)
+                                | bex_vm_types::RustPayload::Ticket(_)
+                                | bex_vm_types::RustPayload::CancelToken(_)
+                                | bex_vm_types::RustPayload::SpanId(_)
+                                | bex_vm_types::RustPayload::TraceOptions(_)
+                                | bex_vm_types::RustPayload::ReservedSpan(_)
+                                | bex_vm_types::RustPayload::File(_)
+                                | bex_vm_types::RustPayload::Glob(_)
+                                | bex_vm_types::RustPayload::OutputFormat(_)
+                                | bex_vm_types::RustPayload::Lock(_)
+                                | bex_vm_types::RustPayload::TcpStream(_)
+                                | bex_vm_types::RustPayload::TcpListener(_)
+                                | bex_vm_types::RustPayload::UdpSocket(_)
+                                | bex_vm_types::RustPayload::Xoshiro256PlusPlus(_)
+                                | bex_vm_types::RustPayload::ChaCha20(_)
+                                | bex_vm_types::RustPayload::InterfaceWitness(_)
+                                | bex_vm_types::RustPayload::CsvReader(_)
+                                | bex_vm_types::RustPayload::CsvWriter(_)
+                                | bex_vm_types::RustPayload::ClassBuilder(_)
+                                | bex_vm_types::RustPayload::ChildProcess(_)
+                                | bex_vm_types::RustPayload::ReadPipe(_)
+                                | bex_vm_types::RustPayload::WritePipe(_)
+                                | bex_vm_types::RustPayload::WebSocket(_)
+                                | bex_vm_types::RustPayload::HttpBody(_)
+                                | bex_vm_types::RustPayload::SseStream(_)
+                                | bex_vm_types::RustPayload::HttpServer(_)
+                                | bex_vm_types::RustPayload::TlsKeys(_)
+                                | bex_vm_types::RustPayload::HostValue(_)
+                                | bex_vm_types::RustPayload::Image(_)
+                                | bex_vm_types::RustPayload::Audio(_)
+                                | bex_vm_types::RustPayload::Pdf(_)
+                                | bex_vm_types::RustPayload::Video(_)
+                                | bex_vm_types::RustPayload::Prompt(_) => {
+                                    return panic("Value does not support structural hashing");
+                                }
+                            },
+                            _ => return panic("Value does not support structural hashing"),
+                        },
+                    }
+                }
+            };
+            let Some(ty) = vm.value_concrete_ty(self.state).map(RealizedTy::from) else {
+                return panic("Hash state does not implement baml.hash.Hasher");
+            };
+            let Some(head) = vm.lang_head(crate::lang_items::BAML_HASH_HASHER) else {
+                return panic("baml.hash.Hasher is unavailable");
+            };
+            let resolver = ImplResolver::for_value(vm, self.state);
+            let Some(implementation) = resolver.resolve_implementation(&ty, head, &[]) else {
+                return panic("Hash state does not implement baml.hash.Hasher");
+            };
+            let (callee, type_args) = match resolver.implementation_method(&implementation, "write")
+            {
+                Ok(method) => method,
+                Err(error) => return error.into(),
+            };
+            let bytes = Value::object(vm.tlab.alloc_uint8array(bytes));
+            return NativeCallResult::YieldToCall {
+                callee,
+                args: vec![self.state, bytes],
+                type_args,
+                continuation: Box::new(self),
+            };
+        }
+        NativeCallResult::Done(Value::NULL)
+    }
+}
+
+impl RootHaver for Work {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        match self {
+            Work::Value(value, _) => value.visit_roots(visitor),
+            Work::Exit(ptr) => ptr.visit_roots(visitor),
+            Work::MapEntry(key, value) => {
+                key.visit_roots(visitor);
+                value.visit_roots(visitor);
+            }
+            Work::FinishMapEntry(previous) => previous.visit_roots(visitor),
+            Work::FinishMap => {}
+        }
+    }
+}
+
+impl RootHaver for HashDriver {
+    fn visit_roots(&mut self, visitor: &mut dyn RootVisitor) {
+        let Self {
+            state,
+            pending,
+            active,
+            map_hashes: _,
+        } = self;
+        state.visit_roots(visitor);
+        pending.visit_roots(visitor);
+        // The pointers are the set's keys, so it is rebuilt through the visitor.
+        let mut moved: Vec<HeapPtr> = active.drain().collect();
+        moved.visit_roots(visitor);
+        active.extend(moved);
+    }
+}
+
+impl Continuation for HashDriver {
+    fn call(self: Box<Self>, vm: &mut BexVm, _value: Value) -> NativeCallResult {
+        (*self).drive(vm)
+    }
+}
+
+pub(super) fn hash_structural_default(
+    vm: &mut BexVm,
+    value: Value,
+    state: Value,
+) -> NativeCallResult {
+    HashDriver {
+        state,
+        pending: vec![Work::Value(value, false)],
+        active: HashSet::new(),
+        map_hashes: Vec::new(),
+    }
+    .drive(vm)
+}
+
+pub(super) fn hash_value(vm: &mut BexVm, value: Value, state: Value) -> NativeCallResult {
+    HashDriver {
+        state,
+        pending: vec![Work::Value(value, true)],
+        active: HashSet::new(),
+        map_hashes: Vec::new(),
+    }
+    .drive(vm)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::Hasher as _;
+
+    use super::framed;
+
+    /// What a map computes for a key whose `Hash` runs BAML code and writes
+    /// `chunks`: a map-key hasher fed those writes, then finished.
+    fn driver_hash(chunks: &[&[u8]]) -> u64 {
+        let mut hasher = bex_vm_types::map_key_hasher();
+        for chunk in chunks {
+            hasher.write(chunk);
+        }
+        hasher.finish()
+    }
+
+    /// Maps hash string and int keys natively. A key whose `Hash` writes the
+    /// same value must land in the same bucket, so the native hashes keep the
+    /// driver's framing.
+    #[test]
+    fn native_key_hashes_match_the_driver() {
+        for int in [0, 1, -1, 42, i64::from(i32::MAX), -(1 << 62)] {
+            assert_eq!(
+                bex_vm_types::map_int_hash(int),
+                driver_hash(&[&framed(1, &int.to_le_bytes())])
+            );
+        }
+        let long = "a key longer than the stack buffer a native hash frames into, ".repeat(3);
+        for text in [
+            "",
+            "a",
+            "ggtatt",
+            "a string longer than sixteen bytes",
+            &long,
+        ] {
+            assert_eq!(
+                bex_vm_types::map_string_hash(text),
+                driver_hash(&[&framed(5, text.as_bytes())])
+            );
+        }
+    }
+
+    /// `baml.hash.Hasher` promises that writing a stream in chunks hashes
+    /// like writing it whole; a map's key hash keeps that promise.
+    #[test]
+    fn map_key_hash_ignores_chunking() {
+        let stream = framed(5, b"a string longer than sixteen bytes");
+        let whole = driver_hash(&[&stream]);
+        for split in [0, 1, 9, 17, stream.len()] {
+            let (head, tail) = stream.split_at(split);
+            assert_eq!(driver_hash(&[head, tail]), whole);
+        }
+        assert_ne!(driver_hash(&[&framed(5, b"ggtatt")]), whole);
+    }
+}

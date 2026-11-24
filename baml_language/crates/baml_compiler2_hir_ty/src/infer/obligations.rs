@@ -150,16 +150,20 @@ fn instantiate_interface(
 }
 
 /// Whether a bound must refuse `head` before consulting any implementation:
-/// the type has no single runtime type for code under the bound to dispatch
-/// on (`TYPE_SYSTEM.md`, "Generics on Functions"), because it spans several
-/// (a union, an existential, `unknown`) or none (`never`, `void`).
+/// the type is not one concrete type (`TYPE_SYSTEM.md`, "Generics on
+/// Functions"), because it spans several runtime types (a union, an
+/// existential, `unknown`), none (`never`), or is a literal type, a subset of
+/// a concrete type rather than one: its values use the base type's members,
+/// but it is never a bound's type argument (the runtime's `bound_admits`
+/// judges a host's or a `let type`'s argument by the same rule).
 fn is_abstract_head(head: &InferTy) -> bool {
     match head {
         InferTy::Union(..)
         | InferTy::Interface(..)
         | InferTy::Unknown
         | InferTy::Never
-        | InferTy::Void => true,
+        | InferTy::Literal(..)
+        | InferTy::EnumVariant(..) => true,
         InferTy::Int
         | InferTy::Bigint
         | InferTy::Float
@@ -171,16 +175,13 @@ fn is_abstract_head(head: &InferTy) -> bool {
         | InferTy::Class(..)
         | InferTy::Enum(..)
         | InferTy::List(..)
+        | InferTy::Tuple(..)
         | InferTy::Map { .. }
         | InferTy::Function { .. }
         | InferTy::Future(..)
         | InferTy::Type
         | InferTy::Resource
-        | InferTy::PromptAst
-        | InferTy::RustType => false,
-        // Literal types are not refused here but left to the implements
-        // verdict (a literal was widened to its base before this is asked).
-        InferTy::Literal(..) | InferTy::EnumVariant(..) => false,
+        | InferTy::PromptAst => false,
         // Symbolic: concreteness is the variable's own bound, which
         // caller-bound selection proves.
         InferTy::TypeVar(..) | InferTy::AssociatedTypeProjection { .. } => false,
@@ -202,9 +203,9 @@ enum Attempt {
 #[derive(Clone, Copy)]
 enum Stall {
     /// Part of the goal is still unsolved: the subject is a variable, a
-    /// union has not closed, or a projection's base has not resolved. No
-    /// candidate was ever consulted, so there is nothing to call ambiguous;
-    /// the diagnostics for an undetermined type own it.
+    /// union has not closed, a projection's base has not resolved, or a
+    /// conditional default needs resolved components. This is not candidate
+    /// ambiguity; the diagnostics for an undetermined type own it.
     Unresolved,
     /// The goal is decidable and MORE THAN ONE candidate decides it. More
     /// solving may still prune the set, so it retries; if nothing does, it
@@ -222,6 +223,21 @@ pub(super) struct Pending {
     stall: Option<Stall>,
 }
 
+/// The generic arguments and associated-type pins of one interface
+/// instantiation.
+#[derive(Clone, PartialEq)]
+pub(super) struct InterfaceInstantiation {
+    pub args: Vec<Ty>,
+    pub pins: Vec<(baml_type::Name, Ty)>,
+}
+
+/// The one impl selection confirmed, with the instantiation of its own
+/// parameters that confirms it.
+type ConfirmedImpl<'db> = (
+    &'db crate::impls::ImplFacts<'db>,
+    rustc_hash::FxHashMap<baml_type::ParamTy, Ty>,
+);
+
 /// The outcome of candidate selection for a goal whose subject is known.
 enum Selection {
     /// Exactly one candidate applied, and confirming it committed its
@@ -229,13 +245,133 @@ enum Selection {
     Confirmed,
     /// Several candidates apply; more solving may prune them.
     Ambiguous,
+    /// A conditional default needs the subject's remaining variables resolved.
+    Unresolved,
     /// No candidate can apply, whatever the goal's open variables become.
     NoCandidate,
 }
 
 impl<'db> InferenceContext<'db> {
+    /// Search bounds without solving them. A structure demand must not
+    /// commit sibling variables merely because they share a bound with it.
+    fn has_structure_operator(
+        &mut self,
+        ty: &Ty,
+        visiting: &mut rustc_hash::FxHashSet<baml_type::interned::InferVar>,
+    ) -> bool {
+        let ty = self.table.resolve_completely(ty);
+        let InferTy::InferVar { var, .. } = ty.kind() else {
+            return false;
+        };
+        let root = self
+            .table
+            .unsolved_root_var(*var)
+            .expect("resolve_completely leaves only unsolved variables");
+        if !visiting.insert(root) {
+            return false;
+        }
+        if self
+            .journals
+            .obligations
+            .iter()
+            .any(|Pending { obligation, .. }| {
+                let Obligation::Operator { out, .. } = obligation else {
+                    return false;
+                };
+                let out = self.table.resolve_completely(out);
+                matches!(out.kind(), InferTy::InferVar { var, .. }
+                if self.table.unsolved_root_var(*var) == Some(root))
+            })
+        {
+            return true;
+        }
+        let bounds = self.table.var_bounds(root);
+        bounds
+            .lowers
+            .iter()
+            .chain(&bounds.uppers)
+            .any(|bound| self.has_structure_operator(&bound.ty, visiting))
+    }
+
+    /// A structure demand can depend on pending arithmetic, e.g.
+    /// `(values.reduce((a, b) -> { a + b }, 0) * 1.0).round()`.
+    /// Resolve only that operator's dependencies from their current bounds;
+    /// unrelated obligations must keep waiting for the finish fixpoint.
+    /// Leave the obligation registered so finish still reports failures.
+    pub(super) fn resolve_structure_operand(
+        &mut self,
+        ty: &Ty,
+        visiting: &mut rustc_hash::FxHashSet<baml_type::interned::InferVar>,
+    ) -> Ty {
+        let resolved = self.table.resolve_completely(ty);
+        let InferTy::InferVar { var, .. } = resolved.kind() else {
+            return resolved;
+        };
+        let var = self
+            .table
+            .unsolved_root_var(*var)
+            .expect("resolve_completely leaves only unsolved variables");
+        if !visiting.insert(var) {
+            return resolved;
+        }
+        let bounds = self.table.var_bounds(var);
+        // Generic passthrough calls may put one or more bounded variables
+        // between the receiver and its producer. Demand those dependencies
+        // before committing their aliases; the root guard breaks cycles
+        // such as a reduce accumulator bounded by its own callback output.
+        for bound in bounds.lowers.iter().chain(&bounds.uppers) {
+            if self.has_structure_operator(&bound.ty, &mut rustc_hash::FxHashSet::default()) {
+                self.resolve_structure_operand(&bound.ty, visiting);
+            }
+        }
+        let bounds = self.table.var_bounds(var);
+        self.try_solve_bounded_var(var, &bounds);
+        let resolved = self.table.resolve_completely(&resolved);
+        let InferTy::InferVar { var, .. } = resolved.kind() else {
+            return resolved;
+        };
+        // Solving can alias the demanded variable to an operator output
+        // without grounding either. Compare union-find roots, not the
+        // original InferVar spellings, and keep following the producer.
+        let root = self
+            .table
+            .unsolved_root_var(*var)
+            .expect("resolve_completely leaves only unsolved variables");
+        let operator =
+            self.journals
+                .obligations
+                .iter()
+                .find_map(|Pending { obligation, .. }| {
+                    let Obligation::Operator {
+                        interface,
+                        lhs,
+                        rhs,
+                        out,
+                        ..
+                    } = obligation
+                    else {
+                        return None;
+                    };
+                    let out = self.table.resolve_completely(out);
+                    let InferTy::InferVar { var, .. } = out.kind() else {
+                        return None;
+                    };
+                    (self.table.unsolved_root_var(*var) == Some(root))
+                        .then(|| (*interface, lhs.clone(), rhs.clone()))
+                });
+        if let Some((interface, lhs, rhs)) = operator {
+            let lhs = self.resolve_structure_operand(&lhs, visiting);
+            let rhs = rhs.map(|rhs| self.resolve_structure_operand(&rhs, visiting));
+            if !lhs.has_infer() && !rhs.as_ref().is_some_and(Ty::has_infer) {
+                let result = self.dispatch_operator(interface, &lhs, rhs.as_ref());
+                let _ = self.table.unify(&resolved, &result);
+            }
+        }
+        self.table.resolve_completely(&resolved)
+    }
+
     pub(super) fn register_obligation(&mut self, obligation: Obligation) {
-        self.obligations.push(Pending {
+        self.journals.obligations.push(Pending {
             obligation,
             stall: None,
         });
@@ -244,12 +380,12 @@ impl<'db> InferenceContext<'db> {
     /// One discharge round over every pending obligation. Returns whether
     /// anything discharged (progress for the fixpoint driver).
     pub(super) fn discharge_obligations_once(&mut self) -> bool {
-        let pending = std::mem::take(&mut self.obligations);
+        let pending = std::mem::take(&mut self.journals.obligations);
         let mut progressed = false;
         for Pending { obligation, .. } in pending {
             match self.attempt(&obligation) {
                 Attempt::Done => progressed = true,
-                Attempt::Stalled(stall) => self.obligations.push(Pending {
+                Attempt::Stalled(stall) => self.journals.obligations.push(Pending {
                     obligation,
                     stall: Some(stall),
                 }),
@@ -279,7 +415,14 @@ impl<'db> InferenceContext<'db> {
                 // the type the alias denotes, widened; a report names the
                 // type as written.
                 let subject = ty;
-                let mut ty = widen_literal(&self.expand_alias_ty(&subject));
+                let written = self.expand_alias_ty(&subject);
+                // A bound judges its argument as written: a fresh literal
+                // (a value's) widens to its base and is one concrete type,
+                // while a literal type written as the argument stays a
+                // literal, which `is_abstract_head` refuses. The implements
+                // verdict below judges every literal by its base.
+                let mut bound_subject = super::widen_fresh_literal(&written);
+                let mut ty = widen_literal(&written);
                 // One spelling, one verdict (B-1576): resolution can ground a
                 // syntactic union after this obligation registered, and the
                 // canonical form may be a single member. An OPEN union may
@@ -298,6 +441,17 @@ impl<'db> InferenceContext<'db> {
                         }
                         Err(_) => {}
                     }
+                }
+                // The bound's subject is judged canonically too: a type is its
+                // value set, so `true | false` written as a type argument is
+                // `bool`, `1 | int` is `int` and `int | never` is `int`, each
+                // one concrete type. Only a union still a union once
+                // canonical, or a literal written alone, is abstract.
+                if let InferTy::Union(..) = bound_subject.kind()
+                    && let Ok(closed) = baml_type::interned::ClosedTy::try_from(&bound_subject)
+                {
+                    bound_subject = self.canonicalize_unions(&closed).into_ty();
+                    bound_subject = self.expand_alias_ty(&bound_subject);
                 }
                 if purpose == GoalPurpose::Coercion {
                     match ty.kind() {
@@ -326,14 +480,23 @@ impl<'db> InferenceContext<'db> {
                 // before the shared verdict, whose existential arm answers by
                 // the existential's own reference — right for a coercion
                 // (a `Show` value is usable as a `Show`), never for a bound.
-                if purpose == GoalPurpose::Bound && is_abstract_head(ty.kind()) {
-                    self.pending_diags
-                        .push(super::PendingDiag::BoundedArgNotConcrete {
-                            expr: at,
-                            arg: ty,
-                            bound: interface,
-                            required_for: required_for.clone(),
-                        });
+                if purpose == GoalPurpose::Bound
+                    && is_abstract_head(bound_subject.kind())
+                    && !crate::impls::is_structural_interface(self.db, &interface)
+                    && crate::impls::conditional_structural_verdict(
+                        self.db,
+                        &self.facts,
+                        &ty,
+                        &interface,
+                    ) != Some(true)
+                {
+                    // Named as the user wrote it: the judgment widened.
+                    self.report(super::PendingDiag::BoundedArgNotConcrete {
+                        expr: at,
+                        arg: subject,
+                        bound: interface,
+                        required_for: required_for.clone(),
+                    });
                     return Attempt::Done;
                 }
                 if let Ok(closed) = baml_type::interned::ClosedTy::try_from(&ty)
@@ -385,6 +548,7 @@ impl<'db> InferenceContext<'db> {
                 match selection {
                     Selection::Confirmed => Attempt::Done,
                     Selection::Ambiguous => Attempt::Stalled(Stall::Ambiguous),
+                    Selection::Unresolved => Attempt::Stalled(Stall::Unresolved),
                     Selection::NoCandidate => {
                         self.report_not_implemented(at, subject, &interface, required_for);
                         Attempt::Done
@@ -418,8 +582,9 @@ impl<'db> InferenceContext<'db> {
     /// inversion B-898 needs): every candidate is tried under a table
     /// snapshot and rolled back; EXACTLY ONE applying confirms it - the
     /// header unification commits, constraining the goal's inference
-    /// variables. Zero applicable is a definite failure (reported);
-    /// several is genuine ambiguity - Stalled, retried once more
+    /// variables. Zero applicable falls back to structural defaults, whose
+    /// eligibility may still be unresolved; otherwise it is a definite failure.
+    /// Several is genuine ambiguity - Stalled, retried once more
     /// information may prune, reported at quiescence if it never does
     /// (rustc's "type annotations needed"). Committing on uniqueness is
     /// sound because coherence (I7) guarantees at most one impl per
@@ -432,25 +597,11 @@ impl<'db> InferenceContext<'db> {
         at: ExprId,
         required_for: &[RequiredFor],
     ) -> Selection {
-        let candidates = crate::impls::impl_candidates(self.db, goal, &interface.name);
-        let mut applicable = None;
-        for facts in candidates {
-            let probe = self.probe();
-            let applies = self.confirm_impl(goal, interface, facts).is_some();
-            self.rollback_probe(probe);
-            if applies {
-                if applicable.is_some() {
-                    return Selection::Ambiguous;
-                }
-                applicable = Some(facts);
-            }
-        }
-        let Some(facts) = applicable else {
-            return Selection::NoCandidate;
+        let (facts, instantiation) = match self.confirm_unique_impl(goal, subject, interface) {
+            Ok(Some(confirmed)) => confirmed,
+            Ok(None) => return Selection::Confirmed,
+            Err(selection) => return selection,
         };
-        let instantiation = self
-            .confirm_impl(goal, interface, facts)
-            .expect("the unique applicable candidate re-confirms");
         let mut nested = required_for.to_vec();
         nested.push(RequiredFor {
             subject: subject.clone(),
@@ -458,6 +609,132 @@ impl<'db> InferenceContext<'db> {
         });
         self.register_impl_bound_obligations(facts, &instantiation, at, &nested);
         Selection::Confirmed
+    }
+
+    /// The candidate half of [`Self::select_impl`]: the unique impl whose
+    /// header applies to `goal`, confirmed (its header unifications
+    /// committed) with the instantiation that confirms it; `Ok(None)` when
+    /// a structural default proves the goal with no impl; otherwise the
+    /// selection no single impl decides. The confirmed impl's own bounds
+    /// are the caller's to register.
+    fn confirm_unique_impl(
+        &mut self,
+        goal: &Ty,
+        subject: &Ty,
+        interface: &InferInterface,
+    ) -> Result<Option<ConfirmedImpl<'db>>, Selection> {
+        let candidates = crate::impls::impl_candidates(self.db, goal, &interface.name);
+        let mut applicable: Option<&'db crate::impls::ImplFacts<'db>> = None;
+        for facts in candidates {
+            let probe = self.probe();
+            let applies = self.confirm_impl(goal, interface, facts).is_some();
+            self.rollback_probe(probe);
+            if applies {
+                if applicable.is_some() {
+                    return Err(Selection::Ambiguous);
+                }
+                applicable = Some(facts);
+            }
+        }
+        let Some(facts) = applicable else {
+            if crate::impls::is_structural_interface(self.db, interface) {
+                return Ok(None);
+            }
+            match crate::impls::structural_interface(self.db, &interface.name) {
+                Some(baml_type::StructuralInterface::Hash) => {
+                    if goal.has_infer() || interface_has_infer(interface) {
+                        return Err(Selection::Unresolved);
+                    }
+                    if crate::impls::hash_eligible(self.db, &self.facts, subject, interface) {
+                        return Ok(None);
+                    }
+                }
+                Some(baml_type::StructuralInterface::Compare)
+                    if matches!(subject.kind(), InferTy::Tuple(_)) =>
+                {
+                    if goal.has_infer() || interface_has_infer(interface) {
+                        return Err(Selection::Unresolved);
+                    }
+                    if crate::impls::derived_tuple_compare(self.db, &self.facts, subject, interface)
+                        == Some(true)
+                    {
+                        return Ok(None);
+                    }
+                }
+                _ => {}
+            }
+            return Err(Selection::NoCandidate);
+        };
+        let instantiation = self
+            .confirm_impl(goal, interface, facts)
+            .expect("the unique applicable candidate re-confirms");
+        Ok(Some((facts, instantiation)))
+    }
+
+    /// The one instantiation - every generic argument and associated-type
+    /// pin - at which `subject` implements the interface `name`, read off
+    /// what selecting a goal with fresh arguments commits: an impl's
+    /// header, a rigid variable's bound, or an existential's own reference
+    /// (each through its `requires` closure). `None` when no candidate
+    /// proves it, several do, or what one proves is not fully determined.
+    /// Nothing the selection does survives the call.
+    pub(super) fn implemented_instantiation(
+        &mut self,
+        subject: &Ty,
+        name: &baml_type::DeclName,
+        arity: usize,
+        associated: &[baml_type::Name],
+    ) -> Option<InterfaceInstantiation> {
+        let subject = self.table.resolve_completely(subject);
+        if subject.has_infer() || subject.has_error() {
+            return None;
+        }
+        let subject = widen_literal(&self.expand_alias_ty(&subject));
+        let probe = self.probe();
+        let goal = InferInterface::new(
+            name.clone(),
+            (0..arity).map(|_| self.table.new_var_ty()).collect(),
+            associated
+                .iter()
+                .map(|member| (member.clone(), self.table.new_var_ty()))
+                .collect(),
+        );
+        let confirmed = match subject.kind() {
+            InferTy::Interface(..) => {
+                matches!(self.select_object(&subject, &goal), Selection::Confirmed)
+            }
+            InferTy::TypeVar(..) => {
+                matches!(self.select_param_env(&subject, &goal), Selection::Confirmed)
+            }
+            // No impl subject is a union, and the top type is no implementor.
+            InferTy::Union(..) | InferTy::Unknown | InferTy::Never => false,
+            // An impl's header pins the arguments only where one impl applies.
+            _ => matches!(
+                self.confirm_unique_impl(&subject, &subject, &goal),
+                Ok(Some(_))
+            ),
+        };
+        let instantiation = confirmed
+            .then(|| {
+                let args: Vec<Ty> = goal
+                    .generics
+                    .iter()
+                    .map(|arg| self.table.resolve_completely(arg))
+                    .collect();
+                let pins: Vec<(baml_type::Name, Ty)> = goal
+                    .associated_types
+                    .iter()
+                    .map(|(member, pin)| (member.clone(), self.table.resolve_completely(pin)))
+                    .collect();
+                InterfaceInstantiation { args, pins }
+            })
+            .filter(|InterfaceInstantiation { args, pins }| {
+                args.iter()
+                    .chain(pins.iter().map(|(_, pin)| pin))
+                    .all(|ty| !ty.has_infer() && !ty.has_error())
+            });
+        self.rollback_probe(probe);
+        instantiation
     }
 
     /// Object selection: the existential subject's own reference and its
@@ -580,6 +857,20 @@ impl<'db> InferenceContext<'db> {
         true
     }
 
+    /// Marks every open class a goal names - its subject, the interface's
+    /// arguments and pins - as owned by the goal's report
+    /// (`InferenceTable::taint_vars_in`).
+    fn taint_goal_vars(&mut self, subject: &Ty, interface: &InferInterface) {
+        self.table.taint_vars_in(subject);
+        for ty in interface
+            .generics
+            .iter()
+            .chain(interface.associated_types.iter().map(|(_, ty)| ty))
+        {
+            self.table.taint_vars_in(ty);
+        }
+    }
+
     /// Records that `subject` does not implement `interface`: the nominal
     /// verdict, reported as such rather than as a subtyping mismatch (which
     /// the finalize filter would re-judge, and `never <: I` holds
@@ -592,8 +883,12 @@ impl<'db> InferenceContext<'db> {
         interface: &InferInterface,
         required_for: &[RequiredFor],
     ) {
+        // The verdict owns the goal's open classes: a slot the goal would
+        // have determined had it held is a cascade of this report, not a
+        // "cannot infer" of its own.
+        self.taint_goal_vars(&subject, interface);
         let interface = interface.existential();
-        let already = self.pending_diags.iter().any(|pending| {
+        let already = self.journals.pending_diags.iter().any(|pending| {
             matches!(
                 pending,
                 super::PendingDiag::DoesNotImplement { expr, value, interface: reported, .. }
@@ -601,13 +896,12 @@ impl<'db> InferenceContext<'db> {
             )
         });
         if !already {
-            self.pending_diags
-                .push(super::PendingDiag::DoesNotImplement {
-                    expr: at,
-                    value: subject,
-                    interface,
-                    required_for: required_for.to_vec(),
-                });
+            self.report(super::PendingDiag::DoesNotImplement {
+                expr: at,
+                value: subject,
+                interface,
+                required_for: required_for.to_vec(),
+            });
         }
     }
 
@@ -619,9 +913,29 @@ impl<'db> InferenceContext<'db> {
     /// resolved - no candidate was ever consulted - and the diagnostics for
     /// an undetermined type own it, as they own the deferred subs' residue.
     pub(super) fn settle_stalled_obligations(&mut self) {
-        for Pending { obligation, stall } in std::mem::take(&mut self.obligations) {
+        for Pending { obligation, stall } in std::mem::take(&mut self.journals.obligations) {
             // An operator stalls only on an unsolved operand, so one pattern
             // covers both kinds: ambiguity is impl selection's outcome alone.
+            // The operand's own undetermined-type report owns a stalled
+            // operator: the operand is an expression whose type is recorded,
+            // so it reports at its origin or through the writeback backstop.
+            // The output is tainted so it does not report a second time -
+            // except where solving merged the output INTO an operand's class
+            // (`xs.push(xs[0] + 1)`): that class is the operand, and its own
+            // report must stand. Settling runs after every solve, so no
+            // later merge can change the split.
+            if let Obligation::Operator { lhs, rhs, out, .. } = &obligation {
+                let mut operand_roots = self.table.open_roots_in(lhs);
+                if let Some(rhs) = rhs {
+                    operand_roots.extend(self.table.open_roots_in(rhs));
+                }
+                for root in self.table.open_roots_in(out) {
+                    if !operand_roots.contains(&root) {
+                        self.table.taint_root(root);
+                    }
+                }
+                continue;
+            }
             let (
                 Obligation::Implements {
                     ty,
@@ -636,14 +950,17 @@ impl<'db> InferenceContext<'db> {
                 continue;
             };
             let ty = self.table.resolve_completely(&ty);
-            let interface = self.resolve_interface_ref(&interface).existential();
-            self.pending_diags
-                .push(super::PendingDiag::AmbiguousImplementation {
-                    expr: at,
-                    value: ty,
-                    interface,
-                    required_for,
-                });
+            let interface = self.resolve_interface_ref(&interface);
+            // As for a failed goal: the ambiguity report owns the slots
+            // the selection would have decided.
+            self.taint_goal_vars(&ty, &interface);
+            let interface = interface.existential();
+            self.report(super::PendingDiag::AmbiguousImplementation {
+                expr: at,
+                value: ty,
+                interface,
+                required_for,
+            });
         }
     }
 
@@ -842,12 +1159,12 @@ impl<'db> InferenceContext<'db> {
         if !crate::impls::is_concrete_receiver(receiver) {
             return None;
         }
-        let mut applicable = None;
+        let lang = baml_compiler2_hir::package::lang_roots(self.db);
+        let mut applicable: Option<&crate::impls::ImplFacts<'_>> = None;
         for facts in crate::impls::all_impl_facts(self.db, self.viewer()) {
-            if !crate::impls::provides_concrete_members(
-                baml_compiler2_hir::package::lang_roots(self.db),
-                &facts.interface.name,
-            ) {
+            if !crate::impls::provides_concrete_members(lang, &facts.interface.name)
+                || crate::impls::is_concrete_type_member(lang, &facts.interface.name, name)
+            {
                 continue;
             }
             let probe = self.probe();
@@ -860,7 +1177,49 @@ impl<'db> InferenceContext<'db> {
                 applicable = Some(facts);
             }
         }
-        let facts = applicable?;
+        let Some(facts) = applicable else {
+            let roots = if receiver.has_infer() {
+                crate::impls::structural_interface_roots(self.db)
+                    .into_iter()
+                    .chain(crate::impls::hash_interface_root(self.db))
+                    .chain(
+                        matches!(receiver.kind(), InferTy::Tuple(_))
+                            .then(|| crate::impls::compare_interface_root(self.db))
+                            .flatten(),
+                    )
+                    .collect()
+            } else {
+                crate::impls::applicable_structural_interface_roots(self.db, &self.facts, receiver)
+            };
+            let mut candidates = roots.into_iter().filter_map(|interface| {
+                crate::method_resolution::member_on_interface(
+                    self.db,
+                    &self.facts,
+                    &interface,
+                    receiver,
+                    name,
+                    false,
+                )
+                .map(|member| (interface, member))
+            });
+            let (interface, member) = candidates.next()?;
+            if candidates.next().is_some() {
+                return None;
+            }
+            // Discovering a conditional default's signature does not prove
+            // conformance. Fulfillment checks it once the receiver resolves.
+            if crate::impls::structural_interface(self.db, &interface.name)
+                .is_some_and(baml_type::StructuralInterface::is_conditional)
+            {
+                self.register_obligation(Obligation::implements(
+                    receiver.clone(),
+                    interface,
+                    at,
+                    GoalPurpose::Bound,
+                ));
+            }
+            return Some(member);
+        };
         let (member, instantiation) = self
             .probe_candidate(receiver, name, facts)
             .expect("the unique applicable candidate re-confirms");
@@ -930,6 +1289,14 @@ impl<'db> InferenceContext<'db> {
     /// construction: a union reaches the registry and no impl subject is
     /// a union, so it fails - never "passes as a subtype".
     fn implements_holds(&mut self, ty: &Ty, interface: &InferInterface) -> bool {
+        if crate::impls::is_structural_interface(self.db, interface) {
+            return true;
+        }
+        if let Some(eligible) =
+            crate::impls::conditional_structural_verdict(self.db, &self.facts, ty, interface)
+        {
+            return eligible;
+        }
         let target = interface.clone();
         let eq = crate::impls::AliasOnlyFacts::new(self.db);
         match ty.kind() {

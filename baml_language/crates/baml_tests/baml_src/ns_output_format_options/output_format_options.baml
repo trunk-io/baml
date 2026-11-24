@@ -41,7 +41,7 @@ test "declarative output format supports every legacy option" {
 }
 
 function of_context() -> ai.Context {
-    let return_type = reflect.Type.of<OfOptionResult>()
+    let return_type = OfOptionResult.type()
     ai.Context {
         client: ai.ContextClient {
             name: "test",
@@ -88,4 +88,12 @@ test "output format distinguishes omitted options from explicit null" {
     assert.is_true(without_prefixes.includes("Answer in JSON") == false)
     assert.contains(without_prefixes, "\nFirst")
     assert.is_true(without_prefixes.includes("\n- First") == false)
+}
+
+test "output format renders explicit defaults as omitted ones" {
+    let defaults = of_context().output_format()
+    assert.equal(of_context().output_format(map_style = "object"), defaults)
+    assert.equal(of_context().output_format(render_null_as = null), defaults)
+    assert.equal(of_context().output_format(quote_class_fields = false), defaults)
+    assert.equal(of_context().output_format(hoist_classes = "auto"), defaults)
 }

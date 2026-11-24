@@ -1,4 +1,4 @@
-// `dispatch_target` is the shared entrypoint for both `baml run` and the
+// `dispatch_target_with_context` is the shared entrypoint for both `baml run` and the
 // `baml-pack-host` runtime that packaged binaries ship with.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -7,8 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use bex_engine::{
-    BexCallArg, BexEngine, BexExternalValue, CallId, EngineError, FunctionCallContext,
-    FunctionCallContextBuilder, RuntimeTy,
+    BexCallArg, BexEngine, BexExternalValue, EngineError, FunctionCallContext, RuntimeTy,
 };
 
 use crate::{
@@ -26,6 +25,10 @@ pub enum DispatchResult {
     /// terminating the process with this code (clamped to the shell's
     /// range as appropriate — typically 0..=255 on Unix).
     Exit(i64),
+    /// The host cancelled the call through the context's cancel token (for
+    /// example on a termination signal, see [`crate::Interrupts`]) and the
+    /// target unwound. Nothing was printed.
+    Interrupted,
 }
 
 /// Reject targets whose signature declares a parameter named `help`.
@@ -33,7 +36,15 @@ pub fn validate_help_param(engine: &BexEngine, function_name: &str) -> Result<()
     let params = engine
         .function_params(function_name)
         .with_context(|| format!("failed to resolve target `{function_name}`"))?;
-    if params.iter().any(|(name, _, _)| *name == "help") {
+    validate_help_param_names(function_name, params.iter().map(|(name, _, _)| *name))
+}
+
+/// Check a signature before constructing an engine.
+pub fn validate_help_param_names<'a>(
+    function_name: &str,
+    param_names: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if param_names.into_iter().any(|name| name == "help") {
         anyhow::bail!(
             "Target `{function_name}` declares a parameter named `help`, \
              which collides with the auto-derived `--help` flag. \
@@ -47,33 +58,6 @@ pub fn validate_help_param(engine: &BexEngine, function_name: &str) -> Result<()
 /// that `std::process::exit` and C's `exit(int)` take.
 pub fn clamp_exit_code(code: i64) -> i32 {
     i32::try_from(code).unwrap_or(if code < 0 { i32::MIN } else { i32::MAX })
-}
-
-/// Invoke `target_name` with parameters drawn from `cli_values` (and
-/// optionally `json_args`), then write the return value to stdout.
-///
-/// `cli_values` is the already-typed map produced by
-/// [`crate::parse_target_argv`] — by the time we reach dispatch, clap has
-/// done structural validation and `parse_cli_value` has converted each
-/// raw string to a `BexExternalValue`. Dispatch only has to merge the
-/// CLI flags with `--json-args`, build the ordered call vector, and run.
-pub async fn dispatch_target(
-    engine: Arc<BexEngine>,
-    target_name: &str,
-    cli_values: HashMap<String, BexExternalValue>,
-    json_args: Option<serde_json::Value>,
-    output_format: OutputFormat,
-) -> Result<DispatchResult> {
-    dispatch_target_with_context(
-        engine,
-        target_name,
-        cli_values,
-        json_args,
-        output_format,
-        FunctionCallContextBuilder::new(CallId::next()).build(),
-        || {},
-    )
-    .await
 }
 
 /// Invoke a target with a caller-provided function context.
@@ -115,6 +99,7 @@ pub async fn dispatch_target_with_context(
     )
     .await?;
 
+    let host_cancel = call_context.cancel.clone();
     let result = engine
         .call_function_bound_args(target_name, args, call_context, true)
         .await;
@@ -122,13 +107,18 @@ pub async fn dispatch_target_with_context(
 
     match result {
         Ok(value) => {
-            // No stdout for `void` return; value-carrying types like `int?`
-            // still emit their serialization even when null.
-            if !matches!(func_info.return_type, RuntimeTy::Void) {
+            // A unit return (`-> void` / `-> null`) carries no information, so
+            // the human format prints nothing for it. JSON output is a document
+            // a consumer parses, so it always prints one — `null` for unit.
+            // Value-carrying types like `int?` print in both, even when null.
+            let elide = match output_format {
+                OutputFormat::Text => func_info.return_type.is_unit(),
+                OutputFormat::Json => false,
+            };
+            if !elide {
                 write_output_with_context(
                     &engine,
                     value,
-                    &func_info.return_type,
                     output_format,
                     &helper_context,
                     after_call,
@@ -138,6 +128,12 @@ pub async fn dispatch_target_with_context(
             Ok(DispatchResult::Ok)
         }
         Err(EngineError::Exit { code }) => Ok(DispatchResult::Exit(code)),
+        Err(e) if host_cancel.is_cancelled() && bex_engine::is_cancelled_engine_error(&e) => {
+            Ok(DispatchResult::Interrupted)
+        }
+        // Hosts report initial telemetry refusal after shutdown has joined authorization.
+        #[cfg(not(target_arch = "wasm32"))]
+        Err(error @ EngineError::CloudAuthorization(_)) => Err(error.into()),
         Err(e) => {
             // Bold-red `error:` matching ariadne / cargo. Same renderer
             // used by `baml run`'s top-level error path so target-side
@@ -159,7 +155,7 @@ enum RawArg {
     Primitive(Box<BexExternalValue>),
     /// JSON text from `--json-args` (the only path that delivers
     /// structured values per BEP-027 §"Open questions" #5). Resolved
-    /// asynchronously via `baml.json.deserialize<T>`.
+    /// asynchronously via `baml.json.decode<T>`.
     JsonText(String),
 }
 
@@ -167,7 +163,7 @@ enum RawArg {
 /// and auto-CLI flags. CLI flags override JSON keys (BEP-027 §"JSON
 /// argument form").
 ///
-/// Complex-typed parameters are coerced through `baml.json.deserialize<T>`
+/// Complex-typed parameters are coerced through `baml.json.decode<T>`
 /// so user `from_json` overrides on classes are honored — same model as
 /// the output side using the stdlib JSON serializer. Primitive parameters
 /// skip the engine and bind directly.
@@ -274,24 +270,24 @@ async fn build_args_from_signature_with_context(
     Ok(ordered)
 }
 
-/// Coerce JSON text into a typed BAML value via the stdlib's
-/// `baml.json.deserialize<T>` (which dispatches user `from_json` overrides).
+/// Hydrate JSON text into a typed BAML value through the stdlib's
+/// `baml.json.decode<T>` (which dispatches user `from_json` overrides), with
+/// declared names.
 async fn deserialize_via_baml_json(
     engine: &Arc<BexEngine>,
     json_text: &str,
     ty: &RuntimeTy,
     helper_context: &HelperCallContext,
 ) -> Result<BexExternalValue> {
-    let result = engine
-        .call_function(
-            "baml.json.deserialize",
-            vec![BexExternalValue::String(json_text.into())],
-            helper_context.call_context(indexmap::IndexMap::from([("T".to_string(), ty.clone())])),
-            true,
-        )
+    let realized = <&baml_type::RealizedTy<baml_type::TypeName>>::try_from(ty).map_err(|_| {
+        anyhow!("the parameter has the generic type {ty}; JSON arguments need a concrete type")
+    })?;
+    engine
+        .deserialize_json(json_text, realized, |type_args| {
+            helper_context.call_context(type_args)
+        })
         .await
-        .map_err(|e| anyhow!("baml.json.deserialize failed: {e:?}"))?;
-    Ok(result)
+        .map_err(|e| anyhow!("baml.json.decode failed: {e:?}"))
 }
 
 #[cfg(test)]
@@ -414,6 +410,56 @@ mod tests {
         assert!(msg.contains("missing required argument"), "got: {msg}");
         // Hint about `--` separator (added recently).
         assert!(msg.contains("--"), "got: {msg}");
+    }
+
+    /// The engine hydrates a JSON object against the function's declared
+    /// parameters: a class from an object, a defaulted parameter may be
+    /// absent, and anything else wrong is reported by name.
+    #[tokio::test]
+    async fn json_arguments_hydrate_each_parameter_against_its_type() {
+        let eng = engine(
+            r#"class Point { x int  y int }
+function main(p: Point, tag: string, count: int = 10) -> string { tag }"#,
+        );
+        let name = eng.find_user_function("main").unwrap().qualified_name;
+        let helper = HelperCallContext::disabled();
+        let hydrate = |json: &'static str| {
+            let eng = Arc::clone(&eng);
+            let helper = helper.clone();
+            let name = name.clone();
+            async move {
+                eng.json_arguments(&name, json, |type_args| helper.call_context(type_args))
+                    .await
+            }
+        };
+
+        let args = hydrate(r#"{"p": {"x": 1, "y": 2}, "tag": "t"}"#)
+            .await
+            .unwrap();
+        assert_eq!(args.len(), 2);
+        assert!(matches!(args["tag"], BexExternalValue::String(_)));
+        assert!(matches!(args["p"], BexExternalValue::Instance { .. }));
+
+        let missing = hydrate(r#"{"tag": "t"}"#).await.unwrap_err().to_string();
+        assert!(
+            missing.contains("missing required argument `p`"),
+            "got: {missing}"
+        );
+        let unknown = hydrate(r#"{"p": {"x": 1, "y": 2}, "tag": "t", "zzz": 1}"#)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("unknown argument(s): zzz"),
+            "got: {unknown}"
+        );
+        let wrong = hydrate(r#"{"p": 5, "tag": "t"}"#)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(wrong.starts_with("argument `p`:"), "got: {wrong}");
+        let not_object = hydrate("[1]").await.unwrap_err().to_string();
+        assert!(not_object.contains("JSON object"), "got: {not_object}");
     }
 
     /// BEP-027 §"What `baml pack` changes" — defaulted params allow the

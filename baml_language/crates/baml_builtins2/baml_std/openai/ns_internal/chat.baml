@@ -11,8 +11,8 @@
 // Wire modelling follows PLAN §1.5: the request, the response envelope and the
 // SSE chunks are all real BAML classes. `baml.json.json` appears exactly three
 // times — the `request_body` passthrough, a tool's `parameters` schema (which is
-// arbitrary JSON Schema by definition), and the per-message directives carried
-// verbatim from `ai.PromptMessage.metadata` onto a content part.
+// arbitrary JSON Schema by definition), and the `args` of a `${cache(args)}`
+// in the prompt, carried as written onto a content part.
 //
 // One language constraint shapes the request/response classes: `function` is a
 // keyword, so it cannot be a BAML field name, and the chat-completions wire
@@ -47,6 +47,71 @@ function _reject(provider: string, detail: string) -> ai.errors.InvalidRequest {
 /// `ChatCompat` exists to name the provider.
 function _azure_reject(detail: string) -> ai.errors.InvalidRequest {
     _reject("azure", detail)
+}
+
+// ---------------------------------------------------------------------------
+// The default cache breakpoint. Shared by the Chat Completions and Responses
+// clients: the field and the models that take it are the same on both APIs.
+
+/// (internal) Whether `model` rejects `prompt_cache_breakpoint`. OpenAI added
+/// the field with GPT-5.6; every earlier model answers 400
+/// ("prompt_cache_breakpoint is not supported on this model") on both Chat
+/// Completions and Responses, and caches implicitly whatever the request says.
+///
+/// The list is the OLD families, because that set is closed and the new one
+/// is not: a model this does not recognize is treated as one that takes the
+/// field, so a new family works without a change here. A model matches a
+/// family by being it or by starting with it plus "-", so "gpt-5" covers
+/// "gpt-5-mini" and "gpt-5-2025-08-07" but not "gpt-5.6-luna". A fine-tune
+/// (`ft:<base model>:<org>:<suffix>:<id>`) is judged by its base model.
+/// Each family is also matched with an "openai." prefix, the model id Bedrock
+/// gives an OpenAI model ("openai.gpt-5.5").
+///
+/// `chat-latest` is a moving alias that points at an old model today.
+function _rejects_cache_breakpoint(model: string) -> bool throws never {
+    let name = model;
+    if (name.starts_with("ft:")) {
+        name = name.split(":").at(1) ?? name;
+    }
+    let families = [
+        "gpt-3.5-turbo",
+        "gpt-4",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-4.5",
+        "gpt-5",
+        "gpt-5.1",
+        "gpt-5.2",
+        "gpt-5.3",
+        "gpt-5.4",
+        "gpt-5.5",
+        "o1",
+        "o3",
+        "o4",
+        "chatgpt-4o",
+        "chat-latest",
+    ];
+    for (let family in families) {
+        for (let id in [family, `openai.${family}`]) {
+            if (name == id || name.starts_with(`${id}-`)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The `prompt_cache_breakpoint` a `${cache()}` sends to `model`:
+/// `{"mode": "explicit"}`, the only value the field takes, or null for a model
+/// that rejects the field (GPT-5.5 and earlier), where a `${cache()}` sends
+/// nothing. The value marks one position; it is not the request-level
+/// `prompt_cache_options.mode`, so the request stays in OpenAI's implicit mode.
+function default_cache_breakpoint(model: string) -> baml.json.json throws never {
+    if (_rejects_cache_breakpoint(model)) {
+        null
+    } else {
+        { "mode": "explicit" }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +172,15 @@ class ChatCompat {
     // Query parameters the endpoint itself requires (Azure `api-version`).
     // User query params are merged over these.
     compat_query: map<string, string>,
+    // Send a `${cache(args)}` in the prompt as `prompt_cache_breakpoint` on
+    // the content part before it. OpenAI and Azure OpenAI document the field;
+    // other OpenAI-compatible servers do not, so everywhere else the delimiter
+    // is dropped and the request is the one the prompt would produce without it.
+    cache_breakpoints: bool,
+    // What a `${cache()}` written with no args sends as the breakpoint: the
+    // wrapper's `default_cache_args()`. Null sends nothing for it. Read only
+    // when `cache_breakpoints` is set.
+    default_cache_args: baml.json.json,
 
     /// Every field defaults to the plain-OpenAI shape; a wrapper overrides the
     /// handful that differ.
@@ -124,6 +198,8 @@ class ChatCompat {
         default_max_tokens: int? = null,
         default_role: string = "user",
         compat_query: map<string, string>? = null,
+        cache_breakpoints: bool = false,
+        default_cache_args: baml.json.json = null,
     ) -> ChatCompat {
         let empty: map<string, string> = {};
         ChatCompat {
@@ -140,6 +216,8 @@ class ChatCompat {
             default_max_tokens: default_max_tokens,
             default_role: default_role,
             compat_query: compat_query ?? empty,
+            cache_breakpoints: cache_breakpoints,
+            default_cache_args: default_cache_args,
         }
     }
 }
@@ -160,6 +238,10 @@ class ChatParams {
     headers: map<string, string>?,
     query_params: map<string, string>?,
     request_body: baml.json.json?,
+    // Send OpenAI Structured Outputs (`response_format` with a strict JSON
+    // Schema of the output type) and read the answer strictly instead of with
+    // SAP. See `openai/ns_internal/structured.baml`.
+    structured_output: bool,
 
     function new(
         model: string,
@@ -173,6 +255,7 @@ class ChatParams {
         headers: map<string, string>? = null,
         query_params: map<string, string>? = null,
         request_body: baml.json.json? = null,
+        structured_output: bool = false,
     ) -> ChatParams {
         ChatParams {
             model: model,
@@ -186,14 +269,9 @@ class ChatParams {
             headers: headers,
             query_params: query_params,
             request_body: request_body,
+            structured_output: structured_output,
         }
     }
-}
-
-/// `provider/model` — the client identity used for `ai.Client.id()`, journal
-/// attribution, and `ai.wire.sanitize_for_client`.
-function chat_client_id(compat: ChatCompat, params: ChatParams) -> string {
-    `${compat.provider}/${params.model}`
 }
 
 // ---------------------------------------------------------------------------
@@ -234,33 +312,27 @@ class ChatFilePart {
     file: ChatFileData,
 }
 
-/// A content part carrying the per-message provider directives authored on
-/// `${ai.Role { name: …, metadata: { … } }}`. Chat completions places
-/// such directives ON A CONTENT PART (`prompt_cache_breakpoint` for OpenAI,
-/// OpenRouter's Anthropic-style `cache_control`), while the authored directive
-/// lives on the MESSAGE — so, exactly as the Anthropic client does, the metadata
-/// attaches to the message's LAST part and everything up to and including it is
-/// the cached prefix.
+/// A content part carrying extra keys beside its own, which is how a
+/// `${cache(args)}` in the prompt reaches the wire: chat completions places a
+/// cache breakpoint ON A CONTENT PART (`prompt_cache_breakpoint`), while the
+/// delimiter sits BETWEEN parts — so the breakpoint goes on the part before the
+/// delimiter, and everything up to and including that part is the cached
+/// prefix (`_chat_apply_cache_delimiter`).
 ///
-/// The keys are forwarded VERBATIM: this file does not maintain an allow-list of
-/// which directives an OpenAI-compatible endpoint understands, and "verbatim"
-/// includes an explicitly authored `null`.
-///
-/// Getting that last part right is why `to_json` PARKS the directives under
-/// `_chat_directives_key()` rather than splatting them onto the part: the body
-/// then goes through `_chat_prune_nulls`, whose job is to drop the CLIENT's
-/// unset options, and it would take an authored `{"cache_control": null}` with
-/// them. The parked key is opaque to that pass and `_chat_apply_directives`
-/// splices it back onto the part immediately afterwards, so the key never
-/// reaches the wire. (The sibling Responses client gets the same result by
-/// applying its directives to the serialized body after its own prune.)
+/// `args` is sent AS WRITTEN, including a `null` nested inside it. That is why
+/// `to_json` PARKS the extra keys under `_chat_directives_key()` rather than
+/// splatting them onto the part: the body then goes through
+/// `_chat_prune_nulls`, whose job is to drop the CLIENT's unset options, and it
+/// would take an authored `{"ttl": null}` with them. The parked key is opaque
+/// to that pass and `_chat_apply_directives` splices it back onto the part
+/// immediately afterwards, so the key never reaches the wire.
 class ChatExtraPart {
     part: ChatContentPart,
     extra: map<string, baml.json.json>,
 
     implements baml.ToJson {
         function to_json(self) -> baml.json.json {
-            let base = baml.json.to_json(self.part);
+            let base = baml.json.from(self.part);
             match (base) {
                 let object: map<string, baml.json.json> => {
                     let out: map<string, baml.json.json> = {};
@@ -268,7 +340,7 @@ class ChatExtraPart {
                         let _ = out.set(key, object.get(key));
                     }
                     if (self.extra.keys().length() > 0) {
-                        let _ = out.set(_chat_directives_key(), baml.json.to_json(self.extra));
+                        let _ = out.set(_chat_directives_key(), baml.json.from(self.extra));
                     }
                     out
                 },
@@ -278,7 +350,7 @@ class ChatExtraPart {
     }
 }
 
-/// (internal) The reserved key `ChatExtraPart` parks per-message directives under between
+/// (internal) The reserved key `ChatExtraPart` parks its extra keys under between
 /// serialization and `_chat_apply_directives`. It exists only inside that
 /// window; nothing with this key is ever sent.
 function _chat_directives_key() -> string {
@@ -306,7 +378,7 @@ class ChatToolCall {
             let out: map<string, baml.json.json> = {};
             let _ = out.set("id", self.id);
             let _ = out.set("type", self.type);
-            let _ = out.set("function", baml.json.to_json(self.fn));
+            let _ = out.set("function", baml.json.from(self.fn));
             out
         }
     }
@@ -335,7 +407,7 @@ class ChatTool {
         function to_json(self) -> baml.json.json {
             let out: map<string, baml.json.json> = {};
             let _ = out.set("type", self.type);
-            let _ = out.set("function", baml.json.to_json(self.fn));
+            let _ = out.set("function", baml.json.from(self.fn));
             out
         }
     }
@@ -343,6 +415,20 @@ class ChatTool {
 
 class ChatStreamOptions {
     include_usage: bool,
+}
+
+/// `response_format.json_schema`.
+class ChatJsonSchema {
+    name: string,
+    strict: bool,
+    // The strict JSON Schema of the output type (`StructuredOutput.schema`).
+    schema: baml.json.json,
+}
+
+/// `{"type": "json_schema", "json_schema": {…}}`.
+class ChatResponseFormat {
+    type: string,
+    json_schema: ChatJsonSchema,
 }
 
 /// The complete request body. Null-valued fields are pruned before the body is
@@ -360,11 +446,12 @@ class ChatRequest {
     tool_choice: string?,
     stream: bool?,
     stream_options: ChatStreamOptions?,
+    response_format: ChatResponseFormat?,
 }
 
 // ---------------------------------------------------------------------------
 // Typed response wire classes. Every field is optional: OpenAI-compatible
-// servers omit freely, and a non-optional int is a ParseFailed waiting to
+// servers omit freely, and a non-optional int is an InvalidResponse waiting to
 // happen (PLAN §1.5).
 
 class CcFunctionCall {
@@ -442,6 +529,7 @@ class CcChoice {
 
 class CcPromptTokensDetails {
     cached_tokens: int?,
+    cache_write_tokens: int?,
 }
 
 class CcCompletionTokensDetails {
@@ -456,7 +544,33 @@ class CcUsage {
     completion_tokens_details: CcCompletionTokensDetails?,
 }
 
+class CcError {
+    message: string?,
+    type: string?,
+    code: (string | int)?,
+}
+
+function _chat_provider_error(
+    error: CcError,
+    provider: string,
+    raw: string,
+) -> ai.errors.ProviderError {
+    ai.errors.ProviderError {
+        provider: provider,
+        message: error.message ?? "the provider reported a failure",
+        error_type: error.type,
+        error_code: if let code: string | int = error.code {
+            code.to_string()
+        } else {
+            null
+        },
+        raw_body: raw,
+        status_code: null,
+    }
+}
+
 class CcResponse {
+    error: CcError?,
     id: string?,
     model: string?,
     choices: CcChoice[]?,
@@ -532,11 +646,13 @@ function _chat_media_part(
                 throw ai.errors.PreviewUnsupported {
                     provider: compat.provider,
                     detail: "this chat endpoint requires downloaded image bytes during request preview",
-                }
+                };
             }
             ChatImagePart {
                 type: "image_url",
-                image_url: ChatImageUrl { url: _chat_media_url(resolved) },
+                image_url: ChatImageUrl {
+                    url: _chat_media_url(resolved),
+                },
             }
         },
         let audio: baml.media.Audio => {
@@ -551,7 +667,7 @@ function _chat_media_part(
                 throw ai.errors.PreviewUnsupported {
                     provider: compat.provider,
                     detail: "chat audio input requires downloaded bytes during request preview",
-                }
+                };
             }
             ChatAudioPart {
                 type: "input_audio",
@@ -578,7 +694,7 @@ function _chat_media_part(
                 throw ai.errors.PreviewUnsupported {
                     provider: compat.provider,
                     detail: "chat PDF input requires downloaded bytes during request preview",
-                }
+                };
             }
             // `resolve_media` hands back a bare URL for a scheme it will not
             // fetch (`gs://`). There is nowhere to put it, and an empty
@@ -587,9 +703,9 @@ function _chat_media_part(
                 let inline: string => inline,
                 null => {
                     throw _reject(
-                    compat.provider,
-                    `OpenAI Chat Completions has no document-by-URL content part, so a PDF must be inlined, and ${resolved.url ?? "this document"} is not a URL this client can fetch (gs:// and other non-HTTP schemes are not supported here). Pass the PDF as base64 or a local file.`,
-                )
+                        compat.provider,
+                        `OpenAI Chat Completions has no document-by-URL content part, so a PDF must be inlined, and ${resolved.url ?? "this document"} is not a URL this client can fetch (gs:// and other non-HTTP schemes are not supported here). Pass the PDF as base64 or a local file.`,
+                    );
                 },
             };
             ChatFilePart {
@@ -599,7 +715,7 @@ function _chat_media_part(
                     // is more useful than a constant, and this is the same
                     // derivation the Responses client uses (query stripped,
                     // `document.pdf` when there is nothing to derive).
-                    filename: _file_name(pdf.file() ?? pdf.url()),
+                    filename: _file_name(pdf.name() ?? pdf.url()),
                     file_data: `data:${resolved.mime_type};base64,${data}`,
                 },
             }
@@ -608,7 +724,7 @@ function _chat_media_part(
             throw _reject(
                 compat.provider,
                 "OpenAI Chat Completions has no video input part; extract frames as images, or use the Realtime API",
-            )
+            );
         },
     }
 }
@@ -630,7 +746,10 @@ function _chat_lower_block(
     preview: bool = false,
 ) -> ChatContentPart {
     match (block) {
-        let text: ai.content.Text => ChatTextPart { type: "text", text: text.text },
+        let text: ai.content.Text => ChatTextPart {
+            type: "text",
+            text: text.text,
+        },
         let media: ai.content.Media => _chat_media_part(media.media, compat, preview = preview),
     }
 }
@@ -647,24 +766,75 @@ function _chat_lower_blocks(
     parts
 }
 
-/// (internal) Attach a message's authored `metadata` to its LAST content part (see
-/// ChatExtraPart). A message that lowered to no parts has nowhere to put the
-/// directive, and an empty metadata map is the common case, so both are no-ops.
-function _chat_apply_metadata(
+/// (internal) Put a `${cache(args)}` on the wire: `prompt_cache_breakpoint: args` on
+/// the LAST part lowered so far (see ChatExtraPart). Nothing is sent when no
+/// part precedes the delimiter in its message, or when `args` is null (a
+/// `${cache()}` with no default, which `ai.wire.prompt_parts` removes). A second
+/// delimiter with no part in between replaces the first.
+function _chat_apply_cache_delimiter(
     parts: ChatContentPart[],
-    metadata: map<string, baml.json.json>,
+    delimiter: ai.CacheDelimiter,
 ) -> void {
-    if (metadata.keys().length() == 0) {
+    if (delimiter.args == null) {
         return;
     }
     if let last: ChatContentPart = parts.pop() {
-        parts.push(ChatExtraPart { part: last, extra: metadata });
+        let extra: map<string, baml.json.json> = {};
+        let _ = extra.set("prompt_cache_breakpoint", delimiter.args);
+        let inner = match (last) {
+            let marked: ChatExtraPart => marked.part,
+            _ => last,
+        };
+        parts.push(ChatExtraPart {
+            part: inner,
+            extra: extra,
+        });
     }
+}
+
+/// (internal) One prompt message as content parts. With `compat.cache_breakpoints` a
+/// `${cache(args)}` becomes a breakpoint on the part before it, with the text on
+/// either side trimmed where it faces the delimiter (`ai.wire.prompt_parts`);
+/// without, the
+/// delimiter is dropped and the text around it is one part again
+/// (`ai.wire.prompt_blocks`), so the request is the one the prompt would
+/// produce without it.
+function _chat_prompt_parts(
+    message: ai.PromptMessage,
+    compat: ChatCompat,
+    preview: bool = false,
+) -> ChatContentPart[] {
+    if (!compat.cache_breakpoints) {
+        return _chat_lower_blocks(ai.wire.prompt_blocks(message), compat, preview = preview);
+    }
+    let parts: ChatContentPart[] = [];
+    for (
+        let part in ai.wire.prompt_parts(message, default_cache_args = compat.default_cache_args)
+    ) {
+        match (part) {
+            let text: string => {
+                parts.push(ChatTextPart {
+                    type: "text",
+                    text: text,
+                });
+                null
+            },
+            let delimiter: ai.CacheDelimiter => {
+                _chat_apply_cache_delimiter(parts, delimiter);
+                null
+            },
+            let media: ai.MediaPart => {
+                parts.push(_chat_media_part(media, compat, preview = preview));
+                null
+            },
+        };
+    }
+    parts
 }
 
 /// (internal) Every part is text — the precondition for `collapse_text_content`. A
 /// `ChatExtraPart` never qualifies even when it wraps text: collapsing to a bare
-/// string would drop the directive it carries.
+/// string would drop the cache breakpoint it carries.
 function _chat_all_text(parts: ChatContentPart[]) -> bool {
     let all = true;
     for (let part in parts) {
@@ -701,8 +871,9 @@ function _chat_content(parts: ChatContentPart[], collapse: bool) -> ChatMessageC
 /// message takes the compat's default role; an authored `tool` role becomes user
 /// content, because a wire `tool` message must answer a specific `tool_call_id`
 /// and only the journal path has one. Adjacent same-role messages merge, as both
-/// prior implementations did. A message's authored `metadata` rides on its last
-/// content part (see `ChatExtraPart`).
+/// prior implementations did. A `${cache(args)}` in a message becomes a
+/// breakpoint on the part before it, when the endpoint takes one
+/// (`_chat_prompt_parts`).
 function chat_lower_prompt(
     prompt: ai.Prompt,
     compat: ChatCompat,
@@ -715,11 +886,10 @@ function chat_lower_prompt(
             "tool" => "user",
             _ => message.role,
         };
-        let parts = _chat_lower_blocks(ai.wire.prompt_blocks(message), compat, preview = preview);
-        // Placement happens BEFORE the adjacent-same-role merge, so a directive
-        // stays on the part it was authored after even when this message is
+        // Breakpoints are placed BEFORE the adjacent-same-role merge, so one
+        // stays on the part it was written after even when this message is
         // folded into the previous one.
-        _chat_apply_metadata(parts, message.metadata);
+        let parts = _chat_prompt_parts(message, compat, preview = preview);
         let merged = false;
         if let last: ChatPromptMessage = lowered.at(lowered.length() - 1) {
             if (last.role == role) {
@@ -730,19 +900,20 @@ function chat_lower_prompt(
             }
         }
         if (!merged) {
-            lowered.push(ChatPromptMessage { role: role, parts: parts });
+            lowered.push(ChatPromptMessage {
+                role: role,
+                parts: parts,
+            });
         }
     }
     let out: ChatMessage[] = [];
     for (let message in lowered) {
-        out.push(
-            ChatMessage {
-                role: message.role,
-                content: _chat_content(message.parts, compat.collapse_text_content),
-                tool_calls: null,
-                tool_call_id: null,
-            },
-        );
+        out.push(ChatMessage {
+            role: message.role,
+            content: _chat_content(message.parts, compat.collapse_text_content),
+            tool_calls: null,
+            tool_call_id: null,
+        });
     }
     out
 }
@@ -753,7 +924,7 @@ function chat_lower_prompt(
 /// `ai.Journal` -> chat-completions messages. Assistant turns carry their text
 /// in `content` and their calls in `tool_calls`; each result comes back as its
 /// own `role: "tool"` message keyed by `tool_call_id`. Journal-only events
-/// (`RunStarted`, `ToolRequested`, `Usage`, `FinalProduced`) and reasoning
+/// (`RunStarted`, `ToolRequested`, `FinalProduced`) and reasoning
 /// blocks lower to nothing.
 ///
 /// Callers pass the journal through `ai.wire.sanitize_for_client` first, so
@@ -762,7 +933,7 @@ function chat_lower_prompt(
 /// A journal turn's text always collapses to a bare string (`_chat_content`
 /// with `collapse = true`): a text-only turn was always sent that way, and a
 /// bare string is the one content shape every compatible server accepts. A
-/// turn carrying media, or a user turn carrying `metadata`, is a part list.
+/// turn carrying media is a part list.
 function chat_lower_journal(
     j: ai.Journal,
     compat: ChatCompat,
@@ -773,15 +944,12 @@ function chat_lower_journal(
         match (event) {
             let user: ai.events.UserMessage => {
                 let parts = _chat_lower_blocks(user.content, compat, preview = preview);
-                _chat_apply_metadata(parts, user.metadata);
-                out.push(
-                    ChatMessage {
-                        role: "user",
-                        content: _chat_content(parts, true),
-                        tool_calls: null,
-                        tool_call_id: null,
-                    },
-                );
+                out.push(ChatMessage {
+                    role: "user",
+                    content: _chat_content(parts, true),
+                    tool_calls: null,
+                    tool_call_id: null,
+                });
                 null
             },
             let assistant: ai.events.AssistantMessage => {
@@ -794,16 +962,14 @@ function chat_lower_journal(
                             null
                         },
                         let use: ai.content.ToolUse => {
-                            calls.push(
-                                ChatToolCall {
-                                    id: use.id,
-                                    type: "function",
-                                    fn: ChatToolCallFunction {
-                                        name: use.name,
-                                        arguments: baml.json.stringify(baml.json.to_json(use.args)),
-                                    },
+                            calls.push(ChatToolCall {
+                                id: use.id,
+                                type: "function",
+                                fn: ChatToolCallFunction {
+                                    name: use.name,
+                                    arguments: baml.json.stringify(use.args),
                                 },
-                            );
+                            });
                             null
                         },
                         // Reasoning has no replayable wire form here.
@@ -815,46 +981,39 @@ function chat_lower_journal(
                 } else {
                     _chat_content(parts, true)
                 };
-                let tool_calls: ChatToolCall[]? = if (calls.length() == 0) {
-                    null
-                } else {
-                    calls
-                };
+                let tool_calls: ChatToolCall[]? = if (calls.length() == 0) { null } else { calls };
                 if (content != null || tool_calls != null) {
-                    out.push(
-                        ChatMessage {
-                            role: "assistant",
-                            content: content,
-                            tool_calls: tool_calls,
-                            tool_call_id: null,
-                        },
-                    );
+                    out.push(ChatMessage {
+                        role: "assistant",
+                        content: content,
+                        tool_calls: tool_calls,
+                        tool_call_id: null,
+                    });
                 }
                 null
             },
             let completed: ai.events.ToolCompleted => {
                 // A `tool` message is text only: `ai.wire.degrade_tool_media`
                 // has already moved every media block out of the result.
-                out.push(
-                    ChatMessage {
-                        role: "tool",
-                        content: _chat_content(_chat_lower_blocks(completed.content, compat, preview = preview), true),
-                        tool_calls: null,
-                        tool_call_id: completed.id,
-                    },
-                );
+                out.push(ChatMessage {
+                    role: "tool",
+                    content: _chat_content(
+                        _chat_lower_blocks(completed.content, compat, preview = preview),
+                        true,
+                    ),
+                    tool_calls: null,
+                    tool_call_id: completed.id,
+                });
                 null
             },
             let failed: ai.events.ToolFailed => {
                 let err: map<string, string> = { "error": failed.message };
-                out.push(
-                    ChatMessage {
-                        role: "tool",
-                        content: baml.json.stringify(baml.json.to_json(err)),
-                        tool_calls: null,
-                        tool_call_id: failed.id,
-                    },
-                );
+                out.push(ChatMessage {
+                    role: "tool",
+                    content: baml.json.stringify(err),
+                    tool_calls: null,
+                    tool_call_id: failed.id,
+                });
                 null
             },
             _ => null,
@@ -871,14 +1030,16 @@ function chat_lower_journal(
 ///   * `parameters` — a tool's JSON Schema, where `{"default": null}` and
 ///     `{"type": ["string", "null"]}` sibling nulls are meaningful, and where a
 ///     strict-schema server validates what it was given.
+///   * `schema` — the output type's JSON Schema under
+///     `response_format.json_schema`, for the same reasons.
 ///
 /// The `request_body` passthrough needs no entry here: it is merged AFTER the
 /// prune (`chat_render_body`), so it is never walked.
 function _chat_is_opaque_key(key: string) -> bool {
-    // `parameters` is a caller-authored tool schema; the directives subtree is
-    // caller-authored too, and both mean exactly what they say — including a
-    // deliberate `null`.
-    key == "parameters" || key == _chat_directives_key()
+    // `parameters` is a caller-authored tool schema and `schema` the output
+    // type's; the directives subtree is caller-authored too, and all of them
+    // mean exactly what they say — including a deliberate `null`.
+    key == "parameters" || key == "schema" || key == _chat_directives_key()
 }
 
 /// (internal) Splice each parked directives object back onto the content part that carries
@@ -905,11 +1066,7 @@ function _chat_apply_directives(j: baml.json.json) -> baml.json.json {
             };
             out
         },
-        let items: baml.json.json[] => {
-            items.map((item) -> {
-                _chat_apply_directives(item)
-            })
-        },
+        let items: baml.json.json[] => { items.map((item) -> { _chat_apply_directives(item) }) },
         _ => j,
     }
 }
@@ -940,11 +1097,7 @@ function _chat_prune_nulls(j: baml.json.json) -> baml.json.json {
             }
             out
         },
-        let items: baml.json.json[] => {
-            items.map((item) -> {
-                _chat_prune_nulls(item)
-            })
-        },
+        let items: baml.json.json[] => { items.map((item) -> { _chat_prune_nulls(item) }) },
         _ => j,
     }
 }
@@ -998,7 +1151,9 @@ function _chat_url(compat: ChatCompat, params: ChatParams) -> string {
     }
     let pairs: string[] = [];
     for (let key in query.keys()) {
-        pairs.push(`${_chat_percent_encode(key)}=${_chat_percent_encode(query.get(key) ?? "")}`);
+        pairs.push(
+            `${_chat_percent_encode(key)}=${_chat_percent_encode(query.get(key) ?? "")}`,
+        );
     }
     `${url}?${pairs.join("&")}`
 }
@@ -1022,7 +1177,7 @@ function _chat_headers(
             throw _reject(
                 compat.provider,
                 `${compat.provider} needs an API key: pass api_key, or set ${compat.api_key_env ?? "the provider's environment variable"}`,
-            )
+            );
         }
         if let credential: string = key {
             match (compat.auth) {
@@ -1048,16 +1203,14 @@ function _chat_tools(toolbox: ai.tools.Toolbox) -> ChatTool[]? {
     }
     let tools: ChatTool[] = [];
     for (let tool in toolbox.list()) {
-        tools.push(
-            ChatTool {
-                type: "function",
-                fn: ChatToolFunction {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: baml.json.to_json(tool.input_schema),
-                },
+        tools.push(ChatTool {
+            type: "function",
+            fn: ChatToolFunction {
+                name: tool.name,
+                description: tool.description,
+                parameters: baml.json.from(tool.input_schema),
             },
-        );
+        });
     }
     tools
 }
@@ -1068,13 +1221,14 @@ function chat_build_request(
     compat: ChatCompat,
     params: ChatParams,
     input: ai.ModelTurnInput,
+    structured: StructuredOutput?,
     stream: bool,
     preview: bool = false,
 ) -> ChatRequest {
-    let prompt = input.prompt(ai.internal.build_output_format(input.output_type));
+    let prompt = (input.prompt)(ai.internal.build_output_format(input.output_type));
     let messages = chat_lower_prompt(prompt, compat, preview = preview);
     let journal = ai.wire.degrade_tool_media(
-        ai.wire.sanitize_for_client(input.journal, chat_client_id(compat, params)),
+        ai.wire.sanitize_for_client(input.journal, compat.provider, params.model),
         [],
     );
     for (let message in chat_lower_journal(journal, compat, preview = preview)) {
@@ -1114,18 +1268,12 @@ function chat_build_request(
     }
 
     let tools = _chat_tools(input.toolbox);
-    let tool_choice: string? = if (tools == null) {
-        null
-    } else {
-        "auto"
-    };
-    let stream_flag: bool? = if (stream) {
-        true
-    } else {
-        null
-    };
+    let tool_choice: string? = if (tools == null) { null } else { "auto" };
+    let stream_flag: bool? = if (stream) { true } else { null };
     let stream_options: ChatStreamOptions? = if (stream && compat.send_stream_options) {
-        ChatStreamOptions { include_usage: true }
+        ChatStreamOptions {
+            include_usage: true,
+        }
     } else {
         null
     };
@@ -1143,13 +1291,40 @@ function chat_build_request(
         tool_choice: tool_choice,
         stream: stream_flag,
         stream_options: stream_options,
+        response_format: match (structured) {
+            let plan: StructuredOutput => {
+                ChatResponseFormat {
+                    type: "json_schema",
+                    json_schema: ChatJsonSchema {
+                        name: plan.name(),
+                        strict: true,
+                        schema: plan.schema,
+                    },
+                }
+            },
+            null => null,
+        },
+    }
+}
+
+/// (internal) The structured output a chat request carries: null unless the client
+/// turned structured outputs on.
+function chat_structured_output(
+    compat: ChatCompat,
+    params: ChatParams,
+    input: ai.ModelTurnInput,
+) -> StructuredOutput? {
+    if (params.structured_output) {
+        structured_output(input.output_type, compat.provider)
+    } else {
+        null
     }
 }
 
 /// The serialized body: typed request -> json -> drop unset options -> apply the
 /// caller's `request_body` passthrough LAST (PLAN P0.3 / `ai.wire`).
 function chat_render_body(compat: ChatCompat, params: ChatParams, request: ChatRequest) -> string {
-    let body = _chat_apply_directives(_chat_prune_nulls(baml.json.from<ChatRequest>(request)));
+    let body = _chat_apply_directives(_chat_prune_nulls(baml.json.from(request)));
     baml.json.stringify(ai.wire.merge_request_body(body, params.request_body))
 }
 
@@ -1158,9 +1333,10 @@ function chat_render(
     compat: ChatCompat,
     params: ChatParams,
     input: ai.ModelTurnInput,
+    structured: StructuredOutput?,
     stream: bool,
 ) -> baml.http.Request {
-    let request = chat_build_request(compat, params, input, stream, preview = false);
+    let request = chat_build_request(compat, params, input, structured, stream, preview = false);
     baml.http.Request {
         method: "POST",
         url: _chat_url(compat, params),
@@ -1170,13 +1346,20 @@ function chat_render(
 }
 
 /// The request one chat `render` would send. Media is lowered through the
-/// preview-only resolver and never reads files or downloads URLs.
+/// preview-only resolver and never downloads URLs.
 function chat_preview(
     compat: ChatCompat,
     params: ChatParams,
     input: ai.ModelTurnInput,
 ) -> baml.http.Request {
-    let request = chat_build_request(compat, params, input, false, preview = true);
+    let request = chat_build_request(
+        compat,
+        params,
+        input,
+        chat_structured_output(compat, params, input),
+        false,
+        preview = true,
+    );
     baml.http.Request {
         method: "POST",
         url: _chat_url(compat, params),
@@ -1203,12 +1386,10 @@ function chat_stop_reason(reason: string) -> ai.content.StopReason {
 function _chat_media_block(url: string) -> ai.content.Media {
     if (url.starts_with("data:")) {
         if let separator: int = url.index_of(";base64,") {
-            return ai.content.Media.new(
-                value = baml.media.Image.from_base64(
-                    url.slice(separator + 8, url.length()),
-                    url.slice(5, separator),
-                ),
-            );
+            return ai.content.Media.new(value = baml.media.Image.from_base64(
+                url.slice(separator + 8, url.length()),
+                url.slice(5, separator),
+            ));
         }
     }
     ai.content.Media.new(value = baml.media.Image.from_url(url, null))
@@ -1220,8 +1401,11 @@ function _chat_media_block(url: string) -> ai.content.Media {
 /// nobody the arguments were discarded, so an undecodable payload is a
 /// `ParseFailed` carrying the raw string.
 function _chat_tool_args(raw: string, provider: string) -> map<string, unknown> {
-    baml.json.from_string<map<string, unknown>>(raw) catch_all (e) {
-        _ => throw ai.errors.ParseFailed { provider: provider, raw_output: raw },
+    baml.json.decode<map<string, unknown>>(raw) catch_all (e) {
+        _ => throw ai.errors.ParseFailed {
+            provider: provider,
+            raw_output: raw,
+        },
     }
 }
 
@@ -1242,15 +1426,17 @@ function _chat_push_tool_uses(
             },
             null => empty,
         };
-        content.push(
-            ai.content.ToolUse { id: call.id ?? "", name: call.fn?.name ?? "", args: args },
-        );
+        content.push(ai.content.ToolUse {
+            id: call.id ?? "",
+            name: call.fn?.name ?? "",
+            args: args,
+        });
     }
 }
 
-/// One decoded response -> canonical content blocks, stop reason and usage.
+/// One decoded response -> canonical content blocks and stop reason.
 ///
-/// `raw` is the response text, used only to populate `ai.errors.ParseFailed`
+/// `raw` is the response text, used to populate `ai.errors.InvalidResponse`
 /// when the envelope carries no usable choice.
 ///
 /// Divergence from both prior implementations, deliberate: more than one choice
@@ -1263,14 +1449,31 @@ function chat_parse(
     raw: string,
     audio_mime: string = "audio/wav",
 ) -> ai.ModelTurn {
+    if let reported: CcError = response.error {
+        throw _chat_provider_error(reported, provider, raw);
+    }
     let choices: CcChoice[] = response.choices ?? [];
     let choice: CcChoice = match (choices.at(0)) {
         let first: CcChoice => first,
-        null => throw ai.errors.ParseFailed { provider: provider, raw_output: raw },
+        null => {
+            throw ai.errors.InvalidResponse {
+                provider: provider,
+                message: "the chat response is missing a choice or its message",
+                raw_body: raw,
+                status_code: null,
+            };
+        },
     };
     let message: CcMessage = match (choice.message) {
         let m: CcMessage => m,
-        null => throw ai.errors.ParseFailed { provider: provider, raw_output: raw },
+        null => {
+            throw ai.errors.InvalidResponse {
+                provider: provider,
+                message: "the chat response is missing a choice or its message",
+                raw_body: raw,
+                status_code: null,
+            };
+        },
     };
 
     let content: ai.content.ModelBlock[] = [];
@@ -1320,12 +1523,10 @@ function chat_parse(
         }
         if let data: string = audio.data {
             if (data != "") {
-                content.push(
-                    ai.content.Media.new(
-                        value = baml.media.Audio.from_base64(data, audio_mime),
-                        provider_id = audio.id,
-                    ),
-                );
+                content.push(ai.content.Media.new(
+                    value = baml.media.Audio.from_base64(data, audio_mime),
+                    provider_id = audio.id,
+                ));
             }
         }
     }
@@ -1346,57 +1547,63 @@ function chat_parse(
         }
     };
 
-    let usage: ai.events.Usage? = match (response.usage) {
+    ai.ModelTurn {
+        calls: [],
+        child_turns: [],
+        content: content,
+        stop_reason: stop,
+    }
+}
+
+/// A chat response's or stream chunk's usage, null when it reported none.
+function chat_usage(usage: CcUsage?) -> ai.events.Usage? {
+    match (usage) {
         let u: CcUsage => {
             ai.events.Usage {
-                input_tokens: u.prompt_tokens ?? 0,
-                output_tokens: u.completion_tokens ?? 0,
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details?.cached_tokens,
                 reasoning_tokens: u.completion_tokens_details?.reasoning_tokens,
-                // prompt_tokens counts the cached share too.
+                cache_write_input_tokens: u.prompt_tokens_details?.cache_write_tokens,
+                // prompt_tokens counts the cached share and the cache writes too.
                 uncached_input_tokens: ai.internal.uncached_input_tokens(
                     u.prompt_tokens,
                     u.prompt_tokens_details?.cached_tokens,
+                    cache_write = u.prompt_tokens_details?.cache_write_tokens,
                 ),
             }
         },
         null => null,
-    };
-
-    ai.ModelTurn { calls: [], content: content, stop_reason: stop, usage: usage }
+    }
 }
 
 /// (internal) Transport + classification for the non-streaming path. This mirrors
 /// `ai.wire.send_as_with_wire` but decodes through `baml.json.to`, which honours
 /// the `baml.FromJson` override that maps the `function` wire key onto
-/// `CcToolCall.fn` — so the LLMCall wire record is built inline here with the
+/// `CcToolCall.fn` — so the ModelCall wire record is built inline here with the
 /// same shape `send_as_with_wire` produces.
 function _chat_send(
     request: baml.http.Request,
     provider: string,
-    client_name: string,
+    requested_model: string,
     capture_wire: bool = true,
     audio_mime: string = "audio/wav",
 ) -> ai.ModelTurn {
     let started = baml.time.Instant.now();
     let response = baml.http.send(request) catch_all (e) {
         let timeout: baml.errors.Timeout => throw timeout,
-        _ => {
-            throw ai.errors.NetworkFailure { status_code: null,
-                provider: provider,
-                detail: `transport failed before a response arrived: ${e.to_string()}`,
-                raw_body: null,
-            }
-        },
+        let io: baml.errors.Io => throw ai.wire.transport_failure(provider, io),
+        _ => throw e,
     };
     let text = response.text() catch_all (e) {
         let timeout: baml.errors.Timeout => throw timeout,
         _ => {
-            throw ai.errors.NetworkFailure { status_code: null,
+            throw ai.errors.NetworkFailure {
+                status_code: null,
                 provider: provider,
                 detail: "the response body could not be read completely",
                 raw_body: null,
-            }
+            };
         },
     };
     if (!response.ok()) {
@@ -1408,19 +1615,29 @@ function _chat_send(
             response.status_code,
             text,
             headers = response.headers,
-        )
+        );
     }
     let decoded = baml.json.to<CcResponse>(baml.json.parse(text)) catch_all (e) {
-        _ => throw ai.errors.ParseFailed { provider: provider, raw_output: text },
+        let parse => {
+            throw ai.errors.InvalidResponse {
+                provider: provider,
+                message: parse.to_string(),
+                raw_body: text,
+                status_code: response.status_code,
+            };
+        },
     };
     let turn = chat_parse(decoded, provider, text, audio_mime = audio_mime);
-    let call = ai.events.LLMCall {
-        client_name: client_name,
-        provider: provider,
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: provider,
+            model: requested_model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: started.elapsed().to_milliseconds(),
-            ttft_ms: null,
+            start_time: started,
+            duration: started.elapsed(),
+            ttft: null,
         },
         http_request: if (capture_wire) {
             baml.http.Request {
@@ -1435,17 +1652,17 @@ function _chat_send(
         http_response: ai.events.HttpResponse {
             status: response.status_code,
             headers: response.headers,
-            body: if (capture_wire) {
-                ai.wire.redact_url_secrets(text)
-            } else {
-                null
-            },
+            body: if (capture_wire) { text } else { null },
         },
-        usage: null,
-        selected: true,
         sse_responses: null,
     };
-    ai.ModelTurn { ...turn, calls: [call], model: decoded.model }
+    ai.internal.with_own_call(
+        turn,
+        call,
+        chat_usage(decoded.usage),
+        requested_model,
+        decoded.model,
+    )
 }
 
 /// The one internal entry point: render, send, normalize — one model turn.
@@ -1457,14 +1674,19 @@ function chat_invoke(
     timeout_options: ai.LlmTimeoutOptions? = null,
 ) -> ai.ModelTurn {
     let limits = timeout_options ?? ai.LlmTimeoutOptions._resolve(null);
-    let request = limits._apply(chat_render(compat, params, input, false));
-    _chat_send(
+    let structured = chat_structured_output(compat, params, input);
+    let request = limits._apply(chat_render(compat, params, input, structured, false));
+    let turn = _chat_send(
         request,
         compat.provider,
-        chat_client_id(compat, params),
+        params.model,
         capture_wire = capture_wire,
         audio_mime = _chat_audio_output_mime(params.request_body),
-    )
+    );
+    match (structured) {
+        let plan: StructuredOutput => with_structured_output(turn, plan, compat.provider),
+        null => turn,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1716,7 @@ class CcStreamChoice {
 }
 
 class CcStreamChunk {
+    error: CcError?,
     id: string?,
     model: string?,
     choices: CcStreamChoice[]?,
@@ -1522,19 +1745,25 @@ class ChatStreamDecoder {
     calls: ChatToolCallBuffer[],
 
     function new(provider: string) -> ChatStreamDecoder {
-        ChatStreamDecoder { provider: provider, calls: [] }
+        ChatStreamDecoder {
+            provider: provider,
+            calls: [],
+        }
     }
 
     /// (internal) Extend (or open) the buffer for one tool-call delta.
     function _absorb_call(self, delta: CcToolCall, position: int) -> void {
         let index = delta.index ?? position;
-        let existing: ChatToolCallBuffer? = self.calls.find((call) -> {
-            call.index == index
-        });
+        let existing: ChatToolCallBuffer? = self.calls.find((call) -> { call.index == index });
         let buffer = match (existing) {
             let found: ChatToolCallBuffer => found,
             null => {
-                let fresh = ChatToolCallBuffer { index: index, id: "", name: "", arguments: "" };
+                let fresh = ChatToolCallBuffer {
+                    index: index,
+                    id: "",
+                    name: "",
+                    arguments: "",
+                };
                 self.calls.push(fresh);
                 fresh
             },
@@ -1558,7 +1787,9 @@ class ChatStreamDecoder {
                 if (data.trim() == "[DONE]") {
                     out.push(ai.stream.TurnDone {});
                 } else {
-                    let parsed: CcStreamChunk? = baml.json.to<CcStreamChunk>(baml.json.parse(data)) catch_all (e) {
+                    let parsed: CcStreamChunk? = baml.json.to<CcStreamChunk>(
+                        baml.json.parse(data),
+                    ) catch_all (e) {
                         _ => null,
                     };
                     // A payload that claims to be a chunk (`{…}`) but does not
@@ -1567,9 +1798,17 @@ class ChatStreamDecoder {
                     // a blank line, an OpenRouter `: PROCESSING` keepalive, a
                     // vendor sentinel — is still ignored.
                     if (parsed == null && data.trim().starts_with("{")) {
-                        throw ai.errors.ParseFailed { provider: self.provider, raw_output: data }
+                        throw ai.errors.InvalidResponse {
+                            provider: self.provider,
+                            message: "the chat stream event could not be decoded",
+                            raw_body: data,
+                            status_code: null,
+                        };
                     }
                     if let chunk: CcStreamChunk = parsed {
+                        if let reported: CcError = chunk.error {
+                            throw _chat_provider_error(reported, self.provider, data);
+                        }
                         let choices: CcStreamChoice[] = chunk.choices ?? [];
                         if let choice: CcStreamChoice = choices.at(0) {
                             if let text: string = choice.delta?.content {
@@ -1598,30 +1837,19 @@ class ChatStreamDecoder {
                                 out.push(ai.stream.ContentSeen {});
                             }
                             if let reason: string = choice.finish_reason {
-                                out.push(
-                                    ai.stream.TurnMeta {
-                                        stop_reason: chat_stop_reason(reason),
-                                        input_tokens: null,
-                                        output_tokens: null,
-                                    },
-                                );
+                                out.push(ai.stream.TurnMeta {
+                                    stop_reason: chat_stop_reason(reason),
+                                    usage: null,
+                                    resolved_model: chunk.model,
+                                });
                             }
                         }
                         if let usage: CcUsage = chunk.usage {
-                            out.push(
-                                ai.stream.TurnMeta {
-                                    stop_reason: null,
-                                    input_tokens: usage.prompt_tokens,
-                                    output_tokens: usage.completion_tokens,
-                                    cached_input_tokens: usage.prompt_tokens_details?.cached_tokens,
-                                    // prompt_tokens counts the cached share too.
-                                    uncached_input_tokens: ai.internal.uncached_input_tokens(
-                                        usage.prompt_tokens,
-                                        usage.prompt_tokens_details?.cached_tokens,
-                                    ),
-                                    reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens,
-                                },
-                            );
+                            out.push(ai.stream.TurnMeta {
+                                stop_reason: null,
+                                usage: chat_usage(usage),
+                                resolved_model: chunk.model,
+                            });
                         }
                     }
                 }
@@ -1640,43 +1868,31 @@ class ChatStreamDecoder {
             } else {
                 _chat_tool_args(buffer.arguments, self.provider)
             };
-            out.push(ai.content.ToolUse { id: buffer.id, name: buffer.name, args: args });
+            out.push(ai.content.ToolUse {
+                id: buffer.id,
+                name: buffer.name,
+                args: args,
+            });
         }
         out
     }
 }
 
-/// (internal) `baml.http.send_sse` reports a non-2xx as `baml.errors.Io` whose message
-/// embeds the status and body: "SSE request failed with status 400: {…}". The
-/// status is the only thing standing between a 400 and a retry-safe
-/// NetworkFailure that a Retry wrapper would happily replay, so it is recovered
-/// here and run through the same classifier the non-streaming path uses.
-function _chat_stream_failure(provider: string, detail: string) -> ai.errors.Failure {
-    let marker = "SSE request failed with status ";
-    if let start: int = detail.index_of(marker) {
-        let rest = detail.slice(start + marker.length(), detail.length());
-        if let colon: int = rest.index_of(":") {
-            let code = int.parse(rest.slice(0, colon)) catch_all (e) {
-                _ => 0,
-            };
-            if (code > 0) {
-                return ai.errors.classify_http(provider, code, rest.slice(colon + 1, rest.length()).trim());
-            }
-        }
-    }
-    ai.errors.NetworkFailure {
-        status_code: null,
-        provider: provider,
-        detail: `transport failed before a response arrived: ${detail}`,
-        raw_body: null,
-    }
-}
-
-function _chat_stream_open_failure(provider: string, error: unknown) -> never {
+/// (internal) The failure for a `baml.http.send_sse` that could not open the
+/// stream: timeouts, cancellation and a rejected argument keep their type, and
+/// only transport errors enter the provider failure taxonomy.
+function _chat_stream_open_failure(
+    provider: string,
+    error: baml.errors.Io
+        | baml.errors.Timeout
+        | baml.errors.InvalidArgument
+        | baml.panics.Cancelled,
+) -> never {
     match (error) {
         let timeout: baml.errors.Timeout => throw timeout,
         let cancelled: baml.panics.Cancelled => throw cancelled,
-        _ => throw _chat_stream_failure(provider, error.to_string()),
+        let io: baml.errors.Io => throw ai.wire.sse_failure(provider, io),
+        let invalid: baml.errors.InvalidArgument => throw invalid,
     }
 }
 
@@ -1689,8 +1905,14 @@ function chat_invoke_stream(
     capture_wire: bool = true,
     timeout_options: ai.LlmTimeoutOptions? = null,
 ) -> ai.stream.TurnStream {
+    if (params.structured_output) {
+        throw _reject(
+            compat.provider,
+            "structured outputs do not stream yet; call the function without streaming, or use a client without structured_output",
+        );
+    }
     let limits = timeout_options ?? ai.LlmTimeoutOptions._resolve(null);
-    let request = limits._apply(chat_render(compat, params, input, true));
+    let request = limits._apply(chat_render(compat, params, input, null, true));
     let decoder = ChatStreamDecoder.new(provider = compat.provider);
     let started = baml.time.Instant.now();
     let sse = baml.http.send_sse(request) catch_all (e) {
@@ -1712,13 +1934,16 @@ function chat_invoke_stream(
         timeout_options = limits,
         dispatched = started,
     );
-    let call = ai.events.LLMCall {
-        client_name: chat_client_id(compat, params),
-        provider: compat.provider,
+    let call = ai.events.ModelCall {
+        resolved_model: ai.events.ModelKey {
+            provider: compat.provider,
+            model: params.model,
+        },
+        usage: null,
         timing: ai.events.Timing {
-            start_time_utc_ms: started.to_timestamp_milliseconds(),
-            duration_ms: null,
-            ttft_ms: null,
+            start_time: started,
+            duration: null,
+            ttft: null,
         },
         http_request: if (capture_wire) {
             baml.http.Request {
@@ -1730,17 +1955,15 @@ function chat_invoke_stream(
         } else {
             null
         },
-        http_response: ai.events.HttpResponse { status: sse.status_code, headers: sse.headers, body: null },
-        usage: null,
-        selected: true,
-        sse_responses: if (capture_wire) {
-            []
-        } else {
-            null
+        http_response: ai.events.HttpResponse {
+            status: sse.status_code,
+            headers: sse.headers,
+            body: null,
         },
+        sse_responses: if (capture_wire) { [] } else { null },
     };
-    stream._calls = [call];
     stream._wire_call = call;
+    stream._requested_model = params.model;
     stream._call_started = started;
     stream._ttft_from = baml.time.Instant.now();
     stream._capture_sse = capture_wire;

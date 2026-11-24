@@ -1,7 +1,5 @@
-//! Runtime reified-generics threading: inferred call-site type args populate
-//! `frame.type_args`, instances constructed in generic frames carry resolved
-//! `class_type_args`, and typed patterns naming the enclosing function's
-//! `TypeVar`s compile to `TypeArgRef` tests (not constant-false `Void` tests).
+//! Host-call reified generics: named type bindings and inbound value shapes.
+//! Source-call behavior lives in `baml_tests/baml_src/ns_engine_generics`.
 
 mod common;
 
@@ -11,22 +9,6 @@ use bex_engine::{BexEngine, BexExternalValue, EngineError, FunctionCallContextBu
 use common::compile_for_engine;
 use sys_native::SysOpsExt;
 
-async fn run_main(source: &str) -> Result<BexExternalValue, EngineError> {
-    let snapshot = compile_for_engine(source);
-    let engine = Arc::new(
-        BexEngine::new(snapshot, Arc::new(sys_native::SysOps::native()), Vec::new())
-            .expect("Failed to create engine"),
-    );
-    engine
-        .call_function(
-            "main",
-            vec![],
-            FunctionCallContextBuilder::new(sys_types::CallId::next()).build(),
-            true,
-        )
-        .await
-}
-
 /// Call a named function with explicit *named* `TypeVar` bindings (the host SDK
 /// `_types=` channel) and the given argument values. The inbound surface that
 /// 01pt3 makes generics-aware.
@@ -34,7 +16,7 @@ async fn call_named(
     source: &str,
     function: &str,
     args: Vec<BexExternalValue>,
-    type_args: Vec<(String, baml_type::RuntimeTy)>,
+    type_args: Vec<(String, bex_external_types::WireTy)>,
 ) -> Result<BexExternalValue, EngineError> {
     let snapshot = compile_for_engine(source);
     let engine = Arc::new(
@@ -51,67 +33,6 @@ async fn call_named(
             true,
         )
         .await
-}
-
-/// An instance constructed inside a generic frame (`Box<T>` in `mk<T>`)
-/// carries the caller-resolved type args, observable via `is` after the
-/// value escapes to a non-generic frame. The `mk("hi")` call writes no
-/// explicit type args — `T = string` is threaded from TIR's inferred
-/// instantiation.
-#[tokio::test]
-async fn escaped_instance_carries_inferred_type_args() {
-    let source = r#"
-        class Box<T> { v T }
-        function mk<T>(x: T) -> Box<T> {
-            let b: Box<T> = Box { v: x };
-            b
-        }
-        function main() -> int {
-            let b = mk("hi");
-            if (b is Box<string>) { 1 } else { 0 }
-        }
-    "#;
-    assert_eq!(run_main(source).await.unwrap(), BexExternalValue::Int(1));
-}
-
-/// Negative control for the test above: the same escaped instance does NOT
-/// match a differently-instantiated type.
-#[tokio::test]
-async fn escaped_instance_rejects_wrong_type_args() {
-    let source = r#"
-        class Box<T> { v T }
-        function mk<T>(x: T) -> Box<T> {
-            let b: Box<T> = Box { v: x };
-            b
-        }
-        function main() -> int {
-            let b: unknown = mk(5);
-            if (b is Box<string>) { 1 } else { 0 }
-        }
-    "#;
-    assert_eq!(run_main(source).await.unwrap(), BexExternalValue::Int(0));
-}
-
-/// A typed catch arm naming the ENCLOSING function's `TypeVar`
-/// (`AllFailed<E>` inside `helper<E>`) matches at runtime: the pattern
-/// lowers to a `TypeArgRef` template resolved against helper's frame
-/// (`E = string`, inferred at main's call site), and the instance thrown by
-/// generic `any` carries `class_type_args = [string]` through the
-/// main → helper → any inferred generic chain.
-#[tokio::test]
-async fn typed_arm_on_enclosing_typevar_matches() {
-    let source = r#"
-        function bad() -> int throws string { throw "x" }
-        function helper<E>(fs: baml.future.Future<int, E>[]) -> int {
-            (await baml.future.any(fs)) catch (e) {
-                let e: baml.future.AllFailed<E> => e.errors.length()
-            }
-        }
-        function main() -> int {
-            helper([spawn { bad() }, spawn { bad() }])
-        }
-    "#;
-    assert_eq!(run_main(source).await.unwrap(), BexExternalValue::Int(2));
 }
 
 // ===========================================================================
@@ -131,7 +52,7 @@ async fn inbound_named_binding_threads_to_reflect() {
         source,
         "one_type_arg",
         vec![],
-        vec![("T".to_string(), baml_type::RuntimeTy::int())],
+        vec![("T".to_string(), bex_external_types::WireTy::int())],
     )
     .await
     .unwrap();
@@ -173,14 +94,14 @@ async fn inbound_instance_arg_lands_class_type_args() {
     "#;
     let arg = BexExternalValue::instance_generic(
         "Box",
-        vec![baml_type::RuntimeTy::int()],
+        vec![bex_external_types::WireTy::int()],
         indexmap::IndexMap::from_iter([("v", BexExternalValue::Int(5))]),
     );
     let out = call_named(
         source,
         "takes_box",
         vec![arg],
-        vec![("T".to_string(), baml_type::RuntimeTy::int())],
+        vec![("T".to_string(), bex_external_types::WireTy::int())],
     )
     .await
     .unwrap();
@@ -198,7 +119,7 @@ async fn inbound_instance_arg_wrong_type_args_rejected() {
     "#;
     let arg = BexExternalValue::instance_generic(
         "Box",
-        vec![baml_type::RuntimeTy::string()],
+        vec![bex_external_types::WireTy::string()],
         indexmap::IndexMap::from_iter([("v", BexExternalValue::String("hi".into()))]),
     );
     let err = call_named(
@@ -206,7 +127,7 @@ async fn inbound_instance_arg_wrong_type_args_rejected() {
         "takes_box",
         vec![arg],
         // bind T = int, but the instance carries Box<string>
-        vec![("T".to_string(), baml_type::RuntimeTy::int())],
+        vec![("T".to_string(), bex_external_types::WireTy::int())],
     )
     .await
     .expect_err("Box<string> arg against Box<int> param must be rejected");
@@ -216,11 +137,10 @@ async fn inbound_instance_arg_wrong_type_args_rejected() {
     );
 }
 
-/// A shape-only generic instance inherits its concrete arguments from the
-/// contextual class slot. Sparse inbound annotations are only required when
-/// that context and the payload do not determine the arguments.
+/// A generic instance states its type arguments; the slot supplies none. An
+/// instance that omits them is refused even where the slot is concrete.
 #[tokio::test]
-async fn inbound_instance_arg_missing_type_args_uses_context() {
+async fn inbound_instance_arg_missing_type_args_is_refused() {
     let source = r#"
         class Box<T> { v T }
         function takes_box<T>(b: Box<T>) -> int { 1 }
@@ -231,15 +151,18 @@ async fn inbound_instance_arg_missing_type_args_uses_context() {
         "Box",
         indexmap::IndexMap::from_iter([("v", BexExternalValue::Int(5))]),
     );
-    let out = call_named(
+    let err = call_named(
         source,
         "takes_box",
         vec![arg],
-        vec![("T".to_string(), baml_type::RuntimeTy::int())],
+        vec![("T".to_string(), bex_external_types::WireTy::int())],
     )
     .await
-    .expect("the concrete Box<int> context supplies the omitted type arg");
-    assert_eq!(out, BexExternalValue::Int(1));
+    .expect_err("an instance of a generic class states its type arguments");
+    assert!(
+        matches!(&err, EngineError::TypeMismatch { message } if message.contains("takes 1 type argument(s), 0 were stated")),
+        "{err:?}"
+    );
 }
 
 /// A generic instance whose wire arity disagrees with the declared class is
@@ -254,14 +177,17 @@ async fn inbound_instance_arg_wrong_arity_rejected() {
     "#;
     let arg = BexExternalValue::instance_generic(
         "Box",
-        vec![baml_type::RuntimeTy::int(), baml_type::RuntimeTy::int()],
+        vec![
+            bex_external_types::WireTy::int(),
+            bex_external_types::WireTy::int(),
+        ],
         indexmap::IndexMap::from_iter([("v", BexExternalValue::Int(5))]),
     );
     let err = call_named(
         source,
         "takes_box",
         vec![arg],
-        vec![("T".to_string(), baml_type::RuntimeTy::int())],
+        vec![("T".to_string(), bex_external_types::WireTy::int())],
     )
     .await
     .expect_err("a two-arg Box against Box<int> must be rejected");
@@ -271,45 +197,31 @@ async fn inbound_instance_arg_wrong_arity_rejected() {
     );
 }
 
-/// A bare host map can be promoted into a generic class when the contextual
-/// class slot already supplies the concrete arguments.
+/// A bare map names no class, and the engine makes it none: a `map<string,
+/// int>` is not a `Box<int>` however its entries line up with the fields.
 #[tokio::test]
-async fn inbound_bare_map_against_generic_class_uses_context() {
+async fn inbound_map_is_not_an_instance_of_a_class() {
     let source = r#"
         class Box<T> { v T }
         function takes_box<T>(b: Box<T>) -> int { 1 }
         function main() -> int { 0 }
     "#;
-    let arg = BexExternalValue::Map {
-        key_type: baml_type::RuntimeTy::string(),
-        value_type: baml_type::RuntimeTy::int(),
-        entries: indexmap::IndexMap::from_iter([("v".to_string(), BexExternalValue::Int(5))]),
+    let fields = indexmap::IndexMap::from_iter([("v".to_string(), BexExternalValue::Int(5))]);
+    let map = BexExternalValue::Map {
+        key_type: bex_external_types::WireTy::string(),
+        value_type: bex_external_types::WireTy::int(),
+        entries: fields,
     };
-    let out = call_named(
+    let err = call_named(
         source,
         "takes_box",
-        vec![arg],
-        vec![("T".to_string(), baml_type::RuntimeTy::int())],
+        vec![map],
+        vec![("T".to_string(), bex_external_types::WireTy::int())],
     )
     .await
-    .expect("the contextual Box<int> type supplies the map's nominal identity");
-    assert_eq!(out, BexExternalValue::Int(1));
-}
-
-/// Explicit call-site type args still win over inference (regression guard
-/// for the explicit path the inferred fallback was added next to).
-#[tokio::test]
-async fn explicit_type_args_still_thread() {
-    let source = r#"
-        class Box<T> { v T }
-        function mk<T>(x: T) -> Box<T> {
-            let b: Box<T> = Box { v: x };
-            b
-        }
-        function main() -> int {
-            let b = mk<string>("hi");
-            if (b is Box<string>) { 1 } else { 0 }
-        }
-    "#;
-    assert_eq!(run_main(source).await.unwrap(), BexExternalValue::Int(1));
+    .expect_err("a map is not an instance of a class");
+    assert!(
+        matches!(err, EngineError::TypeMismatch { .. }),
+        "expected TypeMismatch, got {err:?}"
+    );
 }

@@ -12,12 +12,12 @@ function configured_ast_grep_version(repo_root: string) -> string {
 
 function verify_ast_grep(repo_root: string) -> string {
     let expected = configured_ast_grep_version(repo_root);
-    let result = baml
-        .sys
-        .exec(
+    let result = baml.sys.run(
             "mise",
-            ["exec", "ast-grep", "--", "ast-grep", "--version"],
-            baml.sys.ProcessOptions { cwd: repo_root, env: null, timeout_ms: 120000, stdin: null },
+            args = ["exec", "ast-grep", "--", "ast-grep", "--version"],
+            cwd = repo_root,
+            timeout = baml.time.Duration.from_milliseconds(120000),
+            capture_output = true,
         );
     if (!result.ok()) {
         throw baml.errors.Io {
@@ -81,7 +81,7 @@ function parse_ast_grep_stream(stdout: uint8array, config: SourceConfig) -> AstM
     let matches: AstMatch[] = [];
     for (let line in baml.String.from_utf8(stdout).lines()) {
         if (line.trim().length() > 0) {
-            let decoded: AstMatch = baml.json.from_string<AstMatch>(line);
+            let decoded: AstMatch = baml.json.decode<AstMatch>(line);
             let ast_match = owned_ast_match(decoded);
             if (!ast_match.file.starts_with(`${config.source_root}/`)) {
                 throw baml.errors.InvalidArgument {
@@ -112,12 +112,12 @@ function scan_source(repo_root: string, config: SourceConfig) -> SourceScan {
             message: `missing ast-grep rule file ${config.rule_file}`,
         };
     }
-    let result = baml
-        .sys
-        .exec(
+    let result = baml.sys.run(
             "mise",
-            config.argv,
-            baml.sys.ProcessOptions { cwd: repo_root, env: null, timeout_ms: 120000, stdin: null },
+            args = config.argv,
+            cwd = repo_root,
+            timeout = baml.time.Duration.from_milliseconds(120000),
+            capture_output = true,
         );
     if (!result.ok()) {
         throw baml.errors.Io {

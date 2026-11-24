@@ -124,7 +124,7 @@ message BamlOutboundPanic {
 | absent oneof | Returns `null` (an all-default envelope is a null `ok`; `ProtoReader.java:219`). Pinned by `WireCodecTest.decode_ok_absent_oneof_is_null`. |
 | `error` (`baml.errors.TypeMismatch`) | Throws a native `IllegalArgumentException` (message from the decoded value, BAML trace spliced in), **not** a `BamlError` (`ProtoReader.java:248-251`). |
 | `error` (other) | Decodes `error.value` and throws `BamlError(value, trace, className)`, with BAML frames spliced onto the stack (`ProtoReader.java:252`). |
-| `panic` with `is_exit_panic` | run registered flush hooks (`BamlFfi.runExitFlushHooks`), then `Runtime.getRuntime().halt(exit_code)` — hard process termination, bypassing JVM shutdown hooks (`ProtoReader.java:313-319`). |
+| `panic` with `is_exit_panic` | `Runtime.getRuntime().halt(exit_code)` — hard process termination, bypassing JVM shutdown hooks (`ProtoReader.java:313-319`). |
 | other `panic` | Decodes `panic.value` and throws `BamlPanic(value, trace, className)`, frames spliced (`ProtoReader.java:321-323`). |
 
 > ⚠ **Deviation from Python:** `baml.errors.TypeMismatch` remaps to
@@ -194,10 +194,10 @@ Path Overview → Cancellation** detail under **Decoder Implementation Details**
 > hidden `_handle` (a `HOST_VALUE_OPAQUE` `BamlHandle`; `hostOpaqueHandle`
 > reflectively invokes the registered class's `_handle()` accessor, or a `Map`
 > fallback, `:377-390`), looks the key up in the Java-side registry via
-> `BamlFfi.lookupHostValue(key)` (`:366`), and — on a same-runtime hit —
-> re-throws the **original** `Throwable` *unwrapped* through `sneakyThrow`
+> `HostCalls.lookup(key)`, and — on a same-runtime hit — releases the handle's
+> pin and re-throws the **original** `Throwable` *unwrapped* through `sneakyThrow`
 > (`:265, 400-403`) so `assertSame` holds for any `Throwable` kind (checked,
-> unchecked, `Error`). A foreign/released key (`lookupHostValue` returns `null`
+> unchecked, `Error`). A foreign/released key (`HostCalls.lookup` returns `null`
 > or a non-`Throwable`) falls through to the metadata `BamlError`. The mirror is
 > `bridge_python`'s `_try_rehydrate_host_value` (proto.py). The `outboundClassFqn`
 > peel (below) still gates the `class_name`. **Forced divergence (recorded):** the
@@ -409,13 +409,12 @@ decides the kind — this is the piece the task calls out as **type-directed
 (field 2, repeated `BamlOutboundMapEntry`) and `type_args` (field 3, repeated
 `BamlTy`), then:
 
-1. **media special-case:** if `isMediaFqn(fqn)` and the field map contains
-   `_data`, return `fields.get("_data")` — the nested handle decode already built
-   the media wrapper (`:811-813`; `isMediaFqn` `:909-914`). Mirrors Python's
-   `_decode_class` media short-circuit.
-2. `instance = TypeRegistry.constructClass(fqn, fields)`; if `null` (unregistered
-   FQN) return the field `Map` (`:814-817`).
-3. `bindReifiedTypeArgs(instance, typeArgBytes)` (`:818`).
+1. `instance = TypeRegistry.constructClass(fqn, fields)`; if `null` (unregistered
+   FQN) return the field `Map`.
+2. `bindReifiedTypeArgs(instance, typeArgBytes)`.
+
+A media value never arrives as a `class_value`: it rides its own arm
+(`media_value`, or a media `handle_value`).
 
 ```java
 Object instance = TypeRegistry.constructClass(fqn, fields);
@@ -431,11 +430,11 @@ return instance;
 > marshalling wire fields into declaration order recorded at registration
 > (`ClassEntry.instantiate`, `TypeRegistry.java:474-489`). Python calls
 > `cls.model_validate(field_dict)` (keyword, Pydantic-validated) and injects
-> handle-backed private fields (`_handle`/`_data`/`_body`) into
+> handle-backed private (`_`-prefixed) fields into
 > `__pydantic_private__`. Java generated classes are immutable value classes
 > with no private-field bag, so there is **no private-field injection step**; a
-> handle-backed field is just an ordinary constructor argument (or the whole
-> media class is unwrapped in step 1). A field absent from the wire is passed as
+> handle-backed field is just an ordinary constructor argument. A field absent
+> from the wire is passed as
 > `null` (`TypeRegistry.java:477-482`).
 
 > ⚠ **Deviation from Python — unregistered FQN fallback:** both bridges degrade
@@ -629,9 +628,9 @@ registration is idempotent (first registration of an FQN wins,
 > when present.
 
 The runtime-owned media stdlib classes (`baml.media.Image` / `Audio` / `Video`
-/ `Pdf`) are **never registered** in `TypeRegistry`; they are matched by FQN
-constant instead (`isMediaFqn`, `ProtoReader.java:909-914`, using `Image.FQN`
-etc.). This is the Java analog of Python's `_MEDIA_PYO3_TYPES` reverse overrides.
+/ `Pdf`) are **never registered** in `TypeRegistry`; a media value decodes from
+its own wire arm (`media_value` or a media `handle_value`) straight to the
+wrapper. This is the Java analog of Python's `_MEDIA_PYO3_TYPES` reverse overrides.
 
 For outbound class values, `decodeClass` first decodes all fields into a
 `LinkedHashMap`, then resolves `class_value.name` (a bare FQN string) through the
@@ -639,8 +638,6 @@ registry:
 
 - **Unresolved FQN** → the decoded field `Map` (preserves thrown stdlib/user
   error payloads; `ProtoReader.java:815-816`).
-- **Media stdlib FQN** with a `_data` field → the already-built media wrapper
-  (`:811-813`).
 - **Otherwise** → `constructClass` reifies the generated value class, and
   `bindReifiedTypeArgs` retains any wire `type_args` in the side-table
   (`:814-818`).
@@ -657,9 +654,10 @@ accessor (which reads them back from the side-table).
 
 Inbound and outbound share the `BamlHandleType` enum. Java handle decoding uses
 the outbound `handle_type` discriminator; `decodeHandle`
-reads `key` (field 1), `handle_type` (field 2), and the root class FQN from
-`ty.class_ty.name` (field 3). It builds a
-`BamlHandle(key, handleType, classFqn)`, then dispatches:
+reads `key` (field 1), `handle_type` (field 2), the root class FQN from
+`ty.class_ty.name` (field 3), and a host value's `pin` (field 4). It builds a
+`BamlHandle(key, handleType, classFqn)` (for a host value,
+`BamlHandle.hostValue(key, handleType, classFqn, pin)`), then dispatches:
 
 | Handle type (wire) | Java decode |
 | --- | --- |
@@ -691,22 +689,31 @@ registered classes on the wire-driven path.
 > (the same `default` arm as any unrecognized handle type,
 > `ProtoReader.java:897`). No reject path in Java.
 
-> ⚠ **Deviation from Python — `ADT_MEDIA_GENERIC` (10):** not in Java's
-> dispatch; it falls to the bare-`BamlHandle` default (`ProtoReader.java:874-897`
-> Javadoc calls this out explicitly).
-
 **The engine-drains-cloned-key contract.** A decoded handle **owns** the
 engine-minted `key` — `new BamlHandle(key, handleType, classFqn)` takes ownership
 (ordinary handles use the two-argument overload) and a
 `Cleaner` calls `baml_handle_release(key)` exactly once when the wrapper becomes
 unreachable (`BamlHandle.java:35-103`, per-instance atomic latch at `:61-91`).
-On the *inbound* (encode) direction, `cloneKeyForWire()` mints a **fresh** owned
-key via `baml_handle_clone` so "the engine can `drain` its copy on decode while
-this object keeps its own — never sharing a key would double-release"
-(`BamlHandle.java:19-27, 120-122`). Host-owned handles
-(`HOST_VALUE_CALLABLE` = 15, `HOST_VALUE_OPAQUE` = 16) are **not** tracked in
-`HANDLE_TABLE`, so the release path skips them (`BamlHandle.java:30-34, 78-81`) —
-the same guard as Python's `BamlPyHandle`.
+On the *inbound* (encode) direction, `cloneKeyForWire()` takes one more
+ownership via `baml_handle_clone` for the engine to `drain` on decode, while
+this object keeps its own: the **same** key for a row naming an engine object
+(the row's refcount grows), a **fresh** key for an identity-free row (media).
+
+**Host values** (`HOST_VALUE_CALLABLE` = 15, `HOST_VALUE_OPAQUE` = 16) carry the
+host's own registry key, never a `HANDLE_TABLE` key, plus a `pin`: a
+`HOST_VALUE_PIN` (21) row that keeps the engine's references to the key (and so
+its registration) while Java reads it. Exactly one decode owns each pin and
+releases it once with `baml_handle_release`:
+
+- a host value decoded to a `BamlHandle` (`BamlHandle.hostValue`) owns its pin,
+  released with the handle (`close()` / `Cleaner`), so the key stays registered
+  and re-sendable while Java holds the handle;
+- a host callable resolved to the host's own object (`decodeCallable`) and a
+  host throwable rehydrated on the error arm (`rehydrateHostThrowable`) release
+  the pin as soon as the key is resolved.
+
+The same applies to call results, stream items, error/panic envelopes, and a
+host callback's arguments: all decode through `decodeHandle` / `decodeCallable`.
 
 `BamlStream` is a runtime-owned Java class wrapping a `BamlHandle` (the JVM
 analog of Python's `baml_bridge/_stream.py`); the outbound decode **now
@@ -784,37 +791,17 @@ string so the runtime library never references a generated class.
 
 ### OS-exit
 
-`is_exit_panic` runs the registered telemetry-flush hooks and then terminates the
-process via `Runtime.getRuntime().halt` (`ProtoReader.java:313-319`):
+`is_exit_panic` terminates the process via `Runtime.getRuntime().halt`, bypassing JVM shutdown hooks, like Python's `os._exit`:
 
 ```java
 if (isExit) {
-    // Clean baml.sys.exit: run the best-effort telemetry-flush hooks (the
-    // spec'd flush step — exceptions swallowed, nothing may prevent the
-    // halt), then hard-terminate the process, bypassing JVM shutdown hooks
-    // (the analog of Python's os._exit, which flushes then _exits).
-    baml_bridge.BamlFfi.runExitFlushHooks();
     Runtime.getRuntime().halt((int) exitCode);
     return new AssertionError("halt returned");   // unreachable
 }
 ```
 
-> ✅ **Implemented per spec — telemetry-flush hook wired.** Python "flushes
-> telemetry and calls `os._exit(exit_code)`." Java now mirrors that:
-> `decodePanic` calls `BamlFfi.runExitFlushHooks()` (which runs every hook
-> registered via `BamlFfi.registerExitFlushHooks(Runnable)`, best-effort —
-> exceptions are swallowed so nothing may prevent or delay the halt) **before**
-> `Runtime.getRuntime().halt(exitCode)`, which bypasses JVM shutdown hooks (the
-> correct `os._exit` analog). The hooks are a socket: no telemetry ships in this
-> slice, so the registry is empty by default and the halt behavior is unchanged.
-> The design intent (`java-function-calls-decisions.md` §5, and the
-> state-of-completeness row) is "flush telemetry then `halt`" — the flush step is
-> now present. The hook drain is factored into `runExitFlushHooks()` so its
-> mechanics are unit-tested (`BamlFfiSmokeTest.exit_flush_hooks_run_best_effort_and_swallow_exceptions`)
-> without halting; the halt itself is verified via a `ProcessBuilder` subprocess
-> in `TestErrors` (per the decisions doc). `halt` never returns, so the returned
-> `AssertionError` is unreachable and exists only to satisfy the `Error`-returning
-> signature (`BamlPanic` is now an `Error`).
+The halt behavior is verified via a `ProcessBuilder` subprocess in `TestErrors`.
+The returned `AssertionError` only satisfies the `Error` return type; `halt` never returns.
 
 ## Concrete Type-Shape Examples
 

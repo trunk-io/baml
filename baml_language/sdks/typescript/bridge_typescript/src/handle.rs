@@ -2,6 +2,7 @@
 //! Mirrors bridge_python/src/handle.rs.
 
 use bridge_cffi::{BamlCffiStatus, handle_cffi};
+use bridge_ctypes::WireHandle;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -73,19 +74,44 @@ impl BamlHandle {
         self.handle_type
     }
 
+    /// Another wrapper of the same reference: a fresh engine reference for
+    /// an engine object; for a host value, which no wrapper owns, the key
+    /// itself.
     #[napi(js_name = "clone")]
     pub fn clone_handle(&self) -> napi::Result<BamlHandle> {
-        let new_key = handle_clone(self.key, "BamlHandle.clone")?;
+        let key = match self.wire_handle()? {
+            WireHandle::Host(key, _) => key.get(),
+            WireHandle::Engine(_) => handle_clone(self.key, "BamlHandle.clone")?,
+        };
         Ok(BamlHandle {
-            key: new_key,
+            key,
             handle_type: self.handle_type,
         })
     }
 
+    /// The key one more wire occurrence of this handle carries: a fresh
+    /// engine reference for an engine object. A host value is the engine's
+    /// reference to the host's own object: its key goes as it is, taking one
+    /// more of the host's references to it, and is refused once the key is
+    /// no longer registered. Either is the caller's to give back if the
+    /// occurrence never reaches the engine.
     #[napi(js_name = "_cloneKeyForWire")]
     pub fn clone_key_for_wire(&self) -> napi::Result<HandleKey> {
-        let new_key = handle_clone(self.key, "BamlHandle._cloneKeyForWire")?;
-        Ok(HandleKey::from_u64(new_key))
+        let key = match self.wire_handle()? {
+            WireHandle::Host(key, _) => {
+                crate::host_value::send_again(key)?;
+                key.get()
+            }
+            WireHandle::Engine(_) => handle_clone(self.key, "BamlHandle._cloneKeyForWire")?,
+        };
+        Ok(HandleKey::from_u64(key))
+    }
+
+    /// Whether this handle is the engine's reference to a host object, as
+    /// opposed to the host's reference to an engine object.
+    #[napi(getter, js_name = "isHostValue")]
+    pub fn is_host_value(&self) -> bool {
+        matches!(self.wire_handle(), Ok(WireHandle::Host(..)))
     }
 }
 
@@ -101,27 +127,38 @@ impl BamlHandle {
     pub(crate) fn key_u64(&self) -> u64 {
         self.key
     }
+
+    /// Which reference this handle is: the host's reference to an engine
+    /// object, or the engine's reference to a host object.
+    fn wire_handle(&self) -> napi::Result<WireHandle> {
+        WireHandle::from_parts(self.key, self.handle_type)
+            .map_err(|error| napi::Error::new(napi::Status::InvalidArg, error.to_string()))
+    }
 }
 
 impl ObjectFinalize for BamlHandle {
     fn finalize(self, _env: Env) -> napi::Result<()> {
-        let _ = handle_cffi::release_handle(self.key);
+        // A host value is released through the host-value registry; only an
+        // engine reference is this wrapper's to release.
+        if let Ok(WireHandle::Engine(key)) = self.wire_handle() {
+            let _ = handle_cffi::release_handle(key.get());
+        }
         Ok(())
     }
 }
 
-/// Test-only: seed a `FunctionRef` entry into `HANDLE_TABLE`, returning
-/// `[key, handleType]` so test code can construct a `BamlHandle`.
-#[napi(js_name = "_seedFunctionRefHandle")]
-pub fn seed_function_ref_handle(global_index: u32) -> napi::Result<(HandleKey, i32)> {
-    let parts = handle_cffi::seed_function_ref_handle(u64::from(global_index));
-    Ok((HandleKey::from_u64(parts.key), parts.handle_type))
+/// Release one owned wire reference that never reached a host wrapper.
+#[napi(js_name = "_releaseWireHandle")]
+pub fn release_wire_handle(key: HandleKey) -> napi::Result<()> {
+    handle_cffi::release_handle(key.to_u64())
+        .map_err(|error| status_to_napi("host-call decode rollback", error.into()))
 }
 
-/// Test-only: seed an `Adt(Media(generic))` entry into `HANDLE_TABLE`.
-#[napi(js_name = "_seedGenericMediaHandle")]
-pub fn seed_generic_media_handle() -> napi::Result<(HandleKey, i32)> {
-    let parts = handle_cffi::seed_generic_media_handle();
+/// Test-only: seed an image media entry into `HANDLE_TABLE`, returning
+/// `[key, handleType]`.
+#[napi(js_name = "_seedMediaHandle")]
+pub fn seed_media_handle() -> napi::Result<(HandleKey, i32)> {
+    let parts = handle_cffi::seed_media_handle();
     Ok((HandleKey::from_u64(parts.key), parts.handle_type))
 }
 

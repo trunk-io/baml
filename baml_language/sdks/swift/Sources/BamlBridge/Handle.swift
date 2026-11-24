@@ -1,14 +1,16 @@
 import CBamlBridge
 import Foundation
 
-/// An engine-owned resource riding in a generated model's `$rust_type`
-/// field (`File._handle`, `Response._body`, media `_data`, …). The
-/// wire carries only a key into the engine's handle table; the Swift
-/// object owns one release of that key: deinit performs it, and
-/// encoding clones one more ownership for the wire (a fresh key for
-/// media, the same refcounted key for an engine-heap handle) so this
-/// instance stays independently droppable (Python's
-/// `_clone_key_for_wire` semantics).
+/// A key the wire carries: an engine-owned resource riding in a generated
+/// model's handle field (media `_data`, …), or a host's own value. An engine
+/// key names a row of the engine's handle table; the Swift object owns one
+/// release of it: deinit performs it, and encoding clones one more ownership
+/// for the wire (a fresh key for media, the same refcounted key for an
+/// engine-heap handle) so this instance stays independently droppable
+/// (Python's `_clone_key_for_wire` semantics). A host value's key names this
+/// host's own registration, which the engine's references keep: the instance
+/// owns none, and encoding takes one more for the wire, refused once the
+/// engine has let the key go.
 public final class BamlHandle: @unchecked Sendable {
     let key: UInt64
     let handleType: BamlBridge_Cffi_V1_BamlHandleType
@@ -35,38 +37,79 @@ public final class BamlHandle: @unchecked Sendable {
         // engine handle table — releasing them here would evict a
         // numerically-colliding engine entry (same rule as Python's
         // BamlPyHandle::Drop).
-        if handleType != .hostValueCallable && handleType != .hostValueOpaque {
-            _ = BamlApi.handleRelease(key)
+        switch keySpace {
+        case .engine: _ = BamlApi.handleRelease(key)
+        case .host: break
         }
     }
 }
 
 extension BamlHandle: Equatable {
-    /// Identity is the table key. For an engine-heap handle the table
-    /// issues one key per heap object, so two handles to the same object
-    /// compare EQUAL however they were minted; identity-free rows (media)
-    /// get a key per minting and compare unequal even for the same
-    /// resource. Generated structs holding handles compare by this key,
-    /// mirroring Python where private handle attrs sit outside pydantic
-    /// equality.
+    /// Identity is the key within its key space. An engine handle's key is
+    /// a row of the engine's handle table, which issues one key per heap
+    /// object, so two handles to the same object compare EQUAL however they
+    /// were minted; identity-free rows (media) get a key per minting and
+    /// compare unequal even for the same resource. A host value's key is a
+    /// registration of this host's own, numbered independently, so it never
+    /// equals an engine handle with the same number. Generated structs
+    /// holding handles compare by this identity, mirroring Python where
+    /// private handle attrs sit outside pydantic equality.
     public static func == (lhs: BamlHandle, rhs: BamlHandle) -> Bool {
-        lhs.key == rhs.key
+        lhs.keySpace == rhs.keySpace && lhs.key == rhs.key
     }
 }
 
-extension BamlHandle: BamlEncodable {
-    public func _bamlEncode() -> BamlInboundValue {
+extension BamlHandle {
+    /// The two independent key spaces a handle's key belongs to.
+    enum KeySpace: Equatable {
+        /// A row of the engine's handle table.
+        case engine
+        /// A registration in this host's own registry.
+        case host
+    }
+
+    var keySpace: KeySpace {
+        Self.keySpace(of: handleType)
+    }
+
+    static func keySpace(of handleType: BamlBridge_Cffi_V1_BamlHandleType) -> KeySpace {
+        switch handleType {
+        case .hostValueCallable, .hostValueOpaque:
+            return .host
+        case .handleUnspecified, .untaggedBexHeap, .functionRef, .adtMediaImage,
+            .adtMediaAudio, .adtMediaVideo, .adtMediaPdf, .adtPromptAst,
+            .adtTaggedHeapHandle, .adtFunctionSpec, .adtRuntimeValue, .invocationState,
+            .traceReservation, .hostValuePin, .UNRECOGNIZED:
+            return .engine
+        }
+    }
+}
+
+/// A handle states nothing: its type is the engine's, checked live. It has
+/// no Swift-side type of its own, so it is not `BamlTyped`; a host value's
+/// slot is the field's declared type.
+extension BamlHandle: BamlLeafEncodable {
+    public func _bamlEncode(as _: BamlSlot<BamlHandle>) throws -> BamlInboundValue {
         if let portableMedia {
             return BamlMedia.encodePortable(portableMedia)
         }
-        // Clone a fresh key for the wire; the engine drains it while
-        // this instance keeps its own.
-        var wireKey: UInt64 = 0
-        let status = BamlApi.handleClone(key, &wireKey)
-        precondition(
-            status == BAML_CFFI_STATUS_OK.rawValue,
-            "handle_clone failed with status \(status)"
-        )
+        // An engine handle clones a fresh key for the wire; the engine drains
+        // it while this instance keeps its own. A host value goes under its
+        // own key, taking one more reference to it.
+        var wireKey: UInt64 = key
+        switch keySpace {
+        case .engine:
+            let status = BamlApi.handleClone(key, &wireKey)
+            guard status == BAML_CFFI_STATUS_OK.rawValue else {
+                throw BamlBridgeFailure(message: "handle_clone failed with status \(status)")
+            }
+        case .host:
+            do throws(BamlHostKeyGone) {
+                try HostCallableRegistry.shared.sendAgain(key)
+            } catch {
+                throw BamlBridgeFailure(message: error.description)
+            }
+        }
         var handle = BamlBridge_Cffi_V1_BamlHandle()
         handle.key = wireKey
         handle.handleType = handleType
@@ -85,12 +128,20 @@ extension BamlHandle: BamlDecodable {
         guard case .handleValue(let handle) = raw.value else {
             throw BamlDecodeError.typeMismatch(expected: "handle", got: wireArmName(raw))
         }
-        guard handle.handleType != .handleUnspecified else {
+        switch handle.handleType {
+        case .handleUnspecified:
             throw BamlDecodeError.typeMismatch(expected: "tagged handle", got: "HANDLE_UNSPECIFIED")
+        case .hostValuePin:
+            throw BamlDecodeError.typeMismatch(expected: "tagged handle", got: "HOST_VALUE_PIN, which is never a value")
+        default:
+            break
         }
+        // An anonymous label is display text, never an identity.
         let classFQN: String?
-        if handle.hasTy, case .classTy(let classType)? = handle.ty.ty {
-            classFQN = classType.name.isEmpty ? nil : classType.name
+        if handle.hasTy, case .classTy(let classType)? = handle.ty.ty,
+           case .name(let fqn)? = classType.head, !fqn.isEmpty
+        {
+            classFQN = fqn
         } else {
             classFQN = nil
         }
@@ -109,6 +160,28 @@ extension BamlHandle: BamlDecodable {
             classFQN: classFQN,
             portableMedia: portableMedia
         )
+    }
+}
+
+extension BamlHandle {
+    /// The engine's reference to an instance of the opaque standard-library
+    /// class `fqn` (`reflect.Package`, `sap._ParseCache<T>`, …): an
+    /// `ADT_RUNTIME_VALUE` handle whose type names that class. A generated
+    /// opaque type holds it and sends it back as itself; a host never reads
+    /// the instance's fields. The type arguments are not checked: the engine
+    /// judges the live object against its slot whenever the handle comes back.
+    public static func _bamlDecodeOpaque(
+        _ value: BamlOutboundValue,
+        of fqn: String
+    ) throws -> BamlHandle {
+        let handle = try _bamlDecode(value)
+        guard handle.handleType == .adtRuntimeValue, handle.classFQN == fqn else {
+            throw BamlDecodeError.typeMismatch(
+                expected: "\(fqn) instance (runtime value handle)",
+                got: "handle type \(handle.handleType) of \(handle.classFQN ?? "no class")"
+            )
+        }
+        return handle
     }
 }
 
@@ -142,11 +215,10 @@ public final class BamlFunctionHandle: @unchecked Sendable {
         else {
             throw BamlDecodeError.typeMismatch(expected: "function", got: wireArmName(raw))
         }
-        let names = try functionType.params.enumerated().map { index, parameter in
-            guard parameter.hasName, !parameter.name.isEmpty else {
-                throw BamlDecodeError.unsupported("returned function parameter \(index) has no name")
-            }
-            return parameter.name
+        // A parameter the function's type leaves nameless is bound by the
+        // name the engine gives it, its position's.
+        let names = functionType.params.enumerated().map { index, parameter in
+            parameter.hasName && !parameter.name.isEmpty ? parameter.name : "arg\(index)"
         }
         return BamlFunctionHandle(
             handle: handle,
@@ -155,8 +227,13 @@ public final class BamlFunctionHandle: @unchecked Sendable {
     }
 
     public func callRaw(
-        args: [(String, (any BamlEncodable)?)],
+        args: [BamlArgument],
+        baml: BamlInvocationOptions = .init()
     ) async throws -> BamlOutboundValue {
-        try await BamlRuntime.shared.callHandleRaw(handle.key, args: args)
+        try await BamlRuntime.shared.callHandleRaw(handle.key, args: args, baml: baml)
     }
+    public func callRawSync(args: [BamlArgument], baml: BamlInvocationOptions = .init()) throws -> BamlOutboundValue {
+        try BamlRuntime.shared.callHandleRawSync(handle.key, args: args, baml: baml)
+    }
+
 }

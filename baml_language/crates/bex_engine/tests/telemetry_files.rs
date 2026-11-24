@@ -26,7 +26,7 @@ fn engine(program: bex_vm_types::Program, recording: TelemetryRecording) -> Arc<
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_recording_is_readable_while_running_and_shutdown_finishes_disk_delivery() {
     let root = tempfile::tempdir().unwrap();
-    let mut program = baml_db::testing::compile_source(
+    let mut program = baml_test_support::compile_source(
         r#"
         function leaf() -> int { 7 }
         function main() -> int { let child = spawn { leaf() }; leaf() + (await child) }
@@ -34,10 +34,8 @@ async fn local_recording_is_readable_while_running_and_shutdown_finishes_disk_de
     );
     for object in &mut program.objects.0 {
         if let bex_vm_types::Object::Function(f) = object {
-            if f.name.rsplit('.').next() == Some("leaf") {
-                f.body_meta = Some(bex_vm_types::FunctionMeta::Llm {
-                    client: "test".into(),
-                });
+            if f.name().rsplit('.').next() == Some("leaf") {
+                f.body_meta = Some(bex_vm_types::FunctionMeta::Llm);
             }
         }
     }
@@ -64,7 +62,7 @@ async fn local_recording_is_readable_while_running_and_shutdown_finishes_disk_de
     );
     let prefix = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let read = btel_file::read_directory(&directory).unwrap();
+            let read = btel_core::recording::read_directory(&directory).unwrap();
             if read
                 .files
                 .iter()
@@ -93,7 +91,7 @@ async fn local_recording_is_readable_while_running_and_shutdown_finishes_disk_de
         std::fs::read(directory.join("00000000000000000001.btel")).unwrap(),
         first_bytes
     );
-    let read = btel_file::read_directory(&directory).unwrap();
+    let read = btel_core::recording::read_directory(&directory).unwrap();
     assert!(read.issues.is_empty(), "{:?}", read.issues);
     assert!(read.files.len() > prefix.files.len());
     assert!(
@@ -155,7 +153,10 @@ async fn local_recording_is_readable_while_running_and_shutdown_finishes_disk_de
     }
     engine.shutdown().await;
     assert_eq!(
-        btel_file::read_directory(&directory).unwrap().files.len(),
+        btel_core::recording::read_directory(&directory)
+            .unwrap()
+            .files
+            .len(),
         read.files.len()
     );
 }
@@ -164,7 +165,7 @@ async fn local_recording_is_readable_while_running_and_shutdown_finishes_disk_de
 async fn shutdown_reports_disk_errors_even_without_another_invocation() {
     let root = tempfile::tempdir().unwrap();
     let engine = engine(
-        baml_db::testing::compile_source("function main() -> int { 1 }"),
+        baml_test_support::compile_source("function main() -> int { 1 }"),
         TelemetryRecording::local_files_in(
             root.path(),
             RecordingConfig {
@@ -189,6 +190,48 @@ async fn shutdown_reports_disk_errors_even_without_another_invocation() {
     assert_eq!(engine.telemetry_result(), Some(Err(error)));
 }
 
+/// Every reading is reported, and a file of rows is one JSON object per line.
+#[cfg(feature = "telemetry_diagnostics")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_report_every_pool_and_append_one_line_per_engine() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(
+        baml_test_support::compile_source("function main() -> int { 1 }"),
+        TelemetryRecording::local_files_in(root.path(), RecordingConfig::default()),
+    );
+    engine
+        .call_function("main", vec![], context(), true)
+        .await
+        .unwrap();
+    let diagnostics = engine.telemetry_diagnostics().unwrap();
+    assert_eq!(diagnostics["pid"], u64::from(std::process::id()));
+    assert!(diagnostics["recording_id"].is_string());
+    assert_eq!(diagnostics["delivery"]["kind"], "local");
+    assert!(diagnostics["captures"]["budget_bytes"].as_u64().unwrap() > 0);
+    assert!(diagnostics["chunks"]["sealed_records"].as_u64().unwrap() > 0);
+    assert_eq!(diagnostics["chunks"]["overage_allocations"], 0);
+    assert_eq!(diagnostics["overage_warned"], false);
+    let file = root.path().join("diagnostics.jsonl");
+    bex_engine::append_diagnostics_line(&file, &diagnostics).unwrap();
+    engine.shutdown().await;
+    bex_engine::append_diagnostics_line(&file, &engine.telemetry_diagnostics().unwrap()).unwrap();
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], diagnostics);
+    // After shutdown nothing is held, and the counts only grew: shutdown
+    // seals the records that end the recording.
+    assert_eq!(rows[1]["chunks"]["active_producers"], 0);
+    assert_eq!(rows[1]["captures"]["in_use"], 0);
+    assert!(
+        rows[1]["chunks"]["sealed_records"].as_u64()
+            >= rows[0]["chunks"]["sealed_records"].as_u64()
+    );
+}
+
 #[test]
 fn off_does_not_create_local_files() {
     const CHILD: &str = "BAML_FILE_SINK_OFF_TEST_CHILD";
@@ -210,7 +253,7 @@ fn off_does_not_create_local_files() {
     let destination = root.path().join("must-not-exist");
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let engine = engine(
-            baml_db::testing::compile_source("function main() -> int { 1 }"),
+            baml_test_support::compile_source("function main() -> int { 1 }"),
             TelemetryRecording::local_files_in(&destination, RecordingConfig::default()),
         );
         assert!(engine.telemetry_recording_directory().is_none());
@@ -233,13 +276,13 @@ async fn storage_startup_failure_preserves_status_without_preventing_execution()
     let destination = root.path().join("file-not-directory");
     std::fs::write(&destination, b"occupied").unwrap();
     let engine = engine(
-        baml_db::testing::compile_source(
+        baml_test_support::compile_source(
             "function main() -> int { let child = spawn { 7 }; await child }",
         ),
         TelemetryRecording::local_files_in(destination, RecordingConfig::default()),
     );
     let failure = engine.telemetry_result().unwrap().unwrap_err();
-    assert!(failure.to_string().contains("telemetry file startup"));
+    assert!(failure.to_string().contains("telemetry recording startup"));
     assert!(engine.telemetry_recording_directory().is_none());
     assert_eq!(
         engine
@@ -257,15 +300,13 @@ async fn cas_storage_failure_disables_recording_but_execution_continues() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join(".baml/btel")).unwrap();
     std::fs::write(root.path().join(".baml/btel/cas"), b"not a directory").unwrap();
-    let mut program = baml_db::testing::compile_source(
+    let mut program = baml_test_support::compile_source(
         "function leaf() -> int { 7 } function main() -> int { leaf() }",
     );
     for object in &mut program.objects.0 {
         if let bex_vm_types::Object::Function(f) = object {
-            if f.name.rsplit('.').next() == Some("leaf") {
-                f.body_meta = Some(bex_vm_types::FunctionMeta::Llm {
-                    client: "test".into(),
-                });
+            if f.name().rsplit('.').next() == Some("leaf") {
+                f.body_meta = Some(bex_vm_types::FunctionMeta::Llm);
             }
         }
     }
@@ -300,27 +341,91 @@ async fn cas_storage_failure_disables_recording_but_execution_continues() {
     assert!(engine.telemetry_result().unwrap().is_err());
 }
 
-fn assert_cas_blob(project: &std::path::Path, id: proto::SnapshotId) {
-    use std::fmt::Write as _;
-    let bytes: Vec<_> = id
-        .low
-        .to_le_bytes()
-        .into_iter()
-        .chain(id.high.to_le_bytes())
-        .collect();
-    let mut name = String::with_capacity(32);
-    for byte in &bytes {
-        write!(&mut name, "{byte:02x}").unwrap();
-    }
-    let path = project
-        .join(".baml/btel/cas/v2")
-        .join(&name[..2])
-        .join(&name[2..4])
-        .join(&name[4..6])
-        .join(name);
+#[tokio::test]
+async fn telemetry_disabled_inside_an_owned_span_does_not_stop_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let program = baml_test_support::compile_source(
+        r#"
+        function main() -> int {
+            let span = trace.start_span("operation");
+            let total = span.run(() -> int {
+                let total = 0;
+                let i = 0;
+                while (i < 100) {
+                    baml.sys.sleep(baml.time.Duration.from_milliseconds(10n));
+                    let child = spawn { i };
+                    total += await child;
+                    i += 1;
+                }
+                total
+            });
+            span.finish(total);
+            total
+        }
+        "#,
+    );
+    let engine = engine(
+        program,
+        TelemetryRecording::local_files(
+            root.path(),
+            RecordingConfig {
+                flush_interval_duration: Duration::from_millis(1),
+                ..RecordingConfig::default()
+            },
+        ),
+    );
+    // Once the body is awaiting inside the owned span, the recording's
+    // directory becomes a file: the next write fails and disables it.
+    let recordings = root.path().join(".baml/btel/recordings");
+    let breaker = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let dir = std::fs::read_dir(&recordings)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        // The writer is still adding files: a removal can find the directory
+        // refilled (DirectoryNotEmpty), and a replacement can find it
+        // recreated. Keep at it until the replacement is in place. A rename
+        // can't stand in, since Windows refuses one while files are open.
+        let mut attempts = 0;
+        loop {
+            let broken = std::fs::remove_dir_all(&dir)
+                .and_then(|()| std::fs::write(&dir, b"not a directory"))
+                .is_ok()
+                && dir.is_file();
+            if broken {
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts < 1000,
+                "the recording directory could not be broken"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    assert_eq!(
+        engine
+            .call_function("main", vec![], context(), true)
+            .await
+            .unwrap(),
+        BexExternalValue::Int(4950)
+    );
+    breaker.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .unwrap();
+    assert!(engine.telemetry_result().unwrap().is_err());
+}
+
+fn assert_cas_blob(project: &std::path::Path, id: proto::CasId) {
+    let id = btel_core::recording::cas_id(id);
+    let path = btel_core::cas::cas_path(&project.join(".baml/btel/cas"), id);
     let blob =
         std::fs::read(path).expect("every published CAS reference must have a completed blob");
-    assert!(blob.len() >= 35);
+    assert!(blob.len() >= 38);
     assert_eq!(&blob[..8], b"BTELCAS\0");
-    assert_eq!(&blob[12..28], bytes);
+    assert_eq!(&blob[12..28], id.as_bytes());
 }

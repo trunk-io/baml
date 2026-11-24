@@ -28,19 +28,30 @@ type Selector = root.clients.Selector;
 type MediaPart = baml.media.Image | baml.media.Audio | baml.media.Video | baml.media.Pdf;
 
 /// A position in a prompt: everything before it is the prefix a provider may
-/// cache. `${cache(args)}` in an LLM function's `prompt:` puts one where it is
-/// written, and `args` rides along untouched. A client that has a cache marker
-/// on its wire sends one there, carrying `args` exactly as written; every other
-/// client drops the delimiter and sends the prompt as if it were not there.
+/// cache. `${cache()}` in an LLM function's `prompt:` puts one where it is
+/// written. A client that has a cache marker on its wire sends one there;
+/// every other client drops the delimiter and sends the prompt as if it were
+/// not there.
 ///
-/// `args` is the provider's own cache object. On `aws.BedrockClient` it becomes
-/// the `cachePoint` block:
+/// `${cache()}` leaves `args` null, and the client that sends the request
+/// fills in its own `default_cache_args()`: the marker its wire takes, or
+/// nothing when its model would reject one. So one `${cache()}` is right on
+/// every client, including each member of a fallback.
 ///
-///     ${cache({ "type": "default" })}
-///     ${cache({ "type": "default", "ttl": "1h" })}
+/// `${cache(args)}` sets `args`, which rides along untouched and is sent
+/// exactly as written. It is the provider's own cache object, so it is written
+/// for one provider's wire:
+///
+///     ${cache({ "type": "default", "ttl": "1h" })}   // aws.BedrockClient: a `cachePoint` block
+///     ${cache({ "type": "ephemeral", "ttl": "1h" })} // anthropic.Client: `cache_control` on the block before
+///     ${cache({ "mode": "explicit" })}               // openai.ChatClient, openai.ResponsesClient:
+///                                                    // `prompt_cache_breakpoint` on the part before
+///
+/// `${cache(null)}` is `${cache()}`. To mark a position on some calls only,
+/// put the `${cache()}` inside an `${if (...)}`.
 ///
 /// Outside an LLM function's `prompt:` there is no bare `cache`; interpolate
-/// the value itself, `${ai.CacheDelimiter { args: ... }}`.
+/// the value itself, `${ai.CacheDelimiter { args: null }}`.
 class CacheDelimiter {
     args: baml.json.json,
 }
@@ -59,10 +70,10 @@ class PromptMessage {
     /// Ordered structural content. Provider clients use this instead of the
     /// readable `content` projection so media survives prompt rendering.
     parts: PromptPart[],
-    /// Per-message provider directives, carried verbatim from the
-    /// `ai.Role.metadata` of the `${role(...)}` marker that opened
-    /// this message — Anthropic `cache_control`, for example. Empty when the
-    /// message carried none.
+    /// Free-form per-message data, carried verbatim from the
+    /// `ai.Role.metadata` of the `${role(...)}` marker that opened this
+    /// message. Empty when the message carried none. The built-in clients do
+    /// not read it.
     metadata: map<string, baml.json.json>,
 }
 
@@ -70,10 +81,7 @@ class PromptMessage {
 /// prompt into messages and media remains structural until a provider lowers
 /// it to its wire format.
 class Prompt {
-    _data: $rust_type,
-
     /// Render the prompt as readable text. Message roles are emitted as headers.
-    //baml:vm
     function text(self) -> string throws never {
         $rust_function
     }
@@ -89,6 +97,8 @@ class Prompt {
             self.text()
         }
     }
+
+    @@rust_type("Prompt")
 }
 
 /// Standalone tagged prompt constructor. The returned closure renders a
@@ -106,10 +116,10 @@ function prompt(
         let tagged = body(root.internal.make_role, ctx) catch_all (e) {
             _ => {
                 throw root.errors.PromptRenderError {
-                message: "prompt template rendering threw",
-                cause: e,
-            }
-            }
+                    message: "prompt template rendering threw",
+                    cause: e,
+                };
+            },
         };
         root.internal.assemble_prompt(tagged.parts, tagged.values)
     };
@@ -123,6 +133,8 @@ function prompt(
 /// Neither companion is public.
 class FunctionSpec<Out> {
     spec_name: string,
+    /// Original callable, retained for definition identity without invoking it.
+    target_function: reflect.AnyFunction,
     args: map<string, unknown>,
     prompt_template: (OutputFormat) -> Prompt throws root.errors.PromptRenderError,
     toolbox: root.tools.Toolbox,
@@ -131,12 +143,15 @@ class FunctionSpec<Out> {
     /// Runs this bound spec through the default agent. `client` overrides the
     /// bound client; null keeps it. `on_event` observes the same journal
     /// events a direct LLM-function call reports.
+    //baml:trace_passthrough
     function call(
         self,
         client: Client? = null,
         on_event: ((root.events.Event) -> void)? = null,
     ) -> Out {
-        Agent.new(client = client, on_event = on_event).run(self).value
+        Agent.new(client = client, on_event = on_event)
+            .run(self, $trace = trace._passthrough())
+            .value
     }
 
     /// Parses an existing model reply using this spec's realized output type.
@@ -148,14 +163,16 @@ class FunctionSpec<Out> {
     /// the model. `client` overrides the spec's default; null uses the default.
     function build_request(self, client: Client? = null) -> baml.http.Request {
         let selected = client ?? self.default_client;
-        selected.render(
-            ModelTurnInput {
-                prompt: self.prompt_template,
-                journal: Journal.new(self),
-                toolbox: self.tools(),
-                output_type: self.output_type(),
-            },
-        )
+        selected.render(ModelTurnInput {
+            prompt: self.prompt_template,
+            journal: Journal.new(self),
+            toolbox: self.tools(),
+            output_type: self.output_type(),
+        })
+    }
+
+    function target(self) -> reflect.AnyFunction {
+        self.target_function
     }
 
     function name(self) -> string {
@@ -173,15 +190,15 @@ class FunctionSpec<Out> {
     }
 
     function prompt(self) -> Prompt {
-        self.prompt_template(root.internal.build_output_format(self.output_type()))
+        (self.prompt_template)(root.internal.build_output_format(self.output_type()))
     }
 
     function tools(self) -> root.tools.Toolbox {
         self.toolbox
     }
 
-    function client_id(self) -> string {
-        self.default_client.id()
+    function requested_model(self) -> string {
+        self.default_client.requested_model()
     }
 
     // NOTE: `client` is a keyword, so the default client is read as the

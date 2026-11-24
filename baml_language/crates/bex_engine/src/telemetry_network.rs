@@ -1,16 +1,13 @@
 //! Network spans around the HTTP sys-ops.
 //!
-//! The VM thread writes every record; the IO side only timestamps what
-//! happens to a request and queues it. Before `_send`, `_fetch` or
-//! `_send_sse` the engine opens the request's span and hands the op a
-//! `NetworkContext`. After every sys-op it drains the queue on the VM thread.
-//!
-//! A span ends when the program finishes reading its response (`text()`,
-//! `bytes()`, the `next()` that finds a stream done), closes a stream, or when
-//! the op fails or is cancelled: the span then ends with the thrown value, in
-//! `inject_sysop_throw`. A response that is never read stays open.
+//! The VM opens spans and supplies IO with a `NetworkContext`. Native body
+//! readers record through an engine-owned producer without needing a live VM;
+//! other platforms drain owned metadata at VM-safe boundaries. Small fetch/send
+//! bodies finish at EOF/error, and application reads independently emit await.
+//! SSE keeps its existing read/close lifecycle. Unfinished responses end with
+//! a drop and cancelled outcome on ownership loss or engine shutdown.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use bex_external_types::BexExternalValue;
 use bex_heap::{ActiveHeapPermit, HeapPermit as _};
@@ -19,7 +16,7 @@ use bex_vm::{
     telemetry::{ClockInstant, InvocationOutcome, TelemetryId},
 };
 use bex_vm_types::{Object, SysOp, Value};
-use sys_types::network::{NetworkContext, NetworkEventKind, NetworkRequest, NetworkTraced};
+use sys_types::network::{NetworkContext, NetworkEventKind, NetworkRequest};
 
 use crate::{BexEngine, thread::BexThread};
 
@@ -32,12 +29,11 @@ pub(crate) enum NetworkOp {
         context: NetworkContext,
         url: String,
     },
-    /// `Response.text`/`bytes` or `SseStream.next`/`close` on `traced` data,
-    /// whose response came from `url`.
+    /// `Response.text`/`bytes` or `SseStream.next`/`close` on a body or
+    /// stream from the traced request `network`.
     Reads {
         operation: SysOp,
-        traced: Arc<dyn Any + Send + Sync>,
-        url: Option<String>,
+        network: NetworkContext,
     },
 }
 
@@ -63,9 +59,9 @@ impl NetworkOp {
                 span: *span,
                 urls: quoted_forms(url),
             }),
-            Self::Reads { traced, url, .. } => Some(NetworkClose {
-                span: take_span(traced)?,
-                urls: url.as_deref().map(quoted_forms).unwrap_or_default(),
+            Self::Reads { network, .. } => Some(NetworkClose {
+                span: take_span(network)?,
+                urls: network.response_url().map(quoted_forms).unwrap_or_default(),
             }),
         }
     }
@@ -85,9 +81,11 @@ fn quoted_forms(url: &str) -> Vec<String> {
     forms
 }
 
-fn take_span(traced: &Arc<dyn Any + Send + Sync>) -> Option<TelemetryId> {
-    NetworkTraced::of(traced.as_ref())?
-        .take_span()
+/// The span of `network`'s request, ending it: once, then `None`.
+fn take_span(network: &NetworkContext) -> Option<TelemetryId> {
+    network
+        .close()
+        .then_some(network.span)
         .and_then(TelemetryId::from_raw)
 }
 
@@ -122,12 +120,10 @@ impl BexEngine {
                     url: request.url,
                 })
             }
-            SysOp::BamlHttpResponseText | SysOp::BamlHttpResponseBytes => {
-                reads(&thread.vm, operation, *args.first()?, "_body")
-            }
-            SysOp::BamlHttpSseStreamNext | SysOp::BamlHttpSseStreamClose => {
-                reads(&thread.vm, operation, *args.first()?, "_handle")
-            }
+            SysOp::BamlHttpResponseBodyText
+            | SysOp::BamlHttpResponseBodyBytes
+            | SysOp::BamlHttpSseStateNext
+            | SysOp::BamlHttpSseStateClose => reads(&thread.vm, operation, *args.first()?),
             _ => None,
         }
     }
@@ -136,24 +132,80 @@ impl BexEngine {
     /// belong to. Called after every sys-op, before its result reaches the VM,
     /// so a span's events come before the completion that op may write. The
     /// queue drops the events of a span that ended since they were queued.
-    /// Events still queued when the engine shuts down are not written: a
-    /// last drain onto the root thread belongs in `shutdown`, with the GC
-    /// `drop` hook (see `NetworkTraced`).
+    /// A terminal `drop` preserves earlier queued events, then completes the
+    /// abandoned body as cancelled (not a transport error or a full read).
     pub(crate) fn drain_network_events(&self, vm: &mut BexVm) {
         let Some(telemetry) = &self.telemetry else {
             return;
         };
         for event in telemetry.network.drain() {
             if let Some(span) = TelemetryId::from_raw(event.span) {
-                vm.network_event(span, ClockInstant::from_ticks(event.at_ticks), &event.kind);
+                let at = ClockInstant::from_ticks(event.at_ticks);
+                if let NetworkEventKind::Complete { error } = &event.kind {
+                    vm.complete_network_io(span, at, error.as_ref());
+                    continue;
+                }
+                if event.kind == NetworkEventKind::Cancelled {
+                    vm.close_network_span(span, at, InvocationOutcome::Cancelled, None, &[]);
+                    continue;
+                }
+                vm.network_event(span, at, &event.kind);
+                if event.kind == NetworkEventKind::Drop {
+                    vm.close_network_span(span, at, InvocationOutcome::Cancelled, None, &[]);
+                }
             }
         }
+    }
+
+    /// Drain the final GC drops and abandon responses still rooted by host handles
+    /// or globals after native body readers have stopped and joined.
+    pub(crate) fn finish_network_spans(&self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        telemetry.network.abandon_open();
+        let events = telemetry.network.drain();
+        telemetry.network.seal();
+        if events.is_empty() {
+            return;
+        }
+        let Some(mut state) = crate::telemetry_state::EngineTelemetry::new_root(Some(telemetry))
+        else {
+            return;
+        };
+        telemetry.clock.validate(state.clock(), true);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _scope = state.host_recording_scope();
+        for event in events {
+            if let Some(span) = TelemetryId::from_raw(event.span) {
+                let at = ClockInstant::from_ticks(event.at_ticks);
+                if let NetworkEventKind::Complete { error } = &event.kind {
+                    state.complete_network_io(span, at, error.as_ref());
+                    continue;
+                }
+                if event.kind == NetworkEventKind::Cancelled {
+                    // SAFETY: owned cancellation contains no VM values.
+                    unsafe {
+                        state.close_network_span(span, at, InvocationOutcome::Cancelled, None, &[]);
+                    }
+                    continue;
+                }
+                state.network_event(span, at, &event.kind);
+                if event.kind == NetworkEventKind::Drop {
+                    // SAFETY: a dropped response has no heap-backed error to capture.
+                    unsafe {
+                        state.close_network_span(span, at, InvocationOutcome::Cancelled, None, &[]);
+                    }
+                }
+            }
+        }
+        state.complete_thread(InvocationOutcome::Ok);
     }
 
     /// After an HTTP sys-op succeeded: end the span a finished read or a
     /// `close()` ends. A response its IO side did not trace has no read to
     /// wait for, so its span ends now.
-    pub(crate) fn network_after_ok(vm: &mut BexVm, op: &NetworkOp, result: &BexExternalValue) {
+    pub(crate) fn network_after_ok(vm: &mut BexVm, op: &NetworkOp, result: &sys_types::OpValue) {
         let Some(at) = now(vm) else {
             return;
         };
@@ -163,18 +215,29 @@ impl BexEngine {
                     vm.close_network_span(*span, at, InvocationOutcome::Ok, None, &[]);
                 }
             }
-            NetworkOp::Reads {
-                operation, traced, ..
-            } => {
+            NetworkOp::Reads { operation, network } => {
+                // An application read stays observable even when the native
+                // reader already completed the transfer at EOF.
+                if matches!(
+                    operation,
+                    SysOp::BamlHttpResponseBodyText | SysOp::BamlHttpResponseBodyBytes
+                ) {
+                    network.application_await();
+                }
                 let end = match operation {
-                    SysOp::BamlHttpSseStreamClose => NetworkEventKind::Close,
+                    SysOp::BamlHttpSseStateClose => NetworkEventKind::Close,
                     // A stream is read to its end when `next()` finds it done.
-                    SysOp::BamlHttpSseStreamNext if !matches!(result, BexExternalValue::Null) => {
+                    SysOp::BamlHttpSseStateNext
+                        if !matches!(
+                            result,
+                            sys_types::OpValue::External(BexExternalValue::Null)
+                        ) =>
+                    {
                         return;
                     }
                     _ => NetworkEventKind::Await,
                 };
-                if let Some(span) = take_span(traced) {
+                if let Some(span) = take_span(network) {
                     vm.network_event(span, at, &end);
                     vm.close_network_span(span, at, InvocationOutcome::Ok, None, &[]);
                 }
@@ -235,40 +298,93 @@ fn text(value: &BexExternalValue) -> Option<String> {
     }
 }
 
-/// Whether a `Response` or `SseStream` carries `span`.
-fn carries(result: &BexExternalValue, span: TelemetryId) -> bool {
-    let BexExternalValue::Instance { fields, .. } = result else {
+/// Whether a `Response` or `SseStream` carries `span`: the body or stream it
+/// holds belongs to the request.
+fn carries(result: &sys_types::OpValue, span: TelemetryId) -> bool {
+    let sys_types::OpValue::Instance { fields, .. } = result else {
         return false;
     };
-    fields.values().any(|field| {
-        matches!(field, BexExternalValue::RustData(data)
-            if NetworkTraced::of(data.as_ref()).is_some_and(|traced| traced.network().span == span.get()))
+    fields.iter().any(|field| {
+        matches!(field, sys_types::OpValue::RustInstance { payload, .. }
+            if payload.network().is_some_and(|network| network.span == span.get()))
     })
 }
 
-/// A read on a `Response` or `SseStream` whose `field` is traced data.
-fn reads(vm: &BexVm, operation: SysOp, receiver: Value, field: &str) -> Option<NetworkOp> {
-    let data = instance_field(vm, receiver, field)?.as_object_ptr()?;
-    let Object::RustData(data) = vm.get_object(data) else {
+/// A read on a body or stream that belongs to a traced request.
+fn reads(vm: &BexVm, operation: SysOp, receiver: Value) -> Option<NetworkOp> {
+    let Object::RustInstance(instance) = vm.get_object(receiver.as_object_ptr()?) else {
         return None;
     };
-    NetworkTraced::of(data.as_ref())?;
-    let url = instance_field(vm, receiver, "url")
-        .and_then(|url| vm.as_string(&url).ok())
-        .map(|url| url.as_str().to_owned());
     Some(NetworkOp::Reads {
         operation,
-        traced: Arc::clone(data),
-        url,
+        network: instance.payload.network()?.clone(),
     })
 }
 
-/// An instance's field, by name.
-fn instance_field(vm: &BexVm, value: Value, name: &str) -> Option<Value> {
-    let instance = vm.as_instance(&value).ok()?;
-    let Object::Class(class) = vm.get_object(instance.class) else {
-        return None;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
     };
-    let index = class.fields.iter().position(|field| field.name == name)?;
-    instance.try_load_field(index)
+
+    use sys_native::SysOpsExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn native_reader_join_survives_cancelling_the_shutdown_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            BexEngine::new_with_telemetry_recording(
+                baml_test_support::compile_source("function main() -> int { 1 }"),
+                Arc::new(sys_native::SysOps::native()),
+                vec![],
+                None,
+                btel_clock::ClockMode::Monotonic,
+                crate::TelemetryRecording::local_files_in(
+                    directory.path(),
+                    btel_recorder::RecordingConfig::default(),
+                ),
+            )
+            .unwrap(),
+        );
+        let release = sys_types::CancellationToken::new();
+        let observed = release.clone();
+        let joined = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&joined);
+        assert!(engine.sys_op_ctx.http_readers.spawn(release, async move {
+            observed.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            finished.store(true, Ordering::Release);
+        }));
+        let started = engine.sys_op_ctx.http_readers.clone();
+        // A second controlled reader exposes the exact join phase without
+        // timing a GC or assuming a particular executor scheduling order.
+        let entered = sys_types::CancellationToken::new();
+        let signal = entered.clone();
+        assert!(started.spawn(signal.clone(), async move {
+            signal.cancelled().await;
+        }));
+        let closing = Arc::clone(&engine);
+        let caller = tokio::spawn(async move {
+            closing.shutdown().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.cancelled())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        tokio::time::timeout(Duration::from_secs(2), engine.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            joined.load(Ordering::Acquire),
+            "recorder cannot close before readers join"
+        );
+        assert_eq!(engine.telemetry_result(), Some(Ok(())));
+    }
 }

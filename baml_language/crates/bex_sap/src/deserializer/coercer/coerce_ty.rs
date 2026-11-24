@@ -12,8 +12,8 @@ use crate::{
     jsonish::{self, CompletionState},
     sap_model::{
         ArrayTy, BigintLiteralTy, BigintTy, BoolLiteralTy, BoolTy, ClassTy, EnumTy, EnumVariantTy,
-        FloatTy, IntLiteralTy, IntTy, MapTy, MediaTy, NullTy, PrimitiveTy, StreamStateTy,
-        StringLiteralTy, StringTy, TyResolvedRef, TypeIdent, UnionTy,
+        FloatTy, IntLiteralTy, IntTy, MapTy, MediaTy, NullTy, PrimitiveTy, ShapedTy, StreamStateTy,
+        StringLiteralTy, StringTy, TupleTy, TyResolvedRef, TypeIdent, UnionTy,
     },
 };
 
@@ -39,6 +39,7 @@ where
         match self {
             TyResolvedRef::String(_)
             | TyResolvedRef::Array(_)
+            | TyResolvedRef::Tuple(_)
             | TyResolvedRef::Map(_)
             | TyResolvedRef::Class(_)
             | TyResolvedRef::Union(_)
@@ -54,7 +55,9 @@ where
             | TyResolvedRef::LiteralBigint(_)
             | TyResolvedRef::LiteralBool(_)
             | TyResolvedRef::Enum(_)
-            | TyResolvedRef::EnumVariant(_) => false,
+            | TyResolvedRef::EnumVariant(_)
+            // A shaped type is built from a whole shape value only.
+            | TyResolvedRef::Shaped(_) => false,
         }
     }
 
@@ -114,6 +117,9 @@ where
             TyResolvedRef::Array(a) => {
                 ArrayTy::try_cast(ctx, a, value).map(|v| v.map_value(Into::into))
             }
+            TyResolvedRef::Tuple(t) => {
+                TupleTy::try_cast(ctx, t, value).map(|v| v.map_value(Into::into))
+            }
             TyResolvedRef::Map(m) => {
                 MapTy::try_cast(ctx, m, value).map(|v| v.map_value(Into::into))
             }
@@ -132,6 +138,9 @@ where
             TyResolvedRef::StreamState(s) => {
                 StreamStateTy::try_cast(ctx, s, value).map(|v| v.map_value(Into::into))
             }
+            TyResolvedRef::Shaped(s) => {
+                ShapedTy::try_cast(ctx, s, value).map(|v| v.map_value(BamlValue::Shaped))
+            }
         }
     }
 
@@ -143,6 +152,13 @@ where
     ) -> Result<Option<BamlValueWithFlags<'s, 'v, 't, N>>, ParsingError> {
         if !target.has_partial_parse() && value.completion_state() == &CompletionState::Incomplete {
             return Ok(None);
+        }
+        // A shaped type reads its shape, wrappers (`AnyOf`, markdown, fixed
+        // JSON) included, exactly as the shape alone would.
+        if let TyResolvedRef::Shaped(shaped) = target {
+            return Ok(
+                ShapedTy::coerce(ctx, shaped, value)?.map(|v| v.map_value(BamlValue::Shaped))
+            );
         }
 
         let result = match value {
@@ -264,6 +280,9 @@ where
                         TyResolvedRef::Array(a) => {
                             ArrayTy::coerce(ctx, a, value)?.map(|v| v.map_value(BamlValue::Array))
                         }
+                        TyResolvedRef::Tuple(t) => {
+                            TupleTy::coerce(ctx, t, value)?.map(|v| v.map_value(BamlValue::Tuple))
+                        }
                         TyResolvedRef::Map(m) => {
                             MapTy::coerce(ctx, m, value)?.map(|v| v.map_value(BamlValue::Map))
                         }
@@ -278,6 +297,9 @@ where
                         TyResolvedRef::Union(u) => UnionTy::coerce(ctx, u, value)?,
                         TyResolvedRef::StreamState(s) => StreamStateTy::coerce(ctx, s, value)?
                             .map(|v| v.map_value(BamlValue::StreamState)),
+                        TyResolvedRef::Shaped(s) => {
+                            ShapedTy::coerce(ctx, s, value)?.map(|v| v.map_value(BamlValue::Shaped))
+                        }
                     };
                     let Some(ret) = ret else {
                         return Ok(None);

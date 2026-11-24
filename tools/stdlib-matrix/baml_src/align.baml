@@ -219,7 +219,7 @@ function session_rules() -> string {
         that matters here, because it is indistinguishable from an answer.
 
         Tools, one JSON object each:
-          describe  a BAML symbol or namespace by name — \`baml.sys.exec\`, \`baml.time\`
+          describe  a BAML symbol or namespace by name — \`baml.sys.run\`, \`baml.time\`
           search    what something does, in words — "run a subprocess", "parse a date"
           examples  real call sites for a symbol, from the BAML repository
           docs      one section of the BAML type system reference
@@ -1040,7 +1040,7 @@ function run_sessions(
     limit: int,
     baml_names: map<string, string>,
 ) -> SessionResult[] {
-    let session_limit = baml.spawn.Limit.new(limit) catch (e) {
+    let session_limit = baml.sync.Semaphore.new(limit) catch (e) {
         baml.errors.InvalidArgument => baml.sys.panic(`session limit must be positive, got ${limit}`),
     };
     let pending = requests.map((request) -> {

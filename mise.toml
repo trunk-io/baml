@@ -2,15 +2,15 @@
 
 [tools]
 # Core languages
-go = "1.23.11"
+go = "1.26.10"
 python = "3.13"     # Will use uv for Python package management
 ruby = "3.2.2"
-node = "22"         # For pnpm
+node = "22.23.4"    # For pnpm
 java = "temurin-23"
 gradle = "8.14"     # sdk_tests/crates/java fixtures (compiled with --release 17)
 dotnet = "10.0.301"
 
-uv = "0.11.3"
+uv = "0.13.4"
 direnv = "2.37.1"
 sccache = "0.10.0"
 clang = "22.1.7" # LLVM tools for CI, including llvm-strip
@@ -37,9 +37,10 @@ ninja = "1.13.2"
 "protoc-gen-go" = "1.34.1"
 "go:golang.org/x/tools/cmd/goimports" = "0.36.0"
 
-# Protobuf compiler — needed by sdks/go/bridge_go/build.sh (bridge_ctypes uses vendored protoc).
+# Protobuf compiler — needed by sdks/go/baml_go/internal/cffi/generate.sh (bridge_ctypes uses vendored protoc).
 protoc = "27.1"
-"spm:apple/swift-protobuf" = "1.38.1"
+# Needs a Swift toolchain, which Linux hosts and the Ubuntu devcontainer lack.
+"spm:apple/swift-protobuf" = { version = "1.38.1", os = ["macos"] }
 
 # Python tools
 "pipx:ruff" = "0.15.22"
@@ -47,7 +48,9 @@ protoc = "27.1"
 
 # Node tools
 "npm:pnpm" = "11.1.3"
-"npm:@infisical/cli" = "latest"
+# Native binary: the npm package only fetches it in a postinstall script, which
+# mise skips, leaving a broken `infisical` shim.
+infisical = "latest"
 
 actionlint = "latest"
 ast-grep = "0.44.1"

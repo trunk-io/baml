@@ -1,0 +1,30 @@
+[package]
+name = "bcs_api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The BCS client as BAML hosts use it: bcs-sdk, with BAML's environment and wording"
+
+[lints]
+workspace = true
+
+[features]
+default = [ "auth", "aws-crypto" ]
+auth = [ "dep:baml_env", "dep:dirs", "bcs-sdk/auth" ]
+aws-crypto = [ "bcs-sdk/aws-crypto" ]
+ring-crypto = [ "bcs-sdk/ring-crypto" ]
+
+[dependencies]
+baml_env = { workspace = true, optional = true }
+bcs-sdk = { workspace = true, features = [ "vendored-protoc" ] }
+dirs = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true
+
+[package.metadata.ci]
+wasm_support = false

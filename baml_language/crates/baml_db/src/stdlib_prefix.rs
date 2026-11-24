@@ -9,7 +9,7 @@
 //! This module is the single producer. Its consumers each embed their own
 //! artifact, because their requirements genuinely differ: `bex_project` ships
 //! one optimization level in a production binary where size matters, while
-//! `baml_tests` carries every level for tests, where it does not.
+//! `baml_test_support` carries every level for tests, where it does not.
 //! Sharing the *derivation* is what matters — an artifact that drifted from
 //! what a real compile produces would be silently wrong in both.
 
@@ -17,10 +17,13 @@ use std::collections::BTreeMap;
 
 use baml_base::{SourceRoot, SourceRootKind};
 pub use baml_compiler2_emit::OptLevel;
-use baml_compiler2_emit::emit_package;
 use baml_linker_types::EmittedPackage;
 
-use crate::{ProjectDatabase, program::PackageCache};
+use crate::{
+    ProjectDatabase,
+    check::ProjectDiagnostics,
+    program::{CheckedWorld, PackageCache},
+};
 
 /// The compiler-built stdlib slice: every stdlib package's typed interface
 /// alongside its compiled output, from those same sources.
@@ -83,10 +86,15 @@ pub fn build_stdlib_prefix(opt: OptLevel) -> StdlibPrefix {
     let mut db = ProjectDatabase::new();
     db.ensure_stdlib_sources();
     let interfaces = stdlib_interfaces(&db);
+    // Emitted only through its check: a prefix vouches for the stdlib it
+    // serves, so a consumer checks its own files alone.
+    let diagnostics = ProjectDiagnostics::collect(&db);
     let packages = stdlib_roots(&db)
         .map(|(name, root)| {
-            let emitted =
-                emit_package(&db, root, opt).expect("the embedded stdlib always compiles cleanly");
+            let emitted = CheckedWorld::check(&diagnostics, root)
+                .unwrap_or_else(|refused| panic!("the embedded stdlib checks clean: {refused}"))
+                .emit_package(opt)
+                .expect("the embedded stdlib always compiles cleanly");
             (name, emitted)
         })
         .collect();

@@ -10,17 +10,19 @@
 ///     through `request_body`). Passing `request_body = {"max_tokens": null}`
 ///     removes it again — the merge runs after the default is applied.
 ///
-/// Supply either `base_url` OR both `resource_name` and `deployment_id`.
+/// Supply either `base_url`, which names the deployment in its path, OR
+/// `deployment_id` (with `resource_name` or `AZURE_OPENAI_ENDPOINT`). There is
+/// no `"azure/<model>"` shorthand: Azure serves only the deployments created on
+/// a resource, under whatever names they were given, so a model name does not
+/// identify one.
 class AzureClient {
-    // The model name reported in `id()` and sent in the body. Azure routes on
-    // the deployment, so this is usually the same string as deployment_id.
+    // The model the deployment serves, reported in `id()` and sent in the
+    // body. Azure routes on the deployment and ignores this.
     model: string,
     // Azure resource name — the `{name}` in `{name}.openai.azure.com`.
     resource_name: string?,
-    // The deployment to call. Unset defaults to `model`: Azure deployments are
-    // overwhelmingly named after the model they serve, and that convention is
-    // what lets `client: "azure/gpt-4o"` — which can only carry a model —
-    // reach a real deployment.
+    // The deployment to call: the name it was given when it was created. It
+    // never defaults to `model`.
     deployment_id: string?,
     // The `api-version` query parameter. Defaults to the current GA dated
     // version, `2024-10-21`: every preview before `2024-09-01-preview` predates
@@ -53,7 +55,7 @@ class AzureClient {
     top_p: float?,
     stop: string[]?,
     seed: int?,
-    // Record request/response bodies (and raw SSE events) on the LLMCall wire
+    // Record request/response bodies (and raw SSE events) on the ModelCall wire
     // records delivered through on_event. Status, headers, and timing are
     // always recorded; this flag only gates the bodies.
     capture_wire: bool,
@@ -113,27 +115,17 @@ class AzureClient {
         ai.wire.resolve_credential(self.api_key, "AZURE_OPENAI_API_KEY")
     }
 
-    /// The deployment segment: the caller's `deployment_id`, else the model.
-    function resolved_deployment_id(self) -> string {
-        self.deployment_id ?? self.model
-    }
-
     /// The deployment base this client posts to, resolved in the order Azure
     /// users actually configure things:
     ///
     ///   1. an explicit `base_url` (a literal or an `env.NAME` ref), used
     ///      verbatim — it already names the deployment;
-    ///   2. `resource_name`, which builds
+    ///   2. `deployment_id` with `resource_name`, which builds
     ///      `https://{resource}.openai.azure.com/openai/deployments/{deployment}`;
-    ///   3. `AZURE_OPENAI_ENDPOINT` — the variable the official Azure OpenAI
-    ///      SDKs read — treated as the resource ORIGIN and given the same
-    ///      `/openai/deployments/{deployment}` path as rung 2.
-    ///
-    /// Rung 3 is what makes the `"azure/<model>"` shorthand viable. The
-    /// shorthand can only supply a model, and every other provider's shorthand
-    /// works off ambient credentials; without an endpoint fallback this client
-    /// could never send. With `deployment_id` defaulting to `model`, ambient
-    /// `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_API_KEY` is a complete config.
+    ///   3. `deployment_id` with `AZURE_OPENAI_ENDPOINT` — the variable the
+    ///      official Azure OpenAI SDKs read — treated as the resource ORIGIN
+    ///      and given the same `/openai/deployments/{deployment}` path as
+    ///      rung 2.
     ///
     /// The engine reports the mutually-exclusive shapes at compile time with
     /// per-key spans; a BAML constructor can only report at request time, so
@@ -145,11 +137,15 @@ class AzureClient {
             if (self.resource_name != null || self.deployment_id != null) {
                 throw root.internal._azure_reject(
                     "openai.AzureClient takes base_url OR resource_name/deployment_id, not both",
-                )
+                );
             }
             return explicit;
         }
-        let deployment = self.resolved_deployment_id();
+        let deployment: string = self.deployment_id else {
+            throw root.internal._azure_reject(
+                "openai.AzureClient needs a deployment: set deployment_id to the deployment's name, or base_url to its full URL",
+            );
+        };
         if let resource_name: string = self.resource_name {
             return `https://${resource_name}.openai.azure.com/openai/deployments/${deployment}`;
         }
@@ -164,8 +160,8 @@ class AzureClient {
             return `${origin}/openai/deployments/${deployment}`;
         }
         throw root.internal._azure_reject(
-            "openai.AzureClient needs a deployment endpoint: set base_url, or resource_name, or the AZURE_OPENAI_ENDPOINT environment variable",
-        )
+            "openai.AzureClient needs the resource for deployment_id: set resource_name, or the AZURE_OPENAI_ENDPOINT environment variable, or base_url instead of deployment_id",
+        );
     }
 
     /// The provider record: everything the shared chat core needs to know
@@ -176,13 +172,15 @@ class AzureClient {
             let _ = query.set("api-version", version);
         }
         root.internal.ChatCompat.new(
-            provider = "azure",
+            provider = self.provider(),
             base_url = self.resolved_base_url(),
             auth = root.internal.ChatAuth.ApiKeyHeader,
             api_key_env = "AZURE_OPENAI_API_KEY",
             api_key_required = true,
             default_max_tokens = 4096,
             compat_query = query,
+            cache_breakpoints = true,
+            default_cache_args = self.default_cache_args(),
         )
     }
 
@@ -213,14 +211,34 @@ class AzureClient {
     }
 
     implements ai.Client {
-        function id(self) -> string {
-            `azure/${self.model}`
+        /// What a `${cache()}` sends as `prompt_cache_breakpoint` on the part
+        /// before it, judged from `model` by the same rules as
+        /// `openai.ChatClient`: `{"mode": "explicit"}`, or null for GPT-5.5
+        /// and earlier, which reject the field. Azure routes on the
+        /// deployment, not `model`, so this is only as good as `model`'s
+        /// name for what the deployment serves.
+        ///
+        /// Provisioned (PTU-M) deployments are not supported: Azure rejects
+        /// `prompt_cache_breakpoint` on them, and nothing here can tell one
+        /// from a Standard deployment, so a `${cache()}` on a GPT-5.6 PTU-M
+        /// deployment is a 400.
+        function default_cache_args(self) -> baml.json.json {
+            root.internal.default_cache_breakpoint(self.model)
+        }
+
+        function requested_model(self) -> string {
+            self.model
+        }
+
+        function provider(self) -> string {
+            "azure"
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            openai.internal.chat_preview(self.compat(), self.params(preview = true), input) catch_all (e) {
-                _ => throw ai.errors.normalize(e),
-            }
+            root.internal
+                .chat_preview(self.compat(), self.params(preview = true), input) catch_all (e) {
+                    _ => throw ai.errors.normalize(e),
+                }
         }
 
         function invoke(self, input: ai.ModelTurnInput) -> ai.ModelTurn {

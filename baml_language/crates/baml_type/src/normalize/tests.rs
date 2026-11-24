@@ -1,7 +1,7 @@
 //! Unit tests for the canonical type algebra, driven by a hand-built
 //! [`TypeContext`] stub that records nominal facts directly.
 
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap};
 
 use super::*;
 use crate::{DeclName, Freshness, FunctionParamTy, Literal, Name, Ty};
@@ -25,6 +25,9 @@ struct Ctx {
     /// `(base, interface head, member) → reduced type` projection facts, for the
     /// `project` oracle. A `Vec` (not a map) because `Ty` is not `Hash`.
     projections: Vec<(Ty, DeclName, Name, Ty)>,
+    /// How many times the algebra asked for an alias definition: a refutation
+    /// that skips canonicalization never asks.
+    alias_lookups: Cell<usize>,
 }
 
 fn nominal_head(ty: &Ty) -> Option<DeclName> {
@@ -55,6 +58,7 @@ impl TypeContext for Ctx {
     }
 
     fn alias_def(&self, name: &DeclName) -> Option<Ty> {
+        self.alias_lookups.set(self.alias_lookups.get() + 1);
         self.aliases.get(name).cloned()
     }
 
@@ -1457,6 +1461,164 @@ fn any_function_existentials_are_covariant_in_their_pins() {
     assert!(!is_subtype(&other, &any_function(vec![]), &ctx));
 }
 
+// ── head-category refutation ─────────────────────────────────────────────--
+
+/// `type Json = null | bool | int | float | string | Json[] | map<string, Json>`
+/// registered under the given name: the recursive alias whose canonical form
+/// is expensive to build.
+fn json_alias(ctx: &mut Ctx, name: &str) {
+    ctx.aliases.insert(
+        qtn(name),
+        union(vec![
+            Ty::null(),
+            Ty::bool(),
+            Ty::int(),
+            Ty::float(),
+            Ty::string(),
+            list(alias(name)),
+            map_ty(Ty::string(), alias(name)),
+        ]),
+    );
+}
+
+/// One type of every `Ty` variant, plus the facts that make the context-driven
+/// rules fire: `Box` and `int` implement `Displayable`, `T: Displayable`,
+/// `(Box as Displayable).Item` reduces to `int`, and `Json` is recursive.
+fn kind_corpus() -> (Ctx, Vec<Ty>) {
+    let mut ctx = Ctx::default();
+    json_alias(&mut ctx, "Json");
+    ctx.enums
+        .insert(qtn("Side"), vec![Name::new("L"), Name::new("R")]);
+    ctx.impls.push((qtn("Box"), qtn("Displayable")));
+    ctx.prim_impls.push(("int", qtn("Displayable")));
+    ctx.var_bounds
+        .insert(param(0, "T"), vec![iface("Displayable")]);
+    ctx.projections.push((
+        class("Box"),
+        qtn("Displayable"),
+        Name::new("Item"),
+        Ty::int(),
+    ));
+    let corpus = vec![
+        Ty::int(),
+        bigint(),
+        Ty::float(),
+        Ty::string(),
+        Ty::bool(),
+        Ty::null(),
+        Ty::Uint8Array,
+        Ty::Media(MediaKind::Image),
+        Ty::Media(MediaKind::Generic),
+        Ty::Type,
+        Ty::Resource,
+        Ty::PromptAst,
+        lit_int(1),
+        lit_float("1.5"),
+        lit_str("user"),
+        lit_bool(true),
+        class("Box"),
+        class1("Gen", Ty::int()),
+        enum_ty("Side"),
+        variant("Side", "L"),
+        list(Ty::int()),
+        list(alias("Json")),
+        map_ty(Ty::string(), alias("Json")),
+        map_ty(Ty::string(), Ty::int()),
+        Ty::Function {
+            params: Box::new([FunctionParamTy::required(None, Ty::int())]),
+            ret: Box::new(Ty::bool()),
+            throws: Box::new(Ty::Never),
+        },
+        Ty::Future(Box::new(Ty::int()), Box::new(Ty::Never)),
+        union(vec![Ty::int(), Ty::string()]),
+        Ty::optional(Ty::string()),
+        alias("Json"),
+        iface("Displayable"),
+        typevar(0, "T"),
+        projection(class("Box"), "Displayable", "Item"),
+        Ty::Unknown,
+        Ty::Never,
+        Ty::Error,
+    ];
+    (ctx, corpus)
+}
+
+/// The head-category refutation is only a shortcut: over every pair of
+/// variants, `is_subtype` and `equivalent` give the verdict the canonical
+/// relation gives.
+#[test]
+fn subtype_and_equivalence_agree_with_the_canonical_relation_for_every_kind_pair() {
+    let (ctx, corpus) = kind_corpus();
+    for sub in &corpus {
+        for sup in &corpus {
+            let canonical_sub = NormalTy::canonical(sub, &ctx);
+            let canonical_sup = NormalTy::canonical(sup, &ctx);
+            assert_eq!(
+                ctx.is_subtype(sub, sup),
+                canonical_sub.is_subtype_of(&canonical_sup, &ctx, &mut HashSet::new()),
+                "subtype verdict diverged for {sub:?} <: {sup:?}"
+            );
+            assert_eq!(
+                ctx.equivalent(sub, sup),
+                canonical_sub == canonical_sup,
+                "equivalence verdict diverged for {sub:?} == {sup:?}"
+            );
+        }
+    }
+}
+
+/// Pairs whose top-level kinds no rule relates, the ones a runtime `match` on
+/// a `json` value asks about for every node: none of them may canonicalize
+/// (and so expand) the recursive alias.
+fn cross_category_pairs() -> Vec<(Ty, Ty)> {
+    let json_map = map_ty(Ty::string(), alias("Json"));
+    let json_list = list(alias("Json"));
+    vec![
+        (lit_str("user"), json_map.clone()),
+        (lit_str("user"), json_list.clone()),
+        (json_list.clone(), json_map.clone()),
+        (json_map.clone(), json_list.clone()),
+        (Ty::int(), json_map.clone()),
+        (lit_int(1), Ty::float()),
+        (Ty::null(), json_list),
+        (class("Box"), json_map.clone()),
+        (enum_ty("Side"), json_map),
+    ]
+}
+
+#[test]
+fn cross_category_pairs_are_refuted_without_canonicalizing() {
+    let mut ctx = Ctx::default();
+    json_alias(&mut ctx, "Json");
+    for (sub, sup) in cross_category_pairs() {
+        assert!(!ctx.is_subtype(&sub, &sup), "{sub:?} <: {sup:?}");
+        assert!(!ctx.equivalent(&sub, &sup), "{sub:?} == {sup:?}");
+        assert_eq!(
+            ctx.alias_lookups.get(),
+            0,
+            "{sub:?} vs {sup:?} canonicalized an alias"
+        );
+    }
+}
+
+/// Kinds a canonical form can rewrite, or that a context-driven rule relates
+/// across kinds, are never refuted by their head alone.
+#[test]
+fn rewritable_and_context_driven_kinds_are_not_refuted() {
+    let (ctx, _) = kind_corpus();
+    let json_map = map_ty(Ty::string(), alias("Json"));
+    assert!(ctx.is_subtype(&lit_str("user"), &alias("Json")));
+    assert!(ctx.is_subtype(&json_map, &alias("Json")));
+    assert!(ctx.is_subtype(&Ty::int(), &iface("Displayable")));
+    assert!(ctx.is_subtype(&class("Box"), &iface("Displayable")));
+    assert!(ctx.is_subtype(&typevar(0, "T"), &iface("Displayable")));
+    assert!(ctx.is_subtype(&projection(class("Box"), "Displayable", "Item"), &Ty::int()));
+    assert!(ctx.is_subtype(&Ty::Never, &json_map));
+    assert!(ctx.is_subtype(&json_map, &Ty::Unknown));
+    assert!(ctx.is_subtype(&Ty::Error, &json_map));
+    assert!(ctx.is_subtype(&lit_str("user"), &Ty::optional(Ty::string())));
+}
+
 // ── interned entry (S4b) ───────────────────────────────────────────────────
 
 mod interned_entry {
@@ -1524,6 +1686,62 @@ mod interned_entry {
         ));
     }
 
+    /// The interned entries give the canonical verdict for every kind pair too.
+    #[test]
+    fn interned_verdicts_agree_with_the_canonical_relation_for_every_kind_pair() {
+        let (ctx, corpus) = kind_corpus();
+        let corpus: Vec<_> = corpus.iter().map(it).collect();
+        let cache = InternedCanonicalCache::default();
+        for sub in &corpus {
+            for sup in &corpus {
+                let canonical_sub = NormalTy::canonical_interned(sub, &ctx);
+                let canonical_sup = NormalTy::canonical_interned(sup, &ctx);
+                let subtype =
+                    canonical_sub.is_subtype_of(&canonical_sup, &ctx, &mut HashSet::new());
+                let equivalent = canonical_sub == canonical_sup;
+                assert_eq!(
+                    is_subtype_interned(sub, sup, &ctx),
+                    subtype,
+                    "{sub:?} <: {sup:?}"
+                );
+                assert_eq!(
+                    cache.is_subtype(sub, sup, &ctx),
+                    subtype,
+                    "{sub:?} <: {sup:?}"
+                );
+                assert_eq!(
+                    equivalent_interned(sub, sup, &ctx),
+                    equivalent,
+                    "{sub:?} == {sup:?}"
+                );
+                assert_eq!(
+                    cache.equivalent(sub, sup, &ctx),
+                    equivalent,
+                    "{sub:?} == {sup:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interned_cross_category_pairs_are_refuted_without_canonicalizing() {
+        let mut ctx = Ctx::default();
+        json_alias(&mut ctx, "Json");
+        let cache = InternedCanonicalCache::default();
+        for (sub, sup) in cross_category_pairs() {
+            let (sub, sup) = (it(&sub), it(&sup));
+            assert!(!is_subtype_interned(&sub, &sup, &ctx), "{sub:?} <: {sup:?}");
+            assert!(!equivalent_interned(&sub, &sup, &ctx), "{sub:?} == {sup:?}");
+            assert!(!cache.is_subtype(&sub, &sup, &ctx), "{sub:?} <: {sup:?}");
+            assert!(!cache.equivalent(&sub, &sup, &ctx), "{sub:?} == {sup:?}");
+            assert_eq!(
+                ctx.alias_lookups.get(),
+                0,
+                "{sub:?} vs {sup:?} canonicalized an alias"
+            );
+        }
+    }
+
     #[test]
     fn canonical_cache_matches_reject_free_canonical_relations() {
         let mut ctx = Ctx::default();
@@ -1567,6 +1785,75 @@ mod interned_entry {
                     cache.is_subtype(a, b, &ctx),
                     canonical_a.is_subtype_of(&canonical_b, &ctx, &mut HashSet::new()),
                     "cached subtyping diverged for {a:?} <: {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_normalization_expands_nested_aliases_and_reuses_the_result() {
+        let mut ctx = Ctx::default();
+        ctx.aliases
+            .insert(qtn("MaybeInt"), union(vec![Ty::int(), Ty::null()]));
+        ctx.aliases
+            .insert(qtn("Nested"), union(vec![alias("MaybeInt"), Ty::null()]));
+        json_alias(&mut ctx, "Json");
+        let cache = InternedCanonicalCache::default();
+        for input in [
+            alias("Nested"),
+            union(vec![alias("Nested"), Ty::null()]),
+            alias("Json"),
+        ] {
+            let input = it(&input);
+            let expected = normalize_interned(&input, &ctx);
+            let actual = cache.normalize(&input, &ctx);
+            assert_eq!(actual, expected);
+            if input == it(&alias("Json")) {
+                assert!(
+                    matches!(actual.kind(), interned::InferTy::Union(_)),
+                    "recursive root must unfold"
+                );
+            } else {
+                assert_eq!(actual, it(&union(vec![Ty::int(), Ty::null()])));
+            }
+            let lookups = ctx.alias_lookups.get();
+            assert_eq!(cache.normalize(&input, &ctx), actual);
+            assert_eq!(
+                ctx.alias_lookups.get(),
+                lookups,
+                "warm normalization re-expanded aliases"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_cache_keeps_both_forms_lazy_in_either_access_order() {
+        let mut ctx = Ctx::default();
+        ctx.aliases.insert(qtn("MaybeInt"), Ty::optional(Ty::int()));
+        json_alias(&mut ctx, "Json");
+        for input in [it(&alias("MaybeInt")), it(&alias("Json"))] {
+            let expected_canonical = NormalTy::canonical_interned(&input, &ctx);
+            let expected_normalized = normalize_interned(&input, &ctx);
+            for normalized_first in [false, true] {
+                let cache = InternedCanonicalCache::default();
+                if normalized_first {
+                    assert_eq!(cache.normalize(&input, &ctx), expected_normalized);
+                    assert!(cache.get_canonical(&input).is_none());
+                } else {
+                    assert_eq!(cache.canonical(&input, &ctx), expected_canonical);
+                    assert!(cache.get_normalized(&input).is_none());
+                }
+
+                assert_eq!(cache.canonical(&input, &ctx), expected_canonical);
+                assert_eq!(cache.normalize(&input, &ctx), expected_normalized);
+
+                let lookups = ctx.alias_lookups.get();
+                assert_eq!(cache.canonical(&input, &ctx), expected_canonical);
+                assert_eq!(cache.normalize(&input, &ctx), expected_normalized);
+                assert_eq!(
+                    ctx.alias_lookups.get(),
+                    lookups,
+                    "warm reads recomputed a form"
                 );
             }
         }
@@ -1808,4 +2095,191 @@ fn single_variant_enum_union_is_idempotent() {
         &enum_ty("F"),
         &ctx
     ));
+}
+
+// ── heads carrying a lifetime ──────────────────────────────────────────────
+
+mod branded_head {
+    use super::*;
+
+    /// The shape of the runtime's head once it is branded by the heap epoch it
+    /// was read in: an identity plus a lifetime, nothing `'static` about it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    struct Branded<'p>(u32, std::marker::PhantomData<&'p u8>);
+
+    fn brand<'p>(_epoch: &'p u8, id: u32) -> Branded<'p> {
+        Branded(id, std::marker::PhantomData)
+    }
+
+    /// One recursive alias, `Tree = int | Box<Tree>`, so canonicalization has
+    /// to run the μ-automaton: the one place the algebra used to ask for a
+    /// `'static` head.
+    struct TreeCtx<'p> {
+        tree: Branded<'p>,
+        boxed: Branded<'p>,
+    }
+
+    impl<'p> TypeContext<Branded<'p>> for TreeCtx<'p> {
+        fn well_known(&self, _head: WellKnownHead) -> Option<Branded<'p>> {
+            None
+        }
+
+        fn alias_def(&self, name: &Branded<'p>) -> Option<Ty<Branded<'p>>> {
+            (*name == self.tree).then(|| {
+                Ty::Union(Box::new([
+                    Ty::Int,
+                    Ty::Class(self.boxed, Box::new([Ty::TypeAlias(self.tree)])),
+                ]))
+            })
+        }
+
+        fn implements_interface(
+            &self,
+            _concrete: &Ty<Branded<'p>>,
+            _interface: &Interface<Branded<'p>>,
+        ) -> bool {
+            false
+        }
+
+        fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface<Branded<'p>>> {
+            Vec::new()
+        }
+
+        fn interface_requires(
+            &self,
+            _sub: &Interface<Branded<'p>>,
+            _sup: &Interface<Branded<'p>>,
+        ) -> bool {
+            false
+        }
+
+        fn enum_variants(&self, _name: &Branded<'p>) -> Option<Vec<Name>> {
+            None
+        }
+
+        fn associated_type_bound(
+            &self,
+            _interface: &Interface<Branded<'p>>,
+            _assoc: Name,
+        ) -> Vec<Interface<Branded<'p>>> {
+            Vec::new()
+        }
+
+        fn project(
+            &self,
+            _base: &Ty<Branded<'p>>,
+            _interface: &Interface<Branded<'p>>,
+            _member: &Name,
+            _fuel: u32,
+        ) -> ProjectionStep<Branded<'p>> {
+            ProjectionStep::Opaque
+        }
+    }
+
+    #[test]
+    fn recursive_alias_canonicalizes_over_a_head_carrying_a_lifetime() {
+        // A real, non-`'static` lifetime: every head borrows `epoch`.
+        let epoch = 0u8;
+        let ctx = TreeCtx {
+            tree: brand(&epoch, 1),
+            boxed: brand(&epoch, 2),
+        };
+        let alias = Ty::TypeAlias(ctx.tree);
+
+        assert!(equivalent(&alias, &alias, &ctx));
+        assert!(is_subtype(&Ty::Int, &alias, &ctx));
+        assert!(!equivalent(&alias, &Ty::Int, &ctx));
+        // The alias and its one-step unfolding denote the same type.
+        let unfolded = Ty::Union(Box::new([
+            Ty::Int,
+            Ty::Class(ctx.boxed, Box::new([alias.clone()])),
+        ]));
+        assert!(equivalent(&alias, &unfolded, &ctx));
+    }
+}
+
+#[test]
+fn tuples_are_invariant_elementwise() {
+    let ctx = Ctx::default();
+    let tuple = |elements: Vec<Ty>| Ty::Tuple(elements.into());
+    let narrow = tuple(vec![Ty::int(), Ty::string()]);
+    let wide = tuple(vec![Ty::optional(Ty::int()), Ty::string()]);
+    assert!(!is_subtype(&narrow, &wide, &ctx));
+    assert!(!is_subtype(&wide, &narrow, &ctx));
+    let literal = tuple(vec![lit_int(1), Ty::string()]);
+    assert!(!is_subtype(&literal, &narrow, &ctx));
+    let spelled = tuple(vec![union(vec![lit_int(5), Ty::int()]), Ty::string()]);
+    assert!(equivalent(&spelled, &narrow, &ctx));
+    assert!(is_subtype(&spelled, &narrow, &ctx));
+    assert!(is_subtype(
+        &narrow,
+        &union(vec![narrow.clone(), Ty::int()]),
+        &ctx
+    ));
+    assert!(!is_subtype(
+        &narrow,
+        &union(vec![wide.clone(), Ty::int()]),
+        &ctx
+    ));
+}
+
+#[test]
+fn distinct_tuple_arms_do_not_absorb() {
+    let ctx = Ctx::default();
+    let tuple = |elements: Vec<Ty>| Ty::Tuple(elements.into());
+    let narrow = tuple(vec![Ty::int()]);
+    let wide = tuple(vec![Ty::optional(Ty::int())]);
+    let both = union(vec![narrow.clone(), wide.clone()]);
+    match normalize(&both, &ctx) {
+        Ty::Union(members) => assert_eq!(members.len(), 2, "{members:?}"),
+        other => panic!("`(int,) | (int?,)` collapsed to {other:?}"),
+    }
+    assert!(!equivalent(&both, &wide, &ctx));
+    assert!(!equivalent(&both, &narrow, &ctx));
+    let spelled = tuple(vec![union(vec![lit_int(5), Ty::int()])]);
+    assert!(equivalent(
+        &union(vec![narrow.clone(), spelled]),
+        &narrow,
+        &ctx
+    ));
+}
+
+#[test]
+fn products_of_unions_and_unions_of_products_are_unrelated() {
+    let ctx = Ctx::default();
+    let tuple = |elements: Vec<Ty>| Ty::Tuple(elements.into());
+    let product = tuple(vec![union(vec![Ty::int(), Ty::string()]), Ty::bool()]);
+    let distributed = union(vec![
+        tuple(vec![Ty::int(), Ty::bool()]),
+        tuple(vec![Ty::string(), Ty::bool()]),
+    ]);
+    assert!(!is_subtype(&product, &distributed, &ctx));
+    assert!(!is_subtype(&distributed, &product, &ctx));
+    assert!(!equivalent(&product, &distributed, &ctx));
+    assert!(!is_subtype(
+        &class1("Box", product.clone()),
+        &class1("Box", distributed.clone()),
+        &ctx
+    ));
+    let correlated = union(vec![
+        tuple(vec![Ty::int(), Ty::string()]),
+        tuple(vec![Ty::string(), Ty::int()]),
+    ]);
+    let joined = tuple(vec![
+        union(vec![Ty::int(), Ty::string()]),
+        union(vec![Ty::int(), Ty::string()]),
+    ]);
+    assert!(!is_subtype(&correlated, &joined, &ctx));
+    assert!(!is_subtype(&joined, &correlated, &ctx));
+    let nested = tuple(vec![
+        tuple(vec![union(vec![Ty::int(), Ty::string()])]),
+        Ty::bool(),
+    ]);
+    let nested_distributed = union(vec![
+        tuple(vec![tuple(vec![Ty::int()]), Ty::bool()]),
+        tuple(vec![tuple(vec![Ty::string()]), Ty::bool()]),
+    ]);
+    assert!(!is_subtype(&nested, &nested_distributed, &ctx));
+    assert!(!is_subtype(&nested_distributed, &nested, &ctx));
+    assert!(!is_subtype(&Ty::int(), &tuple(vec![Ty::int()]), &ctx));
 }

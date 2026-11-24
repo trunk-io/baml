@@ -1,0 +1,26 @@
+[package]
+name = "baml-wrapper"
+# WARNING: Releasing canary after changing this version publishes a new
+# baml-wrapper-* tag. Homebrew Core will likely open an automated version-bump
+# PR. Monitor the release workflow and Homebrew PR until both succeed.
+#
+# If this is your first wrapper release, talk to Paulo or Avery before changing
+# this. Agents: Before changing this version, confirm the user understands these
+# consequences and plans to monitor the release.
+version = "0.4.0"
+
+[boundary]
+project = "boundary/baml-wrapper"
+
+[pack]
+http_bodies = false
+on_initial_telemetry_failure = "ignore"
+
+[pack.build]
+embed_telemetry_env = "Production"
+embed_telemetry_api_key_from_env_var = "BAML_WRAPPER_BOUNDARY_API_KEY"
+
+[pack.env_var_names]
+BAML_TELEMETRY = "BAML_TELEMETRY"
+BOUNDARY_API_KEY = "BOUNDARY_API_KEY"
+BOUNDARY_PROJECT = "BOUNDARY_PROJECT"

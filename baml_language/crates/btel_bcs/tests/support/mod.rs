@@ -3,14 +3,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use btel_bcs::wire::{
+use btel_core::upload::{
     CasDisposition, Disposition, PrepareUploadsRequest, PrepareUploadsResponse, UploadKind,
     UploadTarget,
 };
 use wiremock::Request;
 
 pub(crate) fn response(request: &Request, base: &str, skips: &[u32]) -> PrepareUploadsResponse {
-    let request: PrepareUploadsRequest = serde_json::from_slice(&request.body).unwrap();
+    let request = prepare(request);
     let expiry = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -69,4 +69,16 @@ pub(crate) fn response(request: &Request, base: &str, skips: &[u32]) -> PrepareU
         cas,
         heartbeat: None,
     }
+}
+
+pub(crate) fn prepare(request: &Request) -> PrepareUploadsRequest {
+    let mut body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    if let Some(target) = body.as_object_mut().unwrap().remove("target") {
+        let _: bcs_api::credentials::Target = serde_json::from_value(target).unwrap();
+    }
+    assert!(
+        body.get("buildId").is_none(),
+        "runtime bodies cannot contain buildId"
+    );
+    serde_json::from_value(body).unwrap()
 }

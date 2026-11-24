@@ -29,7 +29,7 @@ test "adds two ints" {
 }
 ```
 
-Run it with `target/debug/baml-cli test --from crates/baml_tests/baml_src`
+Run it with `target/debug/baml-cli test --project-dir crates/baml_tests/baml_src`
 (add `-i "<name>"` to select one). See `crates/baml_tests/README.md` for the
 corpus layout and the "END-TO-END TESTING" section below for the CLI workflow
 and the language traps worth knowing.
@@ -41,29 +41,31 @@ constant-pool entry, so BAML source cannot force two distinct allocations).
 
 ## Rust tests: import the prefixed compile helpers
 
-A fresh `ProjectDatabase` re-derives the whole stdlib — about nine CPU-seconds,
-against a few milliseconds for the snippet under test. `cargo nextest` runs each
+A fresh `ProjectDatabase` re-derives the whole stdlib, repeating much more work
+than a small test snippet needs. `cargo nextest` runs each
 test in its own process, so no in-process cache can amortize that; the stdlib
-slice is compiled **once at build time** by `baml_tests`' build script
+slice is compiled **once at build time** by `baml_test_support`'s build script
 instead.
 
-So in a Rust test, import the compile helpers from `baml_tests::stdlib_prefix`,
-not from `baml_project::testing`:
+Add `baml_test_support` as a dev dependency and import its compile helpers.
+It depends only on the compiler/database and VM types, so runtime tests do not
+need a dependency on the full `baml_tests` harness. Existing harness callers
+can also use its `baml_tests::stdlib_prefix` re-export.
 
 ```rust
 // slow — re-derives the stdlib on every test
-use baml_project::{collect_diagnostics, testing::setup_test_db};
+use baml_db::{collect_diagnostics, testing::setup_test_db};
 
 // fast — splices in the build-time stdlib slice
-use baml_tests::stdlib_prefix::{check_user_files, setup_test_db};
+use baml_test_support::{check_user_files, setup_test_db};
 ```
 
 | Need | Use |
 |---|---|
-| compile a snippet to bytecode | `baml_tests::stdlib_prefix::compile_source{,_with_opt}` |
-| several files in one project | `baml_tests::stdlib_prefix::compile_multi_file` / `setup_multi_file_db` |
-| a database to collect diagnostics from | `baml_tests::stdlib_prefix::setup_test_db` |
-| the diagnostics themselves | `baml_tests::stdlib_prefix::check_user_files` (**not** `collect_diagnostics`) |
+| compile a snippet to bytecode | `baml_test_support::compile_source{,_with_opt}` |
+| several files in one project | `baml_test_support::compile_multi_file` / `setup_multi_file_db` |
+| a database to collect diagnostics from | `baml_test_support::setup_test_db` |
+| the diagnostics themselves | `baml_test_support::check_user_files` (**not** `collect_diagnostics`) |
 
 `check_user_files` checks only the project's own files plus the package-level
 pass, instead of re-checking all ~50 stdlib files whose diagnostics every caller
@@ -75,7 +77,7 @@ everything.
 Emitted bytecode is **byte-identical** either way, at every optimization level;
 `tests/stdlib_prefix_equivalence.rs` compiles a corpus both ways and compares
 the serialized programs, so a divergence fails CI. That oracle is why the honest
-helpers in `baml_project::testing` still exist — they are its control arm, not
+helpers in `baml_db::testing` still exist — they are its control arm, not
 dead code.
 
 One thing deliberately *not* done: mounting the stdlib as a source-less
@@ -147,7 +149,7 @@ Failing-to-compile projects snapshot under
 
 ### 5. Fix the issue
 
-Edit the relevant crate (`baml_compiler_parser`, `baml_compiler_syntax`, `baml_compiler2_hir`, etc.).
+Edit the relevant crate (`baml_parser`, `baml_syntax`, `baml_compiler2_ast`, `baml_compiler2_hir`, etc.).
 
 ### 6. Re-run and update snapshots
 
@@ -183,7 +185,7 @@ cargo nextest run -p baml_tests
 cargo nextest run -p baml_tests --lib -E 'test(/corpus_/)'
 
 # Execute the BAML corpus the way CI does
-target/debug/baml-cli test --from crates/baml_tests/baml_src
+target/debug/baml-cli test --project-dir crates/baml_tests/baml_src
 
 # Run the editor-surface tests
 cargo nextest run -p baml_ide -p baml_lsp -p baml_lsp_server
@@ -197,10 +199,10 @@ cargo insta review
 
 ## Key Files
 
-- **Lexer**: `crates/baml_compiler_lexer/src/tokens.rs`
-- **Parser**: `crates/baml_compiler_parser/src/parser.rs`
-- **Syntax kinds**: `crates/baml_compiler_syntax/src/syntax_kind.rs`
-- **AST helpers**: `crates/baml_compiler_syntax/src/ast.rs`
+- **Token table and lexer**: `crates/baml_syntax/src/token.rs`, `crates/baml_syntax/src/lexer.rs`
+- **Syntax nodes**: `crates/baml_syntax/src/nodes/`
+- **Parser**: `crates/baml_parser/src/` (`items.rs`, `types.rs`, `expr.rs`, `stmts.rs`, `patterns.rs`, `templates.rs`)
+- **AST lowering**: `crates/baml_compiler2_ast/src/lower_tree/`
 - **HIR lowering**: `crates/baml_compiler2_hir/src/body.rs`
 - **Type checking**: `crates/baml_compiler2_tir/src/builder.rs`
 
@@ -249,13 +251,13 @@ $BAML describe baml                 # ← THE FULL PICTURE: every namespace, typ
                                     #   http, json, math, net, time, toml, yaml, iter, …)
 $BAML describe baml.json            # drill into a namespace → its types + function signatures
 $BAML describe Array                # drill into a type → full method list + docs
-$BAML describe String --budget 200  # output is line-budgeted; raise --budget to see all methods
+$BAML describe String --limit 200  # output is line-limited; raise --limit to see all methods
 $BAML describe <YourSymbol>         # also works on symbols in the loaded project
 ```
 
 `describe` resolves symbols against a project. From inside a project dir it just works; from
-elsewhere pass `--from <project-dir>`. Output is capped by `--budget` (default 30) and tells
-you "… N more lines (re-run with a higher --budget)" — raise it to see everything. Anything
+elsewhere pass `--project-dir <project-dir>`. Output is capped by `--limit` (default 30) and tells
+you "… N more lines (re-run with a higher --limit)" — raise it to see everything. Anything
 you can't see, `describe` it; do not guess stdlib names or signatures.
 
 ## Setting up a project
@@ -313,7 +315,7 @@ $BAML test -i "<testset>::<case>"    # run a single test by id
   "baml.panics.UserPanic", … } }` with a stack trace pointing into `testing/registry.baml`.
 - LLM functions (`client:` + `prompt:`) hit the network — **do not** rely on live LLM calls in
   e2e tests. Test the deterministic logic, and for parsing use the generated `Fn$parse(raw)`
-  companion against a canned string (or `baml.json.from_string<T>(...)`).
+  companion against a canned string (or `baml.json.decode<T>(...)`).
 
 ## A known-good reference program
 
@@ -339,7 +341,8 @@ bite first — everything else, `baml describe` it:
 1. **Class fields are `name: type,`** (trailing comma); construct with `Point { x: 1 }`.
    Methods take an explicit `self`; static factories don't. `baml fmt` normalizes layout.
 2. **Last expression in a block is its value** (Rust-style). Early exit is `return x;` (with
-   trailing `;`). A no-value function is `-> null` with a trailing `null`.
+   trailing `;`). A no-value function is `-> void` and ends in a statement: a value left as
+   its last expression is an error (and so is one ending a `test` body), so end it with `;`.
 3. **`for (let x in xs)`** iterates values and requires `let`. `if` / `match` / blocks are
    expressions; `match (v) { 0 => "a", _ => "b" }`.
 4. **No implicit string coercion** — `"n=" + 5` will NOT compile; use `baml.unstable.string(5)`.
@@ -347,7 +350,9 @@ bite first — everything else, `baml describe` it:
    Closures are `(x: T) -> R { ... }`; the `=>` arrow is **match-only**. `.map`/`.filter`
    return arrays directly (no `.collect()`). **Map keys must be `string`.**
 5. **`catch` arms are type-only and non-exhaustive**: `f(x) catch (e) { BadInput => fallback }`.
-   `throws T` is part of a function's signature; **panics are not catchable**.
+   `catch_all` must cover every error (E0062). `throws T` is part of a function's signature;
+   **panics are not errors**: `_` lets them pass, so catch one by naming it
+   (`baml.panics.IndexOutOfBounds => …`) or at a `catch_all_panics` boundary.
 
 ## Recommended workflow
 

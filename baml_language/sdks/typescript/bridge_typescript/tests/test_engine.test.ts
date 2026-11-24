@@ -1,7 +1,7 @@
 // test_engine.test.ts — mirrors bridge_python/tests/test_engine.py
 
 import { BamlRuntime, callFunctionSync, callFunction,
-         BamlCallContext, getRuntime, getVersion, flushEvents } from '../dist/index.js';
+         getRuntime, getVersion } from '../dist/index.js';
 
 const BAML_SOURCE = `
 function ReturnOne() -> int {
@@ -73,10 +73,6 @@ describe('Basics', () => {
         expect(rt).toBeDefined();
     });
 
-    test('flush_events runs without error', () => {
-        expect(() => flushEvents()).not.toThrow();
-    });
-
     test('getRuntime returns initialized runtime', () => {
         // initializeRuntime sets the process-global singleton; getRuntime fetches it.
         makeRuntime(BAML_SOURCE);
@@ -127,16 +123,22 @@ describe('callFunctionSync', () => {
     });
 
     test('returned closure accepts args and decodes results', () => {
-        const addTen = callFunctionSync(rt, 'MakeAdder', { offset: 10 }).result() as (value: number) => number;
+        const addTen = callFunctionSync(rt, 'MakeAdder', { offset: 10 }).result() as {
+            (value: number): Promise<number>;
+            callSync(value: number): number;
+        };
         expect(typeof addTen).toBe('function');
-        expect(addTen(5)).toBe(15);
-        expect(addTen(7)).toBe(17);
+        expect(addTen.callSync(5)).toBe(15);
+        expect(addTen.callSync(7)).toBe(17);
     });
 
     test('returned closure is reusable and retains captures', () => {
-        const nextValue = callFunctionSync(rt, 'MakeCounter', { start: 40 }).result() as () => number;
-        expect(nextValue()).toBe(41);
-        expect(nextValue()).toBe(42);
+        const nextValue = callFunctionSync(rt, 'MakeCounter', { start: 40 }).result() as {
+            (): Promise<number>;
+            callSync(): number;
+        };
+        expect(nextValue.callSync()).toBe(41);
+        expect(nextValue.callSync()).toBe(42);
     });
 });
 
@@ -153,6 +155,12 @@ describe('callFunction (async)', () => {
 
     test('ChainedCalls', async () => {
         expect((await callFunction(rt, 'ChainedCalls', {})).result()).toBe(1);
+    });
+
+    test('returned closure is awaited', async () => {
+        const addTen = (await callFunction(rt, 'MakeAdder', { offset: 10 })).result() as (value: number) => Promise<number>;
+        expect(await addTen(5)).toBe(15);
+        expect(await addTen(7)).toBe(17);
     });
 
     test('async enum result — Heading', async () => {
@@ -174,15 +182,15 @@ describe('callFunction (async)', () => {
     });
 });
 
-describe('BamlCallContext', () => {
+describe('native AbortController', () => {
     test('starts not aborted', () => {
-        const ac = new BamlCallContext();
-        expect(ac.aborted).toBe(false);
+        const ac = new AbortController();
+        expect(ac.signal.aborted).toBe(false);
     });
 
     test('abort sets aborted', () => {
-        const ac = new BamlCallContext();
+        const ac = new AbortController();
         ac.abort();
-        expect(ac.aborted).toBe(true);
+        expect(ac.signal.aborted).toBe(true);
     });
 });

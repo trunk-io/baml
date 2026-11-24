@@ -1,0 +1,461 @@
+//! Which member of a union a JSON value decodes as: the best match.
+//!
+//! The candidates are the members a value of its JSON kind can decode as at
+//! all: an object is never a `string`, a number never a class. Among them the
+//! most specific is tried first, and the first that decodes wins:
+//!
+//! - an object prefers the member that uses the most of its keys. A class uses
+//!   the keys that name its fields under the naming in effect, media its tag
+//!   keys, and a map every key;
+//! - a number prefers a literal, then `int`, then `bigint`, then `float`, so an
+//!   integral number is an `int` when it fits;
+//! - a string prefers a literal or a single enum variant, then an enum, then
+//!   `string` (and a `bigint` read from a numeric string, which ties with it);
+//! - `json`, `unknown`, and a map of either take any value, so they come last.
+//!
+//! Ties go to declaration order. A nested union or recursive alias ranks as
+//! its best member, and resolves inside by the same rule when it is decoded.
+//!
+//! Only what decides the order is worked out up front: the JSON kind, and the
+//! keys only when two or more candidates count them. A member that fails deep
+//! inside falls through to the next.
+
+use std::sync::Arc;
+
+use baml_type::json_tags::{TagTree, Untagged, tag_tree};
+use bex_vm_types::{HeapPtr, Object, RealizedTy};
+use smallvec::SmallVec;
+
+use super::{
+    decode::Structural,
+    plan::{ClassPlan, Plans},
+};
+use crate::BexVm;
+
+/// What JSON value a union is decoding: what members are prefiltered by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Kind {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+impl Kind {
+    /// The kind of the JSON text whose first byte is `byte`.
+    pub(super) fn of_text(byte: u8) -> Self {
+        match byte {
+            b'n' => Kind::Null,
+            b't' | b'f' => Kind::Bool,
+            b'"' => Kind::String,
+            b'[' => Kind::Array,
+            b'{' => Kind::Object,
+            _ => Kind::Number,
+        }
+    }
+}
+
+/// The keys of the JSON object a union is decoding, to count against each
+/// member that reads keys.
+pub(super) enum Keys<'k> {
+    /// A `json` object in memory: a string-keyed map.
+    Map(HeapPtr),
+    /// The object's keys as written, sorted and without repeats.
+    Text(&'k [String]),
+}
+
+impl Keys<'_> {
+    fn has(&self, vm: &BexVm, key: &str, hash: u64) -> bool {
+        match self {
+            Keys::Map(ptr) => super::object_get(vm, *ptr, hash, key).is_some(),
+            Keys::Text(keys) => keys
+                .binary_search_by(|written| written.as_str().cmp(key))
+                .is_ok(),
+        }
+    }
+
+    fn len(&self, vm: &BexVm) -> usize {
+        match self {
+            Keys::Map(ptr) => match vm.get_object(*ptr) {
+                Object::Map(map) => map.len(),
+                _ => 0,
+            },
+            Keys::Text(keys) => keys.len(),
+        }
+    }
+}
+
+/// How a member fits a value of one kind, before any decoding.
+#[derive(Clone, Copy)]
+enum Fit {
+    /// Takes any value: `json`, `unknown`, or a map of either.
+    Any,
+    /// Fits values of this kind at a fixed rank: higher is more specific.
+    Rank(u8),
+    /// An object member, ranked by how many of the object's keys it uses.
+    Keys,
+}
+
+/// The members of a union that can decode a value of one kind, each with how
+/// it fits.
+pub(super) struct Candidates(SmallVec<[(usize, Fit); 4]>);
+
+impl Candidates {
+    /// The members of `members` that can decode a value of kind `kind`.
+    pub(super) fn of(vm: &BexVm, members: &[RealizedTy], kind: Kind) -> Self {
+        Self(
+            members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, member)| Some((index, fit(vm, member, kind)?)))
+                .collect(),
+        )
+    }
+
+    /// Whether the order depends on the object's keys: two or more
+    /// candidates count them.
+    pub(super) fn counts_keys(&self) -> bool {
+        self.0
+            .iter()
+            .filter(|(_, fit)| matches!(fit, Fit::Keys))
+            .nth(1)
+            .is_some()
+    }
+
+    /// The candidates' indexes in `members`, in the order to try them, best
+    /// first. `keys` are the object's keys when [`Self::counts_keys`].
+    pub(super) fn order(
+        self,
+        vm: &BexVm,
+        members: &[RealizedTy],
+        plans: &mut Plans,
+        keys: Option<&Keys<'_>>,
+    ) -> SmallVec<[usize; 4]> {
+        if self.0.len() <= 1 {
+            return self.0.into_iter().map(|(index, _)| index).collect();
+        }
+        // `json` and the like below everything, then the kind's own ranks,
+        // or the number of keys used.
+        let mut ranked: SmallVec<[(usize, u64); 4]> = self
+            .0
+            .into_iter()
+            .map(|(index, fit)| {
+                let rank = match fit {
+                    Fit::Any => 0,
+                    Fit::Rank(rank) => 1 + u64::from(rank),
+                    Fit::Keys => {
+                        1 + keys
+                            .map_or(0, |keys| used_keys(vm, &members[index], keys, plans) as u64)
+                    }
+                };
+                (index, rank)
+            })
+            .collect();
+        // Stable: ties keep declaration order.
+        ranked.sort_by(|(_, a), (_, b)| b.cmp(a));
+        ranked.into_iter().map(|(index, _)| index).collect()
+    }
+}
+
+/// How a union with a `@json.fallback` member picks a member for an object.
+pub(super) struct UnionTags {
+    /// The tree over `members`, or why the union can't be told apart: a union
+    /// the compiler never saw, such as one spelled in a type argument.
+    tree: Result<TagTree<RealizedTy>, String>,
+    /// The members the tree picks from.
+    members: Vec<RealizedTy>,
+    fallback: RealizedTy,
+    /// The fallback class's tag, as its JSON keys and literals.
+    fallback_literals: Vec<(String, RealizedTy)>,
+}
+
+/// Why an object is none of a tagged union's members.
+pub(super) struct Refused {
+    pub(super) message: String,
+    /// The tag it is about, when the object holds it.
+    pub(super) key: Option<String>,
+}
+
+/// How the union of `members` picks a member, when one is a `@json.fallback`
+/// class.
+pub(super) fn union_tags(
+    vm: &BexVm,
+    members: &[RealizedTy],
+    plans: &mut Plans,
+) -> Option<Arc<UnionTags>> {
+    if let Some(tags) = plans.unions.get(members) {
+        return tags.clone();
+    }
+    let tags = build_union_tags(vm, members, plans).map(Arc::new);
+    plans.unions.insert(members.into(), tags.clone());
+    tags
+}
+
+fn build_union_tags(vm: &BexVm, members: &[RealizedTy], plans: &mut Plans) -> Option<UnionTags> {
+    let mut flat = Vec::new();
+    for member in members {
+        super::alias_members(vm, member, &mut Vec::new(), &mut flat);
+    }
+    let mut class_plan = |member: &RealizedTy| match member {
+        RealizedTy::Class(head, _) if vm.stdlib_heads().media_kind(*head).is_some() => None,
+        RealizedTy::Class(head, type_args) => plans.class(vm, *head, type_args).ok(),
+        _ => None,
+    };
+    let (fallback, fallback_literals) = flat.iter().find_map(|member| {
+        let plan = class_plan(member).filter(|plan| plan.is_fallback())?;
+        Some((member.clone(), literals(&plan, false)))
+    })?;
+    let mut tagged = Vec::new();
+    let mut tags = Vec::new();
+    let mut untagged = None;
+    for member in &flat {
+        if *member == fallback || fit(vm, member, Kind::Object).is_none() {
+            continue;
+        }
+        match class_plan(member) {
+            Some(plan) if !plan.is_fallback() => {
+                tags.push(literals(&plan, true));
+                tagged.push(member.clone());
+            }
+            _ => untagged = Some(member.clone()),
+        }
+    }
+    let tree = match untagged {
+        Some(member) => Err(format!(
+            "`{member}` has no literal field to tell it from the union's `@json.fallback` member"
+        )),
+        None => tag_tree(&tags, &fallback_literals).map_err(|untold| match untold {
+            Untagged::NoTag => "the union's `@json.fallback` class has no literal field".into(),
+            Untagged::Member(member) => format!(
+                "`{}` lacks the tag of the union's `@json.fallback` class",
+                tagged[member]
+            ),
+            Untagged::Overlap(first, second) => format!(
+                "no literal field tells `{}` from `{}`",
+                tagged[first], tagged[second]
+            ),
+        }),
+    };
+    Some(UnionTags {
+        tree,
+        members: tagged,
+        fallback,
+        fallback_literals,
+    })
+}
+
+/// Each literal field of `plan` as its JSON key and type. A fallback class
+/// holds its literals rather than reading them, so `shown` tells only for the
+/// other classes.
+fn literals(plan: &ClassPlan, shown_only: bool) -> Vec<(String, RealizedTy)> {
+    plan.fields
+        .iter()
+        .filter(|field| matches!(field.ty, RealizedTy::Literal(..)))
+        .filter(|field| field.shown || !shown_only)
+        .map(|field| (field.key.clone(), field.ty.clone()))
+        .collect()
+}
+
+/// The member a union with a `@json.fallback` member decodes the object at
+/// `ptr` as, or `None` for any other union: the member its [`TagTree`] leads
+/// to, the fallback for a tag value no member has, or why it is neither.
+pub(super) fn tagged_member(
+    vm: &mut BexVm,
+    members: &[RealizedTy],
+    ptr: HeapPtr,
+    plans: &mut Plans,
+) -> Option<Result<RealizedTy, Refused>> {
+    if !matches!(vm.get_object(ptr), Object::Map(_)) {
+        return None;
+    }
+    let tags = union_tags(vm, members, plans)?;
+    let mut node = match &tags.tree {
+        Ok(tree) => tree,
+        Err(message) => {
+            return Some(Err(Refused {
+                message: message.clone(),
+                key: None,
+            }));
+        }
+    };
+    loop {
+        let (key, arms) = match node {
+            TagTree::Member(member) => return Some(Ok(tags.members[*member].clone())),
+            TagTree::Read { key, arms } => (key, arms),
+        };
+        let Some(value) = super::object_get(vm, ptr, bex_vm_types::map_string_hash(key), key)
+        else {
+            return Some(Err(Refused {
+                message: format!("missing required field `{key}`"),
+                key: None,
+            }));
+        };
+        let mut next = None;
+        for (literal, tree) in arms {
+            if Structural::quiet(plans).decode(vm, value, literal).is_ok() {
+                next = Some(tree);
+                break;
+            }
+        }
+        match next {
+            Some(tree) => node = tree,
+            None => {
+                // Any literal this key could hold says what kind it can be.
+                let literals = arms.iter().map(|(literal, _)| literal).chain(
+                    tags.fallback_literals
+                        .iter()
+                        .filter(|(tag, _)| tag == key)
+                        .map(|(_, literal)| literal),
+                );
+                let mut kind = "";
+                let mut fits = false;
+                for literal in literals {
+                    let (literal_fits, literal_kind) = super::tag_kind(vm, value, literal);
+                    fits |= literal_fits;
+                    kind = literal_kind;
+                }
+                return Some(if fits {
+                    Ok(tags.fallback.clone())
+                } else {
+                    Err(Refused {
+                        message: format!("expected {kind}"),
+                        key: Some(key.clone()),
+                    })
+                });
+            }
+        }
+    }
+}
+
+/// The member that is not `null`, when `members` is `T | null` in either
+/// order: such a union needs no ranking, since `null` decodes as `null` and
+/// anything else can only be a `T`.
+pub(super) fn other_than_null(members: &[RealizedTy]) -> Option<&RealizedTy> {
+    match members {
+        [RealizedTy::Null, other] | [other, RealizedTy::Null] if !other.is_null() => Some(other),
+        _ => None,
+    }
+}
+
+/// How `member` fits a value of kind `kind`, or `None` when it cannot decode
+/// one.
+fn fit(vm: &BexVm, member: &RealizedTy, kind: Kind) -> Option<Fit> {
+    use baml_type::Literal;
+    if is_any(vm, member) {
+        return Some(Fit::Any);
+    }
+    let rank = |fits: bool, rank: u8| fits.then_some(Fit::Rank(rank));
+    match member {
+        RealizedTy::Null => rank(kind == Kind::Null, 0),
+        RealizedTy::Bool => rank(kind == Kind::Bool, 0),
+        RealizedTy::Literal(Literal::Bool(_), _) => rank(kind == Kind::Bool, 1),
+        RealizedTy::Float => rank(kind == Kind::Number, 0),
+        RealizedTy::Bigint => match kind {
+            Kind::Number => Some(Fit::Rank(1)),
+            // A numeric string ties with `string`.
+            Kind::String => Some(Fit::Rank(0)),
+            _ => None,
+        },
+        RealizedTy::Int => rank(kind == Kind::Number, 2),
+        RealizedTy::Literal(Literal::Int(_) | Literal::Float(_), _) => {
+            rank(kind == Kind::Number, 3)
+        }
+        RealizedTy::Literal(Literal::Bigint(_), _) => {
+            rank(matches!(kind, Kind::Number | Kind::String), 3)
+        }
+        RealizedTy::String => rank(kind == Kind::String, 0),
+        RealizedTy::Enum(_) => rank(kind == Kind::String, 1),
+        RealizedTy::Literal(Literal::String(_), _) | RealizedTy::EnumVariant(..) => {
+            rank(kind == Kind::String, 2)
+        }
+        RealizedTy::List(_) => rank(kind == Kind::Array, 0),
+        RealizedTy::Tuple(_) => rank(kind == Kind::Array, 1),
+        RealizedTy::Map { .. }
+        | RealizedTy::Class(..)
+        | RealizedTy::Interface(..)
+        | RealizedTy::Media(_) => (kind == Kind::Object).then_some(Fit::Keys),
+        RealizedTy::Union(_) | RealizedTy::TypeAlias(_) => {
+            let mut inner = Vec::new();
+            super::alias_members(vm, member, &mut Vec::new(), &mut inner);
+            inner
+                .iter()
+                .filter_map(|inner| fit(vm, inner, kind))
+                .reduce(|best, fit| match (best, fit) {
+                    (Fit::Keys, _) | (_, Fit::Keys) => Fit::Keys,
+                    (Fit::Any, other) | (other, Fit::Any) => other,
+                    (Fit::Rank(a), Fit::Rank(b)) => Fit::Rank(a.max(b)),
+                })
+        }
+        // No JSON form, or no values: these never decode.
+        RealizedTy::Uint8Array
+        | RealizedTy::Function { .. }
+        | RealizedTy::Future(..)
+        | RealizedTy::Resource
+        | RealizedTy::PromptAst
+        | RealizedTy::Type
+        | RealizedTy::Never => None,
+        RealizedTy::Unknown => Some(Fit::Any),
+    }
+}
+
+/// Whether `ty` takes any JSON value: `json`, `unknown`, or a map of either.
+fn is_any(vm: &BexVm, ty: &RealizedTy) -> bool {
+    let any = |ty: &RealizedTy| match ty {
+        RealizedTy::Unknown => true,
+        RealizedTy::TypeAlias(head) => vm.stdlib_heads().is_json_alias(*head),
+        _ => false,
+    };
+    match ty {
+        RealizedTy::Map { value, .. } => any(value),
+        _ => any(ty),
+    }
+}
+
+/// How many of the object's keys `member`, an object member, uses.
+fn used_keys(vm: &BexVm, member: &RealizedTy, keys: &Keys<'_>, plans: &mut Plans) -> usize {
+    match member {
+        RealizedTy::Map { .. } => keys.len(vm),
+        RealizedTy::Media(_) => media_keys(vm, keys),
+        RealizedTy::Class(head, _) if vm.stdlib_heads().media_kind(*head).is_some() => {
+            media_keys(vm, keys)
+        }
+        RealizedTy::Class(head, type_args) | RealizedTy::Interface(head, type_args, _) => {
+            let Ok(plan) = plans.class(vm, *head, type_args) else {
+                return 0;
+            };
+            let mut used = 0;
+            for (index, field) in plan.fields.iter().enumerate() {
+                // Two fields under one key use it once.
+                let repeated = plan.shared_keys
+                    && plan.fields[..index]
+                        .iter()
+                        .any(|other| other.shown && other.key == field.key);
+                if field.shown && !repeated && keys.has(vm, &field.key, field.hash()) {
+                    used += 1;
+                }
+            }
+            used
+        }
+        RealizedTy::Union(_) | RealizedTy::TypeAlias(_) => {
+            let mut inner = Vec::new();
+            super::alias_members(vm, member, &mut Vec::new(), &mut inner);
+            inner
+                .iter()
+                .filter(|inner| matches!(fit(vm, inner, Kind::Object), Some(Fit::Keys)))
+                .map(|inner| used_keys(vm, inner, keys, plans))
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// How many of a tagged media object's keys the object has.
+fn media_keys(vm: &BexVm, keys: &Keys<'_>) -> usize {
+    ["kind", "source", "value", "mime", "name"]
+        .into_iter()
+        .filter(|key| keys.has(vm, key, bex_vm_types::map_string_hash(key)))
+        .count()
+}

@@ -11,15 +11,26 @@
 //! in `baml_compiler2_hir_ty::interfaces`), run on `bex_vm_types::RealizedTy`: unify the rule's
 //! `for_ty_pattern` against the concrete type (binding the impl's generic
 //! params), then discharge each param's declared bound as a nested obligation.
+//!
+//! The three entry points ([`ImplResolver::resolve_implements_rule`],
+//! [`ImplResolver::resolve_implementation`] and
+//! [`ImplResolver::type_implements`]) answer from the VM's
+//! [`ImplCache`](crate::impl_cache::ImplCache) when they can; see that module
+//! for why a cached answer stays exact.
 
 use std::borrow::Cow;
 
-use baml_type::{Literal, Name, normalize::TypeContext};
+use baml_type::{Literal, Name, StructuralInterface, normalize::TypeContext};
 use bex_vm_types::{
-    RealizedTy, TyTemplate, TypeHead, errors::VmInternalError, types::RuntimeImplRule,
+    HeapPtr, RealizedTy, TyTemplate, TypeHead, errors::VmInternalError, types::RuntimeImplRule,
 };
 
-use crate::{BexVm, type_context::StructuralEquivCtx, vec_ext::VecExt};
+use crate::{
+    BexVm,
+    impl_cache::{Answer, CachedImplementation, CachedRule, Query, World},
+    type_context::StructuralEquivCtx,
+    vec_ext::VecExt,
+};
 
 /// A resolver candidate borrows an immutable rule from the heap. Every rule —
 /// compiled into the static image, owned by a runtime package, or registered
@@ -29,6 +40,30 @@ use crate::{BexVm, type_context::StructuralEquivCtx, vec_ext::VecExt};
 pub(crate) enum RuntimeImplRuleCandidate<'vm> {
     Static(&'vm RuntimeImplRule),
     Borrowed(&'vm RuntimeImplRule),
+}
+
+/// An implementation selected without adding synthetic rules to the registry.
+/// Structural defaults carry the exact `Self` type for native and shared-body frames.
+pub(crate) enum ResolvedInterfaceImpl<'vm> {
+    Explicit {
+        rule: RuntimeImplRuleCandidate<'vm>,
+        bindings: Vec<RealizedTy>,
+    },
+    Structural {
+        kind: StructuralInterface,
+        interface: TypeHead,
+        self_ty: RealizedTy,
+    },
+}
+
+impl ResolvedInterfaceImpl<'_> {
+    pub(crate) fn is_static(&self) -> bool {
+        match self {
+            Self::Explicit { rule, .. } => rule.is_static(),
+            // A dynamic explicit implementation can replace this fallback.
+            Self::Structural { .. } => false,
+        }
+    }
 }
 
 impl RuntimeImplRuleCandidate<'_> {
@@ -116,16 +151,16 @@ impl<'vm> ImplResolver<'vm> {
         };
         let head = TypeHead::new(interface, declaration.type_tag);
         let applicable = self
-            .rules_for(head)
+            .rules_for(head, concrete)
             .iter()
-            .filter(|rule| self.requested_rule_args(rule, concrete, args).is_some())
+            .filter(|(_, rule)| self.requested_rule_args(rule, concrete, args).is_some())
             .count();
         if applicable == 1 {
             Ok(())
         } else {
             Err(format!(
                 "overlapping implementations of `{}` for `{concrete}`",
-                declaration.name.display_name()
+                declaration.name().display_name()
             ))
         }
     }
@@ -161,14 +196,25 @@ impl<'vm> ImplResolver<'vm> {
         }
     }
 
-    /// Every impl rule of `iface` in the program, in package-load order.
+    /// Every impl rule of `iface` in the program that could apply to
+    /// `receiver`, in package-load order, each beside its heap pointer (null
+    /// for a staged rule, which has none).
+    ///
+    /// A runtime class's witness applies to that class only (its `for`
+    /// pattern is the class), so for a class receiver only that class's
+    /// witnesses are candidates. Any other receiver gets every witness of
+    /// `iface`; none of them can apply, but no case here depends on that.
     ///
     /// The program-wide [`PackageIndex`](crate::package_load::PackageIndex) is
     /// keyed by the interface's canonical `Object::Interface` pointer, so this is
     /// one O(1) lookup over a table that already spans every package — see that
     /// type's docs for why a per-package search cannot be narrowed correctly. An
     /// unknown interface (not loaded) has no impls anywhere.
-    fn rules_for(self, iface: TypeHead) -> Vec<RuntimeImplRuleCandidate<'vm>> {
+    fn rules_for(
+        self,
+        iface: TypeHead,
+        receiver: &RealizedTy,
+    ) -> Vec<(HeapPtr, RuntimeImplRuleCandidate<'vm>)> {
         // The head *is* the canonical `Object::Interface` pointer that keys
         // every package's `impl_rules` — no name lookup on the dispatch path.
         //
@@ -197,31 +243,122 @@ impl<'vm> ImplResolver<'vm> {
             if let Some(rules) = package.impl_rules.get(&iface_ptr) {
                 pointers.extend(rules);
             }
-            packages.extend(package.declared());
+            // The chain is the ordinary packages reached from here; the
+            // language packages' rules are in the static index already.
+            packages.extend(
+                package
+                    .dependencies()
+                    .filter(|&dependency| !self.vm.is_language_package(dependency)),
+            );
         }
         // A rule can be reached more than once — through the static index
         // and the package that owns it, or through two packages of one
         // chain. Each rule is one candidate, so a coherence count over the
         // candidates is exact.
+        let witnesses = match receiver {
+            RealizedTy::Class(class, _) => self
+                .vm
+                .dynamic_dispatch
+                .rules_of_class(iface_ptr, class.ptr()),
+            _ => self.vm.dynamic_dispatch.rules_of(iface_ptr),
+        };
         let mut seen_rules = std::collections::HashSet::new();
         let mut rules = pointers
             .into_iter()
-            .chain(self.vm.dynamic_dispatch.rules_of(iface_ptr))
+            .chain(witnesses)
             .filter(|rule_ptr| seen_rules.insert(*rule_ptr))
             .filter_map(|rule_ptr| {
                 self.vm
                     .get_object(rule_ptr)
                     .as_impl_rule()
-                    .map(RuntimeImplRuleCandidate::Borrowed)
+                    .map(|rule| (rule_ptr, RuntimeImplRuleCandidate::Borrowed(rule)))
             })
             .collect::<Vec<_>>();
         rules.extend(
             self.staged_rules
                 .iter()
                 .filter(|rule| rule.interface_head == iface_ptr)
-                .map(RuntimeImplRuleCandidate::Borrowed),
+                .map(|rule| (HeapPtr::null(), RuntimeImplRuleCandidate::Borrowed(rule))),
         );
         rules
+    }
+
+    /// The world this resolver's answers depend on, as the cache keys it:
+    /// the packages [`Self::rules_for`] walks, plus the running code's
+    /// package, where nested projections reduce.
+    fn world(self) -> World {
+        let lexical = self.vm.current_runtime_package();
+        World {
+            root: self.root_package.unwrap_or(lexical),
+            additional: self.additional_package,
+            lexical,
+        }
+    }
+
+    /// The question this resolver would ask the cache, or `None` when its
+    /// answer must not be shared: staged rules make a world no other lookup
+    /// sees.
+    fn query<'q>(
+        self,
+        self_ty: &'q RealizedTy,
+        interface: TypeHead,
+        args: &'q [RealizedTy],
+        assoc: &'q [(Name, RealizedTy)],
+    ) -> Option<Query<'q>> {
+        self.staged_rules.is_empty().then(|| Query {
+            world: self.world(),
+            self_ty,
+            interface,
+            args,
+            assoc,
+        })
+    }
+
+    /// This VM's cached answer to `query`, or the generation a computed
+    /// answer must be stored under.
+    fn lookup<V: Answer>(self, query: &Query<'_>) -> Result<V, u64> {
+        let generation = self.vm.dynamic_dispatch.generation();
+        match self.vm.impl_cache.borrow_mut().get::<V>(generation, query) {
+            Some(answer) => Ok(answer.clone()),
+            None => Err(generation),
+        }
+    }
+
+    /// Store an answer computed since generation `started`.
+    fn store<V: Answer>(self, started: u64, query: &Query<'_>, answer: V) {
+        let now = self.vm.dynamic_dispatch.generation();
+        self.vm
+            .impl_cache
+            .borrow_mut()
+            .insert(started, now, query, answer);
+    }
+
+    /// Borrow the rule a cached answer names.
+    fn cached_candidate(self, cached: &CachedRule) -> RuntimeImplRuleCandidate<'vm> {
+        let rule = self
+            .vm
+            .get_object(cached.rule)
+            .as_impl_rule()
+            .expect("a cached impl rule is an Object::ImplRule");
+        if cached.is_static {
+            RuntimeImplRuleCandidate::Static(rule)
+        } else {
+            RuntimeImplRuleCandidate::Borrowed(rule)
+        }
+    }
+}
+
+impl CachedRule {
+    fn new(
+        rule: HeapPtr,
+        candidate: &RuntimeImplRuleCandidate<'_>,
+        bindings: &[RealizedTy],
+    ) -> Self {
+        Self {
+            rule,
+            is_static: candidate.is_static(),
+            bindings: bindings.to_vec(),
+        }
     }
 }
 
@@ -271,6 +408,273 @@ fn concrete_base(ty: &RealizedTy) -> Cow<'_, RealizedTy> {
 }
 
 impl<'vm> ImplResolver<'vm> {
+    pub(crate) fn resolve_implementation(
+        self,
+        self_ty: &RealizedTy,
+        interface: TypeHead,
+        args: &[RealizedTy],
+    ) -> Option<ResolvedInterfaceImpl<'vm>> {
+        let base = concrete_base(self_ty);
+        let Some(query) = self.query(&base, interface, args, &[]) else {
+            return self
+                .select_implementation(self_ty, interface, args)
+                .map(|(_, resolved)| resolved);
+        };
+        let started = match self.lookup::<Option<CachedImplementation>>(&query) {
+            Ok(answer) => {
+                return answer.map(|answer| match answer {
+                    CachedImplementation::Explicit(rule) => ResolvedInterfaceImpl::Explicit {
+                        rule: self.cached_candidate(&rule),
+                        bindings: rule.bindings,
+                    },
+                    CachedImplementation::Structural(kind) => ResolvedInterfaceImpl::Structural {
+                        kind,
+                        interface,
+                        self_ty: self_ty.clone(),
+                    },
+                });
+            }
+            Err(started) => started,
+        };
+        let selected = self.select_implementation(self_ty, interface, args);
+        self.store(
+            started,
+            &query,
+            selected.as_ref().map(|(answer, _)| answer.clone()),
+        );
+        selected.map(|(_, resolved)| resolved)
+    }
+
+    /// [`Self::resolve_implementation`] without the cache, with the answer
+    /// the cache would store.
+    fn select_implementation(
+        self,
+        self_ty: &RealizedTy,
+        interface: TypeHead,
+        args: &[RealizedTy],
+    ) -> Option<(CachedImplementation, ResolvedInterfaceImpl<'vm>)> {
+        if let Some((ptr, rule, bindings)) = self.select_implements_rule(self_ty, interface, args) {
+            return Some((
+                CachedImplementation::Explicit(CachedRule::new(ptr, &rule, &bindings)),
+                ResolvedInterfaceImpl::Explicit { rule, bindings },
+            ));
+        }
+        let kind = self.structural_default(interface, args)?;
+        let eligible = match kind {
+            StructuralInterface::Hash => {
+                self.hash_eligible(self_ty, interface, &mut Vec::new(), &mut Vec::new())
+            }
+            StructuralInterface::Compare => {
+                self.tuple_compare_eligible(self_ty, interface, &mut Vec::new())
+            }
+            _ => true,
+        };
+        if !eligible {
+            return None;
+        }
+        Some((
+            CachedImplementation::Structural(kind),
+            ResolvedInterfaceImpl::Structural {
+                kind,
+                interface,
+                self_ty: self_ty.clone(),
+            },
+        ))
+    }
+
+    fn structural_default(
+        self,
+        interface: TypeHead,
+        args: &[RealizedTy],
+    ) -> Option<StructuralInterface> {
+        if !args.is_empty() {
+            return None;
+        }
+        let bex_vm_types::Object::Interface(declaration) = self.vm.get_object(interface.ptr())
+        else {
+            return None;
+        };
+        declaration
+            .structural_default
+            .as_ref()
+            .map(|default| default.kind)
+    }
+
+    fn hash_eligible(
+        self,
+        ty: &RealizedTy,
+        interface: TypeHead,
+        active: &mut Vec<RealizedTy>,
+        obligations: &mut Vec<Obligation>,
+    ) -> bool {
+        if self
+            .rules_for(interface, ty)
+            .iter()
+            .any(|(_, rule)| self.rule_applies(rule, ty, &[], obligations).is_some())
+        {
+            return true;
+        }
+        let ty = concrete_base(ty).into_owned();
+        if active.contains(&ty) {
+            return true;
+        }
+        if active.len() >= 64 {
+            return false;
+        }
+        // `Equals` is the `baml` package's, which is required at load.
+        let equals = self
+            .vm
+            .lang_head(crate::lang_items::BAML_OPS_EQUALS)
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "the required `baml` package declares `{}`",
+                    crate::lang_items::BAML_OPS_EQUALS
+                )
+            });
+        if matches!(ty, RealizedTy::Class(..) | RealizedTy::Enum(_))
+            && self.rules_for(equals, &ty).iter().any(|(_, rule)| {
+                // Unproven bounds cannot establish the absence of custom
+                // equality: those bounds may depend on Hash itself.
+                rule.methods.contains_key("eq")
+                    && self.match_template(
+                        &rule.for_ty_pattern,
+                        &ty,
+                        &mut vec![None; rule.generic_param_bounds.len()],
+                    )
+            })
+        {
+            return false;
+        }
+        active.push(ty.clone());
+        let eligible = match &ty {
+            RealizedTy::Int
+            | RealizedTy::Bigint
+            | RealizedTy::Float
+            | RealizedTy::Bool
+            | RealizedTy::String
+            | RealizedTy::Null
+            | RealizedTy::Uint8Array
+            | RealizedTy::Enum(_)
+            | RealizedTy::Never => true,
+            RealizedTy::Interface(head, _, _) => self.interface_requires_hash(*head, interface),
+            RealizedTy::List(element) => {
+                self.hash_eligible(element, interface, active, obligations)
+            }
+            RealizedTy::Map { key, value } => {
+                self.hash_eligible(key, interface, active, obligations)
+                    && self.hash_eligible(value, interface, active, obligations)
+            }
+            RealizedTy::Union(members) => members
+                .iter()
+                .all(|member| self.hash_eligible(member, interface, active, obligations)),
+            RealizedTy::Class(head, args) => match self.vm.get_object(head.ptr()) {
+                // Only a class built from its fields hashes by them; the
+                // runtime's own state hashes only through an explicit impl.
+                bex_vm_types::Object::Class(class) => {
+                    class.buildable_fields().is_ok_and(|fields| {
+                        fields.iter().all(|field| {
+                            field
+                                .field_template
+                                .substitute(args, self.vm)
+                                .is_ok_and(|field_ty| {
+                                    self.hash_eligible(&field_ty, interface, active, obligations)
+                                })
+                        })
+                    })
+                }
+                _ => false,
+            },
+            RealizedTy::TypeAlias(head) => match self.vm.get_object(head.ptr()) {
+                bex_vm_types::Object::TypeAlias(alias) => {
+                    self.hash_eligible(&alias.definition, interface, active, obligations)
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        active.pop();
+        eligible
+    }
+
+    fn tuple_compare_eligible(
+        self,
+        ty: &RealizedTy,
+        compare: TypeHead,
+        stack: &mut Vec<Obligation>,
+    ) -> bool {
+        match &*concrete_base(ty) {
+            RealizedTy::Tuple(slots) => slots
+                .iter()
+                .all(|slot| self.prove(slot, compare, &[], &[], stack)),
+            _ => false,
+        }
+    }
+
+    fn interface_requires_hash(self, head: TypeHead, hash: TypeHead) -> bool {
+        let mut pending = vec![head];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(head) = pending.pop() {
+            if head == hash {
+                return true;
+            }
+            if !seen.insert(head) {
+                continue;
+            }
+            if let bex_vm_types::Object::Interface(interface) = self.vm.get_object(head.ptr()) {
+                pending.extend(interface.requires.iter().map(|required| required.name));
+            }
+        }
+        false
+    }
+
+    pub(crate) fn implementation_method(
+        self,
+        implementation: &ResolvedInterfaceImpl<'_>,
+        method: &str,
+    ) -> Result<(bex_vm_types::HeapPtr, Vec<RealizedTy>), VmInternalError> {
+        match implementation {
+            ResolvedInterfaceImpl::Explicit { rule, bindings } => {
+                let resolved = self.rule_method_impl(rule, method)?;
+                Ok((
+                    resolved.method.fqn,
+                    self.realize_frame(&resolved.method.frame, bindings)?,
+                ))
+            }
+            ResolvedInterfaceImpl::Structural {
+                kind,
+                interface,
+                self_ty,
+            } => {
+                debug_assert_eq!(self.structural_default(*interface, &[]), Some(*kind));
+                if method == kind.primary_method() {
+                    let bex_vm_types::Object::Interface(declaration) =
+                        self.vm.get_object(interface.ptr())
+                    else {
+                        unreachable!()
+                    };
+                    let default = declaration
+                        .structural_default
+                        .as_ref()
+                        .expect("selected structural default");
+                    if default.function_ptr.is_null() {
+                        return Err(VmInternalError::UnboundInterfaceDefault {
+                            interface: declaration.name().display_name().to_string(),
+                            method: method.to_string(),
+                        });
+                    }
+                    let frame = if kind.native_type_arg_count() == 0 {
+                        Vec::new()
+                    } else {
+                        vec![self_ty.clone()]
+                    };
+                    return Ok((default.function_ptr, frame));
+                }
+                let default_fn = self.interface_default(interface.ptr(), method)?;
+                Ok((default_fn, vec![self_ty.clone()]))
+            }
+        }
+    }
+
     /// Resolve `(Self, Iface<Args>)` to the single applicable `implements` rule, plus
     /// the impl's bound type args — its generics realized by matching `concrete_ty`
     /// against the rule's `for` pattern. That rule is the canonical handle: read the
@@ -303,6 +707,37 @@ impl<'vm> ImplResolver<'vm> {
         iface: TypeHead,
         iface_args: &[RealizedTy],
     ) -> Option<(RuntimeImplRuleCandidate<'vm>, Vec<RealizedTy>)> {
+        let base = concrete_base(concrete_ty);
+        let Some(query) = self.query(&base, iface, iface_args, &[]) else {
+            return self
+                .select_implements_rule(concrete_ty, iface, iface_args)
+                .map(|(_, rule, bindings)| (rule, bindings));
+        };
+        let started = match self.lookup::<Option<CachedRule>>(&query) {
+            Ok(answer) => {
+                return answer.map(|rule| (self.cached_candidate(&rule), rule.bindings));
+            }
+            Err(started) => started,
+        };
+        let selected = self.select_implements_rule(concrete_ty, iface, iface_args);
+        self.store(
+            started,
+            &query,
+            selected
+                .as_ref()
+                .map(|(ptr, rule, bindings)| CachedRule::new(*ptr, rule, bindings)),
+        );
+        selected.map(|(_, rule, bindings)| (rule, bindings))
+    }
+
+    /// [`Self::resolve_implements_rule`] without the cache, with the selected
+    /// rule's heap pointer.
+    fn select_implements_rule(
+        self,
+        concrete_ty: &RealizedTy,
+        iface: TypeHead,
+        iface_args: &[RealizedTy],
+    ) -> Option<(HeapPtr, RuntimeImplRuleCandidate<'vm>, Vec<RealizedTy>)> {
         // Static/package-image rules are immutable and already indexed by the
         // canonical interface pointer. Try that slice directly: this is the
         // overwhelmingly common virtual-call path and avoids candidate Vecs,
@@ -314,14 +749,14 @@ impl<'vm> ImplResolver<'vm> {
                     continue;
                 };
                 if let Some(type_args) = self.requested_rule_args(rule, concrete_ty, iface_args) {
-                    return Some((RuntimeImplRuleCandidate::Static(rule), type_args));
+                    return Some((rule_ptr, RuntimeImplRuleCandidate::Static(rule), type_args));
                 }
             }
         }
 
-        for rule in self.rules_for(iface) {
+        for (rule_ptr, rule) in self.rules_for(iface, concrete_ty) {
             if let Some(type_args) = self.requested_rule_args(&rule, concrete_ty, iface_args) {
-                return Some((rule, type_args));
+                return Some((rule_ptr, rule, type_args));
             }
         }
         None
@@ -376,21 +811,40 @@ impl<'vm> ImplResolver<'vm> {
         rule: &'r RuntimeImplRule,
         method: &str,
     ) -> Result<RuleMethodImpl<'r>, VmInternalError> {
-        use bex_vm_types::types::{MethodImpl, ObjectType};
+        use bex_vm_types::types::MethodImpl;
         if let Some(provided) = rule.methods.get(method) {
             return Ok(RuleMethodImpl {
                 method: Cow::Borrowed(provided),
                 is_default: false,
             });
         }
-        let head_object = self.vm.get_object(rule.interface_head);
+        let default_fn = self.interface_default(rule.interface_head, method)?;
+        let mut frame = Vec::with_capacity(1 + rule.interface_args.len());
+        frame.push(rule.for_ty_pattern.clone());
+        frame.extend(rule.interface_args.iter().cloned());
+        Ok(RuleMethodImpl {
+            method: Cow::Owned(MethodImpl {
+                fqn: default_fn,
+                frame,
+            }),
+            is_default: true,
+        })
+    }
+
+    fn interface_default(
+        self,
+        interface: bex_vm_types::HeapPtr,
+        method: &str,
+    ) -> Result<bex_vm_types::HeapPtr, VmInternalError> {
+        use bex_vm_types::types::ObjectType;
+        let head_object = self.vm.get_object(interface);
         let bex_vm_types::Object::Interface(iface) = head_object else {
             return Err(VmInternalError::ImplRuleHeadNotInterface {
                 found: ObjectType::of(head_object),
                 method: method.to_string(),
             });
         };
-        let interface = || iface.name.render_dotted(false);
+        let interface = || iface.name().to_string();
         let Some(method_def) = iface.methods.iter().find(|m| m.name.as_str() == method) else {
             return Err(VmInternalError::UndeclaredInterfaceMethod {
                 interface: interface(),
@@ -415,16 +869,7 @@ impl<'vm> ImplResolver<'vm> {
                 },
             });
         }
-        let mut frame = Vec::with_capacity(1 + rule.interface_args.len());
-        frame.push(rule.for_ty_pattern.clone());
-        frame.extend(rule.interface_args.iter().cloned());
-        Ok(RuleMethodImpl {
-            method: Cow::Owned(MethodImpl {
-                fqn: default_fn,
-                frame,
-            }),
-            is_default: true,
-        })
+        Ok(default_fn)
     }
 
     /// Realize a [`MethodImpl`](bex_vm_types::types::MethodImpl) frame template (De
@@ -468,13 +913,29 @@ impl<'vm> ImplResolver<'vm> {
         requested_args: &[RealizedTy],
         requested_assoc: &[(Name, RealizedTy)],
     ) -> bool {
-        self.prove(
+        let base = concrete_base(concrete_ty);
+        let Some(query) = self.query(&base, iface, requested_args, requested_assoc) else {
+            return self.prove(
+                concrete_ty,
+                iface,
+                requested_args,
+                requested_assoc,
+                &mut Vec::new(),
+            );
+        };
+        let started = match self.lookup::<bool>(&query) {
+            Ok(proven) => return proven,
+            Err(started) => started,
+        };
+        let proven = self.prove(
             concrete_ty,
             iface,
             requested_args,
             requested_assoc,
             &mut Vec::new(),
-        )
+        );
+        self.store(started, &query, proven);
+        proven
     }
 
     /// Discharge one membership goal against the in-progress obligation `stack`.
@@ -496,9 +957,7 @@ impl<'vm> ImplResolver<'vm> {
         // observe the blanket rule's broader receiver.
         let any_class = self
             .vm
-            .declaration_head(&baml_type::QualifiedTypeName::from_dotted_path(
-                "reflect.AnyClass",
-            ));
+            .lang_head(baml_type::normalize::WellKnownHead::AnyClass.item());
         if any_class.is_some_and(|head| head == iface) {
             return matches!(concrete_ty, RealizedTy::Class(..));
         }
@@ -517,18 +976,31 @@ impl<'vm> ImplResolver<'vm> {
         stack.push(goal);
         // `rules_for` borrows `self.vm` immutably while `stack` is borrowed
         // mutably inside the predicate, so the candidates are collected first.
-        let candidates = self.rules_for(iface);
-        let proven = candidates.into_iter().any(|rule| {
-            self.rule_applies(&rule, concrete_ty, requested_args, stack)
-                .is_some_and(|bindings| {
-                    self.interface_request_matches(
-                        &rule,
-                        &bindings,
-                        requested_args,
-                        requested_assoc,
-                    )
-                })
+        let candidates = self.rules_for(iface, concrete_ty);
+        let selected = candidates.into_iter().find_map(|(_, rule)| {
+            let bindings = self.rule_applies(&rule, concrete_ty, requested_args, stack)?;
+            self.interface_request_matches(&rule, &bindings, requested_args, &[])
+                .then_some((rule, bindings))
         });
+        let proven = match selected {
+            Some((rule, bindings)) => {
+                self.interface_request_matches(&rule, &bindings, requested_args, requested_assoc)
+            }
+            None => {
+                requested_assoc.is_empty()
+                    && self
+                        .structural_default(iface, requested_args)
+                        .is_some_and(|kind| match kind {
+                            StructuralInterface::Hash => {
+                                self.hash_eligible(concrete_ty, iface, &mut Vec::new(), stack)
+                            }
+                            StructuralInterface::Compare => {
+                                self.tuple_compare_eligible(concrete_ty, iface, stack)
+                            }
+                            _ => true,
+                        })
+            }
+        };
         // SAFETY: this call pushed its goal, and recursive calls remove only theirs.
         #[allow(unsafe_code)]
         unsafe {
@@ -930,5 +1402,327 @@ mod tests {
         let mut binds: Vec<Option<RealizedTy>> = Vec::new();
         assert!(resolver.match_template(&pattern, &one, &mut binds));
         assert!(!resolver.match_template(&pattern, &RealizedTy::int(), &mut binds));
+    }
+
+    /// A runtime interface whose structural default is `ToString`'s, so every
+    /// type without an explicit rule resolves to the default.
+    fn defaulted_interface(vm: &mut BexVm, name: &str) -> TypeHead {
+        use bex_heap::TlabHolder;
+        use bex_vm_types::{Object, types::InterfaceDef};
+
+        let type_tag = baml_type::typetag::TypeTag::fresh_dynamic();
+        let interface = vm.alloc(Object::Interface(Box::new(InterfaceDef {
+            path: bex_vm_types::types::LocalName::new(Vec::new(), Name::new(name)),
+            structural_default: Some(bex_vm_types::types::StructuralDefault {
+                kind: baml_type::StructuralInterface::ToString,
+                function: bex_vm_types::ObjectIndex::from_raw(0),
+                function_ptr: HeapPtr::null(),
+            }),
+            type_tag,
+            args: Vec::new(),
+            requires: Vec::new(),
+            assoc: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            owner: HeapPtr::null(),
+        })));
+        TypeHead::new(interface, type_tag)
+    }
+
+    /// An explicit rule implementing `interface` for `int`.
+    fn int_rule(interface: HeapPtr) -> RuntimeImplRule {
+        RuntimeImplRule {
+            interface_head: interface,
+            for_ty_pattern: TyTemplate::Int,
+            generic_param_bounds: Vec::new(),
+            interface_args: Vec::new(),
+            interface_assoc: Vec::new(),
+            methods: indexmap::IndexMap::new(),
+            field_links: Box::default(),
+        }
+    }
+
+    /// Register `rule` as a runtime witness of its interface, owned by a
+    /// fresh heap object standing in for the minted class. Returns the
+    /// rule's and the owner's pointers.
+    fn register_witness(vm: &mut BexVm, rule: RuntimeImplRule) -> (HeapPtr, HeapPtr) {
+        use bex_heap::TlabHolder;
+        use bex_vm_types::Object;
+
+        let interface = rule.interface_head;
+        let rule = vm.alloc(Object::ImplRule(Box::new(rule)));
+        let owner = vm.alloc(Object::String(bex_str::BexStr::from("witness owner")));
+        vm.dynamic_dispatch.register_rule(interface, owner, rule);
+        (rule, owner)
+    }
+
+    fn is_explicit(resolved: Option<&ResolvedInterfaceImpl<'_>>) -> bool {
+        matches!(resolved, Some(ResolvedInterfaceImpl::Explicit { .. }))
+    }
+
+    fn is_structural(resolved: Option<&ResolvedInterfaceImpl<'_>>) -> bool {
+        matches!(resolved, Some(ResolvedInterfaceImpl::Structural { .. }))
+    }
+
+    #[test]
+    fn explicit_rules_override_implicit_defaults_without_overlapping() {
+        let mut vm = crate::vm::tests::test_vm(Vec::new());
+        let head = defaulted_interface(&mut vm, "Defaulted");
+        let interface = head.ptr();
+        let explicit = int_rule(interface);
+        {
+            let rules = [explicit.clone()];
+            let resolver = ImplResolver::new(&vm).with_staged_rules(&rules);
+            let selected = resolver
+                .resolve_implementation(&RealizedTy::Int, head, &[])
+                .expect("explicit rule applies");
+            assert!(matches!(selected, ResolvedInterfaceImpl::Explicit { .. }));
+            assert!(
+                resolver
+                    .check_sole_implementation(&RealizedTy::Int, interface, &[])
+                    .is_ok()
+            );
+            let selected = resolver
+                .resolve_implementation(&RealizedTy::String, head, &[])
+                .expect("default applies to other types");
+            assert!(matches!(selected, ResolvedInterfaceImpl::Structural { .. }));
+        }
+        let overlapping = [explicit.clone(), explicit];
+        assert!(
+            ImplResolver::new(&vm)
+                .with_staged_rules(&overlapping)
+                .check_sole_implementation(&RealizedTy::Int, interface, &[])
+                .is_err()
+        );
+        // Staged lookups describe a world nobody else sees: none is cached.
+        assert_eq!(vm.impl_cache.borrow().len(), 0);
+    }
+
+    #[test]
+    fn a_registered_witness_replaces_warm_answers() {
+        let mut vm = crate::vm::tests::test_vm(Vec::new());
+        let head = defaulted_interface(&mut vm, "Defaulted");
+        let int = RealizedTy::Int;
+
+        // Warm every entry point: `int` has only the structural default.
+        let resolver = ImplResolver::new(&vm);
+        assert!(is_structural(
+            resolver.resolve_implementation(&int, head, &[]).as_ref()
+        ));
+        assert!(resolver.resolve_implements_rule(&int, head, &[]).is_none());
+        assert!(resolver.type_implements(&int, head, &[], &[]));
+        assert_eq!(vm.impl_cache.borrow().len(), 3);
+        // A hit answers the same.
+        assert!(is_structural(
+            resolver.resolve_implementation(&int, head, &[]).as_ref()
+        ));
+        assert_eq!(vm.impl_cache.borrow().len(), 3);
+
+        let (rule, _) = register_witness(&mut vm, int_rule(head.ptr()));
+
+        let resolver = ImplResolver::new(&vm);
+        assert!(is_explicit(
+            resolver.resolve_implementation(&int, head, &[]).as_ref()
+        ));
+        assert!(resolver.resolve_implements_rule(&int, head, &[]).is_some());
+        assert!(resolver.type_implements(&int, head, &[], &[]));
+        assert!(
+            vm.impl_cache
+                .borrow()
+                .cached_rules()
+                .all(|cached| cached == rule)
+        );
+    }
+
+    #[test]
+    fn an_answer_computed_across_a_generation_bump_is_not_stored() {
+        let mut vm = crate::vm::tests::test_vm(Vec::new());
+        let head = defaulted_interface(&mut vm, "Defaulted");
+        let query = Query {
+            world: World {
+                root: HeapPtr::null(),
+                additional: None,
+                lexical: HeapPtr::null(),
+            },
+            self_ty: &RealizedTy::Int,
+            interface: head,
+            args: &[],
+            assoc: &[],
+        };
+        let mut cache = crate::impl_cache::ImplCache::default();
+        assert!(cache.get::<bool>(0, &query).is_none());
+        // The generation moved while the answer was computed.
+        cache.insert(0, 1, &query, true);
+        assert_eq!(cache.len(), 0);
+        cache.insert(0, 0, &query, true);
+        assert_eq!(cache.get::<bool>(0, &query), Some(&true));
+        // A lookup under a newer generation drops what the old one stored.
+        assert!(cache.get::<bool>(1, &query).is_none());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn a_collection_forwards_live_answers_and_drops_dead_ones() {
+        use bex_vm_types::RootHaverExt as _;
+
+        let mut vm = crate::vm::tests::test_vm(Vec::new());
+        let live_head = defaulted_interface(&mut vm, "Live");
+        let dead_head = defaulted_interface(&mut vm, "Dead");
+        let (live_rule, live_owner) = register_witness(&mut vm, int_rule(live_head.ptr()));
+        // Only the dynamic table, which holds nothing alive, refers to this
+        // witness and its owner, so the collection frees both.
+        register_witness(&mut vm, int_rule(dead_head.ptr()));
+
+        let int = RealizedTy::Int;
+        let resolver = ImplResolver::new(&vm);
+        assert!(is_explicit(
+            resolver
+                .resolve_implementation(&int, live_head, &[])
+                .as_ref()
+        ));
+        assert!(is_explicit(
+            resolver
+                .resolve_implementation(&int, dead_head, &[])
+                .as_ref()
+        ));
+        assert_eq!(vm.impl_cache.borrow().len(), 2);
+
+        let mut roots = Vec::new();
+        vm.collect_roots(&mut roots);
+        roots.extend([live_head.ptr(), dead_head.ptr(), live_rule, live_owner]);
+        let gc_heap = std::sync::Arc::clone(&vm.heap);
+        // SAFETY: the test VM is the heap's only mutator and holds no
+        // pointer the root set misses.
+        #[allow(unsafe_code, reason = "a test drives the collector directly")]
+        let (_, _, forwarding) = unsafe { gc_heap.collect_garbage(&roots) };
+        let moved_rule = forwarding.get(live_rule).unwrap();
+        assert_ne!(
+            moved_rule, live_rule,
+            "the collection moves the live witness"
+        );
+        let heap = std::sync::Arc::clone(&vm.heap);
+        vm.forward_roots(&mut bex_vm_types::ForwardRoots::new(&forwarding, &*heap));
+        crate::package_load::DynDispatchRoot::new(std::sync::Arc::clone(&vm.dynamic_dispatch))
+            .forward_roots(&mut bex_vm_types::ForwardRoots::new(&forwarding, &*heap));
+
+        // The live answer survived the collection at the rule's new address;
+        // the answer naming the freed witness is gone.
+        assert_eq!(vm.impl_cache.borrow().len(), 1);
+        assert_eq!(
+            vm.impl_cache.borrow().cached_rules().collect::<Vec<_>>(),
+            [moved_rule]
+        );
+        let live_head = TypeHead::new(forwarding.get(live_head.ptr()).unwrap(), live_head.tag());
+        let dead_head = TypeHead::new(forwarding.get(dead_head.ptr()).unwrap(), dead_head.tag());
+        let resolver = ImplResolver::new(&vm);
+        let Some(ResolvedInterfaceImpl::Explicit { rule, .. }) =
+            resolver.resolve_implementation(&int, live_head, &[])
+        else {
+            panic!("the live witness still applies");
+        };
+        let moved = vm
+            .get_object(moved_rule)
+            .as_impl_rule()
+            .expect("the moved witness is a rule");
+        assert!(std::ptr::eq(&raw const *rule, moved));
+        assert!(is_structural(
+            resolver
+                .resolve_implementation(&int, dead_head, &[])
+                .as_ref()
+        ));
+    }
+
+    #[test]
+    fn a_collection_rekeys_answers_under_a_moved_world_root() {
+        use bex_heap::TlabHolder;
+        use bex_vm_types::{Object, RootHaverExt as _};
+
+        let mut vm = crate::vm::tests::test_vm(Vec::new());
+        let head = defaulted_interface(&mut vm, "Defaulted");
+        // Any heap object can stand for a runtime package here: the walk
+        // skips a root that is not a package, and the answer is still keyed
+        // under that root.
+        let live_root = vm.alloc(Object::String(bex_str::BexStr::from("live package")));
+        let dead_root = vm.alloc(Object::String(bex_str::BexStr::from("dead package")));
+        let int = RealizedTy::Int;
+        for root in [live_root, dead_root] {
+            assert!(is_structural(
+                ImplResolver::for_package(&vm, root)
+                    .resolve_implementation(&int, head, &[])
+                    .as_ref()
+            ));
+        }
+        assert_eq!(vm.impl_cache.borrow().len(), 2);
+
+        let mut roots = Vec::new();
+        vm.collect_roots(&mut roots);
+        roots.extend([head.ptr(), live_root]);
+        let gc_heap = std::sync::Arc::clone(&vm.heap);
+        // SAFETY: the test VM is the heap's only mutator and holds no
+        // pointer the root set misses.
+        #[allow(unsafe_code, reason = "a test drives the collector directly")]
+        let (_, _, forwarding) = unsafe { gc_heap.collect_garbage(&roots) };
+        let moved_root = forwarding.get(live_root).unwrap();
+        assert_ne!(moved_root, live_root, "the collection moves the live root");
+        let heap = std::sync::Arc::clone(&vm.heap);
+        vm.forward_roots(&mut bex_vm_types::ForwardRoots::new(&forwarding, &*heap));
+
+        // The answer under the freed root is gone; the other one now lives
+        // under the moved root, so asking there is a hit that stores nothing.
+        assert_eq!(vm.impl_cache.borrow().len(), 1);
+        let head = TypeHead::new(forwarding.get(head.ptr()).unwrap(), head.tag());
+        assert!(is_structural(
+            ImplResolver::for_package(&vm, moved_root)
+                .resolve_implementation(&int, head, &[])
+                .as_ref()
+        ));
+        assert_eq!(vm.impl_cache.borrow().len(), 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn threads_with_warm_answers_see_a_witness_registered_mid_run() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const WORKERS: usize = 4;
+        let mut vm = crate::vm::tests::test_vm(Vec::new());
+        let head = defaulted_interface(&mut vm, "Defaulted");
+        let workers: Vec<BexVm> = (0..WORKERS)
+            .map(|_| crate::vm::tests::test_vm_sharing(&vm))
+            .collect();
+        let registered = AtomicBool::new(false);
+        let warmed = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for worker in workers {
+                let (registered, warmed) = (&registered, &warmed);
+                scope.spawn(move || {
+                    let mut warm = false;
+                    loop {
+                        // Read the flag first: a worker that saw the
+                        // registration finish must find the witness.
+                        let after = registered.load(Ordering::Acquire);
+                        let explicit = is_explicit(
+                            ImplResolver::new(&worker)
+                                .resolve_implementation(&RealizedTy::Int, head, &[])
+                                .as_ref(),
+                        );
+                        if after {
+                            assert!(explicit, "a warm cache hid a registered witness");
+                            break;
+                        }
+                        if !warm {
+                            warm = true;
+                            warmed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+            // Register only once every worker holds a cached answer.
+            while warmed.load(Ordering::SeqCst) < WORKERS {
+                std::hint::spin_loop();
+            }
+            register_witness(&mut vm, int_rule(head.ptr()));
+            registered.store(true, Ordering::Release);
+        });
     }
 }

@@ -27,6 +27,7 @@
 //! `CARGO_TARGET_DIR` (the same `run_test_cmd` plumbing python uses for
 //! `UV_CACHE_DIR`), so that stack compiles once, not per fixture.
 //! `crates/rust/setup.sh` pre-warms it serially before nextest fans out.
+#![allow(clippy::disallowed_methods)]
 
 use std::{env, fs, path::Path};
 
@@ -48,7 +49,7 @@ const BAML_BRIDGE_DEP: &str = r#"{ path = "../../../../../sdks/rust/bridge_rust"
 /// (`RustGenOptions::manifest_extra`): dependencies of the ported test
 /// suite, not of the generated SDK itself.
 const MANIFEST_EXTRA: &str = r#"[dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "rt-multi-thread"] }
 "#;
 
 /// Whether a ported test file is compiled into the fixture's test suite.
@@ -71,11 +72,8 @@ const TEST_MODS: &[(&str, &str, Gate)] = &[
         Gate::Later("compile-fail probes need a trybuild-style harness"),
     ),
     ("function_calls", "test_main.rs", Gate::Now),
-    (
-        "function_calls",
-        "test_cancellation.rs",
-        Gate::Later("needs cancellation"),
-    ),
+    ("function_calls", "test_invocation.rs", Gate::Now),
+    ("function_calls", "test_cancellation.rs", Gate::Now),
     (
         "function_calls",
         "test_errors.rs",
@@ -85,22 +83,24 @@ const TEST_MODS: &[(&str, &str, Gate)] = &[
     // Intentionally empty: the Rust SDK does no inference (rustc solves type
     // params at compile time; bindings are always sent explicitly).
     ("function_calls", "test_generic_inference.rs", Gate::Now),
+    ("function_calls", "test_generic_references.rs", Gate::Now),
     ("function_calls", "test_host_callables.rs", Gate::Now),
+    ("function_calls", "test_host_values.rs", Gate::Now),
     // Rust-only: typed error surfaces from callback-throws inference (python/TS
     // erase `throws`, so there is no cross-language counterpart).
     ("function_calls", "test_callback_throws.rs", Gate::Now),
+    // Rust-only: a throws contract with two same-named errors (python/TS
+    // erase `throws`).
+    ("function_calls", "test_same_named_throws.rs", Gate::Now),
     ("function_calls", "test_methods_on_classes.rs", Gate::Now),
     (
         "function_calls",
         "test_optional_args.rs",
         Gate::Later("needs the optional-arg matrix and methods on classes"),
     ),
-    (
-        "function_calls",
-        "test_json.rs",
-        Gate::Later("needs a canonical baml.json.json projection in sdkgen_rust"),
-    ),
+    ("function_calls", "test_json.rs", Gate::Now),
     ("function_calls", "test_raises.rs", Gate::Now),
+    ("function_calls", "test_references.rs", Gate::Now),
     (
         "function_calls",
         "test_stdlib_entrypoints.rs",
@@ -109,6 +109,7 @@ const TEST_MODS: &[(&str, &str, Gate)] = &[
     ("llm_functions", "replay_harness.rs", Gate::Now),
     ("llm_functions", "test_main.rs", Gate::Now),
     ("llm_functions", "test_streaming_e2e.rs", Gate::Now),
+    ("llm_functions", "test_tuple_streams.rs", Gate::Now),
     ("type_shapes", "test_main.rs", Gate::Now),
     ("type_shapes", "test_complex_models.rs", Gate::Now),
     ("type_shapes", "test_generic.rs", Gate::Now),
@@ -127,17 +128,20 @@ const TEST_MODS: &[(&str, &str, Gate)] = &[
         Gate::Now,
     ),
     ("type_shapes", "roundtrip_tests/test_generics.rs", Gate::Now),
+    // Rust-only: the optional `serde` impls agree with BAML's own JSON (no
+    // other SDK has a `serde` feature).
+    (
+        "type_shapes",
+        "roundtrip_tests/test_json_interchange.rs",
+        Gate::Now,
+    ),
     (
         "type_shapes",
         "roundtrip_tests/test_handles.rs",
         Gate::Later("needs handle-backed stdlib types"),
     ),
     ("type_shapes", "roundtrip_tests/test_lists.rs", Gate::Now),
-    (
-        "type_shapes",
-        "roundtrip_tests/test_literals.rs",
-        Gate::Later("needs literal types"),
-    ),
+    ("type_shapes", "roundtrip_tests/test_literals.rs", Gate::Now),
     ("type_shapes", "roundtrip_tests/test_maps.rs", Gate::Now),
     (
         "type_shapes",
@@ -161,9 +165,20 @@ const TEST_MODS: &[(&str, &str, Gate)] = &[
         "roundtrip_tests/test_symbol_collisions.rs",
         Gate::Now,
     ),
+    ("type_shapes", "roundtrip_tests/test_tuples.rs", Gate::Now),
     ("type_shapes", "roundtrip_tests/test_unions.rs", Gate::Now),
     ("type_shapes", "roundtrip_tests/test_void.rs", Gate::Now),
 ];
+
+/// The library name a fixture's tests import the SDK by. One fixture uses a
+/// non-default name, as `package_name` would set it, to prove the generated
+/// crate never assumes it is called `baml_sdk`.
+fn lib_name(fixture: &str) -> &'static str {
+    match fixture {
+        "docstrings_etc" => "docstrings_sdk",
+        _ => sdkgen_rust::DEFAULT_LIB_NAME,
+    }
+}
 
 /// Generate every Rust fixture SDK. Called by the `rust` subcommand of the
 /// `sdk_test_codegen` binary, which `crates/rust/setup.sh` runs before its
@@ -201,6 +216,7 @@ fn codegen_fixture(fixtures_root: &Path, fixture: &str, crate_dir: &Path) {
     let options = RustGenOptions {
         naming_convention: NamingConvention::PreserveCase,
         package_name: format!("sdk-tests-rust-{}", fixture.replace('_', "-")),
+        lib_name: lib_name(fixture).to_string(),
         runtime_dep: BAML_BRIDGE_DEP.to_string(),
         manifest_extra: Some(MANIFEST_EXTRA.to_string()),
         edition: GENERATED_EDITION.to_string(),
@@ -255,7 +271,7 @@ fn codegen_fixture(fixtures_root: &Path, fixture: &str, crate_dir: &Path) {
 /// Like every generated Rust file, the code is built as a `TokenStream`
 /// and pretty-printed through [`sdkgen_rust::render_rust_file`]; only the
 /// comment block (banner + `LATER` rows, which tokens cannot carry)
-/// travels as the string header. The `use baml_sdk as _;` item forces the
+/// travels as the string header. The `use <lib> as _;` item forces the
 /// generated SDK library to build and link even while no test module is
 /// enabled.
 fn render_tests_main(fixture: &str) -> String {
@@ -263,8 +279,9 @@ fn render_tests_main(fixture: &str) -> String {
     header.push_str("// Generated by sdk_test_codegen::rust::run_all — do not edit.\n");
     header.push_str("// To enable a gated-off port, flip its row in the TEST_MODS table in\n");
     header.push_str("// sdk_tests/codegen/src/rust.rs.\n");
+    let lib = proc_macro2::Ident::new(lib_name(fixture), proc_macro2::Span::call_site());
     let mut items = quote::quote! {
-        use baml_sdk as _;
+        use #lib as _;
     };
     // rustfmt reorders `mod` declarations alphabetically
     // (`reorder_modules` is on by default) and this file is under the

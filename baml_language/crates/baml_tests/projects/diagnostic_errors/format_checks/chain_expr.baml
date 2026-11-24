@@ -90,32 +90,34 @@ function ChainExprs(user: ChainUser, items: ChainItem[], m: map<string, int>) ->
     user.profile.items.get(0);
 
     // ===== Trivia in call (line comments) =====
+    (
     // 1 callee leading
     items // 2 callee trailing
     // 3 open paren leading
     . // 4 dot trailing
     // 5 method leading
-    get // 6 method trailing
-    ( // 7 open paren trailing
+    get( // 6 method trailing
+    // 7 open paren trailing
     // 8 arg leading
     0 // 9 arg trailing
     // 10 close paren leading
     ) // 11 close paren trailing
-    ;
+    );
 
     // ===== Trivia in call (block comments) =====
+    (
     /* 1 callee leading */
     items /* 2 callee trailing */
     /* 3 dot leading */
     . /* 4 dot trailing */
     /* 5 method leading */
-    get /* 6 method trailing */
-    ( /* 7 open paren trailing */
+    get /* 6 method trailing */ (
+    /* 7 open paren trailing */
     /* 8 arg leading */
     0 /* 9 arg trailing */
     /* 10 close paren leading */
     ) /* 11 close paren trailing */
-    ;
+    );
 
     // ===== Index access =====
     items[0];
@@ -124,26 +126,28 @@ function ChainExprs(user: ChainUser, items: ChainItem[], m: map<string, int>) ->
     user.scores[0][1];
 
     // ===== Trivia in index (line comments) =====
+    (
     // 1 base leading
-    items // 2 base trailing
+    items[ // 2 base trailing
     // 3 open bracket leading
-    [ // 4 open bracket trailing
+    // 4 open bracket trailing
     // 5 index leading
     0 // 6 index trailing
     // 7 close bracket leading
     ] // 8 close bracket trailing
-    ;
+    );
 
     // ===== Trivia in index (block comments) =====
+    (
     /* 1 base leading */
-    items /* 2 base trailing */
+    items /* 2 base trailing */ [
     /* 3 open bracket leading */
-    [ /* 4 open bracket trailing */
+    /* 4 open bracket trailing */
     /* 5 index leading */
     0 /* 6 index trailing */
     /* 7 close bracket leading */
     ] /* 8 close bracket trailing */
-    ;
+    );
 
     // ===== Chained calls =====
     user.name.len().to_string();
@@ -161,6 +165,7 @@ function ChainExprs(user: ChainUser, items: ChainItem[], m: map<string, int>) ->
     user.profile.items.slice(0, user.profile.items.len() - 1, user.profile.settings.preferences.size);
 
     // ===== Trivia in long wrapping chain (line comments) =====
+    (
     // 1 leading
     user // 2 trailing
     . // 3 trailing
@@ -177,22 +182,23 @@ function ChainExprs(user: ChainUser, items: ChainItem[], m: map<string, int>) ->
     color // 14 trailing
     . // 15 trailing
     // 16 leading
-    len // 17 trailing
-    ( // 18 trailing
+    len( // 17 trailing
+    // 18 trailing
     ) // 19 trailing
     . // 20 trailing
     // 21 leading
-    to_string // 22 trailing
-    ( // 23 trailing
+    to_string( // 22 trailing
+    // 23 trailing
     ) // 24 trailing
     . // 25 trailing
     // 26 leading
-    len // 27 trailing
-    ( // 28 trailing
+    len( // 27 trailing
+    // 28 trailing
     ) // 29 trailing
-    ;
+    );
 
     // ===== Trivia in long wrapping chain (block comments) =====
+    (
     /* 1 leading */
     user /* 2 trailing */
     . /* 3 trailing */
@@ -209,22 +215,23 @@ function ChainExprs(user: ChainUser, items: ChainItem[], m: map<string, int>) ->
     color /* 14 trailing */
     . /* 15 trailing */
     /* 16 leading */
-    len /* 17 trailing */
-    ( /* 18 trailing */
+    len /* 17 trailing */ (
+    /* 18 trailing */
     ) /* 19 trailing */
     . /* 20 trailing */
     /* 21 leading */
-    to_string /* 22 trailing */
-    ( /* 23 trailing */
+    to_string /* 22 trailing */ (
+    /* 23 trailing */
     ) /* 24 trailing */
     . /* 25 trailing */
     /* 26 leading */
-    len /* 27 trailing */
-    ( /* 28 trailing */
+    len /* 27 trailing */ (
+    /* 28 trailing */
     ) /* 29 trailing */
-    ;
+    );
 
     // ===== Trivia in call with long args (line comments) =====
+    (
     // 1 leading
     user // 2 trailing
     . // 3 trailing
@@ -235,15 +242,15 @@ function ChainExprs(user: ChainUser, items: ChainItem[], m: map<string, int>) ->
     items // 8 trailing
     . // 9 trailing
     // 10 leading
-    get // 11 trailing
-    ( // 12 trailing
+    get( // 11 trailing
+    // 12 trailing
     // 13 leading
     user.profile.items.len() - 1 + user.profile.items.len() - 2 // 14 trailing
     ) // 15 trailing
     . // 16 trailing
     // 17 leading
     label // 18 trailing
-    ;
+    );
 
     // ===== Deeply nested index chains =====
     user.scores[0][0];

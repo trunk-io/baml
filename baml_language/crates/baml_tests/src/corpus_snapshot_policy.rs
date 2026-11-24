@@ -129,11 +129,11 @@ pub(super) const BYTECODE: &[Example] = &[
         functions: &[
             "user.lambda_owners.Retry.scaled",
             "user.lambda_owners.Runner.twice",
-            "user.lambda_owners.<(user.lambda_owners.Retry as user.lambda_owners.Runner)>.run",
-            "user.lambda_owners.<(user.lambda_owners.Other as user.lambda_owners.Runner)>.run",
-            "user.lambda_owners.<(user.lambda_owners.Boxed<#0> as user.lambda_owners.Runner)>.run",
+            "user.<(user.lambda_owners.Retry as user.lambda_owners.Runner)>.run",
+            "user.<(user.lambda_owners.Other as user.lambda_owners.Runner)>.run",
+            "user.<(user.lambda_owners.Boxed<#0> as user.lambda_owners.Runner)>.run",
         ],
-        reason: "A lambda's owner segment is the owner's link-name tail for every method kind: inherent, interface default, in-body impl, out-of-body impl, generic impl. Impl- and interface-owned owners once lost their qualification, colliding across impl blocks.",
+        reason: "A lambda's owner segment is the owner's identity tail for every method kind: inherent, interface default, in-body impl, out-of-body impl, generic impl. A provided body spells its target and interface from its own package — by the owner's label, the one the name is prefixed with — so impl- and interface-owned owners stay qualified across impl blocks.",
     },
     Example {
         path: "ns_fixtures/ns_patterns_new/patterns_new.baml",
@@ -171,9 +171,25 @@ pub(super) const BYTECODE: &[Example] = &[
         functions: &["user.fixtures.json_parse_stringify_intrinsics.parse_and_roundtrip"],
         reason: "JSON intrinsic call lowering.",
     },
+    Example {
+        path: "ns_tuples/emit.baml",
+        functions: &[
+            "user.tuples.tpe_carried_calls",
+            "user.tuples.tpe_carried_prefix",
+            "user.tuples.tpe_slot_sum",
+            "user.tuples.tpe_union_slot_sum",
+            "user.tuples.tpe_union_slot_mixed",
+        ],
+        reason: "Tuple elements stack-carried beneath the descriptor's LoadType into AllocTuple, and slot reads typed per constant index (joined across union arms) for arithmetic specialization.",
+    },
 ];
 
 pub(super) const FORMATTER: &[Example] = &[
+    Example {
+        path: "ns_fixtures/ns_top_level_header_comment/repro.baml",
+        functions: &[],
+        reason: "A function-level `//#` title stays above its function.",
+    },
     Example {
         path: "ns_fixtures/ns_parser_expressions/precedence.baml",
         functions: &[],
@@ -198,11 +214,6 @@ pub(super) const FORMATTER: &[Example] = &[
         path: "ns_fixtures/ns_backtick_strings/main.baml",
         functions: &[],
         reason: "Backtick interpolation and escapes.",
-    },
-    Example {
-        path: "ns_fixtures/ns_top_level_header_comment/repro.baml",
-        functions: &[],
-        reason: "Top-level comment attachment.",
     },
     Example {
         path: "ns_fixtures/ns_comment_in_type/comment_in_type.baml",

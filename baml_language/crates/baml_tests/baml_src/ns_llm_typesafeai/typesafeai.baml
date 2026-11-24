@@ -211,8 +211,12 @@ function noun_thresholds() -> bool {
         let cl = typesafeai.Client.new(api_key = "test-key", base_url = mock.base_url());
         let result = ai.Agent.new(client = cl).run(Urgent@spec("Production is down."));
         assert.is_true(result.value);
-        assert.equal(result.usage.input_tokens, 142);
-        assert.equal(result.usage.output_tokens, 9);
+        let usage = ai.events.usage_for(
+            result.usage,
+            ai.events.ModelKey { provider: "typesafeai", model: "jev-latest" },
+        );
+        assert.equal(usage?.input_tokens, 142);
+        assert.equal(usage?.output_tokens, 9);
         let sent = mock.last_request();
         assert.equal(sent.path(), "/systemone");
         assert.equal(sent.header("authorization"), "Bearer test-key");
@@ -319,7 +323,7 @@ test "client defaults keep a lazy credential and the TypeSafe base URL" {
     };
     assert.equal(credential.name, "TYPESAFE_API_KEY");
     assert.equal(cl.base_url, "https://api.typesafe.ai/v1");
-    let request = cl.render(input(reflect.Type.of<bool>()));
+    let request = cl.render(input(bool.type()));
     assert.equal(request.url, "https://api.typesafe.ai/v1/systemone");
     assert.equal(request.headers.get("authorization"), null)
 }
@@ -328,7 +332,41 @@ test "client constructor keeps explicit credentials and endpoint overrides" {
     let cl = typesafeai.Client.new(api_key = "test-key", base_url = "http://localhost:1234");
     assert.equal(cl.api_key, "test-key");
     assert.equal(cl.base_url, "http://localhost:1234");
-    assert.equal(cl.render(input(reflect.Type.of<bool>())).url, "http://localhost:1234/systemone")
+    assert.equal(cl.render(input(bool.type())).url, "http://localhost:1234/systemone")
+}
+
+test "long_context and headers appear in the rendered request" {
+    let request = typesafeai.Client
+        .new(long_context = true, headers = { "X-Trace": "abc", "Authorization": "Bearer proxy" })
+        .render(input(bool.type()));
+    assert.equal(request.headers.get("typesafe-danger-zone-long-context"), "true");
+    assert.equal(request.headers.get("x-trace"), "abc");
+    assert.equal(request.headers.get("authorization"), "Bearer proxy");
+    let plain = typesafeai.Client.new().render(input(bool.type()));
+    assert.equal(plain.headers.get("typesafe-danger-zone-long-context"), null)
+}
+
+function sends_long_context() -> bool {
+    root.llm_mock.mock_json_serve([root.llm_mock.MockResponse.ok(noul_body(0.9))], (
+        mock: root.llm_mock.MockJsonServer,
+    ) -> {
+        let cl = typesafeai.Client.new(
+            api_key = "test-key",
+            base_url = mock.base_url(),
+            long_context = true,
+            headers = { "authorization": "Bearer proxy", "content-type": "application/json; charset=utf-8" },
+        );
+        assert.is_true(ai.Agent.new(client = cl).run(Urgent@spec("Production is down.")).value);
+        let sent = mock.last_request();
+        assert.equal(sent.header("typesafe-danger-zone-long-context"), "true");
+        assert.equal(sent.header("authorization"), "Bearer proxy");
+        assert.equal(sent.header("content-type"), "application/json; charset=utf-8");
+        true
+    })
+}
+
+test "long_context header is sent and user headers override defaults" {
+    assert.is_true(sends_long_context())
 }
 
 test "int literal union" {
@@ -374,7 +412,8 @@ test "false and raw string choice keys" {
 
 class ExactChoice {
     // The enum's wire key is "tech"; the literal's is "Technical".
-    // JSON serializes both values as "Technical", losing their identity.
+    // JSON serializes both values as "Technical", so assembling the class
+    // through JSON would lose which one was chosen.
     route: Team | "Technical" @description("Choose a team or the literal label"),
 }
 
@@ -395,11 +434,13 @@ function exact_class_choice(key: string) -> Team | "Technical" {
     })
 }
 
-test "class JSON reconstruction currently resolves ambiguous strings to enums" {
-    assert.equal(exact_class_choice("tech"), Team.Technical);
-    // TODO(json): preserve the selected literal when it shares an enum's JSON representation.
-    // Both choices currently roundtrip through the same JSON string.
-    assert.equal(exact_class_choice("Technical"), Team.Technical)
+test "class assembly keeps a chosen enum apart from an equal string literal" {
+    let literal: unknown = exact_class_choice("Technical");
+    assert.is_true(literal is string);
+    assert.equal(literal, "Technical");
+    let chosen: unknown = exact_class_choice("tech");
+    assert.is_true(chosen is Team);
+    assert.equal(chosen, Team.Technical)
 }
 
 function MediaInput(media: image | audio | video | pdf) -> bool {
@@ -457,7 +498,7 @@ function wire_capture() -> bool {
         mock: root.llm_mock.MockJsonServer,
     ) -> {
         let cl = typesafeai.Client.new(api_key = "private-key", base_url = mock.base_url());
-        let turn = cl.invoke(input(reflect.Type.of<bool>()));
+        let turn = cl.invoke(input(bool.type()));
         assert.equal(turn.calls.at(0)?.http_response?.body, body);
         assert.equal(turn.calls.at(0)?.http_request?.headers.get("authorization"), "REDACTED");
         let quiet = typesafeai.Client.new(
@@ -465,7 +506,7 @@ function wire_capture() -> bool {
             base_url = mock.base_url(),
             capture_wire = false,
         );
-        let no_body = quiet.invoke(input(reflect.Type.of<bool>()));
+        let no_body = quiet.invoke(input(bool.type()));
         assert.equal(no_body.calls.at(0)?.http_response?.body, null);
         true
     })
@@ -480,7 +521,7 @@ function http_error(status: int) -> string {
         mock: root.llm_mock.MockJsonServer,
     ) -> {
         let cl = typesafeai.Client.new(api_key = "k", base_url = mock.base_url());
-        let result = cl.invoke(input(reflect.Type.of<bool>())).terminal_text() catch_all (e) {
+        let result = cl.invoke(input(bool.type())).terminal_text() catch_all (e) {
             let limited: ai.errors.RateLimited => {
                 return `limited:${limited.retry_after_ms ?? 0}`;
             },
@@ -508,11 +549,11 @@ test "http rate limit preserves retry delay" {
 
 function runtime_shorthand() -> string {
     let provider = "typesafeai";
-    ai.clients.resolve(`${provider}/jev-latest`).id()
+    ai.clients.resolve(`${provider}/jev-latest`).requested_model()
 }
 
 test "runtime shorthand" {
-    assert.equal(runtime_shorthand(), "typesafeai/jev-latest")
+    assert.equal(runtime_shorthand(), "jev-latest")
 }
 
 function nested_report() -> bool {
@@ -600,7 +641,7 @@ function bigint_class_choice(key: string) -> BigintChoice {
     })
 }
 
-test "bigint choices retain precision through nested generic class JSON reconstruction" {
+test "bigint choices retain precision through nested generic class assembly" {
     assert.equal(
         bigint_class_choice("123456789012345678901234567890"),
         123456789012345678901234567890n,
@@ -634,15 +675,15 @@ function rejects(ty: reflect.Type, instructions: bool = true) -> bool {
 }
 
 test "reject string" {
-    assert.is_true(rejects(reflect.Type.of<string>()))
+    assert.is_true(rejects(string.type()))
 }
 
 test "reject int" {
-    assert.is_true(rejects(reflect.Type.of<int>()))
+    assert.is_true(rejects(int.type()))
 }
 
 test "reject bigint" {
-    assert.is_true(rejects(reflect.Type.of<bigint>()))
+    assert.is_true(rejects(bigint.type()))
 }
 
 test "reject string array" {
@@ -678,15 +719,15 @@ test "reject mixed structural union" {
 }
 
 test "reject unsupported leaf" {
-    assert.is_true(rejects(reflect.Type.of<WithNotes>()))
+    assert.is_true(rejects(WithNotes.type()))
 }
 
 test "reject recursive class" {
-    assert.is_true(rejects(reflect.Type.of<Node>()))
+    assert.is_true(rejects(Node.type()))
 }
 
 test "reject direct recursion by identity" {
-    assert.is_true(rejects(reflect.Type.of<DirectNode>()))
+    assert.is_true(rejects(DirectNode.type()))
 }
 
 test "reject recursive alias" {
@@ -694,19 +735,19 @@ test "reject recursive alias" {
 }
 
 test "reject image output" {
-    assert.is_true(rejects(reflect.Type.of<image>()))
+    assert.is_true(rejects(image.type()))
 }
 
 test "reject audio output" {
-    assert.is_true(rejects(reflect.Type.of<audio>()))
+    assert.is_true(rejects(audio.type()))
 }
 
 test "reject pdf output" {
-    assert.is_true(rejects(reflect.Type.of<pdf>()))
+    assert.is_true(rejects(pdf.type()))
 }
 
 test "reject empty instructions" {
-    assert.is_true(rejects(reflect.Type.of<bool>(), instructions = false))
+    assert.is_true(rejects(bool.type(), instructions = false))
 }
 
 test "union ignores member description" {
@@ -718,7 +759,7 @@ test "reject singleton" {
 }
 
 test "reject empty class" {
-    assert.is_true(rejects(reflect.Type.of<Empty>()))
+    assert.is_true(rejects(Empty.type()))
 }
 
 function malformed(body: string, ty: reflect.Type? = null) -> bool {
@@ -726,8 +767,11 @@ function malformed(body: string, ty: reflect.Type? = null) -> bool {
         mock: root.llm_mock.MockJsonServer,
     ) -> {
         let cl = typesafeai.Client.new(api_key = "k", base_url = mock.base_url());
-        let result = cl.invoke(input(ty ?? reflect.Type.of<bool>())).terminal_text() catch_all (e) {
+        let result = cl.invoke(input(ty ?? bool.type())).terminal_text() catch_all (e) {
             let failed: ai.errors.ParseFailed => {
+                return true;
+            },
+            let invalid: ai.errors.InvalidResponse => {
                 return true;
             },
             _ => {
@@ -755,25 +799,23 @@ test "reject malformed response" {
 }
 
 test "reject unoffered choice" {
-    assert.is_true(malformed(choice_body("not-offered"), ty = reflect.Type.of<Team>()))
+    assert.is_true(malformed(choice_body("not-offered"), ty = Team.type()))
 }
 
 test "reject missing choice" {
-    assert.is_true(
-        malformed(`{"answers":{"result":{"type":"choice"}}}`, ty = reflect.Type.of<Team>()),
-    )
+    assert.is_true(malformed(`{"answers":{"result":{"type":"choice"}}}`, ty = Team.type()))
 }
 
 function preview_metadata() -> bool {
     let cl = typesafeai.Client.new(api_key = "secret");
-    let req = cl.render(input(reflect.Type.of<Override>(), instructions = false));
+    let req = cl.render(input(Override.type(), instructions = false));
     assert.equal(req.headers.has("authorization"), false);
     assert.equal(req.url, "https://api.typesafe.ai/v1/systemone");
     assert.equal(
         baml.json.path<string>(baml.json.parse(req.body), ".questions.route.instructions"),
         "Who owns the escalation?",
     );
-    assert.equal(Urgent@spec("x").client_id(), "typesafeai/jev-latest");
+    assert.equal(Urgent@spec("x").requested_model(), "jev-latest");
     true
 }
 
@@ -831,7 +873,7 @@ test "skipped class fields are omitted and filled with null" {
 }
 
 test "reject nonnullable skipped fields before HTTP" {
-    assert.is_true(rejects(reflect.Type.of<InvalidSkipped>()))
+    assert.is_true(rejects(InvalidSkipped.type()))
 }
 
 testset "live" with testing.Sequential() {

@@ -88,7 +88,7 @@ impl WasmRegistry {
     }
 }
 
-/// Opaque body handle stored in `owned::http::Response._body` as `Arc<dyn Any + Send + Sync>`.
+/// A fetched response's body (`owned::http::Response._body`).
 ///
 /// Ties the response's body promise to the registry and cleans up on drop.
 pub(crate) struct WasmResponseBody {
@@ -115,7 +115,7 @@ pub(crate) type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqw
 pub(crate) type SseEventReceiver =
     futures::channel::mpsc::UnboundedReceiver<Result<sys_types::sse::SseEvent, String>>;
 
-/// Opaque handle stored in `owned::http::SseStream._handle`.
+/// An open event stream (`owned::http::SseStream._state`).
 ///
 /// A background task (spawned via `wasm_bindgen_futures::spawn_local`) reads
 /// from the byte stream, parses SSE events, and sends them through an mpsc
@@ -126,6 +126,8 @@ pub(crate) type SseEventReceiver =
 pub(crate) struct WasmSseStreamHandle {
     /// Channel receiver for parsed SSE events. `None` after `close()`.
     receiver: SendWrapper<RefCell<Option<SseEventReceiver>>>,
+    /// Bytes of events sent and not yet received, shared with the sender.
+    retained: Arc<sys_types::RetainedBytes>,
 }
 
 // SAFETY: wasm32-unknown-unknown is single-threaded.
@@ -133,10 +135,21 @@ unsafe impl Send for WasmSseStreamHandle {}
 unsafe impl Sync for WasmSseStreamHandle {}
 
 impl WasmSseStreamHandle {
-    pub(crate) fn new(receiver: SseEventReceiver) -> Self {
+    pub(crate) fn new(receiver: SseEventReceiver, retained: Arc<sys_types::RetainedBytes>) -> Self {
         Self {
             receiver: SendWrapper::new(RefCell::new(Some(receiver))),
+            retained,
         }
+    }
+
+    /// Bytes of events sent and not yet received.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained.get()
+    }
+
+    /// An event left the channel.
+    pub(crate) fn received(&self, event: &sys_types::sse::SseEvent) {
+        self.retained.sub(event.retained_bytes());
     }
 
     /// Returns true if the stream has been closed (receiver dropped).
@@ -150,6 +163,7 @@ impl WasmSseStreamHandle {
     /// and exit.
     pub(crate) fn mark_done(&self) {
         self.receiver.borrow_mut().take();
+        self.retained.set(0);
     }
 
     /// Borrow the inner `RefCell` for synchronous drain and poll operations.

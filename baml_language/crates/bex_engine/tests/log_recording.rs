@@ -10,13 +10,17 @@ use bex_engine::{
     BexEngine, BexExternalValue, FunctionCallContextBuilder, TelemetryRecording,
     logger::TraceLogger,
 };
-use btel_bcs::{CloudPublisherConfig, delivery::DeliveryConfig, proto::CloudUploadEnvelope};
-use btel_reader::{
-    cas::{CasLimits, CasOutcome, CasStore},
-    context::{ContextReference, reference},
+use btel_bcs::{CloudPublisherConfig, delivery::DeliveryConfig};
+use btel_core::{
+    cas::{DecodedBlob, DecodedObject, DecodedRoot, DecodedValue},
+    reader::{
+        context::{ContextReference, reference},
+        store::{CasLimits, CasStore},
+    },
+    upload::envelope::UploadEnvelope,
 };
 use btel_recorder::{RecordingConfig, proto};
-use btel_snapshot::{DecodedObject, DecodedRoot, DecodedSnapshot, DecodedValue, SnapshotId};
+use btel_snapshot::CasId;
 use prost::Message as _;
 use sys_native::SysOpsExt;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate, matchers::method};
@@ -29,7 +33,7 @@ const SOURCE: &str = include_str!("../../baml_tests/baml_src/ns_trace_logs/logs.
 async fn execute(recording: TelemetryRecording, name: &str, live: bool) -> Arc<BexEngine> {
     let engine = Arc::new(
         BexEngine::new_with_telemetry_recording(
-            baml_db::testing::compile_source(SOURCE),
+            baml_test_support::compile_source(SOURCE),
             Arc::new(sys_native::SysOps::native()),
             vec![],
             None,
@@ -79,31 +83,36 @@ async fn execute(recording: TelemetryRecording, name: &str, live: bool) -> Arc<B
     engine
 }
 
-fn root(snapshot: &DecodedSnapshot) -> &DecodedValue {
+fn root(snapshot: &DecodedBlob) -> &DecodedValue {
     let DecodedRoot::Value(value) = &snapshot.root else {
         panic!("log snapshots are values")
     };
     value
 }
 
-fn object(snapshot: &DecodedSnapshot) -> &DecodedObject {
+fn object(snapshot: &DecodedBlob) -> &DecodedObject {
     let DecodedValue::Object(id) = root(snapshot) else {
         panic!("expected an object")
     };
     snapshot.object(*id)
 }
 
-fn fields(entries: &btel_snapshot::Entries) -> BTreeMap<&str, &DecodedValue> {
+fn fields(entries: &btel_core::cas::Entries) -> BTreeMap<&str, &DecodedValue> {
     entries
         .iter()
-        .map(|(key, value)| (key.as_ref(), value))
+        .map(|(key, value)| {
+            let DecodedValue::String(key) = key else {
+                panic!("expected string map key");
+            };
+            (key.as_ref(), value)
+        })
         .collect()
 }
 
 fn assert_logs(
     files: &[proto::RecordingFile],
     name: &str,
-    mut load: impl FnMut(SnapshotId) -> DecodedSnapshot,
+    mut load: impl FnMut(CasId) -> DecodedBlob,
 ) {
     use proto::span_event::Event;
     let functions: BTreeMap<_, _> = files
@@ -134,7 +143,7 @@ fn assert_logs(
                 };
                 assert!(
                     file.header.as_ref().unwrap().format_minor
-                        >= btel_settings::encoding::LOG_FORMAT_MINOR
+                        >= btel_core::recording::minor::LOG_LINE
                 );
                 let ContextReference::Snapshot(context) = reference(section) else {
                     panic!("missing log context")
@@ -170,6 +179,26 @@ fn assert_logs(
                         .as_ref()
                         .is_some_and(|map| log.pc < map.code_bytes)
                 );
+                // The event carries the line a reader resolves from the definition's line
+                // table, so a file without the definition still places it.
+                let own_file = function.source_span.as_ref().map(|span| span.file_id);
+                let resolved = btel_core::reader::source_map::SourceMap::from_wire(
+                    function.source_map.as_ref().unwrap(),
+                    own_file,
+                )
+                .unwrap()
+                .resolve(log.pc)
+                .unwrap();
+                assert_eq!(log.line, Some(resolved.line));
+                assert!(
+                    SOURCE
+                        .lines()
+                        .nth(resolved.line as usize - 1)
+                        .unwrap()
+                        .contains("log."),
+                    "line {} is a log call",
+                    resolved.line
+                );
                 if log.event_name.as_deref() == Some("span") {
                     assert!(spans.contains(&log.parent_id));
                 } else {
@@ -183,11 +212,9 @@ fn assert_logs(
                 }
                 logs.push((
                     log,
-                    load(
-                        log.data_cas_id
-                            .expect("null data is captured, not absent")
-                            .into(),
-                    ),
+                    load(btel_core::recording::cas_id(
+                        log.data_cas_id.expect("null data is captured, not absent"),
+                    )),
                 ));
             }
         }
@@ -241,7 +268,7 @@ fn assert_logs(
     let DecodedObject::Instance { fields: values, .. } = object(named("class")) else {
         panic!("class")
     };
-    assert_eq!(fields(values)["value"], &DecodedValue::Int(7));
+    assert_eq!(values, &vec![("value".into(), DecodedValue::Int(7))]);
     assert!(
         matches!(root(named("enum")), DecodedValue::Enum { variant: 0, name, .. } if name.as_ref() == "First")
     );
@@ -265,11 +292,13 @@ async fn log_data_and_event_time_context_reach_local_cas() {
     )
     .await;
     assert_eq!(engine.telemetry_result(), Some(Ok(())));
-    let read = btel_file::read_directory(engine.telemetry_recording_directory().unwrap()).unwrap();
+    let read =
+        btel_core::recording::read_directory(engine.telemetry_recording_directory().unwrap())
+            .unwrap();
     assert!(read.issues.is_empty(), "{:?}", read.issues);
     let cas = CasStore::new(directory.path().join("cas"), CasLimits::default());
     assert_logs(&read.files, &name, |id| {
-        let CasOutcome::Available(snapshot) = cas.load(id).outcome else {
+        let Ok(snapshot) = cas.load(id).snapshot else {
             panic!("log CAS was not persisted")
         };
         snapshot.as_ref().clone()
@@ -279,8 +308,14 @@ async fn log_data_and_event_time_context_reach_local_cas() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_data_and_context_use_existing_cloud_uploads() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/heartbeat$"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     let base = server.uri();
     Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/uploads:prepare$"))
         .respond_with(move |request: &Request| {
             ResponseTemplate::new(200).set_body_json(cloud_protocol::response(request, &base, &[]))
         })
@@ -295,7 +330,7 @@ async fn log_data_and_context_use_existing_cloud_uploads() {
         TelemetryRecording::cloud(
             RecordingConfig::default(),
             CloudPublisherConfig {
-                snapshot_target: 1,
+                candidate_target: 1,
                 max_pending_snapshots: 1,
                 inline_target_bytes: 1024 * 1024,
                 ..CloudPublisherConfig::default()
@@ -322,13 +357,13 @@ async fn log_data_and_context_use_existing_cloud_uploads() {
         .iter()
         .filter(|request| request.method == "PUT")
     {
-        let envelope = CloudUploadEnvelope::decode(request.body.as_slice()).unwrap();
+        let envelope = UploadEnvelope::decode(request.body.as_slice()).unwrap();
         if let Some(bytes) = envelope.recording_file {
             files.push(proto::RecordingFile::decode(bytes.as_slice()).unwrap());
         }
-        for object in envelope.cas_objects {
+        for object in envelope.blobs {
             let snapshot =
-                btel_snapshot::decode_blob(&object.blob, &btel_snapshot::DecodeLimits::default())
+                btel_core::cas::decode_blob(&object.blob, &btel_core::cas::DecodeLimits::default())
                     .unwrap();
             assert_eq!(snapshot.id.as_bytes().as_slice(), object.snapshot_id);
             snapshots.insert(*snapshot.id.as_bytes(), snapshot);

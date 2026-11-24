@@ -8,13 +8,14 @@
 //! caller skips the enclosing symbol and reports it — never erasing to a
 //! catch-all type.
 
-use baml_sdkgen_types::{CodegenFunctionParamMode, Name, Ty};
+use baml_base::qualified_name::BAML_JSON_JSON;
+use baml_sdkgen_types::{ClassCrossing, CodegenFunctionParamMode, Name, Ty};
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::{
     analyze::Analysis,
-    idents, routing,
+    idents,
     unions::{self, UnionRegistry},
 };
 
@@ -23,6 +24,25 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct Unsupported {
     pub(crate) reason: String,
+}
+
+pub(crate) const MAX_BRIDGE_TUPLE_ARITY: usize = 32;
+
+pub(crate) fn tuple_arity_is_supported(arity: usize) -> bool {
+    (1..=MAX_BRIDGE_TUPLE_ARITY).contains(&arity)
+}
+
+pub(crate) fn unsupported_tuple_arity(arity: usize) -> Option<String> {
+    (!tuple_arity_is_supported(arity)).then(|| {
+        if arity == 0 {
+            "unsupported type: empty tuple".to_string()
+        } else {
+            format!(
+                "unsupported type: tuple of {arity} slots (the Rust SDK converts tuples of at most \
+                 {MAX_BRIDGE_TUPLE_ARITY})"
+            )
+        }
+    })
 }
 
 fn unsupported(what: &str) -> Unsupported {
@@ -70,12 +90,25 @@ pub(crate) fn translate_throws(ty: &Ty, ctx: &TyCtx<'_>) -> Result<TokenStream, 
     translate(&filtered, ctx)
 }
 
+/// Whether `name` is the stdlib's recursive `baml.json.json` alias. A
+/// recursive alias cannot be a plain Rust `type`, so this one alias is
+/// special-cased: it translates to `baml_bridge::Json` (`serde_json::Value`)
+/// wherever it is referenced, whether or not its alias item is in the pool.
+/// Matched by its exact compiler-owned FQN, never by the shape of its
+/// expansion, so a look-alike user alias keeps the ordinary recursive-alias
+/// treatment.
+pub(crate) fn is_canonical_json(name: &Name) -> bool {
+    name == &Name::from_dotted_path(BAML_JSON_JSON)
+}
+
 /// The absolute `crate::…` path of an emitted nominal type.
 pub(crate) fn type_path(name: &Name, analysis: &Analysis) -> TokenStream {
-    let routed = routing::route(name).segments;
-    let segments = analysis.renamed(&routed);
-    let mods = segments.iter().map(|seg| idents::ident(seg));
-    let type_ident = idents::ident(name.name().as_str());
+    let mods = analysis
+        .names
+        .module_path(name)
+        .iter()
+        .map(|seg| idents::ident(seg));
+    let type_ident = idents::ident(analysis.names.type_name(name));
     quote! { crate::#(#mods::)*#type_ident }
 }
 
@@ -86,9 +119,9 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
         Ty::Float => Ok(quote! { ::core::primitive::f64 }),
         Ty::String => Ok(quote! { ::std::string::String }),
         Ty::Bool => Ok(quote! { ::core::primitive::bool }),
-        // BAML `null` (as a type) and `void` both surface as unit: null
-        // rides the wire as an absent value, a void function returns null.
-        Ty::Null | Ty::Void => Ok(quote! { () }),
+        // BAML's unit type (`null`, also spelled `void`) surfaces as Rust's:
+        // null rides the wire as an absent value.
+        Ty::Null => Ok(quote! { () }),
         // Rust cannot refine value-level literals in types; a literal type
         // widens to its base primitive (the same widening TS applies going
         // from `Literal[42]`-style types to `number`).
@@ -103,6 +136,16 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
         Ty::List(inner) => {
             let inner = translate_inner(inner, ctx, true)?;
             Ok(quote! { ::std::vec::Vec<#inner> })
+        }
+        Ty::Tuple(items) => {
+            if let Some(reason) = unsupported_tuple_arity(items.len()) {
+                return Err(Unsupported { reason });
+            }
+            let translated = items
+                .iter()
+                .map(|item| translate_inner(item, ctx, under_heap))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(quote! { (#(#translated,)*) })
         }
         Ty::Map { key, value, .. } => {
             // The language restricts map keys to strings (E0067); the
@@ -164,10 +207,8 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
                     // containment cycle — box the enum reference.
                     let boxed = !under_heap
                         && ctx.boxing_for.is_some_and(|owner| {
-                            arms.iter().any(|arm| match arm {
-                                Ty::Class(name, _) => ctx.analysis.needs_box(owner, name),
-                                _ => false,
-                            })
+                            arms.iter()
+                                .any(|arm| arm_holds_inline(arm, owner, ctx.analysis))
                         });
                     if boxed {
                         quote! { ::std::boxed::Box<#path> }
@@ -183,17 +224,42 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
             }
         }
         Ty::Class(name, args) => {
-            let builtin = name.to_string();
-            if builtin == "ai.FunctionSpec" && args.len() == 1 {
-                let output = translate_inner(&args[0], ctx, true)?;
-                return Ok(quote! { ::baml_bridge::FunctionSpec<#output> });
-            }
-            if builtin == "ai.stream.Stream" && args.len() == 1 {
-                let value = translate_inner(&args[0], ctx, true)?;
-                return Ok(quote! { ::baml_bridge::Stream<#value> });
-            }
-            if builtin == "ai.Prompt" && args.is_empty() {
-                return Ok(quote! { ::baml_bridge::Prompt });
+            // A class with a crossing of its own is the `baml_bridge` type
+            // for that crossing.
+            match (ctx.analysis.crossing(name), &args[..]) {
+                (Some(ClassCrossing::FunctionSpec), [output]) => {
+                    let output = translate_inner(output, ctx, true)?;
+                    return Ok(quote! { ::baml_bridge::FunctionSpec<#output> });
+                }
+                (Some(ClassCrossing::Stream), [value]) => {
+                    let value = translate_inner(value, ctx, true)?;
+                    return Ok(quote! { ::baml_bridge::Stream<#value> });
+                }
+                (Some(ClassCrossing::Prompt), []) => {
+                    return Ok(quote! { ::baml_bridge::Prompt });
+                }
+                // A host's own value is the host's handle to it.
+                (Some(ClassCrossing::HostValue), []) => {
+                    return Ok(quote! { ::baml_bridge::HostValue });
+                }
+                (
+                    Some(
+                        ClassCrossing::FunctionSpec
+                        | ClassCrossing::Stream
+                        | ClassCrossing::Prompt
+                        | ClassCrossing::HostValue,
+                    ),
+                    _,
+                ) => {
+                    return Err(unsupported(&format!(
+                        "`{name}` with {} type arguments",
+                        args.len()
+                    )));
+                }
+                (Some(ClassCrossing::Media(kind)), _) => {
+                    return Err(unsupported(&format!("media wrapper `{name}` ({kind})")));
+                }
+                (Some(ClassCrossing::Fields | ClassCrossing::Opaque) | None, _) => {}
             }
             // The builtin opaque host-error class is the Rust surface of an
             // opaque host throw: it maps to `baml_bridge::HostCallable` (the
@@ -240,19 +306,27 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
             Ok(type_path(name, ctx.analysis))
         }
         Ty::Media(kind) => Err(unsupported(&format!("media ({kind})"))),
-        // Opaque alias references (in-package non-recursive aliases are
-        // inlined upstream, so these are recursive or cross-package ones).
-        // A Rust `type` alias is transparent, so the reference resolves to
-        // the underlying type's conversions; no boxing is needed because
-        // package dependencies are acyclic, so a cross-package alias can
-        // never sit on a containment cycle.
+        Ty::TypeAlias(name) if is_canonical_json(name) => Ok(quote! { ::baml_bridge::Json }),
+        // Alias references stay nominal in the pool. A Rust `type` alias is
+        // transparent, so the reference resolves to the underlying type's
+        // conversions; it also holds its target inline, so on a containment
+        // cycle it is boxed like a class reference.
         Ty::TypeAlias(name) => {
             if !ctx.analysis.is_emitted(name) {
                 return Err(Unsupported {
                     reason: format!("references skipped or unknown type `{name}`"),
                 });
             }
-            Ok(type_path(name, ctx.analysis))
+            let path = type_path(name, ctx.analysis);
+            let boxed = !under_heap
+                && ctx
+                    .boxing_for
+                    .is_some_and(|owner| ctx.analysis.needs_box(owner, name));
+            if boxed {
+                Ok(quote! { ::std::boxed::Box<#path> })
+            } else {
+                Ok(path)
+            }
         }
         // A TypeVar naming one of the enclosing generic function's own
         // `<...>` params translates to that Rust generic parameter. The
@@ -307,7 +381,16 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
         // The uninhabited type: never appears as a field/param/return type
         // (throws-nothing is `throws: None`, handled before translation).
         Ty::Never => Err(unsupported("never")),
-        Ty::RustType => Err(unsupported("$rust_type handle")),
+    }
+}
+
+fn arm_holds_inline(arm: &Ty, owner: &Name, analysis: &Analysis) -> bool {
+    match arm {
+        Ty::Class(name, _) | Ty::TypeAlias(name) => analysis.needs_box(owner, name),
+        Ty::Tuple(items) | Ty::Union(items) => items
+            .iter()
+            .any(|item| arm_holds_inline(item, owner, analysis)),
+        _ => false,
     }
 }
 
@@ -315,7 +398,7 @@ fn translate_inner(ty: &Ty, ctx: &TyCtx<'_>, under_heap: bool) -> Result<TokenSt
 mod tests {
     use std::sync::LazyLock;
 
-    use baml_sdkgen_types::{Class, ClassProperty, Origin, Symbol, SymbolPool};
+    use baml_sdkgen_types::{Class, ClassProperty, NamingConvention, Origin, Symbol, SymbolPool};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -335,6 +418,7 @@ mod tests {
 
     fn class(n: &Name, fields: Vec<(&str, Ty)>) -> Symbol {
         Symbol::Class(Class {
+            crossing: baml_sdkgen_types::ClassCrossing::Fields,
             name: n.clone(),
             generic_params: Vec::new(),
             docstring: None,
@@ -344,6 +428,9 @@ mod tests {
                     name: baml_base::Name::new(field),
                     docstring: None,
                     ty,
+                    json_fallback: false,
+                    json_flatten: false,
+                    json_rename: None,
                 })
                 .collect(),
             static_methods: Vec::new(),
@@ -352,11 +439,12 @@ mod tests {
                 source_file_path: "main.baml".to_string(),
                 span_start: 0,
             },
+            json_omit_nulls: false,
         })
     }
 
     fn empty_analysis() -> Analysis {
-        analyze(&SymbolPool::default()).0
+        analyze(&SymbolPool::default(), NamingConvention::PreserveCase).0
     }
 
     fn rendered(ty: &Ty) -> String {
@@ -374,7 +462,7 @@ mod tests {
     }
 
     fn rendered_throws(ty: &Ty, pool: &SymbolPool) -> String {
-        let (analysis, warnings) = analyze(pool);
+        let (analysis, warnings) = analyze(pool, NamingConvention::PreserveCase);
         assert!(warnings.is_empty(), "unexpected analysis warnings");
         let unions = crate::unions::collect(pool, &analysis);
         let ctx = TyCtx {
@@ -455,7 +543,6 @@ mod tests {
     fn primitives() {
         assert_eq!(rendered(&Ty::Int), ":: core :: primitive :: i64");
         assert_eq!(rendered(&Ty::String), ":: std :: string :: String");
-        assert_eq!(rendered(&Ty::Void), "()");
         assert_eq!(rendered(&Ty::Null), "()");
         assert_eq!(rendered(&Ty::Bigint), ":: baml_bridge :: BigInt");
         assert_eq!(
@@ -538,7 +625,7 @@ mod tests {
         let resume = name("user", &["lorem"], "Resume");
         let pool =
             SymbolPool::from([(resume.clone(), class(&resume, vec![("title", Ty::String)]))]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(warnings.is_empty());
         let ctx = TyCtx {
             analysis: &analysis,
@@ -564,7 +651,7 @@ mod tests {
             bad.clone(),
             class(&bad, vec![("m", Ty::Media(baml_base::MediaKind::Image))]),
         )]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert_eq!(warnings.len(), 1);
         let ctx = TyCtx {
             analysis: &analysis,
@@ -593,7 +680,7 @@ mod tests {
                 ],
             ),
         )]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(warnings.is_empty());
         let ctx = TyCtx {
             analysis: &analysis,
@@ -622,7 +709,7 @@ mod tests {
             (a.clone(), class(&a, vec![("b", a_field)])),
             (b.clone(), class(&b, vec![("a", b_field)])),
         ]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(warnings.is_empty());
         assert!(analysis.needs_box(&a, &b));
         assert!(analysis.needs_box(&b, &a));
@@ -642,7 +729,7 @@ mod tests {
                 ),
             ),
         ]);
-        let (analysis, _) = analyze(&pool);
+        let (analysis, _) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(!analysis.needs_box(&outer, &inner));
     }
 
@@ -661,7 +748,7 @@ mod tests {
                 class(&holder, vec![("bad", Ty::Class(bad.clone(), Box::new([])))]),
             ),
         ]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(!analysis.is_emitted(&bad));
         assert!(!analysis.is_emitted(&holder));
         assert_eq!(warnings.len(), 2);
@@ -699,7 +786,7 @@ mod tests {
                 alias(&recursive, Ty::List(Box::new(Ty::Int)), true),
             ),
         ]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(analysis.is_emitted(&plain));
         assert!(!analysis.is_emitted(&recursive));
         assert_eq!(warnings.len(), 1);
@@ -730,7 +817,7 @@ mod tests {
                 class(&container, vec![("rec_field", Ty::TypeAlias(rec.clone()))]),
             ),
         ]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(!analysis.is_emitted(&container));
         assert!(
             warnings
@@ -750,7 +837,7 @@ mod tests {
             (foo_type.clone(), class(&foo_type, vec![("x", Ty::Int)])),
             (in_foo_ns.clone(), class(&in_foo_ns, vec![("y", Ty::Int)])),
         ]);
-        let (analysis, warnings) = analyze(&pool);
+        let (analysis, warnings) = analyze(&pool, NamingConvention::PreserveCase);
         assert!(warnings.is_empty());
         assert_eq!(
             translate(

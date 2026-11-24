@@ -16,13 +16,11 @@ class MediaTypeEnum(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     AUDIO: _ClassVar[MediaTypeEnum]
     PDF: _ClassVar[MediaTypeEnum]
     VIDEO: _ClassVar[MediaTypeEnum]
-    OTHER: _ClassVar[MediaTypeEnum]
 MEDIA_TYPE_UNSPECIFIED: MediaTypeEnum
 IMAGE: MediaTypeEnum
 AUDIO: MediaTypeEnum
 PDF: MediaTypeEnum
 VIDEO: MediaTypeEnum
-OTHER: MediaTypeEnum
 
 class BamlOutboundResult(_message.Message):
     __slots__ = ("ok", "error", "panic")
@@ -55,7 +53,7 @@ class BamlOutboundPanic(_message.Message):
     def __init__(self, value: _Optional[_Union[BamlOutboundValue, _Mapping]] = ..., trace: _Optional[_Iterable[str]] = ..., is_exit_panic: bool = ..., exit_code: _Optional[int] = ...) -> None: ...
 
 class BamlOutboundValue(_message.Message):
-    __slots__ = ("null_value", "string_value", "int_value", "float_value", "bool_value", "class_value", "enum_value", "literal_value", "list_value", "map_value", "union_variant_value", "handle_value", "media_value", "prompt_ast_value", "uint8array_value", "bigint_value", "ty_value", "ty_def_value")
+    __slots__ = ("null_value", "string_value", "int_value", "float_value", "bool_value", "class_value", "enum_value", "literal_value", "list_value", "map_value", "union_variant_value", "handle_value", "media_value", "prompt_ast_value", "uint8array_value", "bigint_value", "ty_value", "tuple_value")
     NULL_VALUE_FIELD_NUMBER: _ClassVar[int]
     STRING_VALUE_FIELD_NUMBER: _ClassVar[int]
     INT_VALUE_FIELD_NUMBER: _ClassVar[int]
@@ -73,7 +71,7 @@ class BamlOutboundValue(_message.Message):
     UINT8ARRAY_VALUE_FIELD_NUMBER: _ClassVar[int]
     BIGINT_VALUE_FIELD_NUMBER: _ClassVar[int]
     TY_VALUE_FIELD_NUMBER: _ClassVar[int]
-    TY_DEF_VALUE_FIELD_NUMBER: _ClassVar[int]
+    TUPLE_VALUE_FIELD_NUMBER: _ClassVar[int]
     null_value: BamlValueNull
     string_value: str
     int_value: int
@@ -91,18 +89,20 @@ class BamlOutboundValue(_message.Message):
     uint8array_value: bytes
     bigint_value: str
     ty_value: _baml_type_pb2.BamlTy
-    ty_def_value: _baml_type_pb2.BamlTyDef
-    def __init__(self, null_value: _Optional[_Union[BamlValueNull, _Mapping]] = ..., string_value: _Optional[str] = ..., int_value: _Optional[int] = ..., float_value: _Optional[float] = ..., bool_value: bool = ..., class_value: _Optional[_Union[BamlValueClass, _Mapping]] = ..., enum_value: _Optional[_Union[BamlValueEnum, _Mapping]] = ..., literal_value: _Optional[_Union[BamlLiteralValue, _Mapping]] = ..., list_value: _Optional[_Union[BamlValueList, _Mapping]] = ..., map_value: _Optional[_Union[BamlValueMap, _Mapping]] = ..., union_variant_value: _Optional[_Union[BamlValueUnionVariant, _Mapping]] = ..., handle_value: _Optional[_Union[BamlOutboundHandle, _Mapping]] = ..., media_value: _Optional[_Union[BamlValueMedia, _Mapping]] = ..., prompt_ast_value: _Optional[_Union[BamlValuePromptAst, _Mapping]] = ..., uint8array_value: _Optional[bytes] = ..., bigint_value: _Optional[str] = ..., ty_value: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ..., ty_def_value: _Optional[_Union[_baml_type_pb2.BamlTyDef, _Mapping]] = ...) -> None: ...
+    tuple_value: BamlValueTuple
+    def __init__(self, null_value: _Optional[_Union[BamlValueNull, _Mapping]] = ..., string_value: _Optional[str] = ..., int_value: _Optional[int] = ..., float_value: _Optional[float] = ..., bool_value: bool = ..., class_value: _Optional[_Union[BamlValueClass, _Mapping]] = ..., enum_value: _Optional[_Union[BamlValueEnum, _Mapping]] = ..., literal_value: _Optional[_Union[BamlLiteralValue, _Mapping]] = ..., list_value: _Optional[_Union[BamlValueList, _Mapping]] = ..., map_value: _Optional[_Union[BamlValueMap, _Mapping]] = ..., union_variant_value: _Optional[_Union[BamlValueUnionVariant, _Mapping]] = ..., handle_value: _Optional[_Union[BamlOutboundHandle, _Mapping]] = ..., media_value: _Optional[_Union[BamlValueMedia, _Mapping]] = ..., prompt_ast_value: _Optional[_Union[BamlValuePromptAst, _Mapping]] = ..., uint8array_value: _Optional[bytes] = ..., bigint_value: _Optional[str] = ..., ty_value: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ..., tuple_value: _Optional[_Union[BamlValueTuple, _Mapping]] = ...) -> None: ...
 
 class BamlOutboundHandle(_message.Message):
-    __slots__ = ("key", "handle_type", "ty")
+    __slots__ = ("key", "handle_type", "ty", "pin")
     KEY_FIELD_NUMBER: _ClassVar[int]
     HANDLE_TYPE_FIELD_NUMBER: _ClassVar[int]
     TY_FIELD_NUMBER: _ClassVar[int]
+    PIN_FIELD_NUMBER: _ClassVar[int]
     key: int
     handle_type: _baml_handle_pb2.BamlHandleType
     ty: _baml_type_pb2.BamlTy
-    def __init__(self, key: _Optional[int] = ..., handle_type: _Optional[_Union[_baml_handle_pb2.BamlHandleType, str]] = ..., ty: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ...) -> None: ...
+    pin: int
+    def __init__(self, key: _Optional[int] = ..., handle_type: _Optional[_Union[_baml_handle_pb2.BamlHandleType, str]] = ..., ty: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ..., pin: _Optional[int] = ...) -> None: ...
 
 class BamlValueNull(_message.Message):
     __slots__ = ()
@@ -115,6 +115,14 @@ class BamlValueList(_message.Message):
     item_type: _baml_type_pb2.BamlTy
     items: _containers.RepeatedCompositeFieldContainer[BamlOutboundValue]
     def __init__(self, item_type: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ..., items: _Optional[_Iterable[_Union[BamlOutboundValue, _Mapping]]] = ...) -> None: ...
+
+class BamlValueTuple(_message.Message):
+    __slots__ = ("items", "tuple_type")
+    ITEMS_FIELD_NUMBER: _ClassVar[int]
+    TUPLE_TYPE_FIELD_NUMBER: _ClassVar[int]
+    items: _containers.RepeatedCompositeFieldContainer[BamlOutboundValue]
+    tuple_type: _baml_type_pb2.BamlTy
+    def __init__(self, items: _Optional[_Iterable[_Union[BamlOutboundValue, _Mapping]]] = ..., tuple_type: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ...) -> None: ...
 
 class BamlOutboundMapEntry(_message.Message):
     __slots__ = ("key", "value")
@@ -173,18 +181,26 @@ class BamlValueUnionVariant(_message.Message):
     def __init__(self, name: _Optional[str] = ..., is_optional: bool = ..., is_single_pattern: bool = ..., self_type: _Optional[_Union[_baml_type_pb2.BamlTy, _Mapping]] = ..., value_option_name: _Optional[str] = ..., value: _Optional[_Union[BamlOutboundValue, _Mapping]] = ..., selected_option_index: _Optional[int] = ...) -> None: ...
 
 class BamlValueMedia(_message.Message):
-    __slots__ = ("media", "mime_type", "url", "base64", "file")
+    __slots__ = ("media", "mime_type", "url", "base64", "file_content")
     MEDIA_FIELD_NUMBER: _ClassVar[int]
     MIME_TYPE_FIELD_NUMBER: _ClassVar[int]
     URL_FIELD_NUMBER: _ClassVar[int]
     BASE64_FIELD_NUMBER: _ClassVar[int]
-    FILE_FIELD_NUMBER: _ClassVar[int]
+    FILE_CONTENT_FIELD_NUMBER: _ClassVar[int]
     media: MediaTypeEnum
     mime_type: str
     url: str
     base64: str
-    file: str
-    def __init__(self, media: _Optional[_Union[MediaTypeEnum, str]] = ..., mime_type: _Optional[str] = ..., url: _Optional[str] = ..., base64: _Optional[str] = ..., file: _Optional[str] = ...) -> None: ...
+    file_content: BamlValueMediaFileContent
+    def __init__(self, media: _Optional[_Union[MediaTypeEnum, str]] = ..., mime_type: _Optional[str] = ..., url: _Optional[str] = ..., base64: _Optional[str] = ..., file_content: _Optional[_Union[BamlValueMediaFileContent, _Mapping]] = ...) -> None: ...
+
+class BamlValueMediaFileContent(_message.Message):
+    __slots__ = ("name", "base64")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    BASE64_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    base64: str
+    def __init__(self, name: _Optional[str] = ..., base64: _Optional[str] = ...) -> None: ...
 
 class BamlValuePromptAst(_message.Message):
     __slots__ = ("simple", "message", "multiple")
@@ -233,6 +249,24 @@ class BamlToHostCall(_message.Message):
     ARGS_FIELD_NUMBER: _ClassVar[int]
     args: _containers.RepeatedCompositeFieldContainer[BamlToHostArg]
     def __init__(self, args: _Optional[_Iterable[_Union[BamlToHostArg, _Mapping]]] = ...) -> None: ...
+
+class HostInvocation(_message.Message):
+    __slots__ = ("host_value_key", "callback_id", "application_args", "effective_state", "host_environment", "cancel", "deadline_ns")
+    HOST_VALUE_KEY_FIELD_NUMBER: _ClassVar[int]
+    CALLBACK_ID_FIELD_NUMBER: _ClassVar[int]
+    APPLICATION_ARGS_FIELD_NUMBER: _ClassVar[int]
+    EFFECTIVE_STATE_FIELD_NUMBER: _ClassVar[int]
+    HOST_ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
+    CANCEL_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_NS_FIELD_NUMBER: _ClassVar[int]
+    host_value_key: int
+    callback_id: int
+    application_args: bytes
+    effective_state: int
+    host_environment: int
+    cancel: BamlOutboundValue
+    deadline_ns: int
+    def __init__(self, host_value_key: _Optional[int] = ..., callback_id: _Optional[int] = ..., application_args: _Optional[bytes] = ..., effective_state: _Optional[int] = ..., host_environment: _Optional[int] = ..., cancel: _Optional[_Union[BamlOutboundValue, _Mapping]] = ..., deadline_ns: _Optional[int] = ...) -> None: ...
 
 class BamlToHostArg(_message.Message):
     __slots__ = ("value", "arg_name", "is_optional_arg")

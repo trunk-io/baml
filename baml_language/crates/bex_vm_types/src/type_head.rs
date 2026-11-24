@@ -187,26 +187,19 @@ impl TypeHead {
         if !self.is_resolved() {
             return None;
         }
-        // SAFETY: as in `tagged_name` — the caller holds the heap permit for
+        // SAFETY: as in `tagged_name`, the caller holds the heap permit for
         // the read and the collector forwards heads when declarations move
-        // (runtime-created declarations live in the moving region; this very
-        // function's `Anonymous` arm exists for them). A declaration is
-        // immutable after it is created.
+        // (runtime-created declarations live in the moving region).
+        // A declaration is immutable after it is created.
         #[expect(
             unsafe_code,
             reason = "recovering a head's name requires reading its declaration"
         )]
         let object = unsafe { self.ptr.get() };
-        match object {
-            // An anonymous (runtime-created) declaration has no qualified name,
-            // so it is unnameable here by design — `to_name` refuses rather
-            // than fabricating a spelling nothing declares.
-            crate::Object::Class(class) => class.name.declared().cloned(),
-            crate::Object::Enum(enm) => enm.name.declared().cloned(),
-            crate::Object::Interface(iface) => Some(iface.name.clone()),
-            crate::Object::TypeAlias(alias) => Some(alias.name.clone()),
-            _ => None,
-        }
+        // An anonymous (runtime-created) declaration has no qualified name,
+        // so it is unnameable here by design — `to_name` refuses rather than
+        // fabricating a spelling nothing declares.
+        object.declaration_name()
     }
 
     /// This head's declaration name, or the head itself when it has none.
@@ -221,32 +214,6 @@ impl TypeHead {
     /// its declaration has no name a host could look up.
     pub fn to_name(&self) -> Result<baml_type::TypeName, crate::UnnameableHead> {
         self.declared_name().ok_or(crate::UnnameableHead(self.tag))
-    }
-
-    /// The per-call seam spelling of this head's declaration: its declared
-    /// name, or the bare item name as a local spelling when the declaration is
-    /// anonymous. `None` when the head is unresolved or points at no
-    /// declaration. See [`DeclarationName::overlay_name`](crate::DeclarationName::overlay_name)
-    /// for the contract — this spelling is only meaningful against tables the
-    /// same call built.
-    #[must_use]
-    pub fn overlay_name(self) -> Option<baml_type::TypeName> {
-        if !self.is_resolved() {
-            return None;
-        }
-        // SAFETY: as in `declared_name`.
-        #[expect(
-            unsafe_code,
-            reason = "recovering a head's name requires reading its declaration"
-        )]
-        let object = unsafe { self.ptr.get() };
-        match object {
-            crate::Object::Class(class) => Some(class.name.overlay_name()),
-            crate::Object::Enum(enm) => Some(enm.name.overlay_name()),
-            crate::Object::Interface(iface) => Some(iface.name.clone()),
-            crate::Object::TypeAlias(alias) => Some(alias.name.clone()),
-            _ => None,
-        }
     }
 
     /// This head at the sys-op lane's head: the identity it already carries,
@@ -269,14 +236,10 @@ impl TypeHead {
         )]
         let object = unsafe { self.ptr.get() };
         let name = match object {
-            crate::Object::Class(class) => class.name.clone(),
-            crate::Object::Enum(enm) => enm.name.clone(),
-            crate::Object::Interface(iface) => {
-                baml_type::DeclarationName::Declared(iface.name.clone())
-            }
-            crate::Object::TypeAlias(alias) => {
-                baml_type::DeclarationName::Declared(alias.name.clone())
-            }
+            crate::Object::Class(class) => class.name(),
+            crate::Object::Enum(enm) => enm.name(),
+            crate::Object::Interface(iface) => iface.name(),
+            crate::Object::TypeAlias(alias) => alias.name(),
             _ => return None,
         };
         Some(baml_type::TaggedTypeName::new(self.tag, name))
@@ -293,15 +256,44 @@ impl TypeHead {
         self.tagged_name().ok_or(crate::UnnameableHead(self.tag))
     }
 
-    /// The mapper form of [`overlay_name`](Self::overlay_name), for pairing
-    /// with `try_map_heads` — the per-call twin of [`to_name`](Self::to_name).
+    /// This head as an annotation beside a value crossing the host boundary:
+    /// a compiled declaration by name, any other by its display label. A
+    /// label is never a reference, so this is the spelling for a type the
+    /// host only reads; a type the host may state again names its runtime
+    /// declarations by handle instead.
     ///
     /// # Errors
     ///
     /// [`UnnameableHead`](crate::UnnameableHead) when the head is unresolved
     /// or does not point at a declaration.
-    pub fn to_overlay_name(&self) -> Result<baml_type::TypeName, crate::UnnameableHead> {
-        self.overlay_name().ok_or(crate::UnnameableHead(self.tag))
+    pub fn to_annotation_head<L>(&self) -> Result<baml_type::WireHead<L>, crate::UnnameableHead> {
+        if !self.is_resolved() {
+            return Err(crate::UnnameableHead(self.tag));
+        }
+        // SAFETY: as in `declared_name`.
+        #[expect(
+            unsafe_code,
+            reason = "recovering a head's name requires reading its declaration"
+        )]
+        let object = unsafe { self.ptr.get() };
+        let name = match object {
+            crate::Object::Class(class) => class.name(),
+            crate::Object::Enum(enm) => enm.name(),
+            crate::Object::Interface(iface) => iface.name(),
+            crate::Object::TypeAlias(alias) => alias.name(),
+            _ => return Err(crate::UnnameableHead(self.tag)),
+        };
+        // Decided by the tag, as a statement's head is: a declaration the
+        // runtime created has a dynamic tag whether or not a package labels
+        // it (a `Package.compile`d class carries a declared name that spells
+        // the same as the root's), and a host must never take its label for
+        // a compiled declaration's name.
+        Ok(match name.declared() {
+            Some(declared) if !self.tag.is_dynamic() => {
+                baml_type::WireHead::Static(declared.clone())
+            }
+            Some(_) | None => baml_type::WireHead::Anonymous(name.display_name()),
+        })
     }
 
     /// Whether the pointer cache has been filled — false for a head straight out
@@ -341,6 +333,21 @@ impl TypeHead {
         self.tag
     }
 
+    /// Hand the declaration pointer to a collection's visitor, if the head is
+    /// resolved. An unresolved head names nothing on the heap yet.
+    pub fn visit_root(&mut self, visitor: &mut dyn crate::RootVisitor) {
+        if self.is_resolved() {
+            visitor.visit(&mut self.ptr);
+        }
+    }
+
+    /// [`Self::visit_root`] for a head held weakly: the declaration is
+    /// repointed if it moved but not kept alive. Returns whether it is still
+    /// live; an unresolved head is vacuously so.
+    pub fn visit_root_weak(&mut self, visitor: &mut dyn crate::RootVisitor) -> bool {
+        !self.is_resolved() || visitor.visit_weak(&mut self.ptr)
+    }
+
     /// Repoint this head after the collector has moved its declaration.
     ///
     /// Identity is untouched: a moved head remains equal to, and hashes and
@@ -378,10 +385,10 @@ impl baml_type::HeadDisplay for TypeHead {
         )]
         let object = unsafe { self.ptr.get() };
         match object {
-            crate::Object::Class(class) => class.name.display_name().to_string(),
-            crate::Object::Enum(enm) => enm.name.display_name().to_string(),
-            crate::Object::Interface(iface) => iface.name.display_name().to_string(),
-            crate::Object::TypeAlias(alias) => alias.name.display_name().to_string(),
+            crate::Object::Class(class) => class.name().display_name().to_string(),
+            crate::Object::Enum(enm) => enm.name().display_name().to_string(),
+            crate::Object::Interface(iface) => iface.name().display_name().to_string(),
+            crate::Object::TypeAlias(alias) => alias.name().display_name().to_string(),
             _ => format!("<type #{}>", self.tag.as_i64()),
         }
     }
@@ -605,24 +612,27 @@ mod tests {
     fn a_heap_headed_type_renders_through_its_declaration() {
         use baml_type::RealizedTy;
 
-        let name = baml_type::TypeName::new(
+        // A class's name is its path under its package's display name, so the
+        // class needs a package to be `demo.Person`.
+        let mut package = crate::Object::Package(Box::new(crate::types::Package::empty(
             baml_base::Name::new("demo"),
-            vec![],
-            baml_base::Name::new("Person"),
-        );
+        )));
         let mut declaration = crate::Object::Class(Box::new(crate::types::Class {
-            name: crate::DeclarationName::Declared(name),
-            fields: vec![],
+            path: crate::types::LocalName::new(vec![], baml_base::Name::new("Person")),
+            body: crate::ClassBody::Fields(vec![]),
             description: None,
             alias: None,
             docstring: None,
             other: indexmap::IndexMap::default(),
             stream_done: false,
+            declared_crossing: baml_type::ClassCrossing::Fields,
             type_tag: TypeTag::of_static_index(0),
-            has_cleanup: false,
+            cleanup: None,
             methods: indexmap::IndexMap::new(),
             generic_param_count: 0,
-            owner: crate::types::Owner::anonymous(),
+            owner: crate::types::Owner::Package(ptr_to(&mut package)),
+            telemetry_definition: crate::DefinitionCell::default(),
+            redact: false,
         }));
 
         let mut head = TypeHead::unresolved(TypeTag::of_static_index(0));
@@ -650,30 +660,31 @@ mod tests {
 
         let type_tag = TypeTag::fresh_dynamic();
         let mut declaration = crate::Object::Class(Box::new(crate::types::Class {
-            name: crate::DeclarationName::Anonymous(baml_base::Name::new("Widget")),
-            fields: vec![],
+            path: crate::types::LocalName::new(vec![], baml_base::Name::new("Widget")),
+            body: crate::ClassBody::Fields(vec![]),
             description: None,
             alias: None,
             docstring: None,
             other: indexmap::IndexMap::default(),
             stream_done: false,
+            declared_crossing: baml_type::ClassCrossing::Fields,
             type_tag,
-            has_cleanup: false,
+            cleanup: None,
             methods: indexmap::IndexMap::new(),
             generic_param_count: 0,
             owner: crate::types::Owner::anonymous(),
+            telemetry_definition: crate::DefinitionCell::default(),
+            redact: false,
         }));
         let head = TypeHead::new(ptr_to(&mut declaration), type_tag);
 
         assert_eq!(head.declared_name(), None);
         assert!(head.to_name().is_err());
-
-        let overlay = head
-            .overlay_name()
-            .expect("an anonymous head still spells locally");
-        assert!(overlay.is_local());
-        assert!(overlay.namespace().is_empty());
-        assert_eq!(overlay.name().as_str(), "Widget");
+        // An anonymous declaration is never a statement's head: it is a label.
+        assert!(matches!(
+            head.to_annotation_head::<std::convert::Infallible>(),
+            Ok(baml_type::WireHead::Anonymous(label)) if label.as_str() == "Widget"
+        ));
 
         let ty: RealizedTy<TypeHead> = RealizedTy::Class(head, Box::new([]));
         assert_eq!(ty.to_string(), "Widget");

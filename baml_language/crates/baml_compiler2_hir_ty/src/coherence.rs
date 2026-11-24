@@ -86,7 +86,7 @@ const MAX_UNIFY_DEPTH: usize = 256;
 fn contains_bound_typevar(ty: &Ty, generic_params: &[ParamTy]) -> bool {
     match ty {
         Ty::TypeVar(name) => generic_params.contains(name),
-        Ty::Class(_, args) | Ty::Union(args) => args
+        Ty::Class(_, args) | Ty::Union(args) | Ty::Tuple(args) => args
             .iter()
             .any(|arg| contains_bound_typevar(arg, generic_params)),
         Ty::Interface(_, args, associated_bindings) => {
@@ -128,7 +128,7 @@ fn var_under_union(param: &ParamTy, ty: &Ty) -> bool {
         match ty {
             Ty::TypeVar(candidate) => in_union && candidate == param,
             Ty::Union(members) => members.iter().any(|m| occurs(param, m, true)),
-            Ty::Class(_, args) => args.iter().any(|a| occurs(param, a, in_union)),
+            Ty::Class(_, args) | Ty::Tuple(args) => args.iter().any(|a| occurs(param, a, in_union)),
             Ty::Interface(_, args, assoc) => {
                 args.iter().any(|a| occurs(param, a, in_union))
                     || assoc.iter().any(|(_, t)| occurs(param, t, in_union))
@@ -193,6 +193,58 @@ fn unify_into(
     unify_into_at(x, y, vars, aliases, bindings, 0)
 }
 
+/// Bound-free head overlap. Symbolic projections may denote any type; proving
+/// their values here would re-enter trait selection during negative reasoning.
+pub(crate) fn heads_may_overlap(
+    db: &dyn baml_compiler2_hir::Db,
+    package: baml_base::SourceRoot,
+    left: &ClosedTy,
+    right: &ClosedTy,
+) -> bool {
+    fn freshen(
+        ty: &baml_type::interned::Ty,
+        symbols: &mut FxHashMap<baml_type::interned::Ty, baml_type::interned::Ty>,
+        vars: &mut Vec<ParamTy>,
+    ) -> baml_type::interned::Ty {
+        use baml_type::interned::{InferTy, Ty};
+        if matches!(
+            ty.kind(),
+            InferTy::TypeVar(..) | InferTy::AssociatedTypeProjection { .. }
+        ) {
+            return symbols
+                .entry(ty.clone())
+                .or_insert_with(|| {
+                    let param = renamed_var('h', vars.len());
+                    vars.push(param.clone());
+                    Ty::intern(InferTy::TypeVar(param))
+                })
+                .clone();
+        }
+        Ty::intern(
+            ty.kind()
+                .map_children(|child| freshen(child, symbols, vars)),
+        )
+    }
+    let mut vars = Vec::new();
+    let left = freshen(left, &mut FxHashMap::default(), &mut vars);
+    let right = freshen(right, &mut FxHashMap::default(), &mut vars);
+    let aliases = AliasEquivCtx {
+        aliases: crate::interfaces::normalized_alias_map(db, package),
+        lang: lang_roots(db),
+    };
+    unify_into(
+        &ClosedTy::try_from(left)
+            .expect("freshened head is closed")
+            .to_plain(),
+        &ClosedTy::try_from(right)
+            .expect("freshened head is closed")
+            .to_plain(),
+        &vars,
+        &aliases,
+        &mut TypeBindings::default(),
+    ) != Overlap::No
+}
+
 fn unify_into_at(
     x: &Ty,
     y: &Ty,
@@ -255,6 +307,13 @@ fn unify_into_at(
             ))
         }
         (Ty::List(xi), Ty::List(yi)) => unify_into_at(xi, yi, vars, aliases, bindings, depth + 1),
+        (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
+            let mut result = Overlap::Yes;
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                result = result.and(unify_into_at(x, y, vars, aliases, bindings, depth + 1));
+            }
+            result
+        }
         (
             Ty::Map {
                 key: xk, value: xv, ..
@@ -499,7 +558,7 @@ fn unions_set_equal(xs: &[Ty], ys: &[Ty], aliases: &AliasEquivCtx<'_>) -> bool {
 /// subtype); on top sit the two subtypings invariance leaves above the
 /// constructor level (`literal <: base`, `variant <: enum`) and the pairs
 /// undecidable without the impl registry - concrete vs interface, two
-/// different interfaces, opaque `$rust_type` - treated conservatively as
+/// different interfaces - treated conservatively as
 /// possible overlap (`Yes`), never a wrong `No`. Registry-precise
 /// membership is a marked future refinement (the registry IS live in
 /// this crate; changing the answer here changes accepted programs, so it
@@ -549,9 +608,6 @@ fn is_literal_subtype(member: &Ty, candidate: &Ty) -> bool {
 
 /// Pairs whose subtyping needs the impl registry: conservative `Yes`.
 fn needs_conservative_membership(a: &Ty, b: &Ty) -> bool {
-    if matches!(a, Ty::RustType) || matches!(b, Ty::RustType) {
-        return true;
-    }
     match (a, b) {
         (Ty::Interface(qa, ..), Ty::Interface(qb, ..)) => qa != qb,
         (Ty::Interface(..), _) | (_, Ty::Interface(..)) => true,
@@ -678,7 +734,7 @@ fn occurs_in(n: &ParamTy, t: &Ty, vars: &[ParamTy], bindings: &TypeBindings) -> 
     let t = chase_var(t, vars, bindings);
     match &t {
         Ty::TypeVar(m) => m == n,
-        Ty::Class(_, args) | Ty::Union(args) => {
+        Ty::Class(_, args) | Ty::Union(args) | Ty::Tuple(args) => {
             args.iter().any(|a| occurs_in(n, a, vars, bindings))
         }
         Ty::Interface(_, args, assoc) => {
@@ -720,6 +776,12 @@ fn substitute_plain(ty: &Ty, bindings: &TypeBindings) -> Ty {
             members
                 .iter()
                 .map(|m| substitute_plain(m, bindings))
+                .collect(),
+        ),
+        Ty::Tuple(elements) => Ty::Tuple(
+            elements
+                .iter()
+                .map(|e| substitute_plain(e, bindings))
                 .collect(),
         ),
         Ty::Class(name, args) => Ty::Class(
@@ -790,27 +852,15 @@ pub struct CoherenceViolation<'db> {
     pub indeterminate: bool,
 }
 
-/// Wrapper for the manual `salsa::Update` impl (the `ImplFacts`
+/// Wrapper for the manual `salsa::SalsaValue` impl (the `ImplFacts`
 /// precedent).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoherenceReport<'db>(pub Vec<CoherenceViolation<'db>>);
 
-// SAFETY: PartialEq-driven overwrite, the ImplFacts precedent.
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[allow(unsafe_code)]
-unsafe impl salsa::Update for CoherenceReport<'_> {
-    #[allow(unsafe_code)]
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        unsafe {
-            let changed = *old_pointer != new_value;
-            if changed {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            changed
-        }
-    }
-}
+unsafe impl salsa::SalsaValue for CoherenceReport<'_> {}
 
 /// Per-package coherence: overlapping implementations across the package
 /// and its dependency closure - rustc's per-crate coherence plus
@@ -1132,26 +1182,14 @@ pub struct OrphanViolation<'db> {
     pub uncovered_param: Option<Name>,
 }
 
-/// Wrapper for the manual `salsa::Update` impl.
+/// Wrapper for the manual `salsa::SalsaValue` impl.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrphanReport<'db>(pub Vec<OrphanViolation<'db>>);
 
-// SAFETY: PartialEq-driven overwrite, the ImplFacts precedent.
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[allow(unsafe_code)]
-unsafe impl salsa::Update for OrphanReport<'_> {
-    #[allow(unsafe_code)]
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        #[allow(unsafe_code)]
-        unsafe {
-            let changed = *old_pointer != new_value;
-            if changed {
-                std::ptr::drop_in_place(old_pointer);
-                std::ptr::write(old_pointer, new_value);
-            }
-            changed
-        }
-    }
-}
+unsafe impl salsa::SalsaValue for OrphanReport<'_> {}
 
 /// Per-package orphan check: every impl must implement a local interface
 /// or cover a local type (RFC-2451: the first local class/enum in the

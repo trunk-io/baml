@@ -51,7 +51,7 @@ function resolve(
                     status_code: null,
                     detail: `client selector env.${named.name} is not set: point it at a "provider/model" string (valid prefixes are ${prefixes.join(", ")}), or give the client: position a value with a fallback — env.${named.name}.get() ?? "openai/gpt-4o-mini"`,
                     raw_body: null,
-                }
+                };
             }
         },
         let existing: root.Client => existing,
@@ -86,8 +86,55 @@ function default_retry_judgment(f: root.errors.Failure) -> bool {
         let i: root.errors.InvalidRequest => false,
         let p: root.errors.ParseFailed => false,
         let f: root.errors.FinishReasonError => false,
+        let p: root.errors.ProviderError => _provider_error_retryable(p),
         _ => true,
     }
+}
+
+// Provider-reported failures have no reliable HTTP status. Keep the native
+// code/type so policy does not infer retryability from the human message.
+function _provider_error_retryable(error: root.errors.ProviderError) -> bool {
+    let code = ((error.error_code ?? "") + " " + (error.error_type ?? "")).to_lower_case();
+    let native_code = error.error_code ?? "";
+    let kind = error.error_type ?? "";
+    if (error.provider == "aws-bedrock") {
+        return kind == "throttlingException"
+            || kind == "serviceUnavailableException"
+            || kind == "internalServerException"
+            || kind == "modelTimeoutException"
+            || kind.starts_with("error:");
+    }
+    if (error.provider == "anthropic") {
+        return kind == "rate_limit_error"
+            || kind == "overloaded_error"
+            || kind == "api_error"
+            || kind == "timeout_error";
+    }
+    if (native_code == "408" || native_code == "429") {
+        return true;
+    }
+    let status = baml.Int.parse(native_code) catch (e) {
+        baml.errors.ParseError => 0,
+    };
+    if (status >= 500) {
+        return true;
+    }
+    if (
+        code.includes("refusal") || code.includes("content_filter") || code.includes("moderation")
+    ) {
+        return false;
+    }
+    // Responses API codes (including quota/billing, which previously used
+    // RateLimited) and matching OpenAI-compatible provider codes.
+    code.includes("rate_limit")
+        || code.includes("quota")
+        || code.includes("credit_balance")
+        || code.includes("server_error")
+        || code.includes("timeout")
+        || code.includes("timed_out")
+        || code.includes("overloaded")
+        || code.includes("unavailable")
+        || code.includes("try_again")
 }
 
 class Backoff {
@@ -96,7 +143,11 @@ class Backoff {
     max_ms: int,
 
     function new(initial_ms: int = 250, multiplier: int = 2, max_ms: int = 10000) -> Backoff {
-        Backoff { initial_ms: initial_ms, multiplier: multiplier, max_ms: max_ms }
+        Backoff {
+            initial_ms: initial_ms,
+            multiplier: multiplier,
+            max_ms: max_ms,
+        }
     }
 
     /// The delay before attempt N (first retry is attempt 1). A
@@ -126,70 +177,96 @@ class Backoff {
 
 // Streaming retries use the same safety judgment and backoff as invoke, but a
 // new stream may be opened only before the first text delta is returned.
-/// (internal) Map a classified failure or a member timeout to a failed-leg wire
-/// record (`selected: false`). Timing is best-effort: a failed leg's start was
-/// never measured, so it is null — never fabricated. `client_name` falls back
-/// to the failure's own provider when the wrapper does not know the member's
-/// id; a timeout carries no provider, so it reports `"unknown"`.
-function _failed_leg_call(client_name: string?, f: Retryable) -> root.events.LLMCall {
-    let provider = match (f) {
-        let e: root.errors.RateLimited => e.provider,
-        let e: root.errors.NetworkFailure => e.provider,
-        let e: root.errors.InvalidRequest => e.provider,
-        let e: root.errors.PreviewUnsupported => e.provider,
-        let e: root.errors.Refused => e.provider,
-        let e: root.errors.ParseFailed => e.provider,
-        let e: root.errors.FinishReasonError => e.provider,
-        let e: root.errors.StreamingUnsupported => e.client_id,
-        _ => "unknown",
-    };
+/// (internal) Map a classified failure or a member timeout to a failed attempt
+/// of `member`. It holds the call only when a response arrived. No response
+/// named a model and the call's timing was never measured, so both are null,
+/// never fabricated.
+function _failed_attempt(member: root.Client, f: Retryable) -> root.ModelTurn {
     let status: int? = match (f) {
         let e: root.errors.RateLimited => e.status_code,
         let e: root.errors.NetworkFailure => e.status_code,
         let e: root.errors.InvalidRequest => e.status_code,
+        let e: root.errors.InvalidResponse => e.status_code,
+        let e: root.errors.ProviderError => e.status_code,
         _ => null,
     };
     let raw: string? = match (f) {
         let e: root.errors.RateLimited => e.raw_body,
         let e: root.errors.NetworkFailure => e.raw_body,
         let e: root.errors.InvalidRequest => e.raw_body,
+        let e: root.errors.InvalidResponse => e.raw_body,
+        let e: root.errors.ProviderError => e.raw_body,
         let e: root.errors.Refused => e.raw_body,
         _ => null,
     };
-    root.events.LLMCall {
-        client_name: client_name ?? provider,
-        provider: provider,
-        timing: root.events.Timing { start_time_utc_ms: null, duration_ms: null, ttft_ms: null },
-        http_request: null,
-        http_response: match (status) {
-            let s: int => root.events.HttpResponse { status: s, headers: {}, body: raw },
-            null => null,
-        },
-        usage: null,
-        selected: false,
-        sse_responses: null,
+    let calls: root.events.ModelCall[] = [];
+    if let s: int = status {
+        calls.push(root.events.ModelCall {
+            resolved_model: root.events.ModelKey {
+                provider: member.provider(),
+                model: null,
+            },
+            usage: null,
+            timing: root.events.Timing {
+                start_time: null,
+                duration: null,
+                ttft: null,
+            },
+            http_request: null,
+            http_response: root.events.HttpResponse {
+                status: s,
+                headers: {},
+                body: raw,
+            },
+            sse_responses: null,
+        });
+    }
+    root.ModelTurn {
+        parsed_output: null,
+        content: [],
+        stop_reason: root.content.StopReason.Failed,
+        resolved_model: null,
+        requested_model: member.requested_model(),
+        calls: calls,
+        child_turns: [],
+        error: f,
+    }
+}
+
+/// (internal) A wrapper's turn over its member `attempts`, oldest first: it
+/// answers as the last one, which succeeded, and makes no call itself.
+function _wrapper_turn(attempts: root.ModelTurn[]) -> root.ModelTurn {
+    let answered = attempts[attempts.length() - 1];
+    root.ModelTurn {
+        ...answered,
+        calls: [],
+        child_turns: attempts,
+        error: null,
     }
 }
 
 /// One `Retry` attempt, as a span of its own: `attempt` counts from 1 and
-/// `client` is the member's `id()`. Run with `$trace = _attempt_trace()`, which
-/// captures only those inputs (`body` is recorded as an opaque closure), never
-/// the client, the prompt or an error's body. The attempt's requests are
+/// `client` is the member's `requested_model()`. Run with `$trace = _attempt_trace()`, which
+/// captures those inputs (`body` is recorded as an opaque closure) and never
+/// the client or the prompt. An attempt that fails records the error it ended
+/// with, as any span does, so a failed attempt says why it failed; a recording
+/// made with HTTP bodies withheld records none. The attempt's requests are
 /// network spans under it, and each attempt's span ends before the next starts.
 function retry_attempt<T, E>(attempt: int, client: string, body: () -> T throws E) -> T throws E {
     body()
 }
 
 /// One `Fallback` member try, as a span of its own: `member` is the member's
-/// index in `members`, from 0, and `client` its `id()`. Captured like
+/// index in `members`, from 0, and `client` its `requested_model()`. Captured like
 /// `retry_attempt`.
 function fallback_attempt<T, E>(member: int, client: string, body: () -> T throws E) -> T throws E {
     body()
 }
 
-/// (internal) The tracing options of an attempt span: its inputs only.
+/// (internal) The tracing options of an attempt span: its inputs, and the
+/// error it ends with, as every span records it.
 function _attempt_trace() -> trace.Options throws never {
-    trace.span(inputs = true, output = false, error = false)
+    trace.span(inputs = true, output = false)
 }
 
 /// (internal) An attempt that failed and may be tried again: kept apart from
@@ -222,7 +299,7 @@ class Retry {
         self,
         input: root.ModelTurnInput,
         remaining: int,
-        failed: root.events.LLMCall[],
+        attempts: root.ModelTurn[],
     ) -> root.ModelTurn {
         let attempt = self.max_attempts - remaining + 1;
         let inner = self.inner;
@@ -230,33 +307,30 @@ class Retry {
         // attempt, so attempts are siblings.
         let result: root.ModelTurn | RetryCause = retry_attempt(
             attempt,
-            inner.id(),
-            () -> root.ModelTurn {
-                inner.invoke(input)
-            },
+            inner.requested_model(),
+            () -> root.ModelTurn { inner.invoke(input) },
             $trace = _attempt_trace(),
         ) catch_all (e) {
             let cause: Retryable => {
                 if (remaining > 1 && self._wants_retry(cause)) {
                     RetryCause { cause: cause }
                 } else {
-                    throw e
+                    throw e;
                 }
             },
             _ => throw e, // untyped failures are never retried
         };
         match (result) {
-            let turn: root.ModelTurn => turn,
+            let turn: root.ModelTurn => {
+                attempts.push(turn);
+                _wrapper_turn(attempts)
+            },
             let retry: RetryCause => {
-                failed.push(_failed_leg_call(self.inner.id(), retry.cause));
-                let _ = baml.sys.sleep(
-                    baml.time.Duration.from_milliseconds(
-                        self.backoff.delay_ms(attempt, retry.cause),
-                    ),
-                ) catch_all (se) {
-                    _ => null,
-                };
-                self._attempt(input, remaining - 1, failed)
+                attempts.push(_failed_attempt(self.inner, retry.cause));
+                baml.sys.sleep(baml.time.Duration.from_milliseconds(
+                    self.backoff.delay_ms(attempt, retry.cause),
+                ));
+                self._attempt(input, remaining - 1, attempts)
             },
         }
     }
@@ -264,16 +338,19 @@ class Retry {
     /// The safety gate is not overridable; the judgment is. `retry_if` judges
     /// typed failures; a member timeout passes the gate and is always retried.
     function _wants_retry(self, cause: Retryable) -> bool {
-        _may_try_again(cause)
-            && match (cause) {
-                let failure: root.errors.Failure => self.retry_if(failure),
-                baml.errors.Timeout => true,
-            }
+        _may_try_again(cause) && match (cause) {
+            let failure: root.errors.Failure => (self.retry_if)(failure),
+            baml.errors.Timeout => true,
+        }
     }
 
     implements root.Client {
-        function id(self) -> string {
-            self.inner.id()
+        function requested_model(self) -> string {
+            self.inner.requested_model()
+        }
+
+        function provider(self) -> string {
+            self.inner.provider()
         }
 
         /// Rendering is a pure preview of the inner client. It deliberately
@@ -285,14 +362,8 @@ class Retry {
         }
 
         function invoke(self, input: root.ModelTurnInput) -> root.ModelTurn {
-            let failed: root.events.LLMCall[] = [];
-            let turn = self._attempt(input, self.max_attempts, failed) catch_all (e) {
+            self._attempt(input, self.max_attempts, []) catch_all (e) {
                 _ => throw root.errors.normalize_invoke(e),
-            };
-            if (failed.length() == 0) {
-                turn
-            } else {
-                root.ModelTurn { ...turn, calls: failed.concat(turn.calls) }
             }
         }
     }
@@ -307,15 +378,15 @@ class Retry {
                     let streaming: root.stream.StreamingClient => {
                         retry_attempt(
                             self.max_attempts - remaining + 1,
-                            self.inner.id(),
-                            () -> root.stream.TurnStream {
-                                streaming.invoke_stream(input)
-                            },
+                            self.inner.requested_model(),
+                            () -> root.stream.TurnStream { streaming.invoke_stream(input) },
                             $trace = _attempt_trace(),
                         )
                     },
                     let member: root.Client => {
-                        throw root.errors.StreamingUnsupported { client_id: member.id() }
+                        throw root.errors.StreamingUnsupported {
+                            requested_model: member.requested_model(),
+                        };
                     },
                 }
             };
@@ -324,12 +395,9 @@ class Retry {
                     false
                 } else if (remaining > 1 && self._wants_retry(cause)) {
                     let attempt = self.max_attempts - remaining + 1;
-                    let _ = baml.sys.sleep(
+                    baml.sys.sleep(
                         baml.time.Duration.from_milliseconds(self.backoff.delay_ms(attempt, cause)),
-                    ) catch_all (e) {
-                        let cancelled: baml.panics.Cancelled => throw cancelled,
-                        _ => null,
-                    };
+                    );
                     remaining -= 1;
                     true
                 } else {
@@ -339,18 +407,15 @@ class Retry {
             let relay = StreamRelay {
                 open: open,
                 retry: retry,
+                member: () -> root.Client { self.inner },
                 current: null,
                 emitted: false,
-                pending_text: [],
-                pending_cursor: 0,
-                terminal: [],
-                terminal_cursor: 0,
                 finished: false,
-                calls: [],
+                child_turns: [],
             };
             let stream = root.stream.TurnStream.from_event_source(relay.next_event);
             // one list, two holders: the relay appends, final_turn() reads
-            stream._calls = relay.calls;
+            stream._child_turns = relay.child_turns;
             stream
         }
     }
@@ -373,15 +438,34 @@ class RoundRobin {
                 status_code: null,
                 detail: "RoundRobin needs at least one member",
                 raw_body: null,
-            }
+            };
         }
-        RoundRobin { members: members, counter: 0 }
+        RoundRobin {
+            members: members,
+            counter: 0,
+        }
     }
 
     implements root.Client {
-        function id(self) -> string {
-            if let c: root.Client = self.members.at(0) {
-                c.id()
+        /// The member the next call goes to.
+        function requested_model(self) -> string {
+            if (self.members.length() == 0) {
+                return "round-robin";
+            }
+            if let c: root.Client = self.members.at(self.counter % self.members.length()) {
+                c.requested_model()
+            } else {
+                "round-robin"
+            }
+        }
+
+        /// The member the next call goes to.
+        function provider(self) -> string {
+            if (self.members.length() == 0) {
+                return "round-robin";
+            }
+            if let c: root.Client = self.members.at(self.counter % self.members.length()) {
+                c.provider()
             } else {
                 "round-robin"
             }
@@ -398,7 +482,7 @@ class RoundRobin {
                         status_code: null,
                         detail: "RoundRobin needs at least one member",
                         raw_body: null,
-                    }
+                    };
                 },
             } catch_all (e) {
                 _ => throw root.errors.normalize(e),
@@ -415,19 +499,19 @@ class RoundRobin {
                         status_code: null,
                         detail: "RoundRobin needs at least one member",
                         raw_body: null,
-                    }
+                    };
                 }
                 let index = self.counter % self.members.length();
                 self.counter = self.counter + 1;
                 match (self.members.at(index)) {
-                    let c: root.Client => c.invoke(input),
+                    let c: root.Client => _wrapper_turn([c.invoke(input)]),
                     null => {
                         throw root.errors.InvalidRequest {
                             provider: "roundrobin",
                             status_code: null,
                             detail: "RoundRobin needs at least one member",
                             raw_body: null,
-                        }
+                        };
                     },
                 }
             } catch_all (e) {
@@ -445,14 +529,18 @@ class RoundRobin {
                         status_code: null,
                         detail: "RoundRobin needs at least one member",
                         raw_body: null,
-                    }
+                    };
                 }
                 let index = self.counter % self.members.length();
                 self.counter += 1;
                 match (self.members.at(index)) {
-                    let streaming: root.stream.StreamingClient => streaming.invoke_stream(input),
+                    let streaming: root.stream.StreamingClient => {
+                        _relayed(streaming.invoke_stream(input), streaming)
+                    },
                     let member: root.Client => {
-                        throw root.errors.StreamingUnsupported { client_id: member.id() }
+                        throw root.errors.StreamingUnsupported {
+                            requested_model: member.requested_model(),
+                        };
                     },
                     null => {
                         throw root.errors.InvalidRequest {
@@ -460,7 +548,7 @@ class RoundRobin {
                             status_code: null,
                             detail: "RoundRobin needs at least one member",
                             raw_body: null,
-                        }
+                        };
                     },
                 }
             } catch_all (e) {
@@ -480,33 +568,34 @@ class Fallback {
         self,
         input: root.ModelTurnInput,
         index: int,
-        failed: root.events.LLMCall[],
+        attempts: root.ModelTurn[],
     ) -> root.ModelTurn {
         match (self.members.at(index)) {
             let c: root.Client => {
                 // The try's span ends here, before the next member's.
                 let result: root.ModelTurn | RetryCause = fallback_attempt(
                     index,
-                    c.id(),
-                    () -> root.ModelTurn {
-                        c.invoke(input)
-                    },
+                    c.requested_model(),
+                    () -> root.ModelTurn { c.invoke(input) },
                     $trace = _attempt_trace(),
                 ) catch_all (e) {
                     let cause: Retryable => {
                         if (index + 1 < self.members.length() && _may_try_again(cause)) {
                             RetryCause { cause: cause }
                         } else {
-                            throw e
+                            throw e;
                         }
                     },
                     _ => throw e,
                 };
                 match (result) {
-                    let turn: root.ModelTurn => turn,
+                    let turn: root.ModelTurn => {
+                        attempts.push(turn);
+                        _wrapper_turn(attempts)
+                    },
                     let retry: RetryCause => {
-                        failed.push(_failed_leg_call(c.id(), retry.cause));
-                        self._try(input, index + 1, failed)
+                        attempts.push(_failed_attempt(c, retry.cause));
+                        self._try(input, index + 1, attempts)
                     },
                 }
             },
@@ -516,17 +605,25 @@ class Fallback {
                     status_code: null,
                     detail: "Fallback needs at least one member",
                     raw_body: null,
-                }
+                };
             },
         }
     }
 
     implements root.Client {
-        function id(self) -> string {
+        function requested_model(self) -> string {
             // NOTE: `?.method()` on an interface-typed optional trips a VM bug;
             // if-let is the reliable form.
             if let c: root.Client = self.members.at(0) {
-                c.id()
+                c.requested_model()
+            } else {
+                "fallback"
+            }
+        }
+
+        function provider(self) -> string {
+            if let c: root.Client = self.members.at(0) {
+                c.provider()
             } else {
                 "fallback"
             }
@@ -543,7 +640,7 @@ class Fallback {
                         status_code: null,
                         detail: "Fallback needs at least one member",
                         raw_body: null,
-                    }
+                    };
                 },
             } catch_all (e) {
                 _ => throw root.errors.normalize(e),
@@ -551,14 +648,8 @@ class Fallback {
         }
 
         function invoke(self, input: root.ModelTurnInput) -> root.ModelTurn {
-            let failed: root.events.LLMCall[] = [];
-            let turn = self._try(input, 0, failed) catch_all (e) {
+            self._try(input, 0, []) catch_all (e) {
                 _ => throw root.errors.normalize_invoke(e),
-            };
-            if (failed.length() == 0) {
-                turn
-            } else {
-                root.ModelTurn { ...turn, calls: failed.concat(turn.calls) }
             }
         }
     }
@@ -571,21 +662,21 @@ class Fallback {
                 match (self.members.at(index)) {
                     let streaming: root.stream.StreamingClient => {
                         let member_id = if let member: root.Client = self.members.at(index) {
-                            member.id()
+                            member.requested_model()
                         } else {
                             "fallback"
                         };
                         fallback_attempt(
                             index,
                             member_id,
-                            () -> root.stream.TurnStream {
-                                streaming.invoke_stream(input)
-                            },
+                            () -> root.stream.TurnStream { streaming.invoke_stream(input) },
                             $trace = _attempt_trace(),
                         )
                     },
                     let member: root.Client => {
-                        throw root.errors.StreamingUnsupported { client_id: member.id() }
+                        throw root.errors.StreamingUnsupported {
+                            requested_model: member.requested_model(),
+                        };
                     },
                     null => {
                         throw root.errors.InvalidRequest {
@@ -593,7 +684,7 @@ class Fallback {
                             status_code: null,
                             detail: "Fallback needs at least one member",
                             raw_body: null,
-                        }
+                        };
                     },
                 }
             };
@@ -608,20 +699,41 @@ class Fallback {
             let relay = StreamRelay {
                 open: open,
                 retry: advance,
+                member: () -> root.Client {
+                    match (self.members.at(index)) {
+                        let member: root.Client => member,
+                        // A stream is current only once `open` found its member.
+                        null => baml.sys.panic("a fallback stream relayed without a member"),
+                    }
+                },
                 current: null,
                 emitted: false,
-                pending_text: [],
-                pending_cursor: 0,
-                terminal: [],
-                terminal_cursor: 0,
                 finished: false,
-                calls: [],
+                child_turns: [],
             };
             let stream = root.stream.TurnStream.from_event_source(relay.next_event);
-            stream._calls = relay.calls;
+            stream._child_turns = relay.child_turns;
             stream
         }
     }
+}
+
+/// (internal) `stream`, from `member`, relayed
+/// without retrying, so its turn is a child of the relay's, as a wrapper's
+/// turn has its member's.
+function _relayed(stream: root.stream.TurnStream, member: root.Client) -> root.stream.TurnStream {
+    let relay = StreamRelay {
+        open: () -> root.stream.TurnStream { stream },
+        retry: (cause: Retryable) -> bool { false },
+        member: () -> root.Client { member },
+        current: null,
+        emitted: false,
+        finished: false,
+        child_turns: [],
+    };
+    let relayed = root.stream.TurnStream.from_event_source(relay.next_event);
+    relayed._child_turns = relay.child_turns;
+    relayed
 }
 
 /// Pulls one selected stream through a reliability policy. A typed, safely
@@ -632,20 +744,20 @@ class Fallback {
 class StreamRelay {
     open: () -> root.stream.TurnStream throws root.errors.InvokeError,
     retry: (Retryable) -> bool throws root.errors.InvokeError,
+    // The member whose stream is current; read before `retry` moves past it.
+    member: () -> root.Client throws never,
     current: root.stream.TurnStream?,
+    // Set once a batch has been handed out: from then on nothing may replace
+    // the current stream. Each batch is relayed intact, one TextDelta per
+    // member delta, so a consumer that falls behind still gets its backlog
+    // in one `next()`.
     emitted: bool,
-    // Deltas from the current stream's last batch not yet re-emitted:
-    // next() returns every ready delta at once; next_event relays them
-    // one TextDelta at a time so downstream granularity is preserved.
-    pending_text: string[],
-    pending_cursor: int,
-    terminal: root.stream.Event[],
-    terminal_cursor: int,
     finished: bool,
-    // Wire records, oldest first: failed legs pushed on retry, the selected
-    // member's own calls appended at terminal time. Shared by reference with
-    // the outer TurnStream's _calls so final_turn() surfaces them.
-    calls: root.events.LLMCall[],
+    // Member attempts, oldest first: failed ones pushed on retry, the
+    // winning member's final turn appended at terminal time. Shared by
+    // reference with the outer TurnStream's _child_turns so final_turn()
+    // surfaces them.
+    child_turns: root.ModelTurn[],
 
     function close_current(self) -> void {
         if let stream: root.stream.TurnStream = self.current {
@@ -656,45 +768,33 @@ class StreamRelay {
     function recover(self, error: root.errors.RaisedInClient) -> void {
         match (root.errors.normalize_invoke(error)) {
             let cause: Retryable => {
-                if (!self.emitted && self.retry(cause)) {
-                    self.calls.push(_failed_leg_call(null, cause));
+                let failed = (self.member)();
+                if (!self.emitted && (self.retry)(cause)) {
+                    self.child_turns.push(_failed_attempt(failed, cause));
                     self.close_current();
                     self.current = null;
                 } else {
                     self.close_current();
-                    throw cause
+                    throw cause;
                 }
             },
             let unknown_error: baml.errors.UnknownError => {
                 self.close_current();
-                throw unknown_error
+                throw unknown_error;
             },
             let compilation: reflect.errors.CompilationError => {
                 self.close_current();
-                throw compilation
+                throw compilation;
             },
         }
     }
 
-    function next_event(self) -> root.stream.Event | root.stream.Done {
-        if (self.pending_cursor < self.pending_text.length()) {
-            let text = self.pending_text.at(self.pending_cursor)
-                ?? baml.sys.panic("StreamRelay lost a pending delta");
-            self.pending_cursor += 1;
-            self.emitted = true;
-            return root.stream.TextDelta { text: text };
-        }
-        if (self.terminal_cursor < self.terminal.length()) {
-            let event = self.terminal.at(self.terminal_cursor)
-                ?? baml.sys.panic("StreamRelay lost a terminal event");
-            self.terminal_cursor += 1;
-            return event;
-        }
+    function next_event(self) -> root.stream.Event[] | root.stream.Done {
         if (self.finished) {
             return root.stream.Done {};
         }
         if (self.current == null) {
-            let opened: root.stream.TurnStream | StreamRelayError = self.open() catch_all (e) {
+            let opened: root.stream.TurnStream | StreamRelayError = (self.open)() catch_all (e) {
                 _ => StreamRelayError { error: e },
             };
             if let failed: StreamRelayError = opened {
@@ -710,39 +810,36 @@ class StreamRelay {
             };
             match (next) {
                 let batch: string[] => {
-                    self.emitted = true;
-                    self.pending_text = batch;
-                    self.pending_cursor = 1;
-                    root.stream.TextDelta {
-                        text: batch.at(0) ?? baml.sys.panic("StreamRelay received an empty batch"),
+                    // `TurnStream.next()` never returns an empty batch, and
+                    // one would wrongly mark the relay as emitted.
+                    if (batch.length() == 0) {
+                        baml.sys.panic("StreamRelay received an empty batch");
                     }
+                    self.emitted = true;
+                    batch.map((text: string) -> root.stream.Event {
+                        root.stream.TextDelta { text: text }
+                    })
                 },
                 let done: root.stream.Done => {
-                    let final: root.ModelTurn | StreamRelayError = stream.final_turn() catch_all (e) {
-                        _ => StreamRelayError { error: e },
-                    };
+                    let final: root.ModelTurn | StreamRelayError = stream
+                        .final_turn() catch_all (e) {
+                            _ => StreamRelayError { error: e },
+                        };
                     if let failed: StreamRelayError = final {
                         self.recover(failed.error);
                         return self.next_event();
                     } else if let turn: root.ModelTurn = final {
                         self.finished = true;
-                        for (let call in turn.calls) {
-                            self.calls.push(call);
-                        }
-                        self.terminal
-                            = [
-                                root.stream.TurnMeta {
-                                    stop_reason: turn.stop_reason,
-                                    input_tokens: turn.usage?.input_tokens,
-                                    output_tokens: turn.usage?.output_tokens,
-                                    cached_input_tokens: turn.usage?.cached_input_tokens,
-                                    cache_write_input_tokens: turn.usage?.cache_write_input_tokens,
-                                    uncached_input_tokens: turn.usage?.uncached_input_tokens,
-                                    reasoning_tokens: turn.usage?.reasoning_tokens,
-                                },
-                                root.stream.TurnDone {},
-                            ];
-                        return self.next_event();
+                        self.child_turns.push(turn);
+                        let terminal: root.stream.Event[] = [
+                            // The member's usage is on its turn's calls.
+                            root.stream.TurnMeta {
+                                stop_reason: turn.stop_reason,
+                                usage: null,
+                            },
+                            root.stream.TurnDone {},
+                        ];
+                        return terminal;
                     }
                     done
                 },

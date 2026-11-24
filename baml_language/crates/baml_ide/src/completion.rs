@@ -666,8 +666,8 @@ function f() -> int throws never {
             "`?.` reads a member of the non-null payload"
         );
 
-        // And the plain dot does NOT: an optional has no members of its own,
-        // which is exactly the diagnostic the reader needs to see.
+        // The plain dot offers structural methods on the optional itself,
+        // not the non-null payload's string methods.
         let plain = CursorTest::new(
             r#"function f(a: string?) -> int throws never {
     a.<[CURSOR]
@@ -675,7 +675,69 @@ function f() -> int throws never {
 }
 "#,
         );
-        assert!(complete(&plain).is_empty());
+        let items = complete(&plain);
+        assert_eq!(
+            labels(&items),
+            vec!["eq", "hash", "neq", "to_json", "to_string"]
+        );
+        assert!(items.iter().all(|item| item.kind == CompletionKind::Method));
+    }
+
+    #[test]
+    fn tuple_dot_offers_slots_with_their_types() {
+        let test = CursorTest::new("function f(t: (int, string)) -> int { t.<[CURSOR] }\n");
+        let items = complete(&test);
+        for (label, detail) in [("0", "int"), ("1", "string")] {
+            let item = items
+                .iter()
+                .find(|item| item.label == label)
+                .expect("tuple slot offered");
+            assert_eq!(item.detail.as_deref(), Some(detail));
+        }
+        assert!(!labels(&items).contains(&"2"));
+    }
+
+    #[test]
+    fn tuple_union_offers_no_slots() {
+        let test = CursorTest::new(
+            "function f(t: (int, string) | (float, string)) -> int { t.<[CURSOR] }\n",
+        );
+        let items = complete(&test);
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.label.chars().all(|c| c.is_ascii_digit()))
+        );
+    }
+
+    #[test]
+    fn optional_tuple_offers_payload_slots() {
+        let test = CursorTest::new("function f(t: (int, string)?) -> int { t?.<[CURSOR] }\n");
+        let items = complete(&test);
+        assert!(["0", "1"].iter().all(|slot| labels(&items).contains(slot)));
+    }
+
+    #[test]
+    fn chained_tuple_completion_offers_slots() {
+        for source in [
+            "function f(t: ((int, string), bool)) -> int { t.0.<[CURSOR] }\n",
+            "function f(t: ((int, string), bool)) -> int { t.0.1<[CURSOR] }\n",
+            "function f(t: ((int, string)?, bool)) -> int { t.0?.<[CURSOR] }\n",
+        ] {
+            let test = CursorTest::new(source);
+            let items = complete(&test);
+            for (label, detail) in [("0", "int"), ("1", "string")] {
+                let item = items
+                    .iter()
+                    .find(|item| item.label == label)
+                    .unwrap_or_else(|| {
+                        panic!("missing slot {label} in {source}: {:?}", labels(&items))
+                    });
+                assert_eq!(item.detail.as_deref(), Some(detail));
+                let fragment = &test.cursor.file.text(&test.db)[item.source_range];
+                assert!(fragment.is_empty() || fragment == "1", "{fragment}");
+            }
+        }
     }
 
     #[test]
@@ -761,13 +823,58 @@ function f() -> int {
 "#,
         );
         let items = complete(&test);
-        assert_eq!(labels(&items), vec!["Active", "Done"]);
-        assert!(
-            items
-                .iter()
-                .all(|item| item.kind == CompletionKind::EnumVariant),
-            "a variant completes as a variant, not a field"
+        assert_eq!(
+            labels(&items),
+            vec![
+                "Active",
+                "Done",
+                "eq",
+                "from_json",
+                "hash",
+                "neq",
+                "to_json",
+                "to_string",
+                "type",
+            ]
         );
+        for item in &items {
+            assert_eq!(
+                item.kind,
+                match item.label.as_str() {
+                    "Active" | "Done" => CompletionKind::EnumVariant,
+                    _ => CompletionKind::Method,
+                },
+                "variants and structural methods retain their own completion kinds"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_completion_requires_compatible_equality() {
+        let structural = CursorTest::new(
+            r#"class Key { id int }
+function f(value: Key) -> void {
+    value.<[CURSOR]
+}
+"#,
+        );
+        assert!(labels(&complete(&structural)).contains(&"hash"));
+
+        let custom_equals = CursorTest::new(
+            r#"class Key {
+    id int
+    implements baml.ops.Equals {
+        function eq(self, other: Self) -> bool throws never { self.id == other.id }
+    }
+}
+function f(value: Key) -> void {
+    value.<[CURSOR]
+}
+"#,
+        );
+        let items = complete(&custom_equals);
+        assert!(!labels(&items).contains(&"hash"));
+        assert!(labels(&items).contains(&"to_string"));
     }
 
     #[test]
@@ -1172,12 +1279,13 @@ function f() -> int throws <[CURSOR]
             "interface",
             "type",
             "test",
-            "let",
+            "const",
         ] {
             assert!(labels.contains(&keyword), "missing `{keyword}`: {labels:?}");
         }
-        // Expression keywords and names do not open a declaration.
-        for absent in ["return", "await", "Later"] {
+        // Expression keywords and names do not open a declaration, and a
+        // global is declared with `const`, never `let`.
+        for absent in ["return", "await", "Later", "let"] {
             assert!(
                 !labels.contains(&absent),
                 "`{absent}` is not an item: {labels:?}"
@@ -1196,6 +1304,11 @@ function f() -> int throws <[CURSOR]
         assert_eq!(
             test_item.insert,
             CompletionInsert::Snippet("test \"${1:name}\" {\n\t$0\n}".to_string())
+        );
+        let global = items.iter().find(|item| item.label == "const").unwrap();
+        assert_eq!(
+            global.insert,
+            CompletionInsert::Snippet("const ${1:name} = $0;".to_string())
         );
     }
 
@@ -1243,6 +1356,10 @@ function f() -> int throws <[CURSOR]
             "skip",
             "stream.done",
             "stream.must_exist",
+            "json.rename",
+            "json.flatten",
+            "json.fallback",
+            "trace.redact",
         ] {
             assert!(labels.contains(&name), "missing `{name}`: {labels:?}");
         }
@@ -1261,11 +1378,17 @@ function f() -> int throws <[CURSOR]
         let cases: [(&str, &[&str]); 6] = [
             (
                 "enum E {\n    A @<[CURSOR]\n}\n",
-                &["alias", "description", "skip"],
+                &["alias", "description", "json.rename", "skip"],
             ),
             (
                 "class C {\n    x: int\n    @@<[CURSOR]\n}\n",
-                &["alias", "description", "stream.done"],
+                &[
+                    "alias",
+                    "description",
+                    "json.omit_nulls",
+                    "stream.done",
+                    "trace.redact",
+                ],
             ),
             (
                 "enum E {\n    A\n    @@<[CURSOR]\n}\n",
@@ -1314,7 +1437,7 @@ function f() -> int throws <[CURSOR]
     fn the_stdlibs_internal_members_are_not_offered() {
         let test = CursorTest::new(
             r#"function f() -> int throws never {
-    let t = reflect.Type.of<int>();
+    let t = int.type();
     t.<[CURSOR]
     0
 }
@@ -1335,7 +1458,7 @@ function f() -> int throws <[CURSOR]
     fn a_typed_underscore_asks_for_the_internals() {
         let test = CursorTest::new(
             r#"function f() -> int throws never {
-    let t = reflect.Type.of<int>();
+    let t = int.type();
     t._<[CURSOR]
     0
 }

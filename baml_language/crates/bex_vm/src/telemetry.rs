@@ -11,7 +11,6 @@
 )]
 
 use std::{
-    collections::HashMap,
     mem::size_of,
     sync::{
         Arc,
@@ -55,18 +54,30 @@ impl PartialEq for ThreadSpawnContext {
 use btel_settings::policy::{
     AI_DEFAULT_MODE, BYTECODE_DEFAULT_MODE, CALL_PATH_CACHE_SLOTS, NATIVE_DEFAULT_MODE,
 };
-// The resolver below uses the measured single-entry fast path.
-const _: () = assert!(CALL_PATH_CACHE_SLOTS == 1);
+// `CallPathCache` indexes its entries with the top bits of a hash.
+const _: () = assert!(CALL_PATH_CACHE_SLOTS.is_power_of_two());
 // Native instrumentation is unsupported; changing this requires a producer implementation.
 const _: () = assert!(matches!(NATIVE_DEFAULT_MODE, InvocationMode::Hidden));
 
 const SPAN: u8 = 1 << 0;
-const INHERITED_CAPTURE_OUTPUT: u8 = 1 << 1;
-const INHERITED_CAPTURE_ERROR: u8 = 1 << 2;
+const POLICY_CAPTURE_OUTPUT: u8 = 1 << 1;
+const POLICY_CAPTURE_ERROR: u8 = 1 << 2;
 const REENTRY: u8 = 1 << 3;
 const REQUIRES_ANNOUNCEMENT: u8 = 1 << 4;
+/// The span does not record the error it ends with by default: the call
+/// asked for no error capture (`error = false`, as `trace.empty_span` does).
+const ERROR_DECLINED: u8 = 1 << 5;
+/// The frame's function object is its own call-path identity: a plain
+/// function entered by an exact call. Its outgoing calls name it as their
+/// caller without reading the object. See `FrameTelemetry::own_identity`.
+const OWN_IDENTITY: u8 = 1 << 6;
 
 static LAST_CALL_PATH_ID: AtomicU32 = AtomicU32::new(0);
+
+/// How many invocation timings a thread buffers before it hands them to the
+/// runtime in one batch (`TelemetryState::buffer_timing`).
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+const PENDING_TIMING_RECORDS: usize = 64;
 
 fn allocate_call_path_id(last: &AtomicU32) -> CallPathId {
     // Exhaustion stays terminal even if a caller catches the panic. A wrapping
@@ -88,6 +99,82 @@ struct CallPathKey {
     edge: CallPathEdge,
 }
 
+/// Entries in `CallPathCache::callees`: a power of two, since a path's
+/// slot is the low bits of its id. A thread's recursion only ever asks for
+/// the paths on its stack, so this needs fewer entries than the key table.
+const CALL_PATH_CALLEE_SLOTS: usize = 32;
+const _: () = assert!(CALL_PATH_CALLEE_SLOTS.is_power_of_two());
+
+/// A direct-mapped cache in front of `call_paths` and `call_path_keys`. A
+/// call resolves its key with one probe, however many call sites are hot;
+/// two keys that share a slot evict each other and fall back to the map.
+/// Every entry repeats a map entry, so dropping any of them changes no
+/// call-path id, only how fast it is found. The entries hold heap pointers
+/// that a collection may move or free, so `visit_roots` clears them.
+struct CallPathCache {
+    by_key: [Option<(CallPathKey, CallPathId)>; CALL_PATH_CACHE_SLOTS],
+    /// Each path's callee, by path id, for the recursion check.
+    callees: [Option<(CallPathId, HeapPtr)>; CALL_PATH_CALLEE_SLOTS],
+}
+
+impl CallPathCache {
+    const EMPTY: Self = Self {
+        by_key: [None; CALL_PATH_CACHE_SLOTS],
+        callees: [None; CALL_PATH_CALLEE_SLOTS],
+    };
+
+    /// The `by_key` slot of `key`: a multiplicative (Fibonacci) hash of the
+    /// sum of the callee, the call site and the parent path, whose top bits
+    /// pick the slot. A sum keeps evenly spaced keys (consecutive path ids,
+    /// functions allocated one after another) evenly spaced, which this hash
+    /// spreads over distinct slots. The other two fields rarely tell hot keys
+    /// apart; the full key is compared.
+    #[inline(always)]
+    fn key_slot(key: &CallPathKey) -> usize {
+        const BITS: u32 = CALL_PATH_CACHE_SLOTS.trailing_zeros();
+        let callee = key.callee.as_ptr().addr() as u64 >> 3;
+        let hash = callee
+            .wrapping_add(u64::from(key.parent.get()).wrapping_mul(0x2545_F491))
+            .wrapping_add(u64::from(key.caller_pc) << 20)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // The shift leaves `BITS` bits, so the cast loses nothing, and the
+        // slot is in bounds.
+        #[allow(clippy::cast_possible_truncation, reason = "keeps the top BITS bits")]
+        let slot = hash.checked_shr(64 - BITS).unwrap_or(0) as usize;
+        slot
+    }
+
+    #[inline(always)]
+    fn callee_slot(id: CallPathId) -> usize {
+        id.get() as usize & (CALL_PATH_CALLEE_SLOTS - 1)
+    }
+
+    #[inline(always)]
+    fn get(&self, key: &CallPathKey) -> Option<CallPathId> {
+        match self.by_key[Self::key_slot(key)] {
+            Some((cached, id)) if cached == *key => Some(id),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn callee(&self, id: CallPathId) -> Option<HeapPtr> {
+        match self.callees[Self::callee_slot(id)] {
+            Some((cached, callee)) if cached == id => Some(callee),
+            _ => None,
+        }
+    }
+
+    fn insert(&mut self, key: CallPathKey, id: CallPathId) {
+        self.by_key[Self::key_slot(&key)] = Some((key, id));
+        self.insert_callee(id, key.callee);
+    }
+
+    fn insert_callee(&mut self, id: CallPathId, callee: HeapPtr) {
+        self.callees[Self::callee_slot(id)] = Some((id, callee));
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FrameTelemetry {
@@ -97,9 +184,12 @@ pub struct FrameTelemetry {
     pub await_duration: AwaitDuration,
     pub saved_call_path: CallPathId,
     flags: u8,
-    // Keep call-site overrides distinct from inherited requests latched at entry.
-    output_override: Option<bool>,
-    error_override: Option<bool>,
+    // Requests are local to this invocation. False adds no request; policy
+    // requests latched at entry (and later updates) cannot be vetoed here.
+    // A false error request also declines a span's default error capture
+    // (`ERROR_DECLINED`).
+    output_request: bool,
+    error_request: bool,
 }
 
 const _: () = assert!(size_of::<FrameTelemetry>() == btel_settings::layout::FRAME_TELEMETRY_BYTES);
@@ -151,6 +241,30 @@ impl FrameTelemetry {
         self.flags & REENTRY != 0
     }
 
+    /// A span records the error it ends with by default
+    /// (`btel_settings::policy::SPAN_CAPTURE_ERROR`), unless its call declined
+    /// error capture. A timing invocation has no such default.
+    #[inline(always)]
+    const fn records_error_by_default(self) -> bool {
+        btel_settings::policy::SPAN_CAPTURE_ERROR && self.flags & (SPAN | ERROR_DECLINED) == SPAN
+    }
+
+    /// Whether the frame's function pointer is its call-path identity, as
+    /// `BexVm::callable_function_identity` would resolve it. Set only where
+    /// the frame was entered with a function object that carries a telemetry
+    /// id; frames never change their function object.
+    #[inline(always)]
+    pub(crate) const fn own_identity(self) -> bool {
+        self.flags & OWN_IDENTITY != 0
+    }
+
+    /// Mark the frame as running a function object that is its own
+    /// identity (see [`Self::own_identity`]).
+    #[inline(always)]
+    pub(crate) const fn set_own_identity(&mut self) {
+        self.flags |= OWN_IDENTITY;
+    }
+
     #[inline(always)]
     pub fn add_await(&mut self, elapsed: ClockDuration) {
         self.await_duration = self.await_duration.saturating_add(elapsed);
@@ -159,6 +273,9 @@ impl FrameTelemetry {
 
 pub use btel_records::{LogLevel, SpanRecord, TimingRecord};
 
+mod definitions;
+mod host;
+pub(crate) mod manual;
 mod snapshot;
 type VmSpanRecord = SpanRecord<btel_snapshot::Snapshot, btel_snapshot::Snapshot>;
 const _: () = assert!(size_of::<TimingRecord>() <= btel_settings::layout::TIMING_RECORD_MAX_BYTES);
@@ -179,41 +296,165 @@ pub struct ThreadTelemetry {
     running: bool,
     completed: bool,
     name: Option<btel_records::ThreadName>,
+    /// The error that escaped the thread's outermost frame, until the thread's
+    /// completion, which is written with it.
+    error: Option<btel_snapshot::Snapshot>,
 }
 
 pub struct TelemetryState {
     context: btel_types::context::Context,
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
-    context_snapshot: Option<(btel_types::context::Context, btel_snapshot::SnapshotId)>,
+    context_snapshot: Option<(btel_types::context::Context, btel_snapshot::CasId)>,
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     pending_context_snapshot: Option<btel_snapshot::Snapshot>,
     capture_scratch: snapshot::Scratch,
+    /// While the VM unwinds an error: whether a span has recorded it yet.
+    /// Only the innermost span the error escapes records it by default; the
+    /// spans it unwinds through after that record only that they failed.
+    /// One error's context holds the whole stack trace, so recording it at
+    /// every frame of a deep unwind would cost the square of its depth.
+    unwind_recorded: Option<bool>,
     #[cfg(target_arch = "wasm32")]
     snapshots: btel_snapshot::SnapshotPool,
     auto_level: AutoTelemetryLevel,
     thread: ThreadTelemetry,
     call_paths: FxHashMap<CallPathKey, CallPathId>,
     call_path_keys: FxHashMap<CallPathId, CallPathKey>,
-    last_call_path: [Option<(CallPathKey, CallPathId)>; CALL_PATH_CACHE_SLOTS],
+    /// Allocated by the first lookup of a path the thread already resolved,
+    /// so a thread that resolves each of its paths once (a spawned body that
+    /// makes no call) allocates nothing.
+    call_path_cache: Option<Box<CallPathCache>>,
     policies: Arc<TelemetryPolicies>,
     clock: Arc<ClockEpoch>,
     #[cfg(not(target_arch = "wasm32"))]
     runtime: Arc<btel_processor::TelemetryRuntime>,
     /// Exception-path bookkeeping, allocated by the first recorded raise.
     errors: Option<Box<ErrorBook>>,
+    /// Model usage charged to open spans (or the thread), one entry per model,
+    /// written just before the node completes. Empty without model calls.
+    usage: Vec<(TelemetryId, Vec<btel_records::ModelUsage>)>,
+    /// Invocation timings not yet handed to the runtime: they go over in
+    /// batches, so a call does not look up this thread's producer for each
+    /// one. Empty outside an execution scope; see [`Self::flush_timing`].
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    pending_timing: Vec<TimingRecord>,
     #[cfg(test)]
     timing_records: Vec<TimingRecord>,
     #[cfg(test)]
     span_records: Vec<VmSpanRecord>,
+    #[cfg(test)]
+    pub(crate) span_contexts: Vec<btel_types::context::Context>,
 }
 
 impl TelemetryState {
+    pub(crate) fn entry_settings(
+        &self,
+        function: &Function,
+        config: TraceConfig,
+    ) -> bex_vm_types::trace::TraceOptionsData {
+        let mut options = ordinary_settings(function, config);
+        if config.mode.is_none() && config.reserved_id.is_none() {
+            let policy_id = function.telemetry_policy_id.load();
+            options.mode = Some(if policy_id == btel_types::TelemetryPolicyId::NONE {
+                match self.auto_level {
+                    AutoTelemetryLevel::Low => InvocationMode::Hidden,
+                    AutoTelemetryLevel::Medium => {
+                        default_mode(function, self.policy_by_id(policy_id))
+                    }
+                    AutoTelemetryLevel::High => InvocationMode::Span,
+                }
+            } else {
+                default_mode(function, self.policy_by_id(policy_id))
+            });
+        }
+        options
+    }
+    /// Whether `context` is the version already selected: a frame that
+    /// inherits its caller's context unchanged need not reselect it.
+    #[inline(always)]
+    pub(crate) fn has_context(&self, context: &btel_types::context::Context) -> bool {
+        context.same_version(&self.context)
+    }
+
+    pub(crate) fn operation_options(
+        &self,
+        function: &Function,
+        config: TraceConfig,
+    ) -> manual::OperationOptions {
+        let policy = self.policy_by_id(function.telemetry_policy_id.load());
+        let is_ai = matches!(function.body_meta.as_ref(), Some(FunctionMeta::Llm));
+        manual::OperationOptions {
+            mode: config
+                .reserved_id
+                .map(|_| InvocationMode::Span)
+                .or(config.mode)
+                .or(self.entry_settings(function, config).mode)
+                .unwrap_or(InvocationMode::Hidden),
+            reserved_id: config.reserved_id,
+            inputs: config.inputs == Some(true)
+                || policy.capture_inputs
+                || (is_ai && btel_settings::policy::AI_CAPTURE_INPUTS),
+            output: config.output == Some(true)
+                || policy.capture_output
+                || (is_ai && btel_settings::policy::AI_CAPTURE_OUTPUT),
+            error: config.error == Some(true)
+                || policy.capture_error
+                || (is_ai && btel_settings::policy::AI_CAPTURE_ERROR),
+            error_declined: config.error == Some(false),
+            errors_withheld: !self.records_errors(),
+            policy,
+            live_policy: function.telemetry_function_id.map(|function_id| {
+                self.policies
+                    .watch_owned(function_id, &function.telemetry_policy_id)
+            }),
+        }
+    }
+
+    /// [`Self::set_context`] to `context`, cloning it only when it is not
+    /// the version already selected: calls and returns reselect the
+    /// context their frame inherited, which is almost always unchanged.
+    #[inline]
+    pub fn select_context(&mut self, context: &btel_types::context::Context) {
+        if !self.has_context(context) {
+            self.set_context(context.clone());
+        }
+    }
+
     pub fn set_context(&mut self, context: btel_types::context::Context) {
         #[cfg(all(not(test), not(target_arch = "wasm32")))]
         if !context.same_version(&self.context) {
             self.pending_context_snapshot = None;
         }
         self.context = context;
+    }
+
+    /// The current context as a context-observation record names it, and the
+    /// snapshot the record must carry when no earlier record delivered it.
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    pub(crate) fn context_reference(
+        &mut self,
+    ) -> (
+        btel_records::ContextReference,
+        Option<btel_snapshot::Snapshot>,
+    ) {
+        use btel_records::ContextReference;
+
+        if self.context.is_empty() {
+            return (ContextReference::Empty, None);
+        }
+        if let Some((context, id)) = &self.context_snapshot
+            && context.same_version(&self.context)
+        {
+            return (ContextReference::Snapshot(*id), None);
+        }
+        self.prepare_context();
+        match self.pending_context_snapshot.take() {
+            Some(captured) => (
+                ContextReference::Snapshot(captured.root_id()),
+                Some(captured),
+            ),
+            None => (ContextReference::Unavailable, None),
+        }
     }
 
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
@@ -228,8 +469,11 @@ impl TelemetryState {
             return;
         }
         if let Some(builder) = self.runtime.acquire_snapshot() {
-            self.pending_context_snapshot =
-                btel_snapshot::context::capture_with_builder(&self.context, builder);
+            self.pending_context_snapshot = btel_snapshot::context::capture_with_builder(
+                &self.context,
+                builder,
+                self.capture_scratch.shaper(),
+            );
         }
     }
 
@@ -248,11 +492,12 @@ impl TelemetryState {
             #[cfg(all(not(test), not(target_arch = "wasm32")))]
             pending_context_snapshot: None,
             capture_scratch: snapshot::Scratch::default(),
+            unwind_recorded: None,
+            // Every capture is consumed as it is written, so at most two are
+            // alive at once: the pool needs no budget, and `capture` can
+            // rely on admission never being refused.
             #[cfg(target_arch = "wasm32")]
-            snapshots: btel_snapshot::SnapshotPool::new(
-                btel_settings::snapshot::MIN_SNAPSHOT_SLOTS,
-                btel_snapshot::Limits::default(),
-            ),
+            snapshots: btel_snapshot::SnapshotPool::unbounded(btel_snapshot::Limits::default()),
             auto_level: policies.auto_level(),
             thread: ThreadTelemetry {
                 active_id: id,
@@ -265,19 +510,25 @@ impl TelemetryState {
                 running: false,
                 completed: false,
                 name: None,
+                error: None,
             },
             call_paths: FxHashMap::default(),
             call_path_keys: FxHashMap::default(),
-            last_call_path: [None; CALL_PATH_CACHE_SLOTS],
+            call_path_cache: None,
             policies,
             clock,
             #[cfg(not(target_arch = "wasm32"))]
             runtime,
             errors: None,
+            usage: Vec::new(),
+            #[cfg(all(not(test), not(target_arch = "wasm32")))]
+            pending_timing: Vec::new(),
             #[cfg(test)]
             timing_records: Vec::new(),
             #[cfg(test)]
             span_records: Vec::new(),
+            #[cfg(test)]
+            span_contexts: Vec::new(),
         }
     }
 
@@ -286,13 +537,13 @@ impl TelemetryState {
     /// left out rather than given an invented key; nothing is recorded when
     /// no slot has one.
     #[cold]
-    fn capture_type_args(
+    pub(crate) fn capture_type_args(
         &mut self,
         function: &Function,
         type_args: CallTypeArgs<'_>,
     ) -> Option<btel_snapshot::Snapshot> {
-        let mut named: Vec<(&str, &bex_vm_types::RealizedTy)> =
-            Vec::with_capacity(function.type_param_names.len());
+        let mut named: smallvec::SmallVec<[(&str, &bex_vm_types::RealizedTy); 4]> =
+            smallvec::SmallVec::with_capacity(function.type_param_names.len());
         for (name, ty) in function.type_param_names.iter().zip(type_args.iter()) {
             // A frame can bind a name twice (a lambda inside a block that
             // rebinds it); the later slot is the one its body sees.
@@ -346,6 +597,13 @@ impl TelemetryState {
     pub fn set_thread_name(&mut self, name: &str) {
         assert!(!self.thread.started, "telemetry thread already started");
         self.thread.name = Some(Arc::new(Box::from(name)));
+    }
+
+    /// Name a root future after its entry unless something already named it.
+    pub fn name_root_thread(&mut self, name: &str) {
+        if self.is_root_thread() && !self.thread.started && self.thread.name.is_none() {
+            self.set_thread_name(name);
+        }
     }
 
     /// A spawned future's body starts running now, after waiting to be
@@ -505,7 +763,9 @@ impl TelemetryState {
 
     /// End an open request's span. An errored one captures its error; where
     /// the error's text quotes one of `raw_urls` (the URLs the request went
-    /// to, as sent), the capture has the sanitized URL instead.
+    /// to, as sent), the capture has the sanitized URL instead. Without
+    /// bodies it captures only the outcome: an error can quote the response
+    /// body, as a failed `send_sse`'s does.
     ///
     /// # Safety
     /// `error` and its reachable objects must remain live under the heap permit.
@@ -518,6 +778,7 @@ impl TelemetryState {
         raw_urls: &[&str],
     ) {
         self.start_thread();
+        let error = error.filter(|_| self.policies.http_bodies());
         let error = error.and_then(|error| {
             let mut rewrites: Vec<_> = raw_urls
                 .iter()
@@ -535,6 +796,36 @@ impl TelemetryState {
                 completed_at: at,
                 outcome,
                 error,
+            },
+        )));
+    }
+
+    /// Record a native reader's terminal outcome using only owned metadata.
+    pub fn complete_network_io(
+        &mut self,
+        span: TelemetryId,
+        at: ClockInstant,
+        error: Option<&sys_types::network::NetworkError>,
+    ) {
+        self.start_thread();
+        let captured = error
+            .filter(|_| self.policies.http_bodies())
+            .and_then(|error| {
+                self.capture(snapshot::Input::Network(&network::NetworkPayload::Error {
+                    message: &error.message,
+                    timeout: error.timeout,
+                }))
+            });
+        self.write_span(SpanRecord::NetworkSpanCompletion(Box::new(
+            btel_records::NetworkCompletion {
+                span,
+                completed_at: at,
+                outcome: if error.is_some() {
+                    InvocationOutcome::Errored
+                } else {
+                    InvocationOutcome::Ok
+                },
+                error: captured,
             },
         )));
     }
@@ -607,6 +898,19 @@ impl TelemetryState {
         }
     }
 
+    /// Whether an untraced call of `function` may record an invocation at
+    /// this level: what [`Self::enter_bytecode_with_trace`] decides before it
+    /// reads any caller fact. A frame record checks this before it boxes the
+    /// call's arguments and reads its caller's identity and pc.
+    #[inline]
+    pub(crate) fn may_record(&self, function: &Function) -> bool {
+        function.telemetry_function_id.is_some()
+            && matches!(function.kind, FunctionKind::Bytecode)
+            && !function.trace_passthrough
+            && (self.auto_level != AutoTelemetryLevel::Low
+                || function.telemetry_policy_id.load() != btel_types::TelemetryPolicyId::NONE)
+    }
+
     #[inline(always)]
     #[allow(
         clippy::too_many_arguments,
@@ -633,6 +937,10 @@ impl TelemetryState {
             return None;
         }
 
+        if function.trace_passthrough {
+            return None;
+        }
+
         let mode_override = trace.and_then(|config| {
             config
                 .reserved_id
@@ -644,9 +952,7 @@ impl TelemetryState {
             if self.auto_level == AutoTelemetryLevel::Low {
                 return None;
             }
-            if self.auto_level == AutoTelemetryLevel::Medium
-                && !matches!(function.body_meta.as_ref(), Some(FunctionMeta::Llm { .. }))
-            {
+            if self.auto_level == AutoTelemetryLevel::Medium && function.body_meta.is_none() {
                 return Some(self.enter_timing(
                     callee,
                     visible_caller,
@@ -670,14 +976,11 @@ impl TelemetryState {
             return None;
         }
 
-        let is_ai = matches!(function.body_meta.as_ref(), Some(FunctionMeta::Llm { .. }));
+        let is_ai = matches!(function.body_meta.as_ref(), Some(FunctionMeta::Llm));
         let saved_call_path = self.thread.active_call_path;
         let reentry = caller_is_observed
             && visible_caller == Some(callee)
-            && self
-                .call_path_keys
-                .get(&saved_call_path)
-                .is_some_and(|key| key.callee == callee);
+            && self.call_path_callee(saved_call_path) == Some(callee);
         let call_path = if reentry {
             saved_call_path
         } else {
@@ -697,25 +1000,29 @@ impl TelemetryState {
         let mut flags = if reentry { REENTRY } else { 0 };
         if mode == InvocationMode::Span {
             flags |= SPAN;
+            if trace.and_then(|config| config.error) == Some(false) {
+                flags |= ERROR_DECLINED;
+            }
         }
-        let capture_inputs = trace.and_then(|config| config.inputs).unwrap_or(
-            policy.capture_inputs || (is_ai && btel_settings::policy::AI_CAPTURE_INPUTS),
-        );
+        let capture_inputs = trace.and_then(|config| config.inputs) == Some(true)
+            || policy.capture_inputs
+            || (is_ai && btel_settings::policy::AI_CAPTURE_INPUTS);
         if policy.capture_output || (is_ai && btel_settings::policy::AI_CAPTURE_OUTPUT) {
-            flags |= INHERITED_CAPTURE_OUTPUT;
+            flags |= POLICY_CAPTURE_OUTPUT;
         }
         if policy.capture_error || (is_ai && btel_settings::policy::AI_CAPTURE_ERROR) {
-            flags |= INHERITED_CAPTURE_ERROR;
+            flags |= POLICY_CAPTURE_ERROR;
         }
 
         let captured_inputs = (mode == InvocationMode::Span && capture_inputs)
             .then(|| self.capture(snapshot::Input::FunctionArgs(args)))
             .flatten();
-        // Types are not user data: a span records them whether or not it
-        // captures its arguments.
-        let captured_type_args = (mode == InvocationMode::Span && !type_args.is_empty())
-            .then(|| self.capture_type_args(function, type_args))
-            .flatten();
+        // Type arguments are inputs too: a span that doesn't capture its
+        // arguments builds no snapshot of them either.
+        let captured_type_args =
+            (mode == InvocationMode::Span && capture_inputs && !type_args.is_empty())
+                .then(|| self.capture_type_args(function, type_args))
+                .flatten();
         if captured_inputs.is_some() || captured_type_args.is_some() {
             flags |= REQUIRES_ANNOUNCEMENT;
         }
@@ -750,8 +1057,8 @@ impl TelemetryState {
             await_duration: AwaitDuration::ZERO,
             saved_call_path,
             flags,
-            output_override: trace.and_then(|config| config.output),
-            error_override: trace.and_then(|config| config.error),
+            output_request: trace.and_then(|config| config.output) == Some(true),
+            error_request: trace.and_then(|config| config.error) == Some(true),
         })
     }
 
@@ -768,10 +1075,7 @@ impl TelemetryState {
         let saved_call_path = self.thread.active_call_path;
         let reentry = caller_is_observed
             && visible_caller == Some(callee)
-            && self
-                .call_path_keys
-                .get(&saved_call_path)
-                .is_some_and(|key| key.callee == callee);
+            && self.call_path_callee(saved_call_path) == Some(callee);
         let call_path = if reentry {
             saved_call_path
         } else {
@@ -796,8 +1100,48 @@ impl TelemetryState {
             await_duration: AwaitDuration::ZERO,
             saved_call_path,
             flags,
-            output_override: trace.and_then(|config| config.output),
-            error_override: trace.and_then(|config| config.error),
+            output_request: trace.and_then(|config| config.output) == Some(true),
+            error_request: trace.and_then(|config| config.error) == Some(true),
+        }
+    }
+
+    /// Whether any span may record the error it ends with. An engine that keeps
+    /// HTTP bodies out of its recordings (`http_bodies = false` in
+    /// `baml.toml`) records no error value, requested or not, since an error
+    /// can quote a response body: the setting overrides the program's trace
+    /// options and function policies.
+    pub(crate) fn records_errors(&self) -> bool {
+        self.policies.http_bodies()
+    }
+
+    /// Mark the start of an unwind: until [`Self::end_unwind`], only the
+    /// first span that records the error records it by default. Returns the
+    /// enclosing unwind's state, which `end_unwind` restores.
+    pub fn begin_unwind(&mut self) -> Option<bool> {
+        self.unwind_recorded.replace(false)
+    }
+
+    pub fn end_unwind(&mut self, enclosing: Option<bool>) {
+        self.unwind_recorded = enclosing;
+    }
+
+    /// Whether this frame records the error it ends with by default: it is a
+    /// span that did not decline it, and no span closer to the throw has
+    /// recorded it during this unwind.
+    fn records_error_by_default(&self, telemetry: &FrameTelemetry) -> bool {
+        telemetry.records_error_by_default() && self.unwind_recorded != Some(true)
+    }
+
+    /// Note that a span recorded the error being unwound.
+    fn recorded_unwound_error(&mut self, outcome: InvocationOutcome, captured: bool) {
+        if captured
+            && matches!(
+                outcome,
+                InvocationOutcome::Errored | InvocationOutcome::Panicked
+            )
+            && let Some(recorded) = &mut self.unwind_recorded
+        {
+            *recorded = true;
         }
     }
 
@@ -806,14 +1150,17 @@ impl TelemetryState {
     /// capture is on. Lets the unwinder build the error's context only when
     /// some frame can record it.
     pub fn wants_error_capture(&self, telemetry: &FrameTelemetry, function: &Function) -> bool {
+        if !self.records_errors() {
+            return false;
+        }
         let policy_id = function.telemetry_policy_id.load();
         if !telemetry.is_span() && policy_id == btel_types::TelemetryPolicyId::NONE {
             return false;
         }
-        telemetry.error_override.unwrap_or(
-            telemetry.flags & INHERITED_CAPTURE_ERROR != 0
-                || self.policy_by_id(policy_id).capture_error,
-        )
+        self.records_error_by_default(telemetry)
+            || telemetry.error_request
+            || telemetry.flags & POLICY_CAPTURE_ERROR != 0
+            || self.policy_by_id(policy_id).capture_error
     }
 
     #[inline(always)]
@@ -849,7 +1196,7 @@ impl TelemetryState {
         let call_path = self.thread.active_call_path;
         let policy_id = function.telemetry_policy_id.load();
         if !telemetry.is_span() && policy_id == btel_types::TelemetryPolicyId::NONE {
-            self.write_timing(TimingRecord::FunctionTimingCompletion {
+            self.buffer_timing(TimingRecord::FunctionTimingCompletion {
                 call_path,
                 entered_at: telemetry.entered_at,
                 exited_at,
@@ -865,18 +1212,21 @@ impl TelemetryState {
         let policy = self.policy_by_id(policy_id);
         let capture_value = match outcome {
             InvocationOutcome::Ok
-                if telemetry.output_override.unwrap_or(
-                    telemetry.flags & INHERITED_CAPTURE_OUTPUT != 0 || policy.capture_output,
-                ) =>
+                if telemetry.output_request
+                    || telemetry.flags & POLICY_CAPTURE_OUTPUT != 0
+                    || policy.capture_output =>
             {
                 value
             }
-            InvocationOutcome::Errored
-            | InvocationOutcome::Cancelled
-            | InvocationOutcome::Panicked
-                if telemetry.error_override.unwrap_or(
-                    telemetry.flags & INHERITED_CAPTURE_ERROR != 0 || policy.capture_error,
-                ) =>
+            // A cancellation is not a failure of the span's own code, and an
+            // exit or a cancel unwinds every frame with the same value: a
+            // cancelled span records only its outcome.
+            InvocationOutcome::Errored | InvocationOutcome::Panicked
+                if self.records_errors()
+                    && (telemetry.error_request
+                        || telemetry.flags & POLICY_CAPTURE_ERROR != 0
+                        || policy.capture_error
+                        || self.records_error_by_default(&telemetry)) =>
             {
                 value
             }
@@ -886,7 +1236,9 @@ impl TelemetryState {
         if telemetry.is_span() {
             let captured_value =
                 capture_value.and_then(|value| self.capture(snapshot::Input::Value(value)));
+            self.recorded_unwound_error(outcome, captured_value.is_some());
             let id = telemetry.span_id().expect("span frame owns its identity");
+            self.flush_model_usage(id);
             match (
                 outcome,
                 telemetry.is_reentry(),
@@ -1073,6 +1425,7 @@ impl TelemetryState {
         } else if policy::promotes(policy, elapsed, outcome, self.clock.domain()) {
             let captured_value =
                 capture_value.and_then(|value| self.capture(snapshot::Input::Value(value)));
+            self.recorded_unwound_error(outcome, captured_value.is_some());
             match (outcome, telemetry.is_reentry()) {
                 (InvocationOutcome::Ok, false) => {
                     self.write_span(SpanRecord::LateFunctionSpanCompletionOk {
@@ -1164,7 +1517,7 @@ impl TelemetryState {
                 }
             }
         } else {
-            self.write_timing(TimingRecord::FunctionTimingCompletion {
+            self.buffer_timing(TimingRecord::FunctionTimingCompletion {
                 call_path,
                 entered_at: telemetry.entered_at,
                 exited_at,
@@ -1176,17 +1529,92 @@ impl TelemetryState {
         self.thread.active_call_path = telemetry.saved_call_path;
     }
 
+    /// Charge model usage to the innermost span, or the thread when none is
+    /// open. Entries for one provider's model are summed.
+    #[cold]
+    pub fn charge_model_usage(&mut self, entries: Vec<btel_records::ModelUsage>) {
+        let node = self.thread.active_id;
+        let index = match self.usage.iter().position(|(id, _)| *id == node) {
+            Some(index) => index,
+            None => {
+                self.usage.push((node, Vec::new()));
+                self.usage.len() - 1
+            }
+        };
+        merge_usage(&mut self.usage[index].1, entries);
+    }
+
+    /// Remove and return the usage charged to `node`, for a node whose
+    /// completion this thread does not write (an owned span).
+    pub(crate) fn take_model_usage(
+        &mut self,
+        node: TelemetryId,
+    ) -> Option<Vec<btel_records::ModelUsage>> {
+        let index = self.usage.iter().position(|(id, _)| *id == node)?;
+        Some(self.usage.swap_remove(index).1)
+    }
+
+    /// Write the usage charged to `node`, just before its completion.
+    fn flush_model_usage(&mut self, node: TelemetryId) {
+        if self.usage.is_empty() {
+            return;
+        }
+        if let Some(index) = self.usage.iter().position(|(id, _)| *id == node) {
+            let (_, entries) = self.usage.swap_remove(index);
+            self.write_span(SpanRecord::SpanUsage(Box::new(btel_records::SpanUsage {
+                node,
+                entries,
+            })));
+        }
+    }
+
+    /// Capture `error`, the value that escaped the thread's outermost frame,
+    /// for the thread's completion. The last one wins: a host can resume a
+    /// thread after an unhandled throw, and only the throw that ends it counts.
+    ///
+    /// # Safety
+    /// `error` and its reachable objects must remain live under the heap permit.
+    pub unsafe fn record_thread_error(&mut self, error: Value) {
+        // Without HTTP bodies no error is recorded: it can quote a response
+        // body, as a failed `send_sse`'s does.
+        self.thread.error = if self.records_errors() {
+            self.capture(snapshot::Input::Value(error))
+        } else {
+            None
+        };
+    }
+
     pub fn complete_thread(&mut self, outcome: InvocationOutcome) {
         if self.thread.completed {
             return;
         }
         self.start_thread();
+        self.complete_thread_at(outcome, self.clock.read());
+    }
+
+    fn complete_thread_at(&mut self, outcome: InvocationOutcome, completed_at: ClockInstant) {
+        if self.thread.completed {
+            return;
+        }
+        self.start_thread();
         self.thread.completed = true;
-        let completed_at = self.clock.read();
         if self.is_waiting() {
             // Cancelled before it ran: it starts and ends at the same instant.
             self.thread.running = true;
             self.write_span(SpanRecord::ThreadSpanRunning { at: completed_at });
+        }
+        self.flush_model_usage(self.thread.id);
+        // A thread that ended otherwise than with the error captured for it,
+        // returning after a host resumed it or cancelled, says nothing of it.
+        let error = self.thread.error.take();
+        if matches!(
+            outcome,
+            InvocationOutcome::Errored | InvocationOutcome::Panicked
+        ) && error.is_some()
+        {
+            self.write_span(SpanRecord::ThreadSpanError {
+                captured_error: error,
+            });
         }
         self.write_span(SpanRecord::ThreadSpanCompletion {
             id: self.thread.id,
@@ -1230,7 +1658,46 @@ impl TelemetryState {
         if !matches!(function.kind, FunctionKind::Bytecode) {
             return Err("native telemetry policies are immutable");
         }
-        self.policies.publish(&function.telemetry_policy_id, policy)
+        self.policies.publish_for_function(
+            function
+                .telemetry_function_id
+                .expect("checked function identity"),
+            &function.telemetry_policy_id,
+            policy,
+        )
+    }
+
+    /// The callee of the call path `id`, as `call_path_keys` records it.
+    /// A recursive call asks this of the path it is already on, which the
+    /// cache usually holds: the map is read only after an eviction or a
+    /// collection.
+    #[inline(always)]
+    fn call_path_callee(&mut self, id: CallPathId) -> Option<HeapPtr> {
+        if let Some(callee) = self
+            .call_path_cache
+            .as_deref()
+            .and_then(|cache| cache.callee(id))
+        {
+            debug_assert_eq!(
+                self.call_path_keys.get(&id).map(|key| key.callee),
+                Some(callee)
+            );
+            return Some(callee);
+        }
+        self.call_path_callee_slow(id)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn call_path_callee_slow(&mut self, id: CallPathId) -> Option<HeapPtr> {
+        let callee = self.call_path_keys.get(&id)?.callee;
+        self.call_path_cache_mut().insert_callee(id, callee);
+        Some(callee)
+    }
+
+    fn call_path_cache_mut(&mut self) -> &mut CallPathCache {
+        self.call_path_cache
+            .get_or_insert_with(|| Box::new(CallPathCache::EMPTY))
     }
 
     #[inline(always)]
@@ -1239,9 +1706,12 @@ impl TelemetryState {
         key: CallPathKey,
         register: impl FnOnce(Option<HeapPtr>, HeapPtr) -> (Option<FunctionId>, FunctionId),
     ) -> CallPathId {
-        if let Some((cached_key, id)) = self.last_call_path[0]
-            && cached_key == key
+        if let Some(id) = self
+            .call_path_cache
+            .as_deref()
+            .and_then(|cache| cache.get(&key))
         {
+            debug_assert_eq!(self.call_paths.get(&key), Some(&id));
             return id;
         }
         self.resolve_call_path_slow(key, register)
@@ -1256,7 +1726,7 @@ impl TelemetryState {
     ) -> CallPathId {
         if let Some(id) = self.call_paths.get(&key) {
             let id = *id;
-            self.last_call_path[0] = Some((key, id));
+            self.call_path_cache_mut().insert(key, id);
             return id;
         }
         // Registration precedes publishing any definition that references it.
@@ -1265,7 +1735,11 @@ impl TelemetryState {
         let id = allocate_call_path_id(&LAST_CALL_PATH_ID);
         self.call_paths.insert(key, id);
         self.call_path_keys.insert(id, key);
-        self.last_call_path[0] = Some((key, id));
+        // A new path allocates no cache: a spawned body that makes no call
+        // resolves only its own path, once. The first repeat lookup does.
+        if let Some(cache) = &mut self.call_path_cache {
+            cache.insert(key, id);
+        }
         self.write_span(SpanRecord::CallPathDefined {
             call_path: id,
             parent_call_path: key.parent,
@@ -1376,10 +1850,56 @@ impl TelemetryState {
         let _ = (self, record);
     }
 
+    /// [`Self::write_timing`] for an invocation's completion, which the VM
+    /// writes on every observed return. The record waits in this state until
+    /// a batch fills or [`Self::flush_timing`] runs, so it must be written
+    /// inside an execution scope that flushes before it ends. Out of line:
+    /// completions are inlined into the dispatch loop, and code added there
+    /// shifts its register allocation.
+    #[inline(never)]
+    fn buffer_timing(&mut self, record: TimingRecord) {
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        {
+            if self.pending_timing.len() >= PENDING_TIMING_RECORDS {
+                self.flush_full_timing_batch();
+            }
+            self.pending_timing.push(record);
+        }
+        #[cfg(any(test, target_arch = "wasm32"))]
+        self.write_timing(record);
+    }
+
+    /// Hand the buffered invocation timings to the runtime. Call inside the
+    /// execution scope they were written in, before it ends: records still
+    /// buffered when the scope releases its producer are delivered only by
+    /// the next scope's flush.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(test, expect(clippy::unused_self, reason = "tests record unbuffered"))]
+    #[inline]
+    pub(crate) fn flush_timing(&mut self) {
+        #[cfg(not(test))]
+        if !self.pending_timing.is_empty() {
+            self.flush_full_timing_batch();
+        }
+    }
+
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    #[cold]
+    #[inline(never)]
+    fn flush_full_timing_batch(&mut self) {
+        self.runtime
+            .write_timing_batch(self.thread.id, &mut self.pending_timing);
+    }
+
     #[inline(always)]
     fn write_span(&mut self, record: VmSpanRecord) {
         #[cfg(test)]
-        self.span_records.push(record);
+        {
+            if record.is_context_observation() {
+                self.span_contexts.push(self.context.clone());
+            }
+            self.span_records.push(record);
+        }
         #[cfg(all(not(test), not(target_arch = "wasm32")))]
         {
             use btel_records::ContextReference;
@@ -1388,23 +1908,7 @@ impl TelemetryState {
                 self.runtime.write_span(self.thread.id, record);
                 return;
             }
-            let mut snapshot = None;
-            let reference = if self.context.is_empty() {
-                ContextReference::Empty
-            } else if let Some((context, id)) = &self.context_snapshot
-                && context.same_version(&self.context)
-            {
-                ContextReference::Snapshot(*id)
-            } else {
-                self.prepare_context();
-                if let Some(captured) = self.pending_context_snapshot.take() {
-                    let id = captured.id();
-                    snapshot = Some(captured);
-                    ContextReference::Snapshot(id)
-                } else {
-                    ContextReference::Unavailable
-                }
-            };
+            let (reference, snapshot) = self.context_reference();
             if self
                 .runtime
                 .write_span_with_context(self.thread.id, reference, snapshot, record)
@@ -1429,48 +1933,140 @@ impl TelemetryState {
     pub(crate) fn span_records(&self) -> &[VmSpanRecord] {
         &self.span_records
     }
+}
 
-    pub(crate) fn collect_roots(&self, roots: &mut Vec<HeapPtr>) {
-        for key in self.call_paths.keys() {
-            roots.extend(key.visible_caller);
-            roots.push(key.callee);
+impl ::bex_vm_types::RootHaver for TelemetryState {
+    fn visit_roots(&mut self, visitor: &mut dyn ::bex_vm_types::RootVisitor) {
+        let Self {
+            context: _,
+            #[cfg(all(not(test), not(target_arch = "wasm32")))]
+                context_snapshot: _,
+            #[cfg(all(not(test), not(target_arch = "wasm32")))]
+                pending_context_snapshot: _,
+            // Holds heap addresses only during a capture, which never spans a
+            // collection.
+            capture_scratch: _,
+            unwind_recorded: _,
+            #[cfg(target_arch = "wasm32")]
+                snapshots: _,
+            auto_level: _,
+            thread: _,
+            call_paths,
+            call_path_keys,
+            call_path_cache,
+            policies: _,
+            clock: _,
+            #[cfg(not(target_arch = "wasm32"))]
+                runtime: _,
+            errors: _,
+            usage: _,
+            #[cfg(all(not(test), not(target_arch = "wasm32")))]
+                pending_timing: _,
+            #[cfg(test)]
+                timing_records: _,
+            #[cfg(test)]
+                span_records: _,
+            #[cfg(test)]
+                span_contexts: _,
+        } = self;
+        // The cache is keyed by pointers the collection may move or free, and
+        // repeats the map, so it is emptied rather than forwarded.
+        if let Some(cache) = call_path_cache {
+            **cache = CallPathCache::EMPTY;
+        }
+        // The pointers are part of the map's keys, so it is rebuilt through
+        // the visitor.
+        let old_paths = std::mem::take(call_paths);
+        call_path_keys.clear();
+        if crate::hotswap::any_queued() {
+            // A call path only needs its functions to tell paths apart, so once
+            // a swap exists it must not keep them alive: every replaced swap
+            // would stay in memory for the life of the VM.
+            for (mut key, id) in old_paths {
+                if key.visit_weak(visitor) {
+                    call_paths.insert(key, id);
+                    call_path_keys.insert(id, key);
+                }
+            }
+            return;
+        }
+        for (mut key, id) in old_paths {
+            key.visit_roots(visitor);
+            call_paths.insert(key, id);
+            call_path_keys.insert(id, key);
         }
     }
+}
 
-    pub(crate) fn forward_roots(&mut self, roots: &HashMap<HeapPtr, HeapPtr>) {
-        let old_paths = std::mem::take(&mut self.call_paths);
-        self.call_path_keys.clear();
-        for (mut key, id) in old_paths {
-            if let Some(caller) = key.visible_caller {
-                key.visible_caller = Some(roots.get(&caller).copied().unwrap_or(caller));
-            }
-            key.callee = roots.get(&key.callee).copied().unwrap_or(key.callee);
-            self.call_paths.insert(key, id);
-            self.call_path_keys.insert(id, key);
-        }
-        self.last_call_path[0] = self.last_call_path[0].map(|(mut key, id)| {
-            if let Some(caller) = key.visible_caller {
-                key.visible_caller = Some(roots.get(&caller).copied().unwrap_or(caller));
-            }
-            key.callee = roots.get(&key.callee).copied().unwrap_or(key.callee);
-            (key, id)
-        });
+impl CallPathKey {
+    /// Repoint both functions without keeping them alive. `false` once either
+    /// is gone, and the key must then be dropped.
+    fn visit_weak(&mut self, visitor: &mut dyn ::bex_vm_types::RootVisitor) -> bool {
+        let caller_live = self
+            .visible_caller
+            .as_mut()
+            .is_none_or(|caller| visitor.visit_weak(caller));
+        visitor.visit_weak(&mut self.callee) && caller_live
+    }
+}
+
+impl ::bex_vm_types::RootHaver for CallPathKey {
+    fn visit_roots(&mut self, visitor: &mut dyn ::bex_vm_types::RootVisitor) {
+        let Self {
+            parent: _,
+            visible_caller,
+            caller_pc: _,
+            callee,
+            edge: _,
+        } = self;
+        visible_caller.visit_roots(visitor);
+        callee.visit_roots(visitor);
     }
 }
 
 #[inline(always)]
 fn default_mode(function: &Function, policy: TelemetryPolicy) -> InvocationMode {
     match function.kind {
-        FunctionKind::Native(_) | FunctionKind::SysOp(_) | FunctionKind::NativeUnresolved => {
+        FunctionKind::Native(..) | FunctionKind::SysOp(_) | FunctionKind::NativeUnresolved => {
             NATIVE_DEFAULT_MODE
         }
         FunctionKind::Bytecode if policy.span_from_entry => InvocationMode::Span,
-        FunctionKind::Bytecode
-            if matches!(function.body_meta.as_ref(), Some(FunctionMeta::Llm { .. })) =>
-        {
-            AI_DEFAULT_MODE
-        }
+        FunctionKind::Bytecode if function.body_meta.is_some() => AI_DEFAULT_MODE,
         FunctionKind::Bytecode => BYTECODE_DEFAULT_MODE,
+    }
+}
+
+pub(crate) fn ordinary_settings(
+    function: &Function,
+    config: TraceConfig,
+) -> bex_vm_types::trace::TraceOptionsData {
+    let ai = matches!(function.body_meta.as_ref(), Some(FunctionMeta::Llm));
+    bex_vm_types::trace::TraceOptionsData {
+        mode: Some(if config.reserved_id.is_some() {
+            InvocationMode::Span
+        } else {
+            config.mode.unwrap_or(if function.body_meta.is_some() {
+                AI_DEFAULT_MODE
+            } else {
+                BYTECODE_DEFAULT_MODE
+            })
+        }),
+        inputs: Some(
+            config
+                .inputs
+                .unwrap_or(ai && btel_settings::policy::AI_CAPTURE_INPUTS),
+        ),
+        output: Some(
+            config
+                .output
+                .unwrap_or(ai && btel_settings::policy::AI_CAPTURE_OUTPUT),
+        ),
+        error: Some(
+            config
+                .error
+                .unwrap_or(ai && btel_settings::policy::AI_CAPTURE_ERROR),
+        ),
+        context: None,
     }
 }
 
@@ -1494,8 +2090,39 @@ pub(crate) fn test_runtime() -> Arc<btel_processor::TelemetryRuntime> {
     Arc::clone(RUNTIME.get_or_init(|| btel_processor::TelemetryRuntime::new().unwrap()))
 }
 
+/// Add `entries` into `charged`, summing the entries for one provider's model.
+pub(crate) fn merge_usage(
+    charged: &mut Vec<btel_records::ModelUsage>,
+    entries: Vec<btel_records::ModelUsage>,
+) {
+    for entry in entries {
+        match charged
+            .iter_mut()
+            .find(|known| known.provider == entry.provider && known.model == entry.model)
+        {
+            Some(known) => add_usage(known, &entry),
+            None => charged.push(entry),
+        }
+    }
+}
+
+/// Sum `added` into `into`. A count stays `None` only when both are.
+fn add_usage(into: &mut btel_records::ModelUsage, added: &btel_records::ModelUsage) {
+    let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    };
+    into.calls = into.calls.saturating_add(added.calls);
+    into.input_tokens = sum(into.input_tokens, added.input_tokens);
+    into.output_tokens = sum(into.output_tokens, added.output_tokens);
+    into.cache_read_tokens = sum(into.cache_read_tokens, added.cache_read_tokens);
+    into.cache_write_tokens = sum(into.cache_write_tokens, added.cache_write_tokens);
+    into.reasoning_tokens = sum(into.reasoning_tokens, added.reasoning_tokens);
+}
+
 #[cfg(test)]
 mod tests {
+    use bex_vm_types::RootHaverExt;
     fn test_clock() -> std::sync::Arc<btel_clock::ClockEpoch> {
         btel_clock::ClockRuntime::new(btel_clock::ClockMode::Monotonic).start_run()
     }
@@ -1529,6 +2156,67 @@ mod tests {
                 CallTypeArgs::default(),
                 |_, _| (None, function.telemetry_function_id.unwrap()),
             )
+        }
+    }
+
+    #[test]
+    fn only_the_innermost_span_records_an_unwound_error_by_default() {
+        // (inner's error option, outer's): what each records.
+        for (inner, outer, expected) in [
+            (None, None, (true, false)),
+            // A request still records at every span.
+            (None, Some(true), (true, true)),
+            // A span that declines leaves the default to the next one out.
+            (Some(false), None, (false, true)),
+        ] {
+            let function = function(FunctionKind::Bytecode, None);
+            let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
+            state.start_thread();
+            let span = |error| {
+                Some(TraceConfig {
+                    mode: Some(InvocationMode::Span),
+                    error,
+                    ..TraceConfig::default()
+                })
+            };
+            let outer_frame = trace_entry(&mut state, &function, span(outer)).unwrap();
+            let inner_frame = trace_entry(&mut state, &function, span(inner)).unwrap();
+            let enclosing = state.begin_unwind();
+            for frame in [inner_frame, outer_frame] {
+                unsafe {
+                    state.complete_invocation(
+                        frame,
+                        &function,
+                        InvocationOutcome::Errored,
+                        Some(Value::int(9)),
+                    );
+                }
+            }
+            state.end_unwind(enclosing);
+            let recorded: Vec<bool> = state
+                .span_records()
+                .iter()
+                .filter_map(SpanRecord::completion)
+                .map(|done| done.captured_value.is_some())
+                .collect();
+            assert_eq!(recorded, [expected.0, expected.1], "{inner:?}/{outer:?}");
+            // Outside an unwind, every failed span records its error.
+            let frame = trace_entry(&mut state, &function, span(None)).unwrap();
+            unsafe {
+                state.complete_invocation(
+                    frame,
+                    &function,
+                    InvocationOutcome::Errored,
+                    Some(Value::int(9)),
+                );
+            }
+            let last = state
+                .span_records()
+                .iter()
+                .rev()
+                .find_map(SpanRecord::completion)
+                .unwrap();
+            assert!(last.captured_value.is_some());
         }
     }
 
@@ -1657,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn invocation_capture_overrides_policy_and_records_real_snapshots() {
+    fn invocation_capture_requests_combine_with_policy_and_record_real_snapshots() {
         for [capture_inputs, capture_output, capture_error] in [
             [false, false, false],
             [true, false, false],
@@ -1676,6 +2364,7 @@ mod tests {
                 for outcome in [
                     InvocationOutcome::Ok,
                     InvocationOutcome::Errored,
+                    InvocationOutcome::Panicked,
                     InvocationOutcome::Cancelled,
                 ] {
                     let function = function(FunctionKind::Bytecode, None);
@@ -1704,15 +2393,23 @@ mod tests {
                     )
                     .unwrap();
                     let id = frame.span_id().unwrap();
+                    // A span records the error it ends with unless the call
+                    // declined it; a policy request still captures.
+                    let records_failure = error != Some(false) || capture_error;
+                    assert_eq!(
+                        state.wants_error_capture(&frame, &function),
+                        records_failure,
+                        "the unwinder builds an error context only for a frame that records it",
+                    );
                     unsafe {
                         state.complete_invocation(frame, &function, outcome, Some(Value::int(9)));
                     }
-                    let expected_inputs = inputs.unwrap_or(capture_inputs);
+                    let expected_inputs = inputs == Some(true) || capture_inputs;
                     let expected_value = match outcome {
-                        InvocationOutcome::Ok => output.unwrap_or(capture_output),
-                        InvocationOutcome::Errored
-                        | InvocationOutcome::Cancelled
-                        | InvocationOutcome::Panicked => error.unwrap_or(capture_error),
+                        InvocationOutcome::Ok => output == Some(true) || capture_output,
+                        InvocationOutcome::Errored | InvocationOutcome::Panicked => records_failure,
+                        // A cancelled span records only its outcome.
+                        InvocationOutcome::Cancelled => false,
                     };
                     let inputs = state
                         .span_records()
@@ -1736,44 +2433,10 @@ mod tests {
                     let output = state
                         .span_records()
                         .iter()
-                        .find_map(|record| match record {
-                            SpanRecord::FunctionSpanCompletionOk {
-                                id: record_id,
-                                captured_value,
-                                ..
-                            }
-                            | SpanRecord::FunctionSpanCompletionOkNeedsAnnouncement {
-                                id: record_id,
-                                captured_value,
-                                ..
-                            } if *record_id == id && outcome == InvocationOutcome::Ok => {
-                                Some(captured_value)
-                            }
-                            SpanRecord::FunctionSpanCompletionErrored {
-                                id: record_id,
-                                captured_value,
-                                ..
-                            }
-                            | SpanRecord::FunctionSpanCompletionErroredNeedsAnnouncement {
-                                id: record_id,
-                                captured_value,
-                                ..
-                            } if *record_id == id && outcome == InvocationOutcome::Errored => {
-                                Some(captured_value)
-                            }
-                            SpanRecord::FunctionSpanCompletionCancelled {
-                                id: record_id,
-                                captured_value,
-                                ..
-                            }
-                            | SpanRecord::FunctionSpanCompletionCancelledNeedsAnnouncement {
-                                id: record_id,
-                                captured_value,
-                                ..
-                            } if *record_id == id && outcome == InvocationOutcome::Cancelled => {
-                                Some(captured_value)
-                            }
-                            _ => None,
+                        .find_map(|record| {
+                            let done = record.completion()?;
+                            (done.id == id && done.outcome == outcome)
+                                .then_some(done.captured_value)
                         })
                         .unwrap();
                     assert_eq!(output.is_some(), expected_value);
@@ -1792,13 +2455,141 @@ mod tests {
                         }),
                     )
                     .unwrap();
-                    assert_eq!(next.flags & INHERITED_CAPTURE_OUTPUT != 0, capture_output);
-                    assert_eq!(next.flags & INHERITED_CAPTURE_ERROR != 0, capture_error);
+                    assert_eq!(next.flags & POLICY_CAPTURE_OUTPUT != 0, capture_output);
+                    assert_eq!(next.flags & POLICY_CAPTURE_ERROR != 0, capture_error);
                     unsafe {
                         state.complete_invocation(next, &function, InvocationOutcome::Ok, None);
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_span_records_the_error_it_ends_with_and_a_timing_invocation_records_none() {
+        // No capture is requested by the call or by a policy. A call that
+        // passes `error = false`, as `trace.empty_span` does, declines the
+        // default.
+        for error in [None, Some(false)] {
+            let declined = error == Some(false);
+            for (outcome, captured) in [
+                (InvocationOutcome::Ok, false),
+                (InvocationOutcome::Errored, !declined),
+                (InvocationOutcome::Panicked, !declined),
+                (InvocationOutcome::Cancelled, false),
+            ] {
+                let function = function(FunctionKind::Bytecode, None);
+                let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
+                let frame = trace_entry(
+                    &mut state,
+                    &function,
+                    Some(TraceConfig {
+                        mode: Some(InvocationMode::Span),
+                        error,
+                        ..TraceConfig::default()
+                    }),
+                )
+                .unwrap();
+                assert!(frame.is_span());
+                assert_eq!(state.wants_error_capture(&frame, &function), !declined);
+                unsafe {
+                    state.complete_invocation(frame, &function, outcome, Some(Value::int(9)));
+                }
+                let done = state
+                    .span_records()
+                    .iter()
+                    .find_map(SpanRecord::completion)
+                    .unwrap();
+                assert_eq!(done.outcome, outcome);
+                assert_eq!(
+                    done.captured_value.is_some(),
+                    captured,
+                    "{error:?}/{outcome:?}"
+                );
+                if let Some(value) = done.captured_value {
+                    assert!(matches!(
+                        value.roots()[0],
+                        btel_snapshot::SnapshotValue::Int(9)
+                    ));
+                }
+            }
+        }
+        // An engine that keeps HTTP bodies out of its recordings records no
+        // error, since an error can quote a response body: neither a requested
+        // capture nor a function policy brings it back.
+        for (error, capture_error) in [(None, false), (Some(true), false), (Some(true), true)] {
+            let function = function(FunctionKind::Bytecode, None);
+            let mut state = test_state(
+                Arc::new(TelemetryPolicies::new().with_http_bodies(false)),
+                test_clock(),
+            );
+            state
+                .set_policy(
+                    &function,
+                    TelemetryPolicy {
+                        capture_error,
+                        ..TelemetryPolicy::NONE
+                    },
+                )
+                .unwrap();
+            let captured = false;
+            let frame = trace_entry(
+                &mut state,
+                &function,
+                Some(TraceConfig {
+                    mode: Some(InvocationMode::Span),
+                    error,
+                    ..TraceConfig::default()
+                }),
+            )
+            .unwrap();
+            assert_eq!(state.wants_error_capture(&frame, &function), captured);
+            unsafe {
+                state.complete_invocation(
+                    frame,
+                    &function,
+                    InvocationOutcome::Errored,
+                    Some(Value::int(9)),
+                );
+            }
+            let done = state
+                .span_records()
+                .iter()
+                .find_map(SpanRecord::completion)
+                .unwrap();
+            assert_eq!(
+                done.captured_value.is_some(),
+                captured,
+                "{error:?}/{capture_error}"
+            );
+        }
+        // A timing-only invocation has no span to carry a value, so the
+        // unwinder builds no error context for it.
+        for outcome in [InvocationOutcome::Errored, InvocationOutcome::Panicked] {
+            let function = function(FunctionKind::Bytecode, None);
+            let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
+            let frame = trace_entry(
+                &mut state,
+                &function,
+                Some(TraceConfig {
+                    mode: Some(InvocationMode::Timing),
+                    ..TraceConfig::default()
+                }),
+            )
+            .unwrap();
+            assert!(!frame.is_span());
+            assert!(!state.wants_error_capture(&frame, &function));
+            unsafe {
+                state.complete_invocation(frame, &function, outcome, Some(Value::int(9)));
+            }
+            assert!(state.span_records().iter().all(|record| {
+                record.completion().is_none() && record.captures().next().is_none()
+            }));
+            assert!(state.timing_records().iter().any(|record| matches!(
+                record,
+                TimingRecord::FunctionTimingCompletion { outcome: recorded, .. }
+                    if *recorded == outcome
+            )));
         }
     }
 
@@ -1889,17 +2680,18 @@ mod tests {
 
         let mut roots = Vec::new();
         state.collect_roots(&mut roots);
+        let gc_heap = std::sync::Arc::clone(&vm.heap);
         // SAFETY: the test has exclusive heap access and supplies every live
         // cache pointer. No bytecode is running and no frames/captures exist.
-        let (_, _, forwarding) = unsafe {
-            vm.heap
-                .collect_garbage_generational(&roots, bex_heap::CollectionLevel::Major)
-        };
-        state.forward_roots(&forwarding);
+        let (_, _, forwarding) = unsafe { gc_heap.collect_garbage(&roots) };
+        state.forward_roots(&mut ::bex_vm_types::ForwardRoots::new(
+            &forwarding,
+            &*vm.heap,
+        ));
         assert_eq!(definitions(&state), before);
         let moved = CallPathKey {
-            visible_caller: Some(forwarding[&caller]),
-            callee: forwarding[&callee],
+            visible_caller: Some(forwarding.get(caller).unwrap()),
+            callee: forwarding.get(callee).unwrap(),
             ..key
         };
         assert_eq!(
@@ -1912,16 +2704,17 @@ mod tests {
         // Definitions must not keep executable objects alive or need forwarding.
         state.call_paths.clear();
         state.call_path_keys.clear();
-        state.last_call_path[0] = None;
+        state.call_path_cache = None;
         roots.clear();
         state.collect_roots(&mut roots);
         assert!(roots.is_empty());
+        let gc_heap = std::sync::Arc::clone(&vm.heap);
         // SAFETY: as above; the test has discarded all live heap references.
-        let (stats, _, forwarding) = unsafe {
-            vm.heap
-                .collect_garbage_generational(&roots, bex_heap::CollectionLevel::Major)
-        };
-        state.forward_roots(&forwarding);
+        let (stats, _, forwarding) = unsafe { gc_heap.collect_garbage(&roots) };
+        state.forward_roots(&mut ::bex_vm_types::ForwardRoots::new(
+            &forwarding,
+            &*vm.heap,
+        ));
         assert_eq!(stats.live_count, 0);
         assert!(vm.heap.function_metadata(vm.proof(), caller_id).is_none());
         assert!(vm.heap.function_metadata(vm.proof(), callee_id).is_none());
@@ -1929,14 +2722,109 @@ mod tests {
     }
 
     #[test]
+    fn call_path_cache_keeps_several_hot_keys_and_empties_at_collection() {
+        let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
+        let callee_id = function(FunctionKind::Bytecode, None)
+            .telemetry_function_id
+            .unwrap();
+        let key = |caller_pc| CallPathKey {
+            parent: CallPathId::ROOT,
+            visible_caller: None,
+            caller_pc,
+            callee: HeapPtr::null(),
+            edge: CallPathEdge::Synchronous,
+        };
+        // Up to eight call sites with slots of their own, and two others that
+        // share a slot. One slot stays free for that pair, so the search ends
+        // whatever the cache's size.
+        let hot_count = 8.min(CALL_PATH_CACHE_SLOTS - 1);
+        let mut slots = std::collections::HashMap::new();
+        let mut hot = Vec::new();
+        let mut shared = None;
+        for caller_pc in 0.. {
+            let key = key(caller_pc);
+            let slot = CallPathCache::key_slot(&key);
+            if hot.len() < hot_count {
+                if slots.insert(slot, None).is_none() {
+                    hot.push(key);
+                }
+            } else if let Some(entry) = slots.get_mut(&slot) {
+                if let Some(other) = *entry {
+                    shared = Some([other, key]);
+                    break;
+                }
+            } else {
+                slots.insert(slot, Some(key));
+            }
+        }
+        let [first, second] = shared.unwrap();
+        let ids = hot
+            .iter()
+            .map(|key| state.resolve_call_path(*key, |_, _| (None, callee_id)))
+            .collect::<Vec<_>>();
+        let first_id = state.resolve_call_path(first, |_, _| (None, callee_id));
+        let second_id = state.resolve_call_path(second, |_, _| (None, callee_id));
+        let defined = |state: &TelemetryState| {
+            state
+                .span_records()
+                .iter()
+                .filter(|record| matches!(record, SpanRecord::CallPathDefined { .. }))
+                .count()
+        };
+        assert_eq!(defined(&state), hot_count + 2);
+        // Paths resolved once allocate no cache; the first repeat does.
+        assert!(state.call_path_cache.is_none());
+        for (key, id) in hot.iter().zip(&ids) {
+            assert_eq!(
+                state.resolve_call_path(*key, |_, _| panic!("known key registered")),
+                *id
+            );
+        }
+
+        let cached = |state: &TelemetryState, key: &CallPathKey| {
+            state
+                .call_path_cache
+                .as_deref()
+                .and_then(|cache| cache.get(key))
+        };
+        for _ in 0..3 {
+            for (key, id) in hot.iter().zip(&ids) {
+                assert_eq!(cached(&state, key), Some(*id));
+                assert_eq!(
+                    state.resolve_call_path(*key, |_, _| panic!("hot key registered")),
+                    *id
+                );
+                assert_eq!(state.call_path_callee(*id), Some(HeapPtr::null()));
+            }
+            // Keys that share a slot evict each other, and keep their ids.
+            for (key, id) in [(first, first_id), (second, second_id)] {
+                assert_eq!(
+                    state.resolve_call_path(key, |_, _| panic!("evicted key registered")),
+                    id
+                );
+            }
+            assert_eq!(cached(&state, &first), None);
+            assert_eq!(cached(&state, &second), Some(second_id));
+        }
+
+        // A collection empties the cache; the map still has every path.
+        let mut roots = Vec::new();
+        state.collect_roots(&mut roots);
+        assert!(hot.iter().all(|key| cached(&state, key).is_none()));
+        for (key, id) in hot.iter().zip(&ids) {
+            assert_eq!(
+                state.resolve_call_path(*key, |_, _| panic!("collected key registered")),
+                *id
+            );
+            assert_eq!(cached(&state, key), Some(*id));
+        }
+        assert_eq!(defined(&state), hot_count + 2);
+    }
+
+    #[test]
     fn owned_captures_survive_collection_without_being_gc_roots() {
         let mut vm = crate::vm::tests::test_vm(Vec::new());
-        let function = function(
-            FunctionKind::Bytecode,
-            Some(FunctionMeta::Llm {
-                client: "test".into(),
-            }),
-        );
+        let function = function(FunctionKind::Bytecode, Some(FunctionMeta::Llm));
         let input = vm.tlab.alloc_string("input");
         let output = vm.tlab.alloc_string("output");
         let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
@@ -1963,17 +2851,18 @@ mod tests {
         // Isolate capture roots from the separate executable call-path cache.
         state.call_paths.clear();
         state.call_path_keys.clear();
-        state.last_call_path[0] = None;
+        state.call_path_cache = None;
         let mut roots = Vec::new();
         state.collect_roots(&mut roots);
         assert!(roots.is_empty());
+        let gc_heap = std::sync::Arc::clone(&vm.heap);
         // SAFETY: exclusive test heap, and the retained captures are its only
         // live objects. No bytecode or other VM/heap mutation runs concurrently.
-        let (_, _, forwarding) = unsafe {
-            vm.heap
-                .collect_garbage_generational(&roots, bex_heap::CollectionLevel::Major)
-        };
-        state.forward_roots(&forwarding);
+        let (_, _, forwarding) = unsafe { gc_heap.collect_garbage(&roots) };
+        state.forward_roots(&mut ::bex_vm_types::ForwardRoots::new(
+            &forwarding,
+            &*vm.heap,
+        ));
         roots.clear();
         state.collect_roots(&mut roots);
         assert!(roots.is_empty());
@@ -2175,14 +3064,9 @@ mod tests {
         assert!(captured["request"].get("body").is_none());
         assert_eq!(captured["request"]["method"], "POST");
         assert_eq!((data.name.as_str(), data.payload.is_none()), ("data", true));
+        // The error is not captured: it could quote the body.
         assert_eq!(completion.outcome, InvocationOutcome::Errored);
-        assert!(matches!(
-            completion
-                .error
-                .as_ref()
-                .and_then(btel_snapshot::Snapshot::value),
-            Some(btel_snapshot::SnapshotValue::Int(3))
-        ));
+        assert!(completion.error.is_none());
 
         let mut low = test_state(
             Arc::new(TelemetryPolicies::with_auto_level(AutoTelemetryLevel::Low)),
@@ -2194,10 +3078,14 @@ mod tests {
 
     fn function(kind: FunctionKind, body_meta: Option<FunctionMeta>) -> Function {
         Function {
-            name: "telemetry_test".to_string(),
+            identity: bex_vm_types::types::FunctionIdentity::Declared(
+                bex_vm_types::types::FnPath::Free(bex_vm_types::types::LocalName::new(
+                    Vec::new(),
+                    baml_type::Name::new("telemetry_test"),
+                )),
+            ),
             source_file: String::new(),
             docstring: None,
-            declared_name: Some("telemetry_test".to_string()),
             arity: 0,
             real_local_count: 0,
             bytecode: bex_vm_types::Bytecode::default(),
@@ -2209,6 +3097,8 @@ mod tests {
             ),
             telemetry_registration: bex_vm_types::FunctionRegistration::default(),
             telemetry_policy_id: btel_types::TelemetryPolicyId::none(),
+            hotswap_redirect: bex_vm_types::types::HotswapRedirect::default(),
+            compiled_body: None,
             local_names: Vec::new(),
             debug_locals: Vec::new(),
             span: baml_type::Span::fake(),
@@ -2223,25 +3113,36 @@ mod tests {
             display_return_type: "null".to_string(),
             throws_type: bex_vm_types::TyTemplate::Never,
             origin: bex_vm_types::FunctionOrigin::Internal,
-            is_interface_body: false,
             native_key: None,
             body_meta,
-            runtime_package: HeapPtr::null(),
+            trace_passthrough: false,
+            owner: HeapPtr::null(),
         }
     }
 
-    /// Records of one generic call made with `type_args`: its announced
-    /// type arguments, and whether its completion depends on the
+    /// Records of one generic call made with `type_args` under a policy
+    /// capturing inputs or not and a call's own `inputs` request: its
+    /// announced type arguments, and whether its completion depends on the
     /// announcement.
     fn type_args_of(
         function: &Function,
-        inputs: bool,
+        capture_inputs: bool,
+        inputs: Option<bool>,
         type_args: CallTypeArgs<'_>,
     ) -> (Option<serde_json::Value>, bool) {
         let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
+        state
+            .set_policy(
+                function,
+                TelemetryPolicy {
+                    capture_inputs,
+                    ..TelemetryPolicy::NONE
+                },
+            )
+            .unwrap();
         let trace = TraceConfig {
             mode: Some(InvocationMode::Span),
-            inputs: Some(inputs),
+            inputs,
             ..TraceConfig::default()
         };
         // SAFETY: no heap values; the registration hook dereferences nothing.
@@ -2273,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_call_records_its_type_args_by_name_whether_or_not_inputs_are() {
+    fn a_generic_call_records_its_type_args_by_name_when_it_captures_its_inputs() {
         let mut generic = function(FunctionKind::Bytecode, None);
         // A method of `Box<T>`: the class's parameter rides on the receiver,
         // the method's own is passed by the call.
@@ -2284,32 +3185,51 @@ mod tests {
             carried: &carried,
             passed: &passed,
         };
-        for inputs in [false, true] {
-            assert_eq!(
-                type_args_of(&generic, inputs, both),
-                (
-                    Some(serde_json::json!({"T": "type: int", "U": "type: string"})),
-                    true
-                ),
-                "inputs captured: {inputs}"
-            );
+        let recorded = (
+            Some(serde_json::json!({"T": "type: int", "U": "type: string"})),
+            true,
+        );
+        // The same decision as the arguments': the policy, or the call's own
+        // request. A call can ask for its inputs but not opt out of them.
+        for capture_inputs in [false, true] {
+            for inputs in [None, Some(false), Some(true)] {
+                let captured = capture_inputs || inputs == Some(true);
+                assert_eq!(
+                    type_args_of(&generic, capture_inputs, inputs, both),
+                    if captured {
+                        recorded.clone()
+                    } else {
+                        (None, false)
+                    },
+                    "policy: {capture_inputs}, call: {inputs:?}"
+                );
+            }
         }
+        // An LLM function captures its inputs by default, so its type
+        // arguments too.
+        let mut llm = function(FunctionKind::Bytecode, Some(FunctionMeta::Llm));
+        llm.type_param_names = vec!["T".into(), "U".into()];
+        assert_eq!(type_args_of(&llm, false, None, both), recorded);
         // Without type arguments nothing is recorded, and the completion
         // does not wait for an announcement.
         let plain = function(FunctionKind::Bytecode, None);
         assert_eq!(
-            type_args_of(&plain, false, CallTypeArgs::default()),
+            type_args_of(&plain, false, None, CallTypeArgs::default()),
             (None, false)
         );
         // A slot the compiler did not name is left out, never given a key.
         let mut partial = generic;
         partial.type_param_names.truncate(1);
         assert_eq!(
-            type_args_of(&partial, false, both),
+            type_args_of(&partial, false, Some(true), both),
             (Some(serde_json::json!({"T": "type: int"})), true)
         );
         partial.type_param_names.clear();
-        assert_eq!(type_args_of(&partial, false, both), (None, false));
+        assert_eq!(
+            type_args_of(&partial, false, Some(true), both).0,
+            None,
+            "no named slot"
+        );
     }
 
     #[test]
@@ -2379,9 +3299,9 @@ mod tests {
         // Heap-debug adds an epoch to HeapPtr; the rest of each frame stays fixed.
         let pointer_bytes = size_of::<HeapPtr>();
         assert!(matches!(pointer_bytes, 8 | 16));
-        assert_eq!(size_of::<crate::vm::BytecodeFrame>(), 104 + pointer_bytes);
+        assert_eq!(size_of::<crate::vm::BytecodeFrame>(), 96 + pointer_bytes);
         assert_eq!(size_of::<crate::vm::NativeFrame>(), 24 + pointer_bytes);
-        assert_eq!(size_of::<crate::vm::Frame>(), 104 + pointer_bytes);
+        assert_eq!(size_of::<crate::vm::Frame>(), 96 + pointer_bytes);
     }
 
     #[test]
@@ -2427,12 +3347,7 @@ mod tests {
             AutoTelemetryLevel::High,
         ] {
             for ai in [false, true] {
-                let function = function(
-                    FunctionKind::Bytecode,
-                    ai.then(|| FunctionMeta::Llm {
-                        client: "test".into(),
-                    }),
-                );
+                let function = function(FunctionKind::Bytecode, ai.then_some(FunctionMeta::Llm));
                 let mut state = test_state(
                     Arc::new(TelemetryPolicies::with_auto_level(mode)),
                     test_clock(),
@@ -2549,12 +3464,8 @@ mod tests {
         ] {
             for ai in [false, true] {
                 for span_from_entry in [false, true] {
-                    let function = function(
-                        FunctionKind::Bytecode,
-                        ai.then(|| FunctionMeta::Llm {
-                            client: "test".into(),
-                        }),
-                    );
+                    let function =
+                        function(FunctionKind::Bytecode, ai.then_some(FunctionMeta::Llm));
                     let mut state = test_state(
                         Arc::new(TelemetryPolicies::with_auto_level(auto_level)),
                         test_clock(),
@@ -2633,12 +3544,7 @@ mod tests {
 
     #[test]
     fn ai_function_is_a_span_from_entry() {
-        let function = function(
-            FunctionKind::Bytecode,
-            Some(FunctionMeta::Llm {
-                client: "test".to_string(),
-            }),
-        );
+        let function = function(FunctionKind::Bytecode, Some(FunctionMeta::Llm));
         let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
         state.start_thread();
         let parent_id = state.active_id();
@@ -2674,6 +3580,234 @@ mod tests {
             SpanRecord::FunctionSpanCompletionOkNeedsAnnouncement { id, captured_value: Some(value), .. }
                 if *id == span_id && matches!(value.roots()[0],btel_snapshot::SnapshotValue::Int(5))
         )));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn owned_timing_span_promotes_after_its_creating_state_is_gone() {
+        #[derive(Default)]
+        struct Observed {
+            completions: Vec<(bool, bool, InvocationOutcome, Option<i64>)>,
+            population: u64,
+        }
+        struct Sink(Arc<std::sync::Mutex<Observed>>);
+        impl btel_processor::Publisher<btel_snapshot::Snapshot, btel_snapshot::Snapshot> for Sink {
+            fn aggregate(&mut self, delta: btel_processor::AggregateDelta) {
+                self.0.lock().unwrap().population += delta.count;
+            }
+            fn span(&mut self, _: TelemetryId, record: &mut VmSpanRecord) {
+                assert!(
+                    !matches!(
+                        record,
+                        SpanRecord::ManualSpanAnnouncement(_) | SpanRecord::ManualSpanCompletion(_)
+                    ),
+                    "a Timing operation must use late promotion, with no fabricated entry"
+                );
+                if let Some(done) = record.completion() {
+                    let value =
+                        done.captured_value
+                            .and_then(|snapshot| match snapshot.roots()[0] {
+                                btel_snapshot::SnapshotValue::Int(n) => Some(n),
+                                _ => None,
+                            });
+                    self.0.lock().unwrap().completions.push((
+                        done.late,
+                        done.requires_announcement,
+                        done.outcome,
+                        value,
+                    ));
+                }
+            }
+            fn flush(&mut self) {}
+        }
+
+        for outcome in [
+            Some(InvocationOutcome::Ok),
+            Some(InvocationOutcome::Errored),
+            Some(InvocationOutcome::Panicked),
+            Some(InvocationOutcome::Cancelled),
+            None,
+        ] {
+            let observed = Arc::new(std::sync::Mutex::new(Observed::default()));
+            let runtime =
+                btel_processor::TelemetryRuntime::with_publisher(Sink(observed.clone())).unwrap();
+            let policies = Arc::new(TelemetryPolicies::new());
+            let clock = test_clock();
+            let function = function(FunctionKind::Bytecode, None);
+            let mut creator =
+                TelemetryState::new_root(policies.clone(), clock.clone(), runtime.clone());
+            let options = creator.operation_options(
+                &function,
+                TraceConfig {
+                    mode: Some(InvocationMode::Timing),
+                    ..TraceConfig::default()
+                },
+            );
+            assert!(!options.output && !options.error);
+            let metadata = function.runtime_metadata().unwrap();
+            // SAFETY: the only supplied value is an immediate integer.
+            let span = unsafe {
+                manual::ManualSpan::start_with_options(
+                    Some(&mut creator),
+                    btel_types::new_recording_id(),
+                    btel_types::context::Context::default(),
+                    &metadata,
+                    Some(Value::int(7)),
+                    None,
+                    options,
+                    None,
+                )
+            };
+            drop(creator);
+            let updater = TelemetryState::new_root(policies, clock.clone(), runtime.clone());
+            updater
+                .set_policy(
+                    &function,
+                    TelemetryPolicy {
+                        promotion_duration_threshold: Some(
+                            clock.threshold(std::time::Duration::ZERO),
+                        ),
+                        capture_inputs: true,
+                        capture_output: true,
+                        capture_error: true,
+                        ..TelemetryPolicy::NONE
+                    },
+                )
+                .unwrap();
+            // SAFETY: the output/error is immediate and needs no heap traversal.
+            unsafe {
+                span.finish(outcome, outcome.map(|_| Value::int(42)));
+            }
+            drop(updater);
+            drop(span);
+            runtime.finish().unwrap();
+            let observed = observed.lock().unwrap();
+            match outcome {
+                Some(outcome) => {
+                    // A cancelled span records only its outcome.
+                    let value = (outcome != InvocationOutcome::Cancelled).then_some(42);
+                    assert_eq!(observed.completions, vec![(true, false, outcome, value)]);
+                    assert_eq!(observed.population, 1);
+                }
+                None => {
+                    assert!(observed.completions.is_empty());
+                    assert_eq!(
+                        observed.population, 0,
+                        "neutral close must not enter latency statistics"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An owned operation that is a span records the error it ends with unless
+    /// its configuration declined it; one that is timing has no such default,
+    /// even when its completion is promoted to a span.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_operation_records_its_error_by_default_only_as_a_span() {
+        /// Each completion's outcome and the integer it captured, if any.
+        type Completions = Vec<(InvocationOutcome, Option<i64>)>;
+        struct Sink(Arc<std::sync::Mutex<Completions>>);
+        impl btel_processor::Publisher<btel_snapshot::Snapshot, btel_snapshot::Snapshot> for Sink {
+            fn aggregate(&mut self, _: btel_processor::AggregateDelta) {}
+            fn span(&mut self, _: TelemetryId, record: &mut VmSpanRecord) {
+                let done = match record {
+                    SpanRecord::ManualSpanCompletion(done) => done
+                        .outcome
+                        .map(|outcome| (outcome, done.captured_value.as_ref())),
+                    record => record
+                        .completion()
+                        .map(|done| (done.outcome, done.captured_value)),
+                };
+                if let Some((outcome, value)) = done {
+                    let value = value.and_then(|snapshot| match snapshot.roots()[0] {
+                        btel_snapshot::SnapshotValue::Int(n) => Some(n),
+                        _ => None,
+                    });
+                    self.0.lock().unwrap().push((outcome, value));
+                }
+            }
+            fn flush(&mut self) {}
+        }
+
+        for (mode, error, by_default) in [
+            (InvocationMode::Span, None, true),
+            (InvocationMode::Span, Some(false), false),
+            (InvocationMode::Timing, None, false),
+        ] {
+            for outcome in [
+                InvocationOutcome::Ok,
+                InvocationOutcome::Errored,
+                InvocationOutcome::Panicked,
+                InvocationOutcome::Cancelled,
+            ] {
+                let observed = Arc::new(std::sync::Mutex::new(Completions::new()));
+                let runtime =
+                    btel_processor::TelemetryRuntime::with_publisher(Sink(observed.clone()))
+                        .unwrap();
+                let policies = Arc::new(TelemetryPolicies::new());
+                let clock = test_clock();
+                let function = function(FunctionKind::Bytecode, None);
+                let mut creator =
+                    TelemetryState::new_root(policies.clone(), clock.clone(), runtime.clone());
+                // A timing operation is promoted at completion, by a policy
+                // that asks for no capture.
+                if mode == InvocationMode::Timing {
+                    creator
+                        .set_policy(
+                            &function,
+                            TelemetryPolicy {
+                                promotion_duration_threshold: Some(
+                                    clock.threshold(std::time::Duration::ZERO),
+                                ),
+                                ..TelemetryPolicy::NONE
+                            },
+                        )
+                        .unwrap();
+                }
+                let options = creator.operation_options(
+                    &function,
+                    TraceConfig {
+                        mode: Some(mode),
+                        error,
+                        ..TraceConfig::default()
+                    },
+                );
+                assert!(!options.output && !options.error);
+                let metadata = function.runtime_metadata().unwrap();
+                // SAFETY: no value is supplied at creation.
+                let span = unsafe {
+                    manual::ManualSpan::start_with_options(
+                        Some(&mut creator),
+                        btel_types::new_recording_id(),
+                        btel_types::context::Context::default(),
+                        &metadata,
+                        None,
+                        None,
+                        options,
+                        None,
+                    )
+                };
+                // SAFETY: the output/error is immediate and needs no heap traversal.
+                unsafe {
+                    span.finish(Some(outcome), Some(Value::int(42)));
+                }
+                drop(creator);
+                drop(span);
+                runtime.finish().unwrap();
+                let captured = by_default
+                    && matches!(
+                        outcome,
+                        InvocationOutcome::Errored | InvocationOutcome::Panicked
+                    );
+                assert_eq!(
+                    *observed.lock().unwrap(),
+                    vec![(outcome, captured.then_some(42))],
+                    "{mode:?}/{error:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2966,7 +4100,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_overrides_survive_policy_changes_and_late_promotion() {
+    fn capture_requests_survive_policy_changes_and_late_promotion() {
         for mode in [
             None,
             Some(InvocationMode::Timing),
@@ -3029,12 +4163,23 @@ mod tests {
                                 state.span_records().last().unwrap().completion().unwrap();
                             assert_eq!(recorded.outcome, outcome);
                             assert_eq!(recorded.late, !initially_span);
+                            // A span from entry records the error it ends
+                            // with unless the call declined it. A frame
+                            // promoted at completion has no such default.
+                            let by_default = initially_span
+                                && outcome == InvocationOutcome::Errored
+                                && override_ != Some(false);
                             assert_eq!(
                                 recorded.captured_value.map(|snapshot| matches!(
                                     snapshot.roots()[0],
                                     btel_snapshot::SnapshotValue::Int(7)
                                 )),
-                                override_.unwrap_or(initial || current).then_some(true),
+                                (outcome != InvocationOutcome::Cancelled
+                                    && (override_ == Some(true)
+                                        || initial
+                                        || current
+                                        || by_default))
+                                    .then_some(true),
                                 "{mode:?}/{initial}/{current}/{override_:?}/{outcome:?}",
                             );
                         }
@@ -3088,15 +4233,88 @@ mod tests {
                     let recorded = state.span_records().last().unwrap().completion().unwrap();
                     assert!(!recorded.late, "an entry-selected span must remain a span");
                     assert_eq!(recorded.outcome, outcome);
+                    // The output follows the policy at entry or at completion;
+                    // a span records the error it ends with under either.
                     assert_eq!(
                         recorded
                             .captured_value
                             .map(|s| matches!(s.roots()[0], btel_snapshot::SnapshotValue::Int(7))),
-                        (initial || current).then_some(true)
+                        (initial || current || outcome == InvocationOutcome::Errored)
+                            .then_some(true)
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn thread_completion_follows_the_error_the_thread_ended_with() {
+        for (outcome, recorded, carried) in [
+            (InvocationOutcome::Errored, true, true),
+            (InvocationOutcome::Panicked, true, true),
+            // No error was captured for the thread: nothing precedes its completion.
+            (InvocationOutcome::Errored, false, false),
+            // A host resumed the thread after the throw, or cancelled it: it
+            // did not end with the error.
+            (InvocationOutcome::Ok, true, false),
+            (InvocationOutcome::Cancelled, true, false),
+        ] {
+            let mut state = test_state(Arc::new(TelemetryPolicies::new()), test_clock());
+            state.start_thread();
+            if recorded {
+                // An earlier unhandled throw is superseded by the one that ends the thread.
+                unsafe {
+                    state.record_thread_error(Value::int(1));
+                    state.record_thread_error(Value::int(9));
+                }
+            }
+            state.complete_thread(outcome);
+            let records = state.span_records();
+            let completion = records
+                .iter()
+                .position(|record| matches!(record, SpanRecord::ThreadSpanCompletion { .. }))
+                .unwrap();
+            let errors: Vec<usize> = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| matches!(record, SpanRecord::ThreadSpanError { .. }))
+                .map(|(index, _)| index)
+                .collect();
+            if carried {
+                assert_eq!(errors, vec![completion - 1], "{outcome:?}");
+                let SpanRecord::ThreadSpanError {
+                    captured_error: Some(error),
+                } = &records[completion - 1]
+                else {
+                    panic!("the thread error record owns its capture");
+                };
+                assert!(matches!(
+                    error.roots()[0],
+                    btel_snapshot::SnapshotValue::Int(9)
+                ));
+            } else {
+                assert!(errors.is_empty(), "{outcome:?}/{recorded}");
+            }
+            // A completed thread writes nothing more.
+            let written = state.span_records().len();
+            state.complete_thread(InvocationOutcome::Errored);
+            assert_eq!(state.span_records().len(), written);
+        }
+        // An engine that keeps HTTP bodies out of its recordings carries no
+        // thread error: it can quote a response body.
+        let mut state = test_state(
+            Arc::new(TelemetryPolicies::new().with_http_bodies(false)),
+            test_clock(),
+        );
+        state.start_thread();
+        unsafe { state.record_thread_error(Value::int(9)) };
+        state.complete_thread(InvocationOutcome::Errored);
+        assert!(
+            !state
+                .span_records()
+                .iter()
+                .any(|record| matches!(record, SpanRecord::ThreadSpanError { .. }))
+        );
     }
 
     #[test]

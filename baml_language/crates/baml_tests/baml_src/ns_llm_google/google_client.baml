@@ -133,9 +133,10 @@ function google_request_body_passthrough() -> string {
     root.llm_mock.mock_json_serve(
         [root.llm_mock.MockResponse.ok(_canned_turn())],
         (mock: root.llm_mock.MockJsonServer) -> {
-            let overrides = baml.json.parse(
-                `{"generationConfig":{"thinkingConfig":{"thinkingBudget":0},"topK":null},"cachedContent":"projects/p/cachedContents/1"}`,
-            );
+            let overrides: json = {
+                "generationConfig": { "thinkingConfig": { "thinkingBudget": 0 }, "topK": null },
+                "cachedContent": "projects/p/cachedContents/1",
+            };
             let cl = google.GeminiClient.new(
                 model = "gemini-2.5-flash",
                 api_key = "test-key",
@@ -199,19 +200,32 @@ test "google_tool_declarations" {
 // usageMetadata lands in ai.events.Usage — including cachedContentTokenCount
 // and thoughtsTokenCount, which the Rust builders dropped.
 function google_parse_thoughts_and_usage() -> string {
-    let raw = `{"candidates":[{"content":{"parts":[{"text":"weighing it up","thought":true},{"text":"answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4,"cachedContentTokenCount":6,"thoughtsTokenCount":7,"totalTokenCount":27}}`;
-    let turn = google.internal.parse(
-        baml.json.from_string<google.internal.GmResponse>(raw),
-        0,
-    );
+    let raw: json = {
+        "candidates": [
+            {
+                "content": { "parts": [{ "text": "weighing it up", "thought": true }, { "text": "answer" }] },
+                "finishReason": "STOP",
+            },
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 4,
+            "cachedContentTokenCount": 6,
+            "thoughtsTokenCount": 7,
+            "totalTokenCount": 27,
+        },
+    };
+    let response = baml.json.to<google.internal.GmResponse>(raw);
+    let turn = google.internal.parse(response, 0);
+    let usage = google.internal._gm_usage(response.usageMetadata);
     [
         turn.terminal_text() ?? "",
         turn.content.length().to_string(),
         turn.stop_reason.to_string(),
-        (turn.usage?.input_tokens ?? -1).to_string(),
-        (turn.usage?.output_tokens ?? -1).to_string(),
-        (turn.usage?.cached_input_tokens ?? -1).to_string(),
-        (turn.usage?.reasoning_tokens ?? -1).to_string(),
+        (usage?.input_tokens ?? -1).to_string(),
+        (usage?.output_tokens ?? -1).to_string(),
+        (usage?.cached_input_tokens ?? -1).to_string(),
+        (usage?.reasoning_tokens ?? -1).to_string(),
     ].join("|")
 }
 
@@ -222,11 +236,17 @@ test "google_parse_thoughts_and_usage" {
 // Function calls carry no id on the wire, so one is synthesized from the
 // journal position; the turn stops for tool use.
 function google_parse_function_call() -> string {
-    let raw = `{"candidates":[{"content":{"parts":[{"functionCall":{"name":"weather_lookup","args":{"city":"NYC"}}}]},"finishReason":"STOP"}]}`;
-    let turn = google.internal.parse(
-        baml.json.from_string<google.internal.GmResponse>(raw),
-        7,
-    );
+    let raw: json = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{ "functionCall": { "name": "weather_lookup", "args": { "city": "NYC" } } }],
+                },
+                "finishReason": "STOP",
+            },
+        ],
+    };
+    let turn = google.internal.parse(baml.json.to<google.internal.GmResponse>(raw), 7);
     [
         turn.stop_reason.to_string(),
         turn.tool_uses().at(0)?.id ?? "",
@@ -242,11 +262,20 @@ test "google_parse_function_call" {
 // ai.content.Media blocks (so a `-> image` function has something to return)
 // while the text parts stay text.
 function google_parse_inline_media() -> string {
-    let raw = `{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"aGk="}},{"text":"here you go"}]},"finishReason":"STOP"}]}`;
-    let turn = google.internal.parse(
-        baml.json.from_string<google.internal.GmResponse>(raw),
-        0,
-    );
+    let raw: json = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        { "inlineData": { "mimeType": "image/png", "data": "aGk=" } },
+                        { "text": "here you go" },
+                    ],
+                },
+                "finishReason": "STOP",
+            },
+        ],
+    };
+    let turn = google.internal.parse(baml.json.to<google.internal.GmResponse>(raw), 0);
     let kinds: string[] = [];
     for (let m in turn.media()) {
         match (m) {
@@ -269,16 +298,20 @@ test "google_parse_inline_media" {
 
 // A blocked prompt and a safety-stopped candidate both mean Refused; an
 // unknown finish reason must NOT be mistaken for one.
-function _stop_reason_of(raw: string) -> string {
-    let resp = baml.json.from_string<google.internal.GmResponse>(raw);
+function _stop_reason_of(raw: json) -> string {
+    let resp = baml.json.to<google.internal.GmResponse>(raw);
     google.internal.parse(resp, 0).stop_reason.to_string()
 }
 
 function google_parse_stop_reasons() -> string {
-    let blocked = `{"promptFeedback":{"blockReason":"SAFETY"}}`;
-    let safety = `{"candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"SAFETY"}]}`;
-    let truncated = `{"candidates":[{"content":{"parts":[{"text":"half"}]},"finishReason":"MAX_TOKENS"}]}`;
-    let unknown = `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"SOMETHING_NEW"}]}`;
+    let blocked: json = { "promptFeedback": { "blockReason": "SAFETY" } };
+    let safety: json = { "candidates": [{ "content": { "parts": [{ "text": "" }] }, "finishReason": "SAFETY" }] };
+    let truncated: json = {
+        "candidates": [{ "content": { "parts": [{ "text": "half" }] }, "finishReason": "MAX_TOKENS" }],
+    };
+    let unknown: json = {
+        "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "SOMETHING_NEW" }],
+    };
     [
         _stop_reason_of(blocked),
         _stop_reason_of(safety),
@@ -295,35 +328,30 @@ test "google_parse_stop_reasons" {
 // candidate list, an `{"error": …}` document served with a 200 — is a FAILURE,
 // not an empty answer. A finishReason with empty content IS the provider
 // explaining itself and still parses.
-function _parse_label(raw: string) -> string {
-    let resp = baml.json.from_string<google.internal.GmResponse>(raw);
+function _parse_label(raw: json) -> string {
+    let resp = baml.json.to<google.internal.GmResponse>(raw);
     google.internal.parse(resp, 0).stop_reason.to_string() catch_all (e) {
-        _ => {
-            match (e) {
-                let failed: ai.errors.ParseFailed => "ParseFailed",
-                let limited: ai.errors.RateLimited => "RateLimited",
-                let bad: ai.errors.InvalidRequest => "InvalidRequest",
-                _ => "other",
-            }
-        },
+        let invalid: ai.errors.InvalidResponse => "InvalidResponse",
+        let reported: ai.errors.ProviderError => "ProviderError",
+        _ => "other",
     }
 }
 
 function google_parse_empty_response() -> string {
     [
-        _parse_label(`{}`),
-        _parse_label(`{"candidates":[]}`),
-        _parse_label(`{"candidates":[{}]}`),
-        _parse_label(`{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]}`),
-        _parse_label(`{"error":{"code":429,"message":"quota"}}`),
-        _parse_label(`{"promptFeedback":{"blockReason":"SAFETY"}}`),
+        _parse_label({}),
+        _parse_label({ "candidates": [] }),
+        _parse_label({ "candidates": [{}] }),
+        _parse_label({ "candidates": [{ "content": { "parts": [] }, "finishReason": "MAX_TOKENS" }] }),
+        _parse_label({ "error": { "code": 429, "message": "quota" } }),
+        _parse_label({ "promptFeedback": { "blockReason": "SAFETY" } }),
     ].join("|")
 }
 
 test "google_parse_empty_response" {
     assert.equal(
         google_parse_empty_response(),
-        "ParseFailed|ParseFailed|ParseFailed|MaxTokens|RateLimited|Refused",
+        "InvalidResponse|InvalidResponse|InvalidResponse|MaxTokens|ProviderError|Refused",
     )
 }
 
@@ -343,6 +371,7 @@ function google_empty_response_e2e() -> string {
                 _ => {
                     match (e) {
                         let failed: ai.errors.ParseFailed => "ParseFailed",
+                        let invalid: ai.errors.InvalidResponse => "InvalidResponse",
                         _ => "other",
                     }
                 },
@@ -352,7 +381,7 @@ function google_empty_response_e2e() -> string {
 }
 
 test "google_empty_response_e2e" {
-    assert.equal(google_empty_response_e2e(), "ParseFailed")
+    assert.equal(google_empty_response_e2e(), "InvalidResponse")
 }
 
 // ─── Gemini 3: thought signatures ────────────────────────────────────────────
@@ -364,11 +393,22 @@ test "google_empty_response_e2e" {
 // synthesized call id (`call_<seq>_<i>~gts~<sig>`) through the journal and is
 // re-attached to the wire part on replay.
 function google_parse_thought_signature() -> string {
-    let raw = `{"candidates":[{"content":{"parts":[{"functionCall":{"name":"weather_lookup","args":{"city":"NYC"}},"thoughtSignature":"CtwBAcu98"}]},"finishReason":"STOP"}]}`;
-    let turn = google.internal.parse(
-        baml.json.from_string<google.internal.GmResponse>(raw),
-        7,
-    );
+    let raw: json = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": { "name": "weather_lookup", "args": { "city": "NYC" } },
+                            "thoughtSignature": "CtwBAcu98",
+                        },
+                    ],
+                },
+                "finishReason": "STOP",
+            },
+        ],
+    };
+    let turn = google.internal.parse(baml.json.to<google.internal.GmResponse>(raw), 7);
     turn.tool_uses().at(0)?.id ?? ""
 }
 
@@ -448,7 +488,7 @@ function vertex_media_url_passthrough() -> string {
         prompt: GoogleVision@spec(img).prompt_template,
         journal: ai.Journal { log: [] },
         toolbox: ai.tools.Toolbox.new([]),
-        output_type: reflect.Type.of<string>(),
+        output_type: string.type(),
     };
     let cl = google.VertexClient.new(
         model = "gemini-2.5-flash",
@@ -483,7 +523,7 @@ function google_media_url_inlined() -> string {
         prompt: GoogleVision@spec(img).prompt_template,
         journal: ai.Journal { log: [] },
         toolbox: ai.tools.Toolbox.new([]),
-        output_type: reflect.Type.of<string>(),
+        output_type: string.type(),
     };
             let cl = google.GeminiClient.new(
                 model = "gemini-2.5-flash",
@@ -513,7 +553,7 @@ function google_media_youtube_passthrough() -> string {
         prompt: GoogleWatch@spec(clip).prompt_template,
         journal: ai.Journal { log: [] },
         toolbox: ai.tools.Toolbox.new([]),
-        output_type: reflect.Type.of<string>(),
+        output_type: string.type(),
     };
     let cl = google.GeminiClient.new(
         model = "gemini-2.5-flash",
@@ -591,7 +631,7 @@ function google_stream_usage_splits_the_cache() -> string {
                 base_url = mock.base_url(),
             );
             let spec = GoogleEcho@spec("Say pong.");
-            let u = cl
+            let turn = cl
                 .invoke_stream(
                 ai.ModelTurnInput {
                     prompt: spec.prompt_template,
@@ -600,8 +640,8 @@ function google_stream_usage_splits_the_cache() -> string {
                     output_type: spec.output_type(),
                 },
                 )
-                .final_turn()
-                .usage;
+                .final_turn();
+            let u = ai.events.usage_for(ai.events.call_usage(turn.calls), ai.events.ModelKey { provider: "google", model: "gemini-2.5-flash" });
             `${u?.input_tokens ?? -1}/${u?.cached_input_tokens ?? -1}/${u?.cache_write_input_tokens ?? -1}/${u?.uncached_input_tokens ?? -1}/${u?.output_tokens ?? -1}/${u?.reasoning_tokens ?? -1}`
         },
     )
@@ -634,6 +674,7 @@ function _stream_failure_label(events: string[]) -> string {
                     match (e) {
                         let net: ai.errors.NetworkFailure => "NetworkFailure",
                         let failed: ai.errors.ParseFailed => "ParseFailed",
+                        let invalid: ai.errors.InvalidResponse => "InvalidResponse",
                         _ => "other",
                     }
                 },
@@ -665,7 +706,7 @@ function google_stream_malformed_payload() -> string {
 }
 
 test "google_stream_malformed_payload" {
-    assert.equal(google_stream_malformed_payload(), "ParseFailed")
+    assert.equal(google_stream_malformed_payload(), "InvalidResponse")
 }
 
 // ─── Vertex: URL construction ────────────────────────────────────────────────
@@ -827,7 +868,7 @@ function vertex_claude_raw_predict() -> string {
         prompt: spec.prompt_template,
         journal: ai.Journal { log: [] },
         toolbox: ai.tools.Toolbox.new([]),
-        output_type: reflect.Type.of<string>(),
+        output_type: string.type(),
     };
     let cl = google.VertexClient.new(
         model = "claude-sonnet-4-5",
@@ -855,6 +896,68 @@ test "vertex_claude_raw_predict" {
     assert.contains(got, "|vertex-2023-10-16|absent|8192|user")
 }
 
+// Claude on Vertex is the Anthropic Messages body, so a `${cache(args)}` in the
+// prompt is `cache_control: args` on the block before it there too. The same
+// client aimed at a Gemini model has no cache marker and sends nothing for it.
+function VertexCached(question: string) -> string {
+    client: "openai/gpt-4o-mini"
+    prompt: `${role("system")}Follow the rules.${cache({ "type": "ephemeral", "ttl": "1h" })}${role("user")}${question}`
+}
+
+function VertexCacheDefault(question: string) -> string {
+    client: "openai/gpt-4o-mini"
+    prompt: `${role("system")}Follow the rules.${cache()}${role("user")}${question}`
+}
+
+function _vertex_cached_body(model: string, default_args: bool = false) -> string {
+    let spec = if (default_args) {
+        VertexCacheDefault@spec("Say pong.")
+    } else {
+        VertexCached@spec("Say pong.")
+    };
+    let input = ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: ai.Journal { log: [] },
+        toolbox: ai.tools.Toolbox.new([]),
+        output_type: string.type(),
+    };
+    let cl = google.VertexClient.new(
+        model = model,
+        project_id = "my-project",
+        location = "us-east5",
+        api_key = "express-key",
+    );
+    google.internal.vertex_render(cl, input).body
+}
+
+test "vertex_cache_delimiter" {
+    let claude = baml.json.parse(_vertex_cached_body("claude-sonnet-4-5"));
+    let system: json = [
+        {
+            "type": "text",
+            "text": "Follow the rules.",
+            "cache_control": { "type": "ephemeral", "ttl": "1h" },
+        },
+    ];
+    assert.equal(baml.json.path<json>(claude, ".system"), system);
+    let gemini = _vertex_cached_body("gemini-2.5-flash");
+    assert.is_true(!gemini.includes("cache_control"));
+    assert.is_true(!gemini.includes("ephemeral"))
+}
+
+// `${cache()}` on a Claude model is the Anthropic default, the same marker
+// `anthropic.Client` sends; on a Gemini model there is no default.
+test "vertex_cache_default_args" {
+    let claude = baml.json.parse(_vertex_cached_body("claude-sonnet-4-5", default_args = true));
+    let system: json = [
+        { "type": "text", "text": "Follow the rules.", "cache_control": { "type": "ephemeral" } },
+    ];
+    assert.equal(baml.json.path<json>(claude, ".system"), system);
+    let gemini = _vertex_cached_body("gemini-2.5-flash", default_args = true);
+    assert.is_true(!gemini.includes("cache_control"));
+    assert.is_true(!gemini.includes("ephemeral"))
+}
+
 // …and a caller who wants it back puts it in `request_body`, which merges
 // after the Vertex constants.
 function vertex_claude_model_override() -> string {
@@ -863,14 +966,14 @@ function vertex_claude_model_override() -> string {
         prompt: spec.prompt_template,
         journal: ai.Journal { log: [] },
         toolbox: ai.tools.Toolbox.new([]),
-        output_type: reflect.Type.of<string>(),
+        output_type: string.type(),
     };
     let cl = google.VertexClient.new(
         model = "claude-sonnet-4-5",
         project_id = "my-project",
         location = "us-east5",
         api_key = "express-key",
-        request_body = baml.json.parse(`{"model":"claude-opus-4-1"}`),
+        request_body = { "model": "claude-opus-4-1" },
     );
     let body = baml.json.parse(google.internal.vertex_render(cl, input).body);
     baml.json.path_or<string>(body, ".model", "absent")
@@ -1091,7 +1194,7 @@ function google_missing_key_invoke() -> string {
         prompt: GoogleEcho@spec("Say pong.").prompt_template,
         journal: ai.Journal { log: [] },
         toolbox: ai.tools.Toolbox.new([]),
-        output_type: reflect.Type.of<string>(),
+        output_type: string.type(),
     };
     // The concrete classes, not the `ai.errors.Failure` interface: a
     // configuration error and a transport error are both typed, and matching
@@ -1142,7 +1245,7 @@ function live_gemini_answers() -> bool {
 function live_vertex_answers() -> bool {
     let cl = google.VertexClient.new(
         model = "gemini-2.5-flash",
-        credentials_json = baml.env.get("INTEG_TESTS_GOOGLE_APPLICATION_CREDENTIALS_CONTENT"),
+        credentials_json = env.INTEG_TESTS_GOOGLE_APPLICATION_CREDENTIALS_CONTENT,
         location = baml.env.get("GOOGLE_CLOUD_LOCATION") ?? "us-central1",
     );
     let result = ai.Agent.new(client = cl).run(LiveGeminiEcho@spec("Say pong."));

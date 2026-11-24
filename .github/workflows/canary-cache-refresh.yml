@@ -27,7 +27,7 @@ jobs:
           # Without the `v0-rust-` lead, the prefix match never hits and
           # the loop silently deletes nothing.
           # TODO(B-1545): Resume purging macos-cargo when cargo-test-macos is re-enabled as its cache writer.
-          for sk in linux-cargo linux-wasm linux-msrv windows-cargo; do
+          for sk in linux-cargo linux-wasm windows-cargo; do
             gh cache list -R "$REPO" --ref refs/heads/canary --key "v0-rust-$sk" \
               --limit 200 --json id --jq '.[].id' | while read -r id; do
               [ -n "$id" ] || continue
@@ -43,7 +43,6 @@ jobs:
     secrets:
       BAML_SCCACHE_R2_ACCESS_KEY_ID: ${{ secrets.BAML_SCCACHE_R2_ACCESS_KEY_ID }}
       BAML_SCCACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BAML_SCCACHE_R2_SECRET_ACCESS_KEY }}
-      TRUNK_ORG_TOKEN: ${{ secrets.TRUNK_ORG_TOKEN }}
     # Drop `actions: write` for the called workflow — its jobs run
     # cargo build / test code that we don't want touching the cache
     # API. cargo-tests.reusable.yaml also declares `contents: read`

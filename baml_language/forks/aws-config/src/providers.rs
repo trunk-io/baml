@@ -12,24 +12,16 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Static credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-/// (with the legacy `SECRET_ACCESS_KEY` fallback) and optional
-/// `AWS_SESSION_TOKEN`.
+/// and optional `AWS_SESSION_TOKEN`.
 pub(crate) async fn from_env(io: &dyn CredentialIo) -> Option<Credentials> {
     let access_key_id = io
         .env("AWS_ACCESS_KEY_ID")
         .await
         .filter(|s| !s.trim().is_empty())?;
-    let secret_access_key = match io
+    let secret_access_key = io
         .env("AWS_SECRET_ACCESS_KEY")
         .await
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(s) => s,
-        None => io
-            .env("SECRET_ACCESS_KEY")
-            .await
-            .filter(|s| !s.trim().is_empty())?,
-    };
+        .filter(|s| !s.trim().is_empty())?;
     let session_token = io.env("AWS_SESSION_TOKEN").await.and_then(|s| {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -277,11 +269,10 @@ pub(crate) async fn from_container(
         .await
         .filter(|s| !s.is_empty())
     {
-        let token = io.read_file(&token_file).await.ok_or_else(|| {
-            ConfigError::Io(format!(
-                "container authorization token file could not be read: {token_file}"
-            ))
-        })?;
+        let token = io
+            .read_file(&token_file)
+            .await
+            .ok_or_else(|| ConfigError::Io(unreadable_token_file_message(&token_file)))?;
         headers.push(("Authorization".to_string(), token.trim().to_string()));
     } else if let Some(token) = io
         .env("AWS_CONTAINER_AUTHORIZATION_TOKEN")
@@ -365,6 +356,18 @@ pub(crate) async fn from_imds(io: &dyn CredentialIo) -> Result<Option<Credential
         )));
     }
     Ok(Some(credentials_from_json(&creds_resp.body)?))
+}
+
+/// The error for an `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` that names no
+/// readable file. The token itself is sometimes put there by mistake, and the
+/// error reaches logs, so the value is never quoted: a base64 token can look
+/// like an absolute path, and nothing a path has tells it apart.
+fn unreadable_token_file_message(value: &str) -> String {
+    format!(
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE names no readable file (the value, {} characters, \
+         is not shown)",
+        value.chars().count()
+    )
 }
 
 #[cfg(test)]

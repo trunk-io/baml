@@ -3,8 +3,10 @@
 //! Each test creates a minimal DB, adds a `.baml` file, runs the full
 //! compiler2 pipeline through the build-time, byte-identical stdlib prefix,
 //! and verifies the resulting `Program` has the expected structure.
+//! Basic function, enum, and class execution is covered by the native suites
+//! in `baml_src/ns_prompt_parameter`, `ns_enums`, and `ns_classes`.
 
-use baml_db::{ProjectDatabase, compile_program_with};
+use baml_db::{CheckedWorld, ProjectDatabase};
 
 use crate::{
     engine::TestDbExt,
@@ -33,7 +35,9 @@ fn compile(db: &ProjectDatabase) -> bex_vm_types::Program {
     let package = db
         .workspace_root()
         .unwrap_or_else(|| unreachable!("`make_db` adds one workspace root"));
-    compile_program_with(db, package, OptLevel::Two, prefix(OptLevel::Two))
+    CheckedWorld::collect(db, package)
+        .expect("the world checks")
+        .compile_with(OptLevel::Two, prefix(OptLevel::Two))
         .expect("compilation should succeed")
 }
 
@@ -51,10 +55,6 @@ fn callable(program: &bex_vm_types::Program, name: &str) -> usize {
         })
         .object
         .raw()
-}
-
-fn has_callable(program: &bex_vm_types::Program, name: &str) -> bool {
-    program.rendered_callables().contains_key(name)
 }
 
 /// Every rendered callable name, sorted, for diagnostics.
@@ -110,9 +110,11 @@ function main(x: Foo | int) -> int {
             .iter()
             .skip(narrow_bind_idx + 1)
             .any(|instruction| match instruction {
-                Instruction::LoadVar(slot) | Instruction::StoreVarLoadVar(slot) => {
-                    *slot == destination
-                }
+                Instruction::LoadVar(slot)
+                | Instruction::StoreVarLoadVar(slot)
+                | Instruction::LoadVarField(slot, _)
+                | Instruction::LoadVarFieldLocal(slot, _)
+                | Instruction::AddLocalSmall(_, slot, _) => *slot == destination,
                 Instruction::LoadVar2(first, second) => {
                     *first == destination || *second == destination
                 }
@@ -127,21 +129,6 @@ macro_rules! emit_snapshot {
     ($name:expr, $output:expr) => {
         assert_compiler2_snapshot!(SNAPSHOT_PATH, $name, $output);
     };
-}
-
-#[test]
-fn simple_function_compiles() {
-    let mut db = make_db();
-    db.file(
-        "test.baml",
-        "function greet(name: string) -> string { return name; }",
-    );
-    let program = compile(&db);
-    assert!(
-        has_callable(&program, "user.greet"),
-        "expected `user.greet` among the callables, got: {:?}",
-        rendered_names(&program)
-    );
 }
 
 #[test]
@@ -160,42 +147,6 @@ fn builtin_functions_included() {
     assert!(
         has_baml_env,
         "expected at least one 'baml.env.*' function, got: {names:?}"
-    );
-}
-
-#[test]
-fn enum_variant_lookup() {
-    let mut db = make_db();
-    db.file(
-        "test.baml",
-        r#"
-        enum Color { Red Green Blue }
-        function pick() -> Color { return Color.Red; }
-        "#,
-    );
-    let program = compile(&db);
-    assert!(
-        has_callable(&program, "user.pick"),
-        "expected `user.pick` among the callables, got: {:?}",
-        rendered_names(&program)
-    );
-}
-
-#[test]
-fn class_field_lookup() {
-    let mut db = make_db();
-    db.file(
-        "test.baml",
-        r#"
-        class Point { x int  y int }
-        function origin() -> Point { return Point { x: 0, y: 0 }; }
-        "#,
-    );
-    let program = compile(&db);
-    assert!(
-        has_callable(&program, "user.origin"),
-        "expected `user.origin` among the callables, got: {:?}",
-        rendered_names(&program)
     );
 }
 
@@ -229,13 +180,7 @@ fn optional_param_metadata_and_omitted_sentinel_emit() {
             .any(|c| matches!(c, bex_vm_types::ConstValue::OmittedArg)),
         "expected omitted source argument to be emitted as OmittedArg"
     );
-}
 
-#[test]
-fn optional_defaults_emit_snapshot() {
-    let mut db = make_db();
-    db.file("test.baml", OPTIONAL_DEFAULTS_SOURCE);
-    let program = compile(&db);
     emit_snapshot!(
         "optional_defaults_emit_snapshot",
         crate::engine::display_user_functions(&program)
@@ -432,7 +377,7 @@ function main() -> int { 0 }
     let iface = (*program.objects)
         .iter()
         .find_map(|obj| match obj {
-            bex_vm_types::Object::Interface(i) if i.name.name().as_str() == "Shelf" => Some(i),
+            bex_vm_types::Object::Interface(i) if i.path.name.as_str() == "Shelf" => Some(i),
             _ => None,
         })
         .expect("Shelf interface object should be emitted");
@@ -498,13 +443,13 @@ function main() -> int { 0 }
     let class = (*program.objects)
         .iter()
         .find_map(|obj| match obj {
-            bex_vm_types::Object::Class(c) if c.name.item_name().as_str() == "Book" => Some(c),
+            bex_vm_types::Object::Class(c) if c.path.name.as_str() == "Book" => Some(c),
             _ => None,
         })
         .expect("Book class object should be emitted");
     let slot = |name: &str| {
         class
-            .fields
+            .declared_fields()
             .iter()
             .position(|f| f.name == name)
             .unwrap_or_else(|| panic!("Book should have a `{name}` field"))
@@ -564,4 +509,101 @@ function main() -> int { 0 }
     // `name` is `Person`'s second field, so an unlinked interface field must still
     // resolve to slot 1 rather than defaulting to 0.
     assert_eq!(rule.field_links.as_ref(), [1]);
+}
+
+/// BAML runtime assertions cannot observe handler identities or PC ranges.
+/// Keep every clause distinct through optimized and compact bytecode.
+#[test]
+fn chained_catches_keep_separate_bytecode_handlers() {
+    use bex_vm_types::Instruction;
+
+    for opt in [OptLevel::Zero, OptLevel::Two] {
+        for first in ["catch", "catch_all", "catch_all_panics"] {
+            for second in ["catch", "catch_all", "catch_all_panics"] {
+                let mut db = ProjectDatabase::new();
+                db.workspace(std::path::Path::new("."));
+                db.set_seeded_stdlib_interface(prefix(opt).interfaces.clone());
+                db.file(
+                    "test.baml",
+                    &format!(
+                        r#"
+function fail(n: int) -> int throws string {{
+    if (n == 0) {{ throw "original" }}
+    n
+}}
+function main(n: int) -> int {{
+    fail(n) {first} (original) {{
+        _ => throw 42,
+    }} {second} (replacement) {{
+        int => 7,
+        baml.panics.Panic => -1,
+    }}
+}}
+"#
+                    ),
+                );
+                let package = db.workspace_root().expect("workspace root");
+                let program = CheckedWorld::collect(&db, package)
+                    .expect("the world checks")
+                    .compile_with(opt, prefix(opt))
+                    .expect("valid chained catches");
+                let index = callable(&program, "user.main");
+                let bex_vm_types::Object::Function(main) = &(*program.objects)[index] else {
+                    panic!("expected function");
+                };
+                let code = &main.bytecode;
+                let handlers: std::collections::BTreeSet<_> = code
+                    .exception_table
+                    .iter()
+                    .map(|entry| entry.handler_pc)
+                    .collect();
+                assert_eq!(handlers.len(), 2, "{first} then {second} at {opt:?}");
+                let inner = handlers
+                    .iter()
+                    .copied()
+                    .find(|&pc| {
+                        code.exception_handlers_for_pc(pc)
+                            .any(|entry| entry.handler_pc != pc)
+                    })
+                    .expect("the first handler is protected by the second handler");
+                let outer = code
+                    .exception_handlers_for_pc(inner)
+                    .next()
+                    .expect("outer handler entry")
+                    .handler_pc;
+                assert_ne!(inner, outer);
+                assert!(
+                    code.exception_handlers_for_pc(outer).next().is_none(),
+                    "the last handler must not catch its own failures"
+                );
+                let throw_pc = code
+                    .instructions
+                    .iter()
+                    .position(|op| matches!(op, Instruction::Throw))
+                    .expect("first arm throws a new value");
+                assert!(
+                    code.exception_handlers_for_pc(throw_pc)
+                        .any(|entry| entry.handler_pc == outer),
+                    "throws in the first arm must enter the second handler"
+                );
+                let compact = code.lower_to_compact();
+                let handlers: std::collections::BTreeSet<_> = compact
+                    .exception_table
+                    .iter()
+                    .map(|entry| entry.handler_pc)
+                    .collect();
+                assert_eq!(
+                    handlers.len(),
+                    2,
+                    "compact {first} then {second} at {opt:?}"
+                );
+                assert!(
+                    handlers.iter().any(|&pc| compact
+                        .exception_handlers_for_pc(pc)
+                        .any(|entry| entry.handler_pc != pc)),
+                    "compact code preserves nesting"
+                );
+            }
+        }
+    }
 }

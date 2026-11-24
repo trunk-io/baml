@@ -17,13 +17,16 @@
 #include <baml/lit.h>
 
 #include <algorithm>
+#include <any>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -35,7 +38,18 @@ namespace baml {
 template <typename T>
 struct codec;  // primary template intentionally undefined
 
+template <typename T, typename ThrownU>
+class future;
+template <typename Signature>
+class function;
+class host_value;
+class target;
+
 namespace detail {
+
+template <typename Ret, typename ThrownU>
+future<Ret, ThrownU> start_handle_call(uint64_t handle_key,
+                                       args_encoder&& args);
 
 template <typename Ret, typename ThrownU = void>
 Ret call_handle_sync(uint64_t handle_key, args_encoder&& args);
@@ -52,16 +66,20 @@ inline pb::BamlTy primitive_baml_ty(pb::BamlTyPrimitiveKind kind) {
   return ty;
 }
 
-inline void annotate_selected_type(pb::InboundValue& value,
-                                   const pb::BamlTy& selected_type) {
-  if (value.has_value_type()) return;
-  if (selected_type.ty_case() == pb::BamlTy::kUnion ||
-      selected_type.ty_case() == pb::BamlTy::kOptional) {
-    return;
-  }
-  value.mutable_value_type()->CopyFrom(selected_type);
+inline pb::BamlTy unknown_baml_ty() {
+  pb::BamlTy ty;
+  ty.mutable_unknown();
+  return ty;
 }
 
+inline pb::BamlTy never_baml_ty() {
+  pb::BamlTy ty;
+  ty.mutable_never();
+  return ty;
+}
+
+// Byte equality: a `live` head matches another only when their keys are
+// equal (a selected type is an annotation, which never carries one).
 inline bool selected_type_matches(const pb::BamlTy& expected,
                                   const pb::BamlTy& selected) {
   if (expected.SerializeAsString() == selected.SerializeAsString()) return true;
@@ -412,38 +430,233 @@ struct function_handle_state {
   uint64_t key;
 };
 
+// The outcome of a call that ran on the host, already settled: a host
+// callable of this process that BAML handed back is called directly. Holds
+// its result, or what it threw.
+template <typename T>
+struct settled_call {
+  std::optional<T> value;
+  std::exception_ptr thrown;
+};
+template <>
+struct settled_call<void> {
+  std::exception_ptr thrown;
+};
+
+template <typename T, typename Run>
+std::shared_ptr<settled_call<T>> settle_host_call(const Run& run) {
+  auto settled = std::make_shared<settled_call<T>>();
+  try {
+    if constexpr (std::is_void<T>::value) {
+      run();
+    } else {
+      settled->value.emplace(run());
+    }
+  } catch (...) {
+    settled->thrown = std::current_exception();
+  }
+  return settled;
+}
+
+// A BAML function handle the host receives, with the name each argument of
+// a call through it is passed by. The handle's type states its parameters;
+// one it leaves nameless (a closure BAML hands a host callback takes the
+// positional parameter type the host stated) goes by `arg<index>`, the name
+// the bridge gives it when it partitions the call.
+struct received_function {
+  std::shared_ptr<function_handle_state> state;
+  std::shared_ptr<std::vector<std::string>> names;
+};
+
+inline received_function decode_received_function(
+    const pb::BamlOutboundValue& raw, std::size_t arity) {
+  const auto& value = unwrap(raw);
+  if (value.value_case() != pb::BamlOutboundValue::kHandleValue ||
+      value.handle_value().handle_type() != pb::FUNCTION_REF ||
+      value.handle_value().key() == 0) {
+    kind_mismatch("function", value);
+  }
+  auto state =
+      std::make_shared<function_handle_state>(value.handle_value().key());
+  if (!value.handle_value().has_ty() ||
+      value.handle_value().ty().ty_case() != pb::BamlTy::kFunction) {
+    throw error("BAML decode error: function handle has no function type");
+  }
+  const auto& function_ty = value.handle_value().ty().function();
+  if (static_cast<std::size_t>(function_ty.params_size()) != arity) {
+    throw error("BAML decode error: function handle arity mismatch");
+  }
+  auto names = std::make_shared<std::vector<std::string>>();
+  names->reserve(arity);
+  for (int index = 0; index < function_ty.params_size(); ++index) {
+    const auto& param = function_ty.params(index);
+    names->push_back(param.has_name() && !param.name().empty()
+                         ? param.name()
+                         : "arg" + std::to_string(index));
+  }
+  return received_function{std::move(state), std::move(names)};
+}
+
+// Whether a received function value is a host callable, one this process
+// registered and BAML handed back, rather than a BAML function.
+inline bool is_host_callable(const pb::BamlOutboundValue& raw) {
+  const auto& value = unwrap(raw);
+  return value.value_case() == pb::BamlOutboundValue::kHandleValue &&
+         value.handle_value().handle_type() == pb::HOST_VALUE_CALLABLE;
+}
+
+// The C++ callable registered under a host callable BAML handed back. The
+// host calls it directly, so its C++ type must be the one the receiving
+// type spells.
+template <typename R, typename... Args>
+std::function<R(Args...)> registered_host_callable(
+    const pb::BamlOutboundValue& raw) {
+  const auto callable = host_value_registry::instance().find_callable(
+      unwrap(raw).handle_value().key());
+  if (!callable)
+    throw error(
+        "BAML decode error: a received host callable is not registered in "
+        "this process");
+  const auto* original =
+      std::any_cast<std::function<R(Args...)>>(&callable->original);
+  if (original == nullptr)
+    throw error(
+        "BAML decode error: a received host callable was registered with "
+        "another C++ signature");
+  return *original;
+}
+
 }  // namespace detail
+
+// A `baml.host.Value`: a C++ value BAML holds by reference and never looks
+// into. Sent to BAML, it is registered with this process; back from BAML, it
+// is the same value again. Copies share one value, and one value is
+// registered under one key while BAML holds it, so a value sent several
+// times is one value to BAML.
+class host_value {
+ public:
+  host_value() = default;
+  template <class T, class = std::enable_if_t<
+                         !std::is_same_v<std::decay_t<T>, host_value>>>
+  explicit host_value(T value)
+      : original_(std::make_shared<const std::any>(std::move(value))) {}
+
+  // The C++ value.
+  const std::any& value() const {
+    if (!original_) throw error("invalid host value");
+    return *original_;
+  }
+
+  // The same value: the one this process sent.
+  friend bool operator==(const host_value& lhs, const host_value& rhs) {
+    return lhs.original_ == rhs.original_;
+  }
+
+ private:
+  friend struct codec<host_value>;
+  explicit host_value(std::shared_ptr<const std::any> original)
+      : original_(std::move(original)) {}
+  std::shared_ptr<const std::any> original_;
+};
+template <>
+struct codec<host_value> {
+  static detail::pb::BamlTy baml_ty() {
+    detail::pb::BamlTy ty;
+    ty.mutable_class_ty()->set_name("baml.host.Value");
+    return ty;
+  }
+  static void encode(detail::pb::InboundValue& out, const host_value& value) {
+    if (!value.original_) throw error("invalid host value");
+    out.mutable_handle()->set_key(
+        detail::host_value_registry::instance().send_value(value.original_));
+    out.mutable_handle()->set_handle_type(detail::pb::HOST_VALUE_OPAQUE);
+  }
+  static host_value decode(const detail::pb::BamlOutboundValue& raw) {
+    const auto& value = detail::unwrap(raw);
+    if (!value.has_handle_value() ||
+        value.handle_value().handle_type() != detail::pb::HOST_VALUE_OPAQUE ||
+        !value.handle_value().key())
+      detail::kind_mismatch("host value", value);
+    // Only this process registers its values, and the pin the engine sends
+    // with the key keeps it registered while the value is read: a miss is a
+    // lifetime bug.
+    auto original = detail::host_value_registry::instance().find_value(
+        value.handle_value().key());
+    if (!original)
+      throw bridge_error(
+          "BAML returned a host value this process does not hold");
+    return host_value(std::move(original));
+  }
+};
+
+// A function value the host received: a BAML function, called through the
+// engine, or a host callable of this process BAML handed back, called
+// directly.
+template <typename R, typename... Args>
+class function<R(Args...)> {
+ public:
+  function(std::shared_ptr<detail::function_handle_state> state,
+           std::shared_ptr<std::vector<std::string>> names)
+      : target_(engine_function{std::move(state), std::move(names)}) {}
+  explicit function(std::function<R(Args...)> host)
+      : target_(std::move(host)) {}
+
+  // Starts a call. A BAML function runs on the engine under `controls`; a
+  // host callable runs here, before this returns, and takes no controls.
+  future<R, void> call_async(Args... arguments,
+                             const invocation_options& controls = {}) const {
+    if (const auto* host = std::get_if<std::function<R(Args...)>>(&target_))
+      return future<R, void>(detail::settle_host_call<R>(
+          [&] { return (*host)(std::forward<Args>(arguments)...); }));
+    const engine_function& engine = std::get<engine_function>(target_);
+    detail::args_encoder encoded(controls);
+    std::size_t index = 0;
+    (encoded.add_arg((*engine.names)[index++],
+                     [&arguments](detail::pb::InboundValue& target) {
+                       codec<std::decay_t<Args>>::encode(target, arguments);
+                     }),
+     ...);
+    return detail::start_handle_call<R, void>(engine.state->key,
+                                              std::move(encoded));
+  }
+  R call(Args... arguments, const invocation_options& controls = {}) const {
+    return call_async(std::forward<Args>(arguments)..., controls).get();
+  }
+  R operator()(Args... arguments) const {
+    return call(std::forward<Args>(arguments)...);
+  }
+
+ private:
+  // A BAML function: the engine's handle, and the name each argument of a
+  // call through it is passed by.
+  struct engine_function {
+    std::shared_ptr<detail::function_handle_state> state;
+    std::shared_ptr<std::vector<std::string>> names;
+  };
+
+  // The engine handle a dynamic invocation calls through.
+  const std::shared_ptr<detail::function_handle_state>& engine_state() const {
+    const auto* engine = std::get_if<engine_function>(&target_);
+    if (engine == nullptr)
+      throw error(
+          "a host callable runs directly; it has no engine handle to invoke");
+    return engine->state;
+  }
+
+  std::variant<engine_function, std::function<R(Args...)>> target_;
+  friend class target;
+};
 
 template <typename R, typename... Args>
 struct codec<std::function<R(Args...)>> {
   static std::function<R(Args...)> decode(
       const detail::pb::BamlOutboundValue& raw) {
-    const auto& value = detail::unwrap(raw);
-    if (value.value_case() != detail::pb::BamlOutboundValue::kHandleValue ||
-        value.handle_value().handle_type() != detail::pb::FUNCTION_REF ||
-        value.handle_value().key() == 0) {
-      detail::kind_mismatch("function", value);
-    }
-    auto state = std::make_shared<detail::function_handle_state>(
-        value.handle_value().key());
-    if (!value.handle_value().has_ty() ||
-        value.handle_value().ty().ty_case() != detail::pb::BamlTy::kFunction) {
-      throw error("BAML decode error: returned function has no function type");
-    }
-    const auto& function_ty = value.handle_value().ty().function();
-    if (function_ty.params_size() != sizeof...(Args)) {
-      throw error("BAML decode error: returned function arity mismatch");
-    }
-    auto names = std::make_shared<std::vector<std::string>>();
-    names->reserve(function_ty.params_size());
-    for (const auto& param : function_ty.params()) {
-      if (!param.has_name() || param.name().empty()) {
-        throw error(
-            "BAML decode error: returned function parameter has no name");
-      }
-      names->push_back(param.name());
-    }
-    return [state, names](Args... args) -> R {
+    if (detail::is_host_callable(raw))
+      return detail::registered_host_callable<R, Args...>(raw);
+    detail::received_function received =
+        detail::decode_received_function(raw, sizeof...(Args));
+    return [state = std::move(received.state),
+            names = std::move(received.names)](Args... args) -> R {
       detail::args_encoder encoded;
       std::size_t index = 0;
       (encoded.add_arg((*names)[index++],
@@ -457,6 +670,27 @@ struct codec<std::function<R(Args...)>> {
         return detail::call_handle_sync<R>(state->key, std::move(encoded));
       }
     };
+  }
+};
+template <typename R, typename... Args>
+struct codec<function<R(Args...)>> {
+  // The type a host callback states for a BAML closure it receives:
+  // positional parameters and the result, from their codecs. What the
+  // closure throws is not part of its C++ type, and a callback that takes a
+  // closure takes it whatever it throws, so that is stated as `unknown`.
+  static detail::pb::BamlTy baml_ty() {
+    static_assert(!(detail::is_arg<std::decay_t<Args>>::value || ...),
+                  "a received BAML closure has no optional parameters");
+    return detail::callable_baml_ty<R, Args...>({}, detail::unknown_baml_ty());
+  }
+  static function<R(Args...)> decode(const detail::pb::BamlOutboundValue& raw) {
+    if (detail::is_host_callable(raw))
+      return function<R(Args...)>(
+          detail::registered_host_callable<R, Args...>(raw));
+    detail::received_function received =
+        detail::decode_received_function(raw, sizeof...(Args));
+    return function<R(Args...)>(std::move(received.state),
+                                std::move(received.names));
   }
 };
 
@@ -694,11 +928,12 @@ struct codec<std::vector<T>> {
   }
   static void encode(detail::pb::InboundValue& value_msg,
                      const std::vector<T>& v) {
+    const detail::encode_level level;
     detail::pb::InboundListValue* list = value_msg.mutable_list_value();
     for (const T& item : v) {
       codec<T>::encode(*list->add_values(), item);
     }
-    detail::annotate_selected_type(value_msg, baml_ty());
+    *value_msg.mutable_value_type() = baml_ty();
   }
   static std::vector<T> decode(const detail::pb::BamlOutboundValue& raw) {
     const auto& v = detail::unwrap(raw);
@@ -714,6 +949,48 @@ struct codec<std::vector<T>> {
   }
 };
 
+template <typename... Ts>
+struct codec<std::tuple<Ts...>> {
+  static_assert(sizeof...(Ts) > 0, "a BAML tuple has at least one slot");
+  using T = std::tuple<Ts...>;
+
+  static detail::pb::BamlTy baml_ty() {
+    detail::pb::BamlTy ty;
+    auto* tuple = ty.mutable_tuple();
+    (tuple->add_items()->CopyFrom(codec<Ts>::baml_ty()), ...);
+    return ty;
+  }
+  static void encode(detail::pb::InboundValue& value_msg, const T& v) {
+    const detail::encode_level level;
+    detail::pb::InboundListValue* list = value_msg.mutable_list_value();
+    std::apply(
+        [list](const Ts&... items) {
+          (codec<Ts>::encode(*list->add_values(), items), ...);
+        },
+        v);
+    *value_msg.mutable_value_type() = baml_ty();
+  }
+  static T decode(const detail::pb::BamlOutboundValue& raw) {
+    const auto& v = detail::unwrap(raw);
+    if (v.value_case() != detail::pb::BamlOutboundValue::kTupleValue) {
+      detail::kind_mismatch("tuple", v);
+    }
+    const auto& items = v.tuple_value().items();
+    if (items.size() != static_cast<int>(sizeof...(Ts))) {
+      throw error("BAML decode error: expected a tuple of " +
+                  std::to_string(sizeof...(Ts)) + " slots, got " +
+                  std::to_string(items.size()));
+    }
+    return decode_slots(items, std::index_sequence_for<Ts...>{});
+  }
+
+ private:
+  template <typename Items, std::size_t... Is>
+  static T decode_slots(const Items& items, std::index_sequence<Is...>) {
+    return T{codec<Ts>::decode(items.Get(static_cast<int>(Is)))...};
+  }
+};
+
 template <typename T>
 struct codec<std::unordered_map<std::string, T>> {
   static detail::pb::BamlTy baml_ty() {
@@ -725,13 +1002,14 @@ struct codec<std::unordered_map<std::string, T>> {
   }
   static void encode(detail::pb::InboundValue& value_msg,
                      const std::unordered_map<std::string, T>& v) {
+    const detail::encode_level level;
     detail::pb::InboundMapValue* map = value_msg.mutable_map_value();
     for (const auto& entry : v) {
       detail::pb::InboundMapEntry* e = map->add_entries();
       e->set_string_key(entry.first);
       codec<T>::encode(*e->mutable_value(), entry.second);
     }
-    detail::annotate_selected_type(value_msg, baml_ty());
+    *value_msg.mutable_value_type() = baml_ty();
   }
   static std::unordered_map<std::string, T> decode(
       const detail::pb::BamlOutboundValue& raw) {
@@ -828,8 +1106,6 @@ struct codec<lit<Vs...>> {
 //     unions with a float arm but no int arm.
 //
 // Class/enum alternatives dispatch precisely by wire FQN inside their own
-// codecs; structurally ambiguous alternatives (two lists) resolve by
-// probing elements.
 template <class... Ts>
 struct codec<std::variant<Ts...>> {
   using V = std::variant<Ts...>;
@@ -841,12 +1117,13 @@ struct codec<std::variant<Ts...>> {
     return ty;
   }
 
+  // A union has no wire shape of its own: the member leaves as the value it
+  // is, which implies or states its own type.
   static void encode(detail::pb::InboundValue& value_msg, const V& v) {
     std::visit(
         [&value_msg](const auto& alt) {
           using T = std::decay_t<decltype(alt)>;
           codec<T>::encode(value_msg, alt);
-          detail::annotate_selected_type(value_msg, codec<T>::baml_ty());
         },
         v);
   }
@@ -871,6 +1148,12 @@ struct codec<std::variant<Ts...>> {
     }
     const auto& v = detail::unwrap(raw);
     std::optional<V> out;
+    if (v.value_case() == detail::pb::BamlOutboundValue::kTupleValue &&
+        v.tuple_value().has_tuple_type()) {
+      const std::string carried =
+          v.tuple_value().tuple_type().SerializeAsString();
+      if ((claim_carried<Ts>(v, carried, out) || ...)) return std::move(*out);
+    }
     const bool lit = (try_arm<Ts>(v, out, pass::literal) || ...);
     if (!lit) {
       const bool strict = (try_arm<Ts>(v, out, pass::strict) || ...);
@@ -902,6 +1185,14 @@ struct codec<std::variant<Ts...>> {
         "generated C++ union");
   }
 
+  template <class T>
+  static bool claim_carried(const detail::pb::BamlOutboundValue& v,
+                            const std::string& carried, std::optional<V>& out) {
+    if (codec<T>::baml_ty().SerializeAsString() != carried) return false;
+    out.emplace(std::in_place_type<T>, codec<T>::decode(v));
+    return true;
+  }
+
   static bool is_int_arm(const detail::pb::BamlOutboundValue& v) {
     if (v.value_case() == detail::pb::BamlOutboundValue::kIntValue) {
       return true;
@@ -911,6 +1202,12 @@ struct codec<std::variant<Ts...>> {
                detail::pb::BamlLiteralValue::kIntValue;
   }
 
+  // BUG: an alternative that adopts an engine handle (a function, a
+  // capability) and then fails releases that handle as its
+  // partial value unwinds; a later alternative that adopts the same handle
+  // then owns a reference already given back. The engine keys one instance
+  // by one counted handle, so that extra release takes a reference another
+  // holder of the instance still counts on.
   template <class T>
   static bool try_arm(const detail::pb::BamlOutboundValue& v,
                       std::optional<V>& out, pass pass) {
@@ -973,18 +1270,12 @@ inline std::string thrown_class_name(const pb::BamlOutboundValue& raw) {
              : std::string();
 }
 
-// The re-encoded thrown value, kept on the exception so error::get<T>()
-// can decode it as a typed value later.
-inline std::vector<uint8_t> raw_payload(const pb::BamlOutboundValue& v) {
-  const std::string bytes = v.SerializeAsString();
-  return std::vector<uint8_t>(bytes.begin(), bytes.end());
-}
-
-[[noreturn]] inline void throw_from_result(
-    const pb::BamlOutboundResult& result) {
+[[noreturn]] inline void throw_from_result(pb::BamlOutboundResult& result) {
   const bool is_panic = result.result_case() == pb::BamlOutboundResult::kPanic;
-  const pb::BamlOutboundValue& value =
-      is_panic ? result.panic().value() : result.error().value();
+  const std::shared_ptr<const thrown_value> owned =
+      take_thrown_value(is_panic ? *result.mutable_panic()->mutable_value()
+                                 : *result.mutable_error()->mutable_value());
+  const pb::BamlOutboundValue& value = owned->wire;
   std::string class_name = thrown_class_name(value);
   std::string message = error_message_of(value);
 
@@ -1017,14 +1308,12 @@ inline std::vector<uint8_t> raw_payload(const pb::BamlOutboundValue& v) {
     }
     std::string trace = join_trace(result.panic().trace());
     if (class_name == "baml.panics.Cancelled") {
-      throw cancelled(std::move(message), class_name, std::move(trace),
-                      raw_payload(value));
+      throw cancelled(std::move(message), class_name, std::move(trace), owned);
     }
-    throw panic(std::move(message), class_name, std::move(trace),
-                raw_payload(value));
+    throw panic(std::move(message), class_name, std::move(trace), owned);
   }
   throw error(std::move(message), class_name,
-              join_trace(result.error().trace()), raw_payload(value));
+              join_trace(result.error().trace()), owned);
 }
 
 inline pb::BamlOutboundResult parse_result_envelope(
@@ -1045,21 +1334,21 @@ inline pb::BamlOutboundResult parse_result_envelope(
 // the typed payload. Anything else (undeclared throw, panic, exit) falls
 // through to the untyped throw_from_result.
 template <typename ThrownU>
-[[noreturn]] void throw_from_result_typed(
-    const pb::BamlOutboundResult& result) {
+[[noreturn]] void throw_from_result_typed(pb::BamlOutboundResult& result) {
   if (result.result_case() == pb::BamlOutboundResult::kError) {
-    const pb::BamlOutboundValue& value = result.error().value();
     std::optional<ThrownU> decoded;
     try {
-      decoded.emplace(codec<ThrownU>::decode(value));
+      decoded.emplace(
+          codec<ThrownU>::decode(clone_control_value(result.error().value())));
     } catch (const error&) {
       // Not in the declared set: untyped fallback below.
     }
     if (decoded.has_value()) {
-      throw thrown<ThrownU>(std::move(*decoded), error_message_of(value),
-                            thrown_class_name(value),
-                            join_trace(result.error().trace()),
-                            raw_payload(value));
+      const std::shared_ptr<const thrown_value> owned =
+          take_thrown_value(*result.mutable_error()->mutable_value());
+      throw thrown<ThrownU>(std::move(*decoded), error_message_of(owned->wire),
+                            thrown_class_name(owned->wire),
+                            join_trace(result.error().trace()), owned);
     }
   }
   throw_from_result(result);
@@ -1078,6 +1367,13 @@ T decode_result(const std::vector<uint8_t>& envelope) {
       throw_from_result_typed<ThrownU>(result);
     }
   }
+  struct release_borrowed_references {
+    const pb::BamlOutboundValue& ok;
+    ~release_borrowed_references() { release_borrowed(ok); }
+  } borrowed{result.ok()};
+  // BUG: a decode that fails part way leaks the engine handles it had not
+  // yet adopted (so does error::get and value::as, which decode a clone):
+  // nothing records which handles the decoded value took.
   if constexpr (!std::is_void<T>::value) {
     return codec<T>::decode(result.ok());
   }
@@ -1085,17 +1381,13 @@ T decode_result(const std::vector<uint8_t>& envelope) {
 
 }  // namespace detail
 
-// Typed access to a thrown BAML value: re-decode the raw error payload the
-// envelope carried. Declared in errors.h; defined here because decoding
-// needs the codec.
+// Typed access to a thrown BAML value: decode a clone of it, so the error
+// keeps its own references. Declared in errors.h; defined here because
+// decoding needs the codec.
 template <typename T>
 T error::get() const {
-  detail::pb::BamlOutboundValue value;
-  if (!value.ParseFromArray(payload().data(),
-                            static_cast<int>(payload().size()))) {
-    throw error("BAML decode error: malformed error payload");
-  }
-  return codec<T>::decode(value);
+  if (!value_) throw error("this error carries no BAML value");
+  return codec<T>::decode(detail::clone_control_value(value_->wire));
 }
 
 template <typename T>

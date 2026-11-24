@@ -36,15 +36,21 @@ impl ExprMetadataKey {
     }
 }
 
-/// HIR resolution of a value path's root segment.
+/// HIR's reading of a value path's first segment, recorded for every
+/// `Path` expression while the lexical scope stack is active.
 ///
-/// Local roots are resolved to declaration identity while the lexical scope
-/// stack is active. Non-local roots are completed by TIR because package-item
-/// resolution would introduce a HIR query cycle.
+/// A binding wins over everything (`#4543`: a local named `reflect` shadows
+/// the package). Otherwise the head is a package or a plain name
+/// ([`PathHead`]); which ITEM a plain name or a package path reaches is the
+/// checker's to complete — looking a package's items up here would cycle
+/// `file_semantic_index` through `package_items`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathResolution {
+    /// A binding or parameter in scope; every later segment is a member of
+    /// its value.
     Local(BindingId),
-    Unknown,
+    /// Not a binding: an item path starting at `head`.
+    Item(PathHead),
 }
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -53,6 +59,7 @@ use crate::{
     contributions::FileSymbolContributions,
     diagnostic::Hir2Diagnostic,
     item_tree::{ItemTree, ItemTreeSourceMap},
+    package::PathHead,
     scope::{FileScopeId, ItemScopeOwner, Scope, ScopeId, ScopeKind},
 };
 
@@ -285,33 +292,12 @@ pub struct FileSemanticIndex<'db> {
     pub env_var_refs: Vec<baml_compiler2_ast::EnvVarRef>,
 }
 
-// ── salsa::Update impl ────────────────────────────────────────────────────────
+// ── Salsa retention safety ────────────────────────────────────────────────
 
-/// # Safety
-///
-/// This impl is required for `FileSemanticIndex` to be returned from a
-/// `#[salsa::tracked(no_eq)]` query. With `no_eq`, Salsa never calls
-/// `values_equal` so the actual equality logic doesn't matter — but the
-/// `maybe_update` function must correctly transfer ownership of `new_value`
-/// into `old_pointer` and return whether a change occurred.
-///
-/// We always return `true` (always mark as changed), matching the `no_eq`
-/// semantics. The `*old_pointer = new_value` write is safe because `old_pointer`
-/// points to valid allocated memory that Salsa owns.
+// SAFETY: This type owns its data. Its database lifetime only appears
+// in Salsa identities; it contains no references into query storage.
 #[allow(unsafe_code)]
-unsafe impl salsa::Update for FileSemanticIndex<'_> {
-    #[allow(unsafe_code)]
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        // SAFETY: `old_pointer` is valid, aligned, and points to memory Salsa
-        // has previously initialized. We drop the old value and write the new one.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::ptr::drop_in_place(old_pointer);
-            std::ptr::write(old_pointer, new_value);
-        }
-        true
-    }
-}
+unsafe impl salsa::SalsaValue for FileSemanticIndex<'_> {}
 
 impl FileSemanticIndex<'_> {
     /// Find the `Lambda` scope whose range exactly matches `span`.

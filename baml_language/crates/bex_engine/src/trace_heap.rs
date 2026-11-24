@@ -13,10 +13,11 @@ use std::{
     },
 };
 
-use baml_builtins2::{MediaContent, MediaValue};
-use bex_external_types::{BexExternalAdt, BexExternalValue, MediaKind, try_convert_rust_data};
+use bex_external_types::ConcreteMediaKind;
 use bex_heap::{BexHeap, PermitProof};
-use bex_vm_types::{HeapPtr, Object, Value, ValueKind};
+use bex_vm_types::{
+    Field, HeapPtr, InstanceRef, MediaContent, MediaValue, Object, Value, ValueKind,
+};
 
 /// A structured-log snapshot could not allocate its owned value graph.
 #[derive(Debug)]
@@ -59,6 +60,10 @@ pub enum TraceValue {
     String(String),
     Bytes(Vec<u8>),
     Array(Vec<TraceValueRef>),
+    Tuple {
+        element_types: Vec<baml_type::RuntimeTy>,
+        items: Vec<TraceValueRef>,
+    },
     Map(Vec<(String, TraceValueRef)>),
     Media(TraceMediaValue),
     Instance {
@@ -75,7 +80,7 @@ pub enum TraceValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceMediaValue {
-    pub kind: MediaKind,
+    pub kind: ConcreteMediaKind,
     pub mime_type: Option<String>,
     pub content: TraceMediaContent,
 }
@@ -83,8 +88,11 @@ pub struct TraceMediaValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceMediaContent {
     Url(String),
-    Base64(String),
-    File(String),
+    Base64 {
+        base64: String,
+        /// The base name of the file the content was read from.
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,26 +187,6 @@ impl TraceHeap {
         self.insert_snapshot(builder.finish(root))
     }
 
-    pub fn copy_named_values_from_bex_heap(
-        &self,
-        heap: &BexHeap,
-        permit: PermitProof<'_>,
-        entries: &[(String, Value)],
-    ) -> TraceSnapshotHandle {
-        let mut builder = TraceSnapshotBuilder::default();
-        let entries = entries
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    Self::unbounded(builder.copy_value(heap, permit, *value)),
-                )
-            })
-            .collect();
-        let root = Self::unbounded(builder.alloc(TraceValue::Map(entries)));
-        self.insert_snapshot(builder.finish(root))
-    }
-
     #[must_use]
     pub fn get(&self, handle: TraceSnapshotHandle) -> Option<TraceSnapshot> {
         self.inner
@@ -215,15 +203,6 @@ impl TraceHeap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&handle)
-    }
-
-    #[must_use]
-    pub fn retained_snapshot_count(&self) -> usize {
-        self.inner
-            .snapshots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
     }
 
     fn insert_snapshot(&self, snapshot: TraceSnapshot) -> TraceSnapshotHandle {
@@ -280,6 +259,17 @@ impl TraceSnapshotBuilder {
         Ok(values)
     }
 
+    /// An instance's type arguments as a snapshot shows them: a compiled
+    /// declaration by name, a runtime declaration by its label; one with no
+    /// annotation form is left out.
+    fn trace_type_args(
+        class_type_args: &[bex_vm_types::RealizedTy],
+    ) -> Result<Vec<baml_type::RuntimeTy>, CopyError> {
+        let mut type_args = Self::vec_with_capacity(class_type_args.len())?;
+        type_args.extend(class_type_args.iter().filter_map(display_ty));
+        Ok(type_args)
+    }
+
     fn copy_str(value: &str) -> Result<String, CopyError> {
         let mut output = String::new();
         output
@@ -312,6 +302,7 @@ impl TraceSnapshotBuilder {
             ValueKind::Null => self.alloc(TraceValue::Null),
             ValueKind::Bool(value) => self.alloc(TraceValue::Bool(value)),
             ValueKind::Int(value) => self.alloc(TraceValue::Int(value)),
+            ValueKind::Float(value) => self.alloc(TraceValue::Float(value)),
             ValueKind::OmittedArg => {
                 self.omitted(TraceOmissionReason::OmittedArgument, "omitted argument")
             }
@@ -328,7 +319,7 @@ impl TraceSnapshotBuilder {
         let object = unsafe { ptr.get() };
         let tracks_recursion = matches!(
             object,
-            Object::Array(_) | Object::Map(_) | Object::Instance(_)
+            Object::Array(_) | Object::Map(_) | Object::Instance | Object::Tuple(_)
         );
         if tracks_recursion && self.in_progress.contains(&ptr) {
             return self.omitted(TraceOmissionReason::CyclicReference, "cyclic reference");
@@ -362,50 +353,138 @@ impl TraceSnapshotBuilder {
                 }
                 self.alloc(TraceValue::Array(items))
             }
+            Object::Tuple(tuple) => {
+                let mut element_types = Self::vec_with_capacity(tuple.element_tys.len())?;
+                for ty in &tuple.element_tys {
+                    element_types.push(display_ty(ty).unwrap_or(baml_type::RuntimeTy::Unknown));
+                }
+                let mut items = Self::vec_with_capacity(tuple.len())?;
+                for value in tuple.slot_values() {
+                    items.push(self.copy_value(heap, permit, value)?);
+                }
+                self.alloc(TraceValue::Tuple {
+                    element_types,
+                    items,
+                })
+            }
             Object::Map(map) => {
                 let map = map.data.lock();
-                let mut entries = Self::vec_with_capacity(map.len())?;
-                for (key, value) in map.iter() {
-                    let key = Self::copy_str(key.as_str())?;
-                    let value = self.copy_value(heap, permit, *value)?;
-                    entries.push((key, value));
-                }
-                self.alloc(TraceValue::Map(entries))
-            }
-            Object::Instance(instance) => {
-                let class_object = unsafe { instance.class.get() };
-                if let Object::Class(class) = class_object {
-                    let mut fields = Self::vec_with_capacity(class.fields.len())?;
-                    for (field, slot) in class.fields.iter().zip(instance.fields.iter()) {
-                        let name = Self::copy_str(&field.name)?;
-                        let value = self.copy_value(heap, permit, slot.load())?;
-                        fields.push((name, value));
+                let string_key = |key: &Value| {
+                    // SAFETY: the copy holds a heap permit for the entire traversal.
+                    match key.as_object_ptr().map(|ptr| unsafe { ptr.get() }) {
+                        Some(Object::String(key)) => Some(key),
+                        _ => None,
                     }
-                    let mut type_args = Self::vec_with_capacity(instance.class_type_args.len())?;
-                    for type_arg in &instance.class_type_args {
-                        // Snapshots retain the wire form of the runtime type.
-                        let Ok(wire) = crate::conversion::overlay_wire_ty(
-                            &bex_vm_types::RuntimeTy::from(type_arg),
-                        ) else {
-                            continue;
-                        };
-                        type_args.push(wire);
-                    }
-                    // A trace is read by a person: the display name, never an
-                    // internal identity.
-                    let type_name = Self::copy_str(&class.name.to_string())?;
-                    self.alloc(TraceValue::Instance {
-                        type_name,
-                        type_args,
-                        fields,
-                    })
-                } else {
+                };
+                if map.keys().any(|key| string_key(key).is_none()) {
                     self.omitted(
-                        TraceOmissionReason::InvalidRuntimeValue,
-                        "instance class pointer did not point at a class",
+                        TraceOmissionReason::UnsupportedValue,
+                        "map with non-string keys",
                     )
+                } else {
+                    let mut entries = Self::vec_with_capacity(map.len())?;
+                    for (key, value) in map.iter() {
+                        let key = string_key(key).expect("map keys validated under the same lock");
+                        let key = Self::copy_str(key.as_str())?;
+                        let value = self.copy_value(heap, permit, *value)?;
+                        entries.push((key, value));
+                    }
+                    self.alloc(TraceValue::Map(entries))
                 }
             }
+            Object::Instance => {
+                let instance = unsafe { InstanceRef::of(ptr) }.expect("an instance pointer");
+                let class = instance.class_object();
+                let mut fields = Self::vec_with_capacity(class.instance_fields().len())?;
+                for (field, value) in class.instance_fields().iter().zip(instance.fields()) {
+                    let name = Self::copy_str(&field.name)?;
+                    let value = match value {
+                        Field::Value(value) => self.copy_value(heap, permit, value)?,
+                        Field::Float(float) => self.alloc(TraceValue::Float(float))?,
+                    };
+                    fields.push((name, value));
+                }
+                let type_args = Self::trace_type_args(instance.type_args())?;
+                let type_name = Self::copy_str(&class.name().to_string())?;
+                self.alloc(TraceValue::Instance {
+                    type_name,
+                    type_args,
+                    fields,
+                })
+            }
+            // Media is traced as the value it is; a rendered prompt and a
+            // host's value are omitted. Any other instance is its declaration
+            // and type arguments, with no fields: the payload records nothing
+            // a reader could use.
+            Object::RustInstance(instance) => match &instance.payload {
+                bex_vm_types::RustPayload::Image(media)
+                | bex_vm_types::RustPayload::Audio(media)
+                | bex_vm_types::RustPayload::Pdf(media)
+                | bex_vm_types::RustPayload::Video(media) => self.copy_media(media),
+                bex_vm_types::RustPayload::Prompt(_) => {
+                    self.omitted(TraceOmissionReason::UnsupportedValue, "prompt AST")
+                }
+                bex_vm_types::RustPayload::HostValue(host) => self.omitted(
+                    TraceOmissionReason::HostOwnedValue,
+                    match host.kind {
+                        bex_external_types::HostValueKind::Callable => "host-owned callable",
+                        bex_external_types::HostValueKind::Opaque => "host-owned opaque value",
+                    },
+                ),
+                bex_vm_types::RustPayload::Foreign(_)
+                | bex_vm_types::RustPayload::DefaultHasher(_)
+                | bex_vm_types::RustPayload::Sha256(_)
+                | bex_vm_types::RustPayload::Aes256GcmSiv(_)
+                | bex_vm_types::RustPayload::Aes128GcmSiv(_)
+                | bex_vm_types::RustPayload::ChaCha20Poly1305(_)
+                | bex_vm_types::RustPayload::XChaCha20Poly1305(_)
+                | bex_vm_types::RustPayload::Regex(_)
+                | bex_vm_types::RustPayload::CsvRecord(_)
+                | bex_vm_types::RustPayload::Semaphore(_)
+                | bex_vm_types::RustPayload::Permit(_)
+                | bex_vm_types::RustPayload::Ticket(_)
+                | bex_vm_types::RustPayload::CancelToken(_)
+                | bex_vm_types::RustPayload::SpanId(_)
+                | bex_vm_types::RustPayload::TraceOptions(_)
+                | bex_vm_types::RustPayload::ReservedSpan(_)
+                | bex_vm_types::RustPayload::File(_)
+                | bex_vm_types::RustPayload::Glob(_)
+                | bex_vm_types::RustPayload::OutputFormat(_)
+                | bex_vm_types::RustPayload::Lock(_)
+                | bex_vm_types::RustPayload::TcpStream(_)
+                | bex_vm_types::RustPayload::TcpListener(_)
+                | bex_vm_types::RustPayload::UdpSocket(_)
+                | bex_vm_types::RustPayload::Xoshiro256PlusPlus(_)
+                | bex_vm_types::RustPayload::ChaCha20(_)
+                | bex_vm_types::RustPayload::InterfaceWitness(_)
+                | bex_vm_types::RustPayload::CsvReader(_)
+                | bex_vm_types::RustPayload::CsvWriter(_)
+                | bex_vm_types::RustPayload::ClassBuilder(_)
+                | bex_vm_types::RustPayload::ChildProcess(_)
+                | bex_vm_types::RustPayload::ReadPipe(_)
+                | bex_vm_types::RustPayload::WritePipe(_)
+                | bex_vm_types::RustPayload::WebSocket(_)
+                | bex_vm_types::RustPayload::HttpBody(_)
+                | bex_vm_types::RustPayload::SseStream(_)
+                | bex_vm_types::RustPayload::HttpServer(_)
+                | bex_vm_types::RustPayload::TlsKeys(_) => {
+                    let class_object = unsafe { instance.class.get() };
+                    if let Object::Class(class) = class_object {
+                        let type_args = Self::trace_type_args(&instance.class_type_args)?;
+                        let type_name = Self::copy_str(&class.name().to_string())?;
+                        self.alloc(TraceValue::Instance {
+                            type_name,
+                            type_args,
+                            fields: Vec::new(),
+                        })
+                    } else {
+                        self.omitted(
+                            TraceOmissionReason::InvalidRuntimeValue,
+                            "rust instance class pointer did not point at a class",
+                        )
+                    }
+                }
+            },
             Object::Variant(variant) => {
                 let enum_object = unsafe { variant.enm.get() };
                 let Object::Enum(enum_) = enum_object else {
@@ -420,7 +499,7 @@ impl TraceSnapshotBuilder {
                         "variant index was outside the enum definition",
                     );
                 };
-                let type_name = Self::copy_str(&enum_.name.to_string())?;
+                let type_name = Self::copy_str(&enum_.name().to_string())?;
                 let variant = Self::copy_str(&variant_def.name)?;
                 self.alloc(TraceValue::Enum { type_name, variant })
             }
@@ -444,13 +523,7 @@ impl TraceSnapshotBuilder {
                 TraceOmissionReason::HostOwnedValue,
                 unsupported_object_message(object),
             ),
-            Object::RustData(data) => match try_convert_rust_data(data) {
-                Some(value) => self.copy_external_value(value),
-                None => self.omitted(
-                    TraceOmissionReason::HostOwnedValue,
-                    unsupported_object_message(object),
-                ),
-            },
+            Object::Tombstone => Object::tombstone_reached(),
             #[cfg(feature = "heap_debug")]
             Object::Sentinel(_) => self.omitted(
                 TraceOmissionReason::InvalidRuntimeValue,
@@ -466,36 +539,13 @@ impl TraceSnapshotBuilder {
         value_ref
     }
 
-    fn copy_external_value(&mut self, value: BexExternalValue) -> Result<TraceValueRef, CopyError> {
-        match value {
-            BexExternalValue::Adt(BexExternalAdt::Media(media)) => self.copy_media(&media),
-            BexExternalValue::HostValue(host) => self.omitted(
-                TraceOmissionReason::HostOwnedValue,
-                match host.kind {
-                    bex_external_types::HostValueKind::Callable => "host-owned callable",
-                    bex_external_types::HostValueKind::Opaque => "host-owned opaque value",
-                },
-            ),
-            BexExternalValue::RustData(_) => {
-                self.omitted(TraceOmissionReason::HostOwnedValue, "host-owned rust data")
-            }
-            BexExternalValue::Adt(BexExternalAdt::PromptAst(_)) => {
-                self.omitted(TraceOmissionReason::UnsupportedValue, "prompt AST")
-            }
-            _ => self.omitted(
-                TraceOmissionReason::UnsupportedValue,
-                "unsupported rust data conversion",
-            ),
-        }
-    }
-
     fn copy_media(&mut self, media: &MediaValue) -> Result<TraceValueRef, CopyError> {
         let content = media.read_content(|content| match content {
             MediaContent::Url { url, .. } => Self::copy_str(url).map(TraceMediaContent::Url),
-            MediaContent::Base64 { base64_data } => {
-                Self::copy_str(base64_data).map(TraceMediaContent::Base64)
-            }
-            MediaContent::File { file, .. } => Self::copy_str(file).map(TraceMediaContent::File),
+            MediaContent::Base64 { base64_data, name } => Ok(TraceMediaContent::Base64 {
+                base64: Self::copy_str(base64_data)?,
+                name: name.as_deref().map(Self::copy_str).transpose()?,
+            }),
         })?;
         let mime_type = media
             .read_mime_type(|mime_type| mime_type.map(Self::copy_str))
@@ -535,29 +585,43 @@ fn unsupported_object_message(object: &Object) -> &'static str {
         Object::HostClosure(_) => "host-owned callable",
         Object::Cell(_) => "cell",
         Object::Future(_) => "future",
-        Object::RustData(_) => "host-owned rust data",
         Object::Type(_) => "type descriptor",
+        Object::Tombstone => Object::tombstone_reached(),
         #[cfg(feature = "heap_debug")]
         Object::Sentinel(_) => "heap sentinel",
         Object::String(_)
         | Object::Bigint(_)
         | Object::Uint8Array(_)
         | Object::Array(_)
+        | Object::Tuple(_)
         | Object::Map(_)
-        | Object::Instance(_)
+        | Object::Instance
+        | Object::RustInstance(_)
         | Object::Variant(_)
         | Object::Float(_) => "unsupported value",
     }
 }
 
+fn display_ty(ty: &bex_vm_types::RealizedTy) -> Option<baml_type::RuntimeTy> {
+    let annotated = crate::conversion::to_annotation::<std::convert::Infallible>(ty).ok()?;
+    Some(baml_type::RuntimeTy::from(&annotated.map_heads(
+        &mut |head: &bex_external_types::WireHead<std::convert::Infallible>| match head {
+            bex_external_types::WireHead::Static(name) => name.clone(),
+            bex_external_types::WireHead::Live(never) => match *never {},
+            bex_external_types::WireHead::Anonymous(label) => {
+                baml_type::TypeName::local(label.clone())
+            }
+        },
+    )))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
-    use baml_builtins2::MediaValue;
-    use bex_external_types::MediaKind;
+    use bex_external_types::ConcreteMediaKind;
     use bex_heap::{BexHeap, HeapPermit as _, HeapPermitManager, Tlab, TlabHolder};
-    use bex_vm_types::{Object, RootHaver, Value};
+    use bex_vm_types::{MediaValue, Object, RootHaver, Value};
 
     use super::{TraceHeap, TraceMediaContent, TraceOmissionReason, TraceValue};
 
@@ -566,12 +630,7 @@ mod tests {
     }
 
     impl RootHaver for EmptyRoots {
-        fn collect_roots(&self, _roots: &mut Vec<bex_vm_types::HeapPtr>) {}
-        fn forward_roots(
-            &mut self,
-            _forward: &HashMap<bex_vm_types::HeapPtr, bex_vm_types::HeapPtr>,
-        ) {
-        }
+        fn visit_roots(&mut self, _visitor: &mut dyn bex_vm_types::RootVisitor) {}
     }
 
     impl TlabHolder for EmptyRoots {
@@ -582,6 +641,154 @@ mod tests {
         fn tlab_mut(&mut self) -> &mut Tlab {
             &mut self.tlab
         }
+    }
+
+    #[tokio::test]
+    async fn trace_heap_omits_only_the_unsupported_map_and_unwinds_its_visit() {
+        let heap = BexHeap::new(Vec::new());
+        let manager = HeapPermitManager::new();
+        let mut permit = manager
+            .new_permit(EmptyRoots {
+                tlab: Tlab::new(Arc::clone(&heap)),
+            })
+            .await
+            .acquire()
+            .await;
+        let first_key = permit.tlab_mut().alloc_string("first");
+        let discarded = permit.tlab_mut().alloc_string("must not survive omission");
+        let unsupported = permit
+            .tlab_mut()
+            .alloc(Object::Map(bex_vm_types::types::Map::new(
+                bex_vm_types::RealizedTy::Union(
+                    vec![
+                        bex_vm_types::RealizedTy::string(),
+                        bex_vm_types::RealizedTy::int(),
+                    ]
+                    .into(),
+                ),
+                bex_vm_types::RealizedTy::unknown(),
+                bex_vm_types::MapData::from_hashed_entries([
+                    (
+                        bex_vm_types::map_string_hash("first"),
+                        Value::object(first_key),
+                        Value::object(discarded),
+                    ),
+                    (0, Value::int(1), Value::int(2)),
+                ]),
+            )));
+        let outer = permit.tlab_mut().alloc_map(
+            bex_vm_types::RealizedTy::string(),
+            bex_vm_types::RealizedTy::unknown(),
+            [
+                ("before".into(), Value::int(7)),
+                ("unsupported".into(), Value::object(unsupported)),
+                ("again".into(), Value::object(unsupported)),
+                ("after".into(), Value::int(8)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let trace_heap = TraceHeap::new();
+        let handle =
+            trace_heap.copy_value_from_bex_heap(&heap, permit.proof(), Value::object(unsupported));
+        let root = trace_heap.release(handle).expect("root snapshot retained");
+        assert_eq!(
+            root.values.len(),
+            1,
+            "omitted map must retain no copied entries"
+        );
+        assert!(matches!(
+            root.value(root.root()),
+            Some(TraceValue::Omitted(descriptor))
+                if descriptor.reason == TraceOmissionReason::UnsupportedValue
+        ));
+        let handle =
+            trace_heap.copy_value_from_bex_heap(&heap, permit.proof(), Value::object(outer));
+        let snapshot = trace_heap
+            .release(handle)
+            .expect("sibling snapshot retained");
+        assert_eq!(
+            snapshot.values.len(),
+            5,
+            "only reachable snapshot values survive"
+        );
+        let Some(TraceValue::Map(entries)) = snapshot.value(snapshot.root()) else {
+            panic!("supported containing map must survive");
+        };
+        assert_eq!(entries.len(), 4);
+        assert_eq!(snapshot.value(entries[0].1), Some(&TraceValue::Int(7)));
+        assert_eq!(snapshot.value(entries[3].1), Some(&TraceValue::Int(8)));
+        for (_, reference) in &entries[1..3] {
+            assert!(matches!(
+                snapshot.value(*reference),
+                Some(TraceValue::Omitted(descriptor))
+                    if descriptor.reason == TraceOmissionReason::UnsupportedValue
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_traced_tuple_keeps_its_carried_types_through_a_cyclic_omission() {
+        let heap = BexHeap::new(Vec::new());
+        let manager = HeapPermitManager::new();
+        let mut permit = manager
+            .new_permit(EmptyRoots {
+                tlab: Tlab::new(Arc::clone(&heap)),
+            })
+            .await
+            .acquire()
+            .await;
+        let child = permit
+            .tlab_mut()
+            .alloc_array(bex_vm_types::RealizedTy::Unknown, vec![]);
+        let tuple = permit.tlab_mut().alloc_tuple(
+            bex_vm_types::Tuple::new(
+                [
+                    bex_vm_types::RealizedTy::Union(
+                        vec![
+                            bex_vm_types::RealizedTy::int(),
+                            bex_vm_types::RealizedTy::null(),
+                        ]
+                        .into(),
+                    ),
+                    bex_vm_types::RealizedTy::unknown(),
+                ],
+                [Value::int(1), Value::object(child)],
+            )
+            .unwrap(),
+        );
+        // SAFETY: this test is the child's only reader or writer.
+        let Object::Array(array) = (unsafe { child.get() }) else {
+            unreachable!()
+        };
+        unsafe { array.data_unchecked_mut() }.push(Value::object(tuple));
+        let trace_heap = TraceHeap::new();
+        let handle =
+            trace_heap.copy_value_from_bex_heap(&heap, permit.proof(), Value::object(tuple));
+        let snapshot = trace_heap.release(handle).expect("snapshot retained");
+        let Some(TraceValue::Tuple {
+            element_types,
+            items,
+        }) = snapshot.value(snapshot.root())
+        else {
+            panic!("the root is a tuple");
+        };
+        assert_eq!(
+            element_types,
+            &vec![
+                baml_type::RuntimeTy::Union(
+                    vec![baml_type::RuntimeTy::Int, baml_type::RuntimeTy::Null].into()
+                ),
+                baml_type::RuntimeTy::Unknown,
+            ],
+            "the carried types, not the types of what the slots hold"
+        );
+        assert_eq!(snapshot.value(items[0]), Some(&TraceValue::Int(1)));
+        assert!(matches!(
+            match snapshot.value(items[1]) { Some(TraceValue::Array(children)) => snapshot.value(children[0]), _ => None },
+            Some(TraceValue::Omitted(descriptor))
+                if descriptor.reason == TraceOmissionReason::CyclicReference
+        ));
     }
 
     #[tokio::test]
@@ -627,9 +834,41 @@ mod tests {
             .await
             .acquire()
             .await;
-        let host_owned = permit
+        // A host's own value: the trace reads only the payload, so the class
+        // is bare.
+        let class = permit
             .tlab_mut()
-            .alloc(Object::RustData(std::sync::Arc::new(1_u64)));
+            .alloc(Object::Class(Box::new(bex_vm_types::Class {
+                declared_crossing: baml_type::ClassCrossing::HostValue,
+                path: bex_vm_types::types::LocalName::new(
+                    Vec::new(),
+                    baml_type::Name::new("Value"),
+                ),
+                body: bex_vm_types::ClassBody::RustType(baml_base::RustPayloadKind::HostValue),
+                description: None,
+                alias: None,
+                docstring: None,
+                other: indexmap::IndexMap::default(),
+                type_tag: baml_type::typetag::TypeTag::from_i64(301),
+                stream_done: false,
+                cleanup: None,
+                methods: indexmap::IndexMap::new(),
+                generic_param_count: 0,
+                owner: bex_vm_types::types::Owner::anonymous(),
+                telemetry_definition: bex_vm_types::DefinitionCell::default(),
+                redact: false,
+            })));
+        let host_owned =
+            permit
+                .tlab_mut()
+                .alloc(Object::RustInstance(bex_vm_types::RustInstance::new(
+                    class,
+                    bex_vm_types::ThinVec::new(),
+                    bex_vm_types::RustPayload::HostValue(bex_resource_types::HostValueArc::new(
+                        bex_resource_types::HostKey::new(1).expect("nonzero"),
+                        bex_resource_types::HostValueKind::Opaque,
+                    )),
+                )));
         let trace_heap = TraceHeap::new();
 
         let handle = trace_heap.copy_values_from_bex_heap(
@@ -654,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trace_heap_snapshots_media_rust_data() {
+    async fn trace_heap_snapshots_a_media_instance() {
         let heap = BexHeap::new(Vec::new());
         let manager = HeapPermitManager::new();
         let mut permit = manager
@@ -664,9 +903,42 @@ mod tests {
             .await
             .acquire()
             .await;
-        let media =
-            MediaValue::from_base64(MediaKind::Image, "aW1hZ2UtYnl0ZXM=", Some("image/png"));
-        let media_ptr = permit.tlab_mut().alloc(Object::RustData(media));
+        let media = MediaValue::from_base64(
+            ConcreteMediaKind::Image,
+            "aW1hZ2UtYnl0ZXM=".into(),
+            Some("image/png"),
+        );
+        // The trace reads only the payload, so the class is bare.
+        let class = permit
+            .tlab_mut()
+            .alloc(Object::Class(Box::new(bex_vm_types::Class {
+                declared_crossing: baml_type::ClassCrossing::Media(ConcreteMediaKind::Image),
+                path: bex_vm_types::types::LocalName::new(
+                    Vec::new(),
+                    baml_type::Name::new("Image"),
+                ),
+                body: bex_vm_types::ClassBody::RustType(baml_base::RustPayloadKind::Image),
+                description: None,
+                alias: None,
+                docstring: None,
+                other: indexmap::IndexMap::default(),
+                type_tag: baml_type::typetag::TypeTag::from_i64(300),
+                stream_done: false,
+                cleanup: None,
+                methods: indexmap::IndexMap::new(),
+                generic_param_count: 0,
+                owner: bex_vm_types::types::Owner::anonymous(),
+                telemetry_definition: bex_vm_types::DefinitionCell::default(),
+                redact: false,
+            })));
+        let media_ptr =
+            permit
+                .tlab_mut()
+                .alloc(Object::RustInstance(bex_vm_types::RustInstance::new(
+                    class,
+                    bex_vm_types::ThinVec::new(),
+                    bex_vm_types::RustPayload::media(media),
+                )));
         let trace_heap = TraceHeap::new();
 
         let handle =
@@ -676,11 +948,14 @@ mod tests {
         let Some(TraceValue::Media(media)) = snapshot.value(snapshot.root()) else {
             panic!("root should be media");
         };
-        assert_eq!(media.kind, MediaKind::Image);
+        assert_eq!(media.kind, ConcreteMediaKind::Image);
         assert_eq!(media.mime_type.as_deref(), Some("image/png"));
         assert_eq!(
             media.content,
-            TraceMediaContent::Base64("aW1hZ2UtYnl0ZXM=".to_string())
+            TraceMediaContent::Base64 {
+                base64: "aW1hZ2UtYnl0ZXM=".to_string(),
+                name: None,
+            }
         );
     }
 

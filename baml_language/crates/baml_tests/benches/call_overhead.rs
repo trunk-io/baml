@@ -1,14 +1,18 @@
 //! Runtime call and structured logging overhead benchmarks.
 //! Run with: cargo bench --bench call_overhead
+#![allow(clippy::disallowed_methods)]
 
 use std::{path::Path, sync::Arc};
 
 use baml_compiler2_emit::OptLevel;
-use baml_db::{ProjectDatabase, compile_program};
+use baml_db::{CheckedWorld, ProjectDatabase};
 use baml_tests::engine::TestDbExt;
 use bex_engine::{BexEngine, FunctionCallContextBuilder, logger::TraceLogger};
 use divan::{Bencher, black_box};
 use sys_native::{CallId, SysOpsExt};
+
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
     if cfg!(debug_assertions) {
@@ -39,8 +43,10 @@ fn compile_source(source: &str) -> (ProjectDatabase, BexEngine) {
     let mut db = ProjectDatabase::new();
     let package = db.workspace(Path::new("."));
     db.file("bench.baml", source);
-    let bytecode =
-        compile_program(&db, package, OptLevel::Two).expect("benchmark compilation failed");
+    let bytecode = CheckedWorld::collect(&db, package)
+        .expect("the world checks")
+        .compile(OptLevel::Two)
+        .expect("benchmark compilation failed");
     let engine = BexEngine::new(bytecode, Arc::new(sys_native::SysOps::native()), vec![])
         .expect("benchmark engine creation failed");
     (db, engine)
@@ -81,6 +87,41 @@ include!(concat!(env!("OUT_DIR"), "/speedtest_profiling_sources.rs"));
 #[divan::bench]
 fn call_compute_pure_call_1m(bencher: Bencher) {
     bench_vm_main(bencher, PROF_SRC_COMPUTE_PURE_CALL_1M, BenchMode::Off);
+}
+
+// Tracing's ordinary-call regression probes are independent of the optional
+// speedtest corpus. Run each under BAML_TELEMETRY=off, medium, and high.
+#[divan::bench]
+fn ordinary_calls_100k(bencher: Bencher) {
+    bench_vm_main(
+        bencher,
+        r#"
+function leaf(n: int) -> int { n + 1 }
+function main() -> int {
+    let n = 0;
+    for (let i = 0; i < 100000; i += 1) { n = leaf(n); }
+    n
+}
+"#,
+        BenchMode::Off,
+    );
+}
+
+#[divan::bench]
+fn nested_calls_100k(bencher: Bencher) {
+    bench_vm_main(
+        bencher,
+        r#"
+function leaf(n: int) -> int { n + 1 }
+function middle(n: int) -> int { leaf(n) + 1 }
+function main() -> int {
+    let n = 0;
+    for (let i = 0; i < 100000; i += 1) { n = middle(n); }
+    n
+}
+"#,
+        BenchMode::Off,
+    );
 }
 
 #[divan::bench]

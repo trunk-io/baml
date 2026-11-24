@@ -25,7 +25,7 @@ const TOP_LEVEL: &[(&str, &str)] = &[
         "implement ${1:Interface} for ${2:Type} {\n\t$0\n}",
     ),
     ("type", "type ${1:Name} = $0"),
-    ("let", "let ${1:name} = $0;"),
+    ("const", "const ${1:name} = $0;"),
     ("client", "client ${1:Name} = $0"),
     ("generator", "generator ${1:name} {\n\t$0\n}"),
     ("test", "test \"${1:name}\" {\n\t$0\n}"),
@@ -74,7 +74,7 @@ pub(crate) fn complete_attributes(position: AttributePosition, out: &mut Complet
     // Unknown `@` names are legal user schema annotations (hoisted for
     // reflection read-back), so this list is a menu of the names the compiler
     // gives meaning to at this position, not a closed set.
-    for spec in baml_base::schema_attribute_specs_at(position) {
+    for spec in baml_base::user_attribute_specs_at(position) {
         out.add_attribute(spec.name);
     }
 }

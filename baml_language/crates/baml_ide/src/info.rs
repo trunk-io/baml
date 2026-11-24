@@ -34,18 +34,27 @@
 //! - `ResolvedName::Unknown` or cursor not on a WORD token — returns `None`.
 
 use baml_base::{Name, SourceFile, SourceRoot};
-use baml_compiler_syntax::{SyntaxKind, SyntaxToken};
 use baml_compiler2_hir::{
     contributions::Definition,
     item_data,
     loc::{DeclRef, FunctionLoc},
+    package::ROOT_SEGMENT,
 };
 use baml_compiler2_hir_ty::package_interface::ExportedFunction;
+use baml_syntax::{
+    index::TreeIndex,
+    nodes::{Attribute, BlockAttr, DottedName, Name as NameNode, TemplateInterp},
+    token::{TokenKind, TokenSet as _, sets::StringToken},
+    tree::AnyNodeIdOf,
+};
 use baml_type::BuiltinTypeName;
 use serde::Serialize;
 use text_size::{TextRange, TextSize};
 
-use crate::render::{self, FnSigParts, SigSlot, SigStyle, TypeForm};
+use crate::{
+    render::{self, FnSigParts, SigSlot, SigStyle, TypeForm},
+    syntax::TokenRef,
+};
 
 // ── TypeInfo ──────────────────────────────────────────────────────────────────
 
@@ -400,11 +409,21 @@ pub fn type_at(
 ) -> Option<TypeInfo> {
     // ── Step 1: find the token at the cursor ─────────────────────────────────
     let token = crate::syntax::find_token_at_offset(db, file, offset)?;
-    // The reader is wherever the cursor is: paths in the answer are spelled
-    // from the file's package.
-    let viewer = baml_compiler2_hir::file_package::file_package(db, file).root;
+    let index = baml_parser::tree_index(db, file);
 
-    if let Some(info) = literal_type_info(&token) {
+    if let Some(access) = crate::resolve::tuple_access_at(db, file, offset) {
+        return Some(TypeInfo::Symbol {
+            declaration: format!(
+                "{}: {}",
+                access.access,
+                render::display_ty_for_file(db, file, &access.ty)
+            ),
+            owner: None,
+            docstring: None,
+        });
+    }
+
+    if let Some(info) = literal_type_info(&token, &index) {
         return Some(info);
     }
 
@@ -412,11 +431,7 @@ pub fn type_at(
         return Some(info);
     }
 
-    if let Some(info) = client_config_key_type_info(&token) {
-        return Some(info);
-    }
-
-    if let Some(info) = attribute_type_info(&token) {
+    if let Some(info) = attribute_type_info(&token, &index) {
         return Some(info);
     }
 
@@ -427,7 +442,7 @@ pub fn type_at(
         return match position {
             crate::resolve::TemplatePosition::Driver(func) => Some(type_info_for_definition(
                 db,
-                viewer,
+                &render::Reader::of_file(db, file),
                 DeclRef::Source(Definition::Function(func)),
             )),
             crate::resolve::TemplatePosition::DefaultText => Some(TypeInfo::Documentation {
@@ -440,16 +455,23 @@ form stringifies each value and produces a `string`."
         };
     }
 
-    if token.kind().is_keyword() {
+    // A contextual keyword (`type` in `let type`) is a keyword where it is
+    // not a name: its token then belongs to the statement, not a `Name`.
+    let as_keyword = token.kind().is_keyword()
+        || (token.kind().is_contextual_keyword()
+            && token
+                .owner(&index)
+                .is_none_or(|owner| owner.cast::<NameNode>().is_none()));
+    if as_keyword {
         return keyword_type_info(token.text());
     }
 
     // Only WORD tokens can be names — but an operator token addresses its
     // dispatch method through the same layer as go-to-definition, so hover
     // and navigation provably agree on `+`/`<`/`[` too.
-    if token.kind() != SyntaxKind::WORD {
+    if !token.is_ident() {
         let target = crate::resolve::symbol_at(db, file, offset)?;
-        return target_type_info(db, viewer, file, target);
+        return target_type_info(db, file, target);
     }
 
     let name_text = token.text();
@@ -468,18 +490,18 @@ form stringifies each value and produces a `string`."
     let Some(target) = crate::resolve::symbol_at(db, file, offset) else {
         return template_frame_param_info(db, file, offset, &name);
     };
-    target_type_info(db, viewer, file, target)
+    target_type_info(db, file, target)
 }
 
 /// Build `TypeInfo` for a resolved [`SymbolTarget`]. Every arm reads
 /// recorded compiler data (firewall items, source maps, inference records) —
 /// no span-equality matching, no name heuristics.
-/// `reader` is the file the hover is asked from: a served package's rows
-/// have no file of their own, so their types are spelled for the reader.
+/// `cursor_file` is the file the hover is asked from: everything in the
+/// answer is spelled as source in that file writes it, a served package's
+/// rows (which have no file of their own) included.
 fn target_type_info(
     db: &dyn baml_compiler2_hir::Db,
-    viewer: SourceRoot,
-    reader: SourceFile,
+    cursor_file: SourceFile,
     target: crate::resolve::SymbolTarget<'_>,
 ) -> Option<TypeInfo> {
     use baml_compiler2_hir::loc::DeclRef;
@@ -489,13 +511,15 @@ fn target_type_info(
 
     use crate::resolve::SymbolTarget;
 
+    let reader = render::Reader::of_file(db, cursor_file);
+
     match target {
-        SymbolTarget::Item(def) => Some(type_info_for_definition(db, viewer, def)),
+        SymbolTarget::Item(def) => Some(type_info_for_definition(db, &reader, def)),
         SymbolTarget::Local {
-            func,
-            func_scope,
+            owner,
+            owner_scope,
             binding,
-        } => local_target_type_info(db, func, func_scope, binding),
+        } => local_target_type_info(db, owner, owner_scope, binding),
         SymbolTarget::Field {
             class: DeclRef::Source(class),
             field_index,
@@ -503,11 +527,13 @@ fn target_type_info(
             let class_data = item_data::class_data(db, class);
             let field = class_data.fields.get(field_index)?;
             // Resolved field types (Salsa-cached), canonical — matching the
-            // class hover body; unresolved firewall spelling as fallback.
+            // class hover body, spelled from the cursor_file's package (the class
+            // may be another package's or namespace's); unresolved firewall
+            // spelling as fallback.
             let ty = baml_compiler2_hir_ty::lower::resolve_class_fields(db, class)
                 .iter()
                 .find(|(name, _, _)| *name == field.name)
-                .map(|(_, ty, _)| render::display_ty_canonical_for_file(db, class.file(db), ty))
+                .map(|(_, ty, _)| reader.display_addressable_ty(ty))
                 .unwrap_or_else(|| render::display_type_ref(&class_data.type_refs, field.type_ref));
             // The owner is the class's own self type — the same subject-type
             // rule as methods, so generic owners anchor their params
@@ -517,7 +543,11 @@ fn target_type_info(
                 name: field.name.as_str().to_string(),
                 ty,
                 is_let: false,
-                owner: Some(render::display_owner_ty(db, &self_ty)),
+                owner: Some(render::display_ty_canonical_for_file(
+                    db,
+                    cursor_file,
+                    &self_ty,
+                )),
             })
         }
         SymbolTarget::Variant {
@@ -535,19 +565,16 @@ fn target_type_info(
             );
             Some(TypeInfo::Symbol {
                 declaration: format!("{}: {}", variant.name.as_str(), enum_data.name.as_str()),
-                owner: Some(render::canonical_path(db, &qtn)),
+                owner: Some(render::addressable_path_for_file(db, cursor_file, &qtn)),
                 docstring: variant.docstring.clone(),
             })
         }
         SymbolTarget::Method {
             func: DeclRef::Source(func),
         } => Some(TypeInfo::Symbol {
-            declaration: resolved_function_sig_parts(db, func, None).render(
-                db,
-                func.file(db),
-                hover_sig_style(),
-            ),
-            owner: method_owner_path(db, func),
+            declaration: resolved_function_sig_parts(db, func, None)
+                .render_for(&reader, hover_sig_style()),
+            owner: method_owner_path(db, cursor_file, func),
             docstring: item_data::function_data(db, func).docstring.clone(),
         }),
         SymbolTarget::AssociatedType { iface, assoc_index } => {
@@ -561,7 +588,7 @@ fn target_type_info(
             );
             Some(TypeInfo::Symbol {
                 declaration,
-                owner: Some(render::canonical_path(db, &qtn)),
+                owner: Some(render::addressable_path_for_file(db, cursor_file, &qtn)),
                 docstring: None,
             })
         }
@@ -580,7 +607,7 @@ fn target_type_info(
                 name: field.name.as_str().to_string(),
                 ty: render::display_type_ref(&iface_data.type_refs, field.type_ref),
                 is_let: false,
-                owner: Some(render::canonical_path(db, &qtn)),
+                owner: Some(render::addressable_path_for_file(db, cursor_file, &qtn)),
             })
         }
         // A served package's rows, read whole: the resolved signature or
@@ -592,12 +619,16 @@ fn target_type_info(
             field_index,
         } => {
             let row = extern_class_row(db, class);
-            let (name, ty, _) = row.fields.get(field_index)?;
+            let (name, ty, _) = row.body.fields().get(field_index)?;
             Some(TypeInfo::LocalVar {
                 name: name.as_str().to_string(),
-                ty: render::display_ty_canonical_for_file(db, reader, ty),
+                ty: render::display_ty_canonical_for_file(db, cursor_file, ty),
                 is_let: false,
-                owner: Some(render::canonical_path(db, class.head(db))),
+                owner: Some(render::addressable_path_for_file(
+                    db,
+                    cursor_file,
+                    class.head(db),
+                )),
             })
         }
         SymbolTarget::Variant {
@@ -609,7 +640,7 @@ fn target_type_info(
             let head = enum_loc.head(db);
             Some(TypeInfo::Symbol {
                 declaration: format!("{}: {}", variant.as_str(), head.name().as_str()),
-                owner: Some(render::canonical_path(db, head)),
+                owner: Some(render::addressable_path_for_file(db, cursor_file, head)),
                 docstring: None,
             })
         }
@@ -618,10 +649,10 @@ fn target_type_info(
         } => Some(TypeInfo::Symbol {
             declaration: FnSigParts::of_exported(extern_function_row(db, func)).render(
                 db,
-                reader,
+                cursor_file,
                 hover_sig_style(),
             ),
-            owner: extern_owner_path(db, func),
+            owner: extern_owner_path(db, cursor_file, func),
             docstring: None,
         }),
         SymbolTarget::InterfaceField {
@@ -632,9 +663,13 @@ fn target_type_info(
             let (name, ty, _) = row.fields.get(field_index)?;
             Some(TypeInfo::LocalVar {
                 name: name.as_str().to_string(),
-                ty: render::display_ty_canonical_for_file(db, reader, ty),
+                ty: render::display_ty_canonical_for_file(db, cursor_file, ty),
                 is_let: false,
-                owner: Some(render::canonical_path(db, iface.head(db))),
+                owner: Some(render::addressable_path_for_file(
+                    db,
+                    cursor_file,
+                    iface.head(db),
+                )),
             })
         }
     }
@@ -643,13 +678,13 @@ fn target_type_info(
 /// `TypeInfo::LocalVar` for a local binding, from inference records.
 fn local_target_type_info(
     db: &dyn baml_compiler2_hir::Db,
-    func: baml_compiler2_hir::loc::FunctionLoc<'_>,
-    func_scope: baml_compiler2_hir::scope::FileScopeId,
+    owner: baml_compiler2_hir::body::BodyOwnerId<'_>,
+    owner_scope: baml_compiler2_hir::scope::FileScopeId,
     binding: baml_compiler2_hir::semantic_index::BindingId,
 ) -> Option<TypeInfo> {
-    use baml_compiler2_hir::semantic_index::BindingKind;
+    use baml_compiler2_hir::{body::BodyOwnerId, semantic_index::BindingKind};
 
-    let file = func.file(db);
+    let file = owner.file(db);
     let index = baml_compiler2_hir::file_semantic_index(db, file);
     match binding.kind {
         BindingKind::Parameter(idx) => {
@@ -657,20 +692,25 @@ fn local_target_type_info(
             // generic arguments are preserved (`Lorem<int>`). A *lambda*
             // parameter's scope is not the function's own scope and its type
             // is not declared anywhere the firewall records — pending
-            // inference support, it renders as the inference hole.
-            if binding.scope != func_scope {
-                let bindings = &index.scope_bindings[binding.scope.index() as usize];
-                let (name, _) = bindings
-                    .params
-                    .iter()
-                    .find(|(_, param_idx)| *param_idx == idx)?;
-                return Some(TypeInfo::LocalVar {
-                    name: name.as_str().to_string(),
-                    ty: render::PENDING_INFERENCE.to_string(),
-                    is_let: false,
-                    owner: None,
-                });
-            }
+            // inference support, it renders as the inference hole. A global
+            // initializer declares no parameters, so every parameter in one
+            // is a lambda's.
+            let func = match owner {
+                BodyOwnerId::Function(func) if binding.scope == owner_scope => func,
+                _ => {
+                    let bindings = &index.scope_bindings[binding.scope.index() as usize];
+                    let (name, _) = bindings
+                        .params
+                        .iter()
+                        .find(|(_, param_idx)| *param_idx == idx)?;
+                    return Some(TypeInfo::LocalVar {
+                        name: name.as_str().to_string(),
+                        ty: render::PENDING_INFERENCE.to_string(),
+                        is_let: false,
+                        owner: None,
+                    });
+                }
+            };
             let data = item_data::function_data(db, func);
             let param = data.params.get(idx)?;
             let ty = param
@@ -710,121 +750,87 @@ fn local_target_type_info(
     }
 }
 
-fn client_config_key_type_info(token: &SyntaxToken) -> Option<TypeInfo> {
-    let config_item = token.parent()?;
-    if config_item.kind() != SyntaxKind::CONFIG_ITEM
-        || !config_item
-            .ancestors()
-            .any(|ancestor| ancestor.kind() == SyntaxKind::CLIENT_DEF)
-    {
-        return None;
-    }
-
-    let key = config_item
-        .children_with_tokens()
-        .filter_map(rowan::NodeOrToken::into_token)
-        .find(|candidate| {
-            matches!(
-                candidate.kind(),
-                SyntaxKind::WORD | SyntaxKind::KW_RETRY_POLICY
-            )
-        })?;
-    if key.text_range() != token.text_range() {
-        return None;
-    }
-
-    let spec = baml_base::client_config_key_spec(token.text());
-    let label = spec.map_or(token.text(), |spec| spec.signature);
-    let detail = spec
-        .and_then(|spec| baml_builtins2::language_topic(spec.name))
-        .or_else(|| baml_builtins2::language_topic("client_option"))
-        .map(|topic| topic.summary.as_str())?;
-
-    Some(TypeInfo::Documentation {
-        label: label.to_string(),
-        detail: detail.to_string(),
-    })
-}
-
-fn attribute_type_info(token: &SyntaxToken) -> Option<TypeInfo> {
-    let attribute = token.parent()?;
-    let prefix = match attribute.kind() {
-        SyntaxKind::ATTRIBUTE => "@",
-        SyntaxKind::BLOCK_ATTRIBUTE => "@@",
-        _ => return None,
+/// Hover on the head of a `@attr`/`@@attr`: the attribute's signature and
+/// its language topic.
+fn attribute_type_info(token: &TokenRef, index: &TreeIndex) -> Option<TypeInfo> {
+    let tree = token.tree();
+    let name = token.owner(index)?.cast::<NameNode>()?;
+    let any = |id: &dyn AnyNodeIdOf| {
+        id.any_node_id()
+            .unwrap_or_else(|| unreachable!("a typed id is a node"))
     };
-
-    let name = attribute
-        .children_with_tokens()
-        .filter_map(rowan::NodeOrToken::into_token)
-        .find(|candidate| candidate.kind() == SyntaxKind::WORD)?;
-    if name.text_range() != token.text_range() {
+    let dotted = index.parent(any(&name))?.cast::<DottedName>()?;
+    if tree.get(dotted).head != name {
         return None;
     }
-
+    let attribute = index.parent(any(&dotted))?;
+    let prefix = if attribute.cast::<Attribute>().is_some() {
+        "@"
+    } else if attribute.cast::<BlockAttr>().is_some() {
+        "@@"
+    } else {
+        return None;
+    };
     let spec = baml_base::schema_attribute_spec(token.text())?;
     let detail = baml_builtins2::language_topic(spec.name)?.summary.clone();
-
     Some(TypeInfo::Documentation {
         label: format!("{prefix}{}", spec.signature()),
         detail,
     })
 }
 
-fn literal_type_info(token: &SyntaxToken) -> Option<TypeInfo> {
-    let (label, ty, detail) = match (token.kind(), token.text()) {
-        (_, "true" | "false") => (token.text().to_string(), "bool", "A boolean literal type."),
-        (_, "null") => (token.text().to_string(), "null", "The `null` literal type."),
-        (SyntaxKind::INTEGER_LITERAL, _) => (
+/// Hover on a literal: its exact literal type and base type. Code inside a
+/// `${…}` interpolation of a template is not a literal of the template.
+fn literal_type_info(token: &TokenRef, index: &TreeIndex) -> Option<TypeInfo> {
+    let (label, ty, detail) = match token.kind() {
+        TokenKind::True | TokenKind::False => {
+            (token.text().to_string(), "bool", "A boolean literal type.")
+        }
+        TokenKind::Null => (token.text().to_string(), "null", "The `null` literal type."),
+        TokenKind::Integer => (
             token.text().to_string(),
             "int",
             "An exact `int` literal type.",
         ),
-        (SyntaxKind::BIGINT_LITERAL, _) => (
+        TokenKind::Bigint => (
             token.text().to_string(),
             "bigint",
             "An exact arbitrary-precision `bigint` literal type.",
         ),
-        (SyntaxKind::FLOAT_LITERAL, _) => (
+        TokenKind::Float => (
             token.text().to_string(),
             "float",
             "An exact `float` literal type.",
         ),
-        _ => {
-            if token
-                .parent_ancestors()
-                .any(|node| matches!(node.kind(), SyntaxKind::BACKTICK_INTERPOLATION))
+        kind if StringToken::KINDS.contains(kind) => {
+            let owner = token.owner(index)?;
+            if index
+                .ancestors(owner)
+                .any(|ancestor| ancestor.cast::<TemplateInterp>().is_some())
             {
                 return None;
             }
-            let string = token.parent_ancestors().find(|node| {
-                matches!(
-                    node.kind(),
-                    SyntaxKind::STRING_LITERAL
-                        | SyntaxKind::RAW_STRING_LITERAL
-                        | SyntaxKind::BYTE_STRING_LITERAL
-                )
-            })?;
-            let label = string.text().to_string();
-            let (ty, detail) = if string.kind() == SyntaxKind::BYTE_STRING_LITERAL {
-                ("uint8array", "A byte-string literal type.")
-            } else {
-                ("string", "An exact `string` literal type.")
-            };
+            let label = token.text().to_string();
+            let (ty, detail) =
+                if matches!(kind, TokenKind::ByteString | TokenKind::UnclosedByteString) {
+                    ("uint8array", "A byte-string literal type.")
+                } else {
+                    ("string", "An exact `string` literal type.")
+                };
             return Some(TypeInfo::Documentation {
                 label,
                 detail: format!("{detail} Its base type is `{ty}`."),
             });
         }
+        _ => return None,
     };
-
     Some(TypeInfo::Documentation {
         label,
         detail: format!("{detail} Its base type is `{ty}`."),
     })
 }
 
-fn builtin_type_info(db: &dyn baml_compiler2_hir::Db, token: &SyntaxToken) -> Option<TypeInfo> {
+fn builtin_type_info(db: &dyn baml_compiler2_hir::Db, token: &TokenRef) -> Option<TypeInfo> {
     let builtin = BuiltinTypeName::from_alias(token.text())?;
     let detail = match builtin {
         BuiltinTypeName::Primitive(_) => {
@@ -864,21 +870,39 @@ fn keyword_type_info(keyword: &str) -> Option<TypeInfo> {
     })
 }
 
-/// The owning container of `file`'s items: the compiler's package name
-/// plus the namespace path (`user`, `user.util`, `baml.http`). Assembled
-/// from `file_package`'s components with no eliding and no special cases —
-/// the spelling changes automatically when workspace packages gain real
-/// names.
-fn owning_path(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> String {
+/// The owner line of an item declared in `file`, read from `viewer`: the
+/// package as the viewer's root namespace addresses it (`root` for its own,
+/// its edge name for another, the display name for one it has no edge to)
+/// followed by the item's namespace — the prefix the reader puts before the
+/// item's name to address it.
+fn owning_path(db: &dyn baml_compiler2_hir::Db, viewer: SourceRoot, file: SourceFile) -> String {
     let pkg = baml_compiler2_hir::file_package::file_package(db, file);
-    let mut path = baml_compiler2_hir::package::spelling(db)
-        .of(pkg.root)
-        .to_string();
-    for segment in &pkg.namespace_path {
-        path.push('.');
-        path.push_str(segment.as_str());
-    }
-    path
+    owner_prefix(db, viewer, pkg.root, &pkg.namespace_path)
+}
+
+/// [`owning_path`] for a declaration by its head.
+fn served_owning_path(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: SourceRoot,
+    declared: &baml_type::DeclName,
+) -> String {
+    owner_prefix(db, viewer, declared.root(), declared.namespace())
+}
+
+fn owner_prefix(
+    db: &dyn baml_compiler2_hir::Db,
+    viewer: SourceRoot,
+    root: SourceRoot,
+    namespace: &[Name],
+) -> String {
+    let viewpoint = baml_compiler2_hir_ty::render::Viewpoint::user_facing(db, viewer);
+    let package = viewpoint
+        .package_prefix(root)
+        .map_or_else(|| ROOT_SEGMENT.to_string(), std::borrow::Cow::into_owned);
+    std::iter::once(package.as_str())
+        .chain(namespace.iter().map(Name::as_str))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The owner line for a method: the subject type of its declaring container,
@@ -887,10 +911,11 @@ fn owning_path(db: &dyn baml_compiler2_hir::Db, file: SourceFile) -> String {
 /// bridging spells the companion classes structurally (`T[]`, `map<K, V>`,
 /// `string`) with no per-class special case, an out-of-body `implements`
 /// block spells its resolved for-target, and an interface default method
-/// spells the interface's path. Full canonical paths throughout — member
-/// owners never elide.
+/// spells the interface's path — all as source in the reader's file writes
+/// them.
 fn method_owner_path(
     db: &dyn baml_compiler2_hir::Db,
+    reader: SourceFile,
     func: baml_compiler2_hir::loc::FunctionLoc<'_>,
 ) -> Option<String> {
     use baml_compiler2_hir::item_data::MethodOwner;
@@ -898,20 +923,21 @@ fn method_owner_path(
     match item_data::method_owner(db, func)? {
         MethodOwner::Class(class) => {
             let self_ty = baml_compiler2_hir_ty::lower::class_self_ty(db, class);
-            Some(render::display_owner_ty(db, &self_ty))
+            Some(render::display_ty_canonical_for_file(db, reader, &self_ty))
         }
         MethodOwner::Interface(iface) => {
             let name = &item_data::interface_data(db, iface).name;
             let qtn =
                 baml_compiler2_hir_ty::lower::qualify_def(db, Definition::Interface(iface), name);
-            Some(render::canonical_path(db, &qtn))
+            Some(render::addressable_path_for_file(db, reader, &qtn))
         }
         MethodOwner::Impl(block) => {
             // `impl_facts` is `None` when the block's header does not resolve
             // to an interface — honest absence beats a wrong owner.
             let facts = baml_compiler2_hir_ty::impls::impl_facts(db, block).resolved()?;
-            Some(render::display_owner_ty(
+            Some(render::display_ty_canonical_for_file(
                 db,
+                reader,
                 &facts.for_ty_pattern.to_plain(),
             ))
         }
@@ -925,6 +951,7 @@ fn method_owner_path(
 /// IMPLEMENTOR (the impl's for-target), a free function under none.
 fn extern_owner_path(
     db: &dyn baml_compiler2_hir::Db,
+    reader: SourceFile,
     func: baml_compiler2_hir_ty::extern_loc::ExternFunctionLoc<'_>,
 ) -> Option<String> {
     use baml_compiler2_hir_ty::{
@@ -934,16 +961,21 @@ fn extern_owner_path(
     };
     match func.addr(db) {
         ExternRowAddr::Declared(ExternalCallTarget::Free { .. }) => None,
-        ExternRowAddr::Declared(ExternalCallTarget::Method { class, .. }) => Some(
-            render::display_owner_ty(db, &mounted_type_row(db, class)?.to_ty()),
-        ),
+        ExternRowAddr::Declared(ExternalCallTarget::Method { class, .. }) => {
+            Some(render::display_ty_canonical_for_file(
+                db,
+                reader,
+                &mounted_type_row(db, class)?.to_ty(),
+            ))
+        }
         ExternRowAddr::Declared(ExternalCallTarget::Interface { interface, .. }) => {
-            Some(render::canonical_path(db, interface))
+            Some(render::addressable_path_for_file(db, reader, interface))
         }
         ExternRowAddr::ImplProvided { .. } => {
             let block = func.impl_block(db)?;
-            Some(render::display_owner_ty(
+            Some(render::display_ty_canonical_for_file(
                 db,
+                reader,
                 &extern_impl_row(db, block).for_ty_pattern,
             ))
         }
@@ -1025,7 +1057,11 @@ fn generic_type_parameter_info_at(
                     let subject = baml_compiler2_hir_ty::impls::impl_facts(db, block)
                         .resolved()
                         .map(|facts| {
-                            render::display_owner_ty(db, &facts.for_ty_pattern.to_plain())
+                            render::display_ty_canonical_for_file(
+                                db,
+                                file,
+                                &facts.for_ty_pattern.to_plain(),
+                            )
                         });
                     match subject {
                         Some(subject) => format!("method {}.{}", subject, data.name.as_str()),
@@ -1048,10 +1084,7 @@ fn generic_type_parameter_info_at(
             continue;
         }
         let data = item_data::impl_block_data(db, *impl_loc);
-        let item_data::ImplSubjectData::Free { generics, .. } = &data.subject else {
-            continue;
-        };
-        if let Some(declared) = generics.iter().find(|param| &param.name == name) {
+        if let Some(declared) = data.generics.iter().find(|param| &param.name == name) {
             let subject = baml_compiler2_hir_ty::impls::impl_facts(db, *impl_loc)
                 .resolved()
                 .map_or_else(
@@ -1059,7 +1092,11 @@ fn generic_type_parameter_info_at(
                     |facts| {
                         format!(
                             "implements for {}",
-                            render::display_owner_ty(db, &facts.for_ty_pattern.to_plain())
+                            render::display_ty_canonical_for_file(
+                                db,
+                                file,
+                                &facts.for_ty_pattern.to_plain()
+                            )
                         )
                     },
                 );
@@ -1137,18 +1174,18 @@ fn generic_type_parameter_info_at(
 /// the reader is in: the addressable paths in the result are spelled from it.
 pub fn type_info_for_definition(
     db: &dyn baml_compiler2_hir::Db,
-    viewer: SourceRoot,
+    reader: &render::Reader<'_>,
     def: baml_compiler2_hir_ty::extern_loc::DefinitionRef<'_>,
 ) -> TypeInfo {
     match def {
-        DeclRef::Source(def) => type_info_for_source_definition(db, viewer, def),
-        DeclRef::External(def) => type_info_for_served_definition(db, viewer, def),
+        DeclRef::Source(def) => type_info_for_source_definition(db, reader, def),
+        DeclRef::External(def) => type_info_for_served_definition(db, reader, def),
     }
 }
 
 fn type_info_for_source_definition(
     db: &dyn baml_compiler2_hir::Db,
-    viewer: SourceRoot,
+    reader: &render::Reader<'_>,
     def: Definition<'_>,
 ) -> TypeInfo {
     match def {
@@ -1186,7 +1223,7 @@ fn type_info_for_source_definition(
                         .throws
                         .map(|id| render::display_type_ref(&data.type_refs, id)),
                     note: None,
-                    owner: Some(owning_path(db, file)),
+                    owner: Some(owning_path(db, reader.viewer(), file)),
                     docstring: data.docstring.clone(),
                 };
             };
@@ -1200,21 +1237,21 @@ fn type_info_for_source_definition(
                         .as_ref()
                         .map(|name| name.as_str().to_string())
                         .unwrap_or_else(|| "_".to_string()),
-                    ty: display_surface_ty(db, file, &param.ty),
+                    ty: display_surface_ty(reader, &param.ty),
                     optional: param.is_optional(),
                 })
                 .collect();
-            let return_type = Some(display_surface_ty(db, file, &exported.return_type));
+            let return_type = Some(display_surface_ty(reader, &exported.return_type));
             // The resolved contract always renders, `never` included: hover
             // states what the compiler checked, not what the source spelled.
-            let throws = Some(display_surface_ty(db, file, &exported.callable_throws));
+            let throws = Some(display_surface_ty(reader, &exported.callable_throws));
             TypeInfo::Function {
                 name: exported.name.as_str().to_string(),
                 params,
                 return_type,
                 throws,
                 note: callback_forwarding_note(exported),
-                owner: Some(owning_path(db, file)),
+                owner: Some(owning_path(db, reader.viewer(), file)),
                 docstring: data.docstring.clone(),
             }
         }
@@ -1224,20 +1261,21 @@ fn type_info_for_source_definition(
             let class_name = class_data.name.as_str().to_string();
 
             // Use resolved field types (Salsa-cached), rendered canonically so
-            // builtin companion classes collapse to their alias (`string`).
+            // builtin companion classes collapse to their alias (`string`),
+            // from the reader's package: the class may be another package's.
             let resolved = baml_compiler2_hir_ty::lower::resolve_class_fields(db, class_loc);
             let fields = resolved
                 .iter()
                 .map(|(field_name, ty, _attrs)| {
                     (
                         field_name.as_str().to_string(),
-                        render::display_ty_canonical_for_file(db, class_loc.file(db), ty),
+                        reader.display_addressable_ty(ty),
                     )
                 })
                 .collect();
             let qtn = baml_compiler2_hir_ty::lower::qualify_def(db, def, &class_data.name);
-            let canonical_fqn = render::addressable_path(db, viewer, &qtn);
-            let methods = type_method_sigs(db, viewer, def);
+            let canonical_fqn = reader.addressable_path(&qtn);
+            let methods = type_method_sigs(db, reader, def);
 
             let generic_params =
                 render::render_generic_params(&class_data.generic_params, &class_data.type_refs);
@@ -1249,7 +1287,7 @@ fn type_info_for_source_definition(
                 methods,
                 docstring: class_data.docstring.clone(),
                 canonical_fqn,
-                owner: Some(owning_path(db, class_loc.file(db))),
+                owner: Some(owning_path(db, reader.viewer(), class_loc.file(db))),
             }
         }
 
@@ -1264,9 +1302,9 @@ fn type_info_for_source_definition(
             TypeInfo::Enum {
                 name: enum_data.name.as_str().to_string(),
                 variants,
-                methods: type_method_sigs(db, viewer, def),
-                canonical_fqn: render::addressable_path(db, viewer, &qtn),
-                owner: Some(owning_path(db, enum_loc.file(db))),
+                methods: type_method_sigs(db, reader, def),
+                canonical_fqn: reader.addressable_path(&qtn),
+                owner: Some(owning_path(db, reader.viewer(), enum_loc.file(db))),
             }
         }
 
@@ -1294,7 +1332,7 @@ fn type_info_for_source_definition(
                     )
                 })
                 .collect();
-            let (required_methods, default_methods) = interface_method_sigs(db, iface_loc);
+            let (required_methods, default_methods) = interface_method_sigs(db, reader, iface_loc);
             let qtn = baml_compiler2_hir_ty::lower::qualify_def(db, def, &iface.name);
             TypeInfo::Interface {
                 name: iface.name.as_str().to_string(),
@@ -1305,8 +1343,8 @@ fn type_info_for_source_definition(
                 required_methods,
                 default_methods,
                 docstring: iface.docstring.clone(),
-                owner: Some(owning_path(db, iface_loc.file(db))),
-                canonical_fqn: render::addressable_path(db, viewer, &qtn),
+                owner: Some(owning_path(db, reader.viewer(), iface_loc.file(db))),
+                canonical_fqn: reader.addressable_path(&qtn),
             }
         }
 
@@ -1314,14 +1352,15 @@ fn type_info_for_source_definition(
             let alias_data = baml_compiler2_hir::item_data::type_alias_data(db, alias_loc);
             let alias_name = alias_data.name.as_str().to_string();
 
-            // Use the resolved (lowered) type for display.
+            // Use the resolved (lowered) type for display, spelled from the
+            // reader's package.
             let resolved = baml_compiler2_hir_ty::lower::type_alias_value(db, alias_loc);
-            let expansion = render::display_ty_for_file(db, alias_loc.file(db), &resolved);
+            let expansion = reader.display_ty(&resolved);
 
             TypeInfo::TypeAlias {
                 name: alias_name,
                 expansion,
-                owner: Some(owning_path(db, alias_loc.file(db))),
+                owner: Some(owning_path(db, reader.viewer(), alias_loc.file(db))),
             }
         }
 
@@ -1329,22 +1368,28 @@ fn type_info_for_source_definition(
             let data = baml_compiler2_hir::item_data::let_data(db, loc);
             let kind = match data.origin {
                 baml_compiler2_ast::ast::LetOrigin::Client => "client",
-                baml_compiler2_ast::ast::LetOrigin::Source => "let",
+                baml_compiler2_ast::ast::LetOrigin::Source => "const",
             };
-            TypeInfo::OtherItem {
-                name: data.name.as_str().to_string(),
-                kind,
+            // A global reads as the binding it is: its keyword, name, and the
+            // one type every reader sees (the annotation, or the widened
+            // initializer type).
+            let declaration = match baml_compiler2_hir_ty::globals::global_value_type(db, loc) {
+                Some(ty) => format!("{kind} {}: {}", data.name, reader.display_ty(&ty)),
+                None => format!("{kind} {}", data.name),
+            };
+            TypeInfo::Symbol {
+                declaration,
+                owner: Some(owning_path(db, reader.viewer(), loc.file(db))),
+                docstring: data.docstring.clone(),
             }
         }
     }
 }
 
-fn display_surface_ty(
-    db: &dyn baml_compiler2_hir::Db,
-    file: SourceFile,
-    ty: &baml_type::Ty,
-) -> String {
-    render::display_ty_for_file(db, file, ty)
+/// A describe row's type, spelled from the viewer's root namespace — the
+/// same viewpoint as the row's owner line and its addressable path.
+fn display_surface_ty(reader: &render::Reader<'_>, ty: &baml_type::Ty) -> String {
+    reader.display_ty(ty)
 }
 
 /// Hover for a served package's row: the shapes a source definition renders
@@ -1356,7 +1401,7 @@ fn display_surface_ty(
 /// own methods.
 fn type_info_for_served_definition(
     db: &dyn baml_compiler2_hir::Db,
-    viewer: SourceRoot,
+    reader: &render::Reader<'_>,
     def: baml_compiler2_hir_ty::extern_loc::ExternDefinition<'_>,
 ) -> TypeInfo {
     use baml_compiler2_hir_ty::extern_loc::{
@@ -1365,8 +1410,8 @@ fn type_info_for_served_definition(
     };
 
     let declared = def.declared_at(db);
-    let owner = Some(served_owning_path(db, &declared));
-    let display = |ty: &baml_type::Ty| render::display_addressable_ty(db, viewer, ty);
+    let owner = Some(served_owning_path(db, reader.viewer(), &declared));
+    let display = |ty: &baml_type::Ty| reader.display_addressable_ty(ty);
     match def {
         ExternDefinition::Function(loc) => {
             let row = extern_function_row(db, loc);
@@ -1401,17 +1446,18 @@ fn type_info_for_served_definition(
                     .map(|param| param.name().to_string())
                     .collect(),
                 fields: row
-                    .fields
+                    .body
+                    .fields()
                     .iter()
                     .map(|(name, ty, _attrs)| (name.as_str().to_string(), display(ty)))
                     .collect(),
                 methods: row
                     .methods
                     .iter()
-                    .map(|method| served_method_sig(db, viewer, method, None))
+                    .map(|method| served_method_sig(reader, method, None))
                     .collect(),
                 docstring: None,
-                canonical_fqn: render::addressable_path(db, viewer, &declared),
+                canonical_fqn: reader.addressable_path(&declared),
                 owner,
             }
         }
@@ -1423,7 +1469,7 @@ fn type_info_for_served_definition(
                 .map(|variant| variant.as_str().to_string())
                 .collect(),
             methods: Vec::new(),
-            canonical_fqn: render::addressable_path(db, viewer, &declared),
+            canonical_fqn: reader.addressable_path(&declared),
             owner,
         },
         ExternDefinition::Interface(loc) => {
@@ -1432,7 +1478,7 @@ fn type_info_for_served_definition(
                 |methods: &[baml_compiler2_hir_ty::package_interface::ExportedFunction]| {
                     methods
                         .iter()
-                        .map(|method| served_method_sig(db, viewer, method, None))
+                        .map(|method| served_method_sig(reader, method, None))
                         .collect::<Vec<_>>()
                 };
             TypeInfo::Interface {
@@ -1472,7 +1518,7 @@ fn type_info_for_served_definition(
                 default_methods: sigs(row.default_methods),
                 docstring: None,
                 owner,
-                canonical_fqn: render::addressable_path(db, viewer, &declared),
+                canonical_fqn: reader.addressable_path(&declared),
             }
         }
         ExternDefinition::TypeAlias(loc) => TypeInfo::TypeAlias {
@@ -1486,34 +1532,16 @@ fn type_info_for_served_definition(
     }
 }
 
-/// The owner line of a served row: the defining package's spelling, then
-/// the row's namespace — what [`owning_path`] renders for a source file.
-fn served_owning_path(db: &dyn baml_compiler2_hir::Db, declared: &baml_type::DeclName) -> String {
-    let mut path = baml_compiler2_hir::package::spelling(db)
-        .of(declared.root())
-        .to_string();
-    for segment in declared.namespace() {
-        path.push('.');
-        path.push_str(segment.as_str());
-    }
-    path
-}
-
-/// A [`MethodSig`] for a served row's method, its signature spelled from
-/// the viewer's package.
+/// A [`MethodSig`] for a served row's method, its signature spelled for the
+/// reader.
 fn served_method_sig(
-    db: &dyn baml_compiler2_hir::Db,
-    viewer: SourceRoot,
+    reader: &render::Reader<'_>,
     method: &ExportedFunction,
     implements: Option<String>,
 ) -> MethodSig {
     MethodSig {
         name: method.name.as_str().to_string(),
-        signature: FnSigParts::of_exported(method).render_for_viewer(
-            db,
-            viewer,
-            method_sig_style(),
-        ),
+        signature: FnSigParts::of_exported(method).render_for(reader, method_sig_style()),
         is_instance: method.params.first().is_some_and(|param| {
             param
                 .name
@@ -1601,7 +1629,7 @@ fn callback_forwarding_note(
 /// inferences whose binding maps were populated from the use-site's own
 /// arena. Mirrors the structure already used by
 /// `completions.rs::find_binding_ty_for_local`.
-fn find_binding_ty_in_scopes(
+pub(crate) fn find_binding_ty_in_scopes(
     db: &dyn baml_compiler2_hir::Db,
     index: &baml_compiler2_hir::semantic_index::FileSemanticIndex<'_>,
     from_scope: baml_compiler2_hir::scope::FileScopeId,
@@ -1724,9 +1752,9 @@ pub(crate) fn render_associated_type(
 /// hover renders signature-only methods ahead of default bodies.
 fn interface_method_sigs(
     db: &dyn baml_compiler2_hir::Db,
+    reader: &render::Reader<'_>,
     iface_loc: baml_compiler2_hir::loc::InterfaceLoc<'_>,
 ) -> (Vec<MethodSig>, Vec<MethodSig>) {
-    let file = iface_loc.file(db);
     let mut required = Vec::new();
     let mut defaulted = Vec::new();
     for &method_loc in &item_data::interface_data(db, iface_loc).methods {
@@ -1736,11 +1764,8 @@ fn interface_method_sigs(
         }
         let sig = MethodSig {
             name: method.name.as_str().to_string(),
-            signature: resolved_function_sig_parts(db, method_loc, None).render(
-                db,
-                file,
-                method_sig_style(),
-            ),
+            signature: resolved_function_sig_parts(db, method_loc, None)
+                .render_for(reader, method_sig_style()),
             is_instance: method
                 .params
                 .first()
@@ -1759,10 +1784,10 @@ fn interface_method_sigs(
 
 pub(crate) fn type_method_sigs(
     db: &dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     definition: Definition<'_>,
 ) -> Vec<MethodSig> {
-    let surface = collect_type_surface(db, viewer, definition);
+    let surface = collect_type_surface(db, reader, definition);
     let sig = |m: CollectedMethod, implements: Option<String>| MethodSig {
         name: m.name,
         signature: m.signature,
@@ -1831,7 +1856,7 @@ pub(crate) struct CollectedImpl<'db> {
 /// concrete type.
 pub(crate) fn collect_type_surface<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     definition: Definition<'db>,
 ) -> TypeSurface<'db> {
     use baml_compiler2_hir_ty::package_interface::ExportedType;
@@ -1839,15 +1864,16 @@ pub(crate) fn collect_type_surface<'db>(
     let file = definition.file(db);
 
     // A source method: signature from its item (resolved slots from the
-    // export), docstring, and its own definition site — which for an
-    // out-of-body impl may be another file than the type's.
+    // export), spelled from the reader's package, docstring, and its own
+    // definition site — which for an out-of-body impl may be another file
+    // than the type's.
     let collect_source = |method_loc: baml_compiler2_hir::loc::FunctionLoc<'_>,
                           ef: Option<&ExportedFunction>|
      -> CollectedMethod {
         let m = item_data::function_data(db, method_loc);
         let is_instance = m.params.first().is_some_and(|p| p.name.as_str() == "self");
         let signature =
-            resolved_function_sig_parts(db, method_loc, ef).render(db, file, method_sig_style());
+            resolved_function_sig_parts(db, method_loc, ef).render_for(reader, method_sig_style());
         let docstring = m
             .docstring
             .as_ref()
@@ -1894,7 +1920,7 @@ pub(crate) fn collect_type_surface<'db>(
         }
     }
 
-    let impls = type_impls(db, viewer, definition)
+    let impls = type_impls(db, reader, definition)
         .into_iter()
         .map(|imp| CollectedImpl {
             display: imp.display,
@@ -1916,11 +1942,8 @@ pub(crate) fn collect_type_surface<'db>(
                             baml_compiler2_hir_ty::extern_loc::extern_function_row(db, method);
                         CollectedMethod {
                             name: exported.name.as_str().to_string(),
-                            signature: render::FnSigParts::of_exported(exported).render(
-                                db,
-                                file,
-                                method_sig_style(),
-                            ),
+                            signature: render::FnSigParts::of_exported(exported)
+                                .render_for(reader, method_sig_style()),
                             docstring: None,
                             location: None,
                             is_instance:
@@ -1944,8 +1967,7 @@ pub(crate) fn collect_type_surface<'db>(
 /// split): it is what tells same-head impls of one class apart, so listings
 /// and drill-ins label impl-tier methods with it.
 pub(crate) fn render_impl_head(
-    db: &dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     interface: &baml_type::interned::ClosedInterface,
 ) -> String {
     let iface = interface.to_plain();
@@ -1953,15 +1975,14 @@ pub(crate) fn render_impl_head(
     let mut args: Vec<String> = iface
         .generics
         .iter()
-        .map(|ty| render::display_addressable_ty(db, viewer, ty))
+        .map(|ty| reader.display_addressable_ty(ty))
         .collect();
-    args.extend(iface.associated_types.iter().map(|(name, ty)| {
-        format!(
-            "{} = {}",
-            name.as_str(),
-            render::display_addressable_ty(db, viewer, ty)
-        )
-    }));
+    args.extend(
+        iface
+            .associated_types
+            .iter()
+            .map(|(name, ty)| format!("{} = {}", name.as_str(), reader.display_addressable_ty(ty))),
+    );
     if !args.is_empty() {
         head.push('<');
         head.push_str(&args.join(", "));
@@ -1973,11 +1994,10 @@ pub(crate) fn render_impl_head(
 /// An impl's for-target in the canonical owner spelling (`int`, `T[]`,
 /// `user.Foo`, or a bare `T` for a blanket impl).
 pub(crate) fn render_impl_target(
-    db: &dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     for_ty: &baml_type::interned::ClosedTy,
 ) -> String {
-    render::display_addressable_ty(db, viewer, &for_ty.to_plain())
+    reader.display_addressable_ty(&for_ty.to_plain())
 }
 
 /// The label a drill-in carries for an impl's method: the head alone when
@@ -1985,18 +2005,17 @@ pub(crate) fn render_impl_target(
 /// otherwise (`Concrete for T` — a blanket or pattern impl the type merely
 /// falls under).
 pub(crate) fn type_impl_label(
-    db: &dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     self_ty: &baml_type::Ty,
     resolved: &baml_compiler2_hir_ty::impls::ResolvedImpl<'_>,
 ) -> String {
-    let head = render_impl_head(db, viewer, resolved.facts.interface());
+    let head = render_impl_head(reader, resolved.facts.interface());
     if impl_is_for_type(self_ty, resolved) {
         head
     } else {
         format!(
             "{head} for {}",
-            render_impl_target(db, viewer, resolved.facts.for_ty_pattern())
+            render_impl_target(reader, resolved.facts.for_ty_pattern())
         )
     }
 }
@@ -2009,8 +2028,7 @@ pub(crate) fn type_impl_label(
 /// under an interface every row names it, under a type the variation a
 /// reader scans for is the context, the instantiation and the target.
 pub(crate) fn render_impl_row(
-    db: &dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     generic_params: &[(
         baml_type::ParamTy,
         Vec<baml_type::interned::ClosedInterface>,
@@ -2029,7 +2047,7 @@ pub(crate) fn render_impl_row(
                     spelled.push_str(
                         &bounds
                             .iter()
-                            .map(|bound| render_impl_head(db, viewer, bound))
+                            .map(|bound| render_impl_head(reader, bound))
                             .collect::<Vec<_>>()
                             .join(" & "),
                     );
@@ -2042,9 +2060,9 @@ pub(crate) fn render_impl_row(
         row.push('>');
     }
     row.push(' ');
-    row.push_str(&render_impl_head(db, viewer, interface));
+    row.push_str(&render_impl_head(reader, interface));
     row.push_str(" for ");
-    row.push_str(&render_impl_target(db, viewer, for_ty));
+    row.push_str(&render_impl_target(reader, for_ty));
     row
 }
 
@@ -2139,7 +2157,7 @@ pub(crate) struct TypeImpl<'db> {
 /// that is no concrete type.
 pub(crate) fn type_impls<'db>(
     db: &'db dyn baml_compiler2_hir::Db,
-    viewer: baml_base::SourceRoot,
+    reader: &render::Reader<'_>,
     definition: Definition<'db>,
 ) -> Vec<TypeImpl<'db>> {
     use baml_compiler2_hir::loc::DeclRef;
@@ -2149,7 +2167,7 @@ pub(crate) fn type_impls<'db>(
         return Vec::new();
     };
     let (own, other): (Vec<_>, Vec<_>) =
-        baml_compiler2_hir_ty::method_resolution::impls_of_type(db, viewer, &self_ty)
+        baml_compiler2_hir_ty::method_resolution::impls_of_type(db, reader.viewer(), &self_ty)
             .into_iter()
             .partition(|resolved| impl_is_for_type(&self_ty, resolved));
 
@@ -2157,13 +2175,12 @@ pub(crate) fn type_impls<'db>(
         .chain(other)
         .map(|resolved| {
             let display = render_impl_row(
-                db,
-                viewer,
+                reader,
                 resolved.facts.generic_params(),
                 resolved.facts.interface(),
                 resolved.facts.for_ty_pattern(),
             );
-            let label = type_impl_label(db, viewer, &self_ty, &resolved);
+            let label = type_impl_label(reader, &self_ty, &resolved);
             let associated_types = resolved
                 .facts
                 .associated_types()
@@ -2171,7 +2188,7 @@ pub(crate) fn type_impls<'db>(
                 .map(|(name, ty)| {
                     (
                         name.as_str().to_string(),
-                        render::display_addressable_ty(db, viewer, &ty.to_plain()),
+                        reader.display_addressable_ty(&ty.to_plain()),
                     )
                 })
                 .collect();
@@ -2266,30 +2283,31 @@ mod tests {
     }
 
     #[test]
-    fn client_config_hover_only_documents_the_key_token() {
-        let key = CursorTest::new(
-            r#"client<llm> Example {
-  prov<[CURSOR]ider openai
-}"#,
+    fn let_type_keyword_hover_documents_let_type() {
+        let test = CursorTest::new(
+            "interface Named { name string }\nfunction f(t: reflect.Type) -> string {\n  let ty<[CURSOR]pe T extends Named = t;\n  \"x\"\n}\n",
         );
-        let TypeInfo::Documentation { label, .. } = info_at(&key) else {
-            panic!("config key hovers as documentation");
+        let TypeInfo::Documentation { label, detail } = info_at(&test) else {
+            panic!("the `type` keyword hovers as documentation");
         };
-        assert!(label.contains("provider <name>"));
-
-        let value = CursorTest::new(
-            r#"client<llm> Example {
-  provider open<[CURSOR]ai
-}"#,
-        );
-        let value_info = type_at(&value.db, value.cursor.file, value.cursor.offset);
+        assert_eq!(label, "type");
+        let topic = baml_builtins2::language_topic("type").expect("the `type` keyword topic");
+        assert_eq!(detail, topic.summary);
         assert!(
-            !matches!(
-                &value_info,
-                Some(TypeInfo::Documentation { label, .. }) if label.contains("provider <name>")
-            ),
-            "the value token must not document the key, got: {value_info:?}"
+            topic
+                .syntax
+                .as_deref()
+                .is_some_and(|syntax| syntax.contains("let type T = t;")),
+            "the keyword docs show the `let type` spelling: {topic:?}"
         );
+    }
+
+    #[test]
+    fn a_bounded_let_type_value_reaches_the_bound_member() {
+        let test = CursorTest::new(
+            "interface Named { name string }\nfunction f(t: reflect.Type) -> string {\n  let type T extends Named = t else { return \"\" };\n  let v = baml.json.to<T>({});\n  v.na<[CURSOR]me\n}\n",
+        );
+        assert_eq!(info_at(&test).to_describe_block(), "name: string");
     }
 
     #[test]
@@ -2643,7 +2661,7 @@ class Foo<[CURSOR] {
     }
 
     #[test]
-    fn class_method_owner_is_the_full_self_type_path() {
+    fn class_method_owner_is_the_self_type_as_the_reader_writes_it() {
         let test = CursorTest::new(
             r#"class Widget {
     label string
@@ -2658,7 +2676,7 @@ function example(w: Widget) -> string {
 }"#,
         );
         let (_, owner, _) = symbol_parts(info_at(&test));
-        assert_eq!(owner.as_deref(), Some("user.Widget"));
+        assert_eq!(owner.as_deref(), Some("Widget"));
     }
 
     #[test]
@@ -2680,7 +2698,7 @@ function example(w: Widget) -> string {
 }"#,
         );
         let (_, owner, docstring) = symbol_parts(info_at(&test));
-        assert_eq!(owner.as_deref(), Some("user.Greeter"));
+        assert_eq!(owner.as_deref(), Some("Greeter"));
         assert_eq!(docstring.as_deref(), Some("Say hello."));
     }
 
@@ -2698,7 +2716,7 @@ function example() -> Status {
         );
         let (declaration, owner, _) = symbol_parts(info_at(&test));
         assert_eq!(declaration, "Active: Status");
-        assert_eq!(owner.as_deref(), Some("user.Status"));
+        assert_eq!(owner.as_deref(), Some("Status"));
     }
 
     #[test]
@@ -2731,7 +2749,7 @@ implements<El<[CURSOR]em extends Wrap> Wrap for Elem[] {
         );
         let (declaration, owner, _) = symbol_parts(info_at(&test));
         assert_eq!(declaration, "type Item extends HasItem");
-        assert_eq!(owner.as_deref(), Some("user.HasItem"));
+        assert_eq!(owner.as_deref(), Some("HasItem"));
     }
 
     #[test]
@@ -2755,7 +2773,7 @@ implements Yielding for Widget {
         );
         let (declaration, owner, _) = symbol_parts(info_at(&test));
         assert_eq!(declaration, "type Output");
-        assert_eq!(owner.as_deref(), Some("user.Yielding"));
+        assert_eq!(owner.as_deref(), Some("Yielding"));
     }
 
     #[test]
@@ -2806,6 +2824,42 @@ implements Yielding for Widget {
         assert_eq!(owner.as_deref(), Some("baml.ops.Compare"));
     }
 
+    /// `>=` is a `>` token and an `=` token joined by adjacency: a cursor on
+    /// the `=` is on the operator.
+    #[test]
+    fn cursor_on_the_tail_of_a_joined_operator_hovers_the_operator() {
+        let test = CursorTest::new(
+            r#"function example(a: int, b: int) -> bool {
+    a ><[CURSOR]= b
+}"#,
+        );
+        let (declaration, owner, _) = symbol_parts(info_at(&test));
+        assert!(
+            declaration.starts_with("function ge(self"),
+            "`>=` names `Compare.ge`, got: {declaration}"
+        );
+        assert_eq!(owner.as_deref(), Some("baml.ops.Compare"));
+    }
+
+    /// The end of a file without a trailing newline belongs to its last
+    /// token: a cursor there hovers that token.
+    #[test]
+    fn cursor_at_the_end_of_the_file_hovers_the_last_token() {
+        let test = CursorTest::new(
+            r#"enum Status {
+    Active
+}
+
+let current = Status.Active<[CURSOR]"#,
+        );
+        let (declaration, owner, _) = symbol_parts(info_at(&test));
+        assert!(
+            declaration.starts_with("Active"),
+            "the variant under the cursor, got: {declaration}"
+        );
+        assert_eq!(owner.as_deref(), Some("Status"));
+    }
+
     #[test]
     fn index_operator_hovers_the_container_impl() {
         let test = CursorTest::new(
@@ -2819,6 +2873,89 @@ implements Yielding for Widget {
             "indexing dispatches Index.index, got: {declaration}"
         );
         assert_eq!(owner.as_deref(), Some("T[]"));
+    }
+
+    #[test]
+    fn tuple_slot_hovers_its_type() {
+        let test = CursorTest::new("function example(t: (int, string)) -> string { t.<[CURSOR]1 }");
+        let (declaration, owner, docstring) = symbol_parts(info_at(&test));
+        assert_eq!(declaration, "t.1: string");
+        assert_eq!(owner, None);
+        assert_eq!(docstring, None);
+    }
+
+    #[test]
+    fn tuple_slot_dot_hovers_its_type() {
+        for (source, expected) in [
+            (
+                "function f(t: (int, string)) -> string { t<[CURSOR].1 }",
+                "t.1: string",
+            ),
+            (
+                "function f(t: (int, string)?) -> string? { t<[CURSOR]?.1 }",
+                "t?.1: string | null",
+            ),
+            (
+                "function f(t: ((int, string), bool)) -> string { t.0<[CURSOR].1 }",
+                "t.0.1: string",
+            ),
+            (
+                "function f(t: ((int, string), bool)) -> string { t<[CURSOR].0.1 }",
+                "t.0: (int, string)",
+            ),
+        ] {
+            let test = CursorTest::new(source);
+            let (declaration, ..) = symbol_parts(info_at(&test));
+            assert_eq!(declaration, expected);
+        }
+    }
+
+    #[test]
+    fn chained_tuple_slots_have_independent_hover_types() {
+        let test = CursorTest::new(
+            "function example(t: ((int, string), bool)) -> string { t.0.<[CURSOR]1 }",
+        );
+        let (declaration, ..) = symbol_parts(info_at(&test));
+        assert_eq!(declaration, "t.0.1: string");
+        let test = CursorTest::new(
+            "function example(t: ((int, string), bool)) -> string { t.<[CURSOR]0.1 }",
+        );
+        let (declaration, ..) = symbol_parts(info_at(&test));
+        assert_eq!(declaration, "t.0: (int, string)");
+    }
+
+    #[test]
+    fn optional_tuple_slot_hovers_include_null() {
+        for (source, expected) in [
+            (
+                "function f(t: (int, string)) -> string { t?.<[CURSOR]1 }",
+                "t?.1: string",
+            ),
+            (
+                "function f(t: (int, string)?) -> string? { t?.<[CURSOR]1 }",
+                "t?.1: string | null",
+            ),
+            (
+                "function f(t: ((int, string), bool)?) -> string? { t?.0.<[CURSOR]1 }",
+                "t?.0.1: string | null",
+            ),
+            (
+                "function f(t: ((int, string), bool)?) -> string? { t?.<[CURSOR]0.1 }",
+                "t?.0: (int, string) | null",
+            ),
+        ] {
+            let test = CursorTest::new(source);
+            let (declaration, ..) = symbol_parts(info_at(&test));
+            assert_eq!(declaration, expected);
+        }
+    }
+
+    #[test]
+    fn tuple_slot_has_no_declaration_target() {
+        let test = CursorTest::new("function example(t: (int, string)) -> string { t.<[CURSOR]1 }");
+        assert!(
+            crate::resolve::symbol_at(&test.db, test.cursor.file, test.cursor.offset).is_none()
+        );
     }
 
     #[test]
@@ -2844,7 +2981,7 @@ function example(a: Meters, b: Meters) -> Meters {
             declaration.starts_with("function add(self, rhs: Meters)"),
             "the user impl's override, got: {declaration}"
         );
-        assert_eq!(owner.as_deref(), Some("user.Meters"));
+        assert_eq!(owner.as_deref(), Some("Meters"));
     }
 
     #[test]
@@ -2878,7 +3015,7 @@ function example(a: Meters, b: Meters) -> Meters {
             declaration.starts_with("function describe_self(self)"),
             "got: {declaration}"
         );
-        assert_eq!(owner.as_deref(), Some("user.Widget"));
+        assert_eq!(owner.as_deref(), Some("Widget"));
     }
 
     #[test]
@@ -2899,7 +3036,7 @@ function example(a: Meters, b: Meters) -> Meters {
         // may omit it), distinguishing it from the bare required signature.
         let expected = "interface Store {\n    type Item extends Store;\n    capacity: int,\n    function get(self, key: string) -> string throws never\n    function get_or(self, key: string, fallback: string) -> string throws never { ... }\n}";
         assert_eq!(block, expected);
-        assert_eq!(info.owner_path(), Some("user"));
+        assert_eq!(info.owner_path(), Some("root"));
     }
 
     #[test]
@@ -2951,7 +3088,7 @@ class Safe {
         );
         let (declaration, owner, _) = symbol_parts(info_at(&test));
         assert_eq!(declaration, "function act(self) -> string throws never");
-        assert_eq!(owner.as_deref(), Some("user.Safe"));
+        assert_eq!(owner.as_deref(), Some("Safe"));
     }
 
     #[test]
@@ -3107,7 +3244,7 @@ function helpful_turn(username: string) -> string {
     }
 
     #[test]
-    fn item_owners_are_the_compiler_package_path() {
+    fn item_owners_are_the_package_as_the_reader_addresses_it() {
         // Class/enum owners come from `file_package`, never from string
         // surgery on the canonical fqn (which spelled `root`).
         let class = CursorTest::new(
@@ -3115,13 +3252,13 @@ function helpful_turn(username: string) -> string {
     x int
 }"#,
         );
-        assert_eq!(info_at(&class).owner_path(), Some("user"));
+        assert_eq!(info_at(&class).owner_path(), Some("root"));
 
         let en = CursorTest::new(
             r#"enum Sta<[CURSOR]tus {
     Active
 }"#,
         );
-        assert_eq!(info_at(&en).owner_path(), Some("user"));
+        assert_eq!(info_at(&en).owner_path(), Some("root"));
     }
 }

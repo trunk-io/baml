@@ -1,9 +1,10 @@
 """Protobuf encoder/decoder for the BAML bridge_ctypes protocol.
 
-Inbound (09d): Python value → `baml_inbound.proto`. The encoder dispatches
-on the Python runtime shape — never on the declared BAML parameter type —
-per 09d §1. Rust re-runs BAML type checking after deserializing, so
-structural mismatches surface as `CallAck.error` → `BamlError`.
+Inbound: Python builds the control part of `CallFunctionArgs` (identity,
+target, explicit type arguments, invocation options). The argument values
+themselves are not encoded here: the bridge walks them against the types
+the program declares for the target's parameters (`bridge_encode`), so a
+value that does not fit raises a `TypeError` before anything is sent.
 
 Outbound (09e): `baml_outbound.proto` → Python value. Decoding is driven
 by the FQN metadata embedded on `BamlValueClass` / `BamlValueEnum` and
@@ -13,11 +14,16 @@ caller's declared Python return type plays no runtime role.
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import keyword
 import os
 import types as python_types
 import typing
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel
 
 from .cffi.v1 import baml_handle_pb2, baml_inbound_pb2, baml_outbound_pb2, baml_type_pb2
 from .baml_py import (
@@ -26,51 +32,29 @@ from .baml_py import (
     BamlPdf,
     BamlPyHandle,
     BamlVideo,
+    cancel_function_call,
     get_runtime as _get_runtime,
     new_function_call,
-    register_host_callable,
+    release_function_call,
     _release_wire_handle,
-    release_host_callable,
 )
 from ._stream import BamlStream
 from ._function_spec import BamlFunctionSpec
-from ._runtime_value import BamlRuntimeValue
+from ._runtime_value import BamlOpaque, BamlRuntimeValue
 from .errors import BamlCancelledError, BamlError, BamlPanic, attach_baml_traceback
-from .typemap import BamlTypeMap, get_type_map
-
-
-def _is_pydantic_model(value: Any) -> bool:
-    try:
-        from pydantic import BaseModel  # type: ignore[import-untyped]
-    except ImportError:
-        return False
-    return isinstance(value, BaseModel)
-
-
-def _is_pydantic_model_class(cls: type) -> bool:
-    try:
-        from pydantic import BaseModel  # type: ignore[import-untyped]
-    except ImportError:
-        return False
-    return issubclass(cls, BaseModel)
+from .typemap import BamlClassInstance, TypeLookup, get_type_map
 
 
 # Media PyO3 types — kept as a tuple for `isinstance` dispatch in the
-# encoder and `_decode_class` unwrap (15b §line 21). Their sparse inbound
-# annotation is the exact primitive media kind; the class-shaped `_data`
-# payload remains an implementation shell around the native handle.
+# `_decode_class` unwrap (15b §line 21). The class-shaped `_data` payload
+# remains an implementation shell around the native handle.
 _MEDIA_PYO3_TYPES = (BamlImage, BamlAudio, BamlVideo, BamlPdf)
+# Media Python types as wire `BamlTy` media kinds, for `_types=` lowering.
 _MEDIA_WIRE_KINDS = {
     BamlImage: baml_type_pb2.BAML_TY_MEDIA_KIND_IMAGE,
     BamlAudio: baml_type_pb2.BAML_TY_MEDIA_KIND_AUDIO,
     BamlVideo: baml_type_pb2.BAML_TY_MEDIA_KIND_VIDEO,
     BamlPdf: baml_type_pb2.BAML_TY_MEDIA_KIND_PDF,
-}
-_MEDIA_PROTO_KINDS = {
-    BamlImage: baml_outbound_pb2.IMAGE,
-    BamlAudio: baml_outbound_pb2.AUDIO,
-    BamlVideo: baml_outbound_pb2.VIDEO,
-    BamlPdf: baml_outbound_pb2.PDF,
 }
 _PROTO_MEDIA_TYPES = {
     baml_outbound_pb2.IMAGE: BamlImage,
@@ -81,7 +65,8 @@ _PROTO_MEDIA_TYPES = {
 
 
 class _PortablePromptAst:
-    """Owned wire copy stored in the generated ``ai.Prompt._data`` slot."""
+    """Owned wire copy of a rendered prompt, held by a generated ``ai.Prompt``
+    instance as its ``_data`` private attribute."""
 
     __slots__ = ("_value",)
 
@@ -95,32 +80,68 @@ class _PortablePromptAst:
         return copied
 
 
+def _live_keys(message: Any) -> typing.Iterator[int]:
+    """Every `live` head under a wire type, once per occurrence: each is a row
+    of the engine's handle table that names a runtime declaration."""
+    for field, value in message.ListFields():
+        if (
+            field.name == "live"
+            and field.containing_oneof is not None
+            and field.containing_oneof.name == "head"
+        ):
+            yield value
+        elif field.type == field.TYPE_MESSAGE:
+            if field.is_repeated:
+                for item in value:
+                    yield from _live_keys(item)
+            else:
+                yield from _live_keys(value)
+
+
+class _LiveRows:
+    """The engine rows a type value's runtime declarations are held by, one
+    per occurrence, released together when the last type sharing them goes."""
+
+    __slots__ = ("_handles",)
+
+    def __init__(self, keys: typing.Iterable[int]) -> None:
+        untagged = int(baml_handle_pb2.BamlHandleType.UNTAGGED_BEX_HEAP)
+        self._handles = [BamlPyHandle(key, untagged) for key in keys]
+
+
 class BamlType:
-    """Opaque host handle for a reflected BAML type definition.
+    """Opaque host handle for a reflected BAML type.
 
     The protobuf payload is intentionally private: the supported host surface
     is composition (`meta`, `array`, `optional`) and passing the value back to
-    BAML. Python object identity is not BAML type identity.
+    BAML. A runtime declaration the type names is held by the engine row it
+    arrived under; a type sent back states it with a reference of the call's
+    own. Python object identity is not BAML type identity.
     """
 
-    __slots__ = ("_definition",)
+    __slots__ = ("_ty", "_rows")
 
-    def __init__(self, definition: "baml_type_pb2.BamlTyDef") -> None:
-        copied = baml_type_pb2.BamlTyDef()
-        copied.CopyFrom(definition)
-        self._definition = copied
+    def __init__(self, ty: "baml_type_pb2.BamlTy", rows: Optional[_LiveRows] = None) -> None:
+        copied = baml_type_pb2.BamlTy()
+        copied.CopyFrom(ty)
+        self._ty = copied
+        self._rows = rows
+
+    @classmethod
+    def _adopt(cls, ty: "baml_type_pb2.BamlTy") -> "BamlType":
+        """A type the engine handed over: its `live` heads are rows this
+        value now holds."""
+        return cls(ty, _LiveRows(_live_keys(ty)))
 
     @classmethod
     def _from_python(cls, value: Any) -> "BamlType":
         if isinstance(value, cls):
             return value
-        definition = baml_type_pb2.BamlTyDef()
-        definition.root.CopyFrom(python_type_to_wire_ty(value))
-        return cls(definition)
+        return cls(python_type_to_wire_ty(value))
 
-    def _wire_copy(self) -> "baml_type_pb2.BamlTyDef":
-        copied = baml_type_pb2.BamlTyDef()
-        copied.CopyFrom(self._definition)
+    def _wire_copy(self) -> "baml_type_pb2.BamlTy":
+        copied = baml_type_pb2.BamlTy()
+        copied.CopyFrom(self._ty)
         return copied
 
     def meta(
@@ -140,20 +161,14 @@ class BamlType:
         )
 
     def array(self) -> "BamlType":
-        definition = self._wire_copy()
-        old_root = baml_type_pb2.BamlTy()
-        old_root.CopyFrom(definition.root)
-        definition.root.Clear()
-        definition.root.list.item.CopyFrom(old_root)
-        return BamlType(definition)
+        composed = baml_type_pb2.BamlTy()
+        composed.list.item.CopyFrom(self._ty)
+        return BamlType(composed, self._rows)
 
     def optional(self) -> "BamlType":
-        definition = self._wire_copy()
-        old_root = baml_type_pb2.BamlTy()
-        old_root.CopyFrom(definition.root)
-        definition.root.Clear()
-        definition.root.optional.inner.CopyFrom(old_root)
-        return BamlType(definition)
+        composed = baml_type_pb2.BamlTy()
+        composed.optional.inner.CopyFrom(self._ty)
+        return BamlType(composed, self._rows)
 
     def __reduce__(self):
         raise TypeError("BamlType values are runtime handles and cannot be serialized")
@@ -163,6 +178,33 @@ class BamlType:
 
     def __repr__(self) -> str:
         return "BamlType(<opaque>)"
+
+
+class BamlTuple(tuple):
+    """A BAML tuple as Python receives it: a native `tuple`, with the tuple
+    type the value carries.
+
+    The carried type is the value's own (its slot types, generic arguments
+    applied), not what its items happen to be, so `(1, True)` of a
+    `(int | string, bool)` goes back to BAML as that type wherever the
+    destination fixes none. Every tuple operation (slicing, concatenation,
+    `tuple(...)`) makes a plain `tuple`, which states only its items' types.
+    The type is an annotation: it names no runtime declaration row, so the
+    value holds nothing of the engine's.
+    """
+
+    _ty: "baml_type_pb2.BamlTy"
+
+    def __new__(
+        cls, items: typing.Iterable[Any], ty: "baml_type_pb2.BamlTy"
+    ) -> "BamlTuple":
+        value = super().__new__(cls, items)
+        value._ty = baml_type_pb2.BamlTy()
+        value._ty.CopyFrom(ty)
+        return value
+
+    def __reduce__(self):
+        return (tuple, (tuple(self),))
 
 
 class _BamlTypeMetadataRow:
@@ -182,412 +224,6 @@ class _BamlTypeMetadataRow:
         self.description = description
         self.docstring = docstring
         self.other = other
-
-
-# ---------------------------------------------------------------------------
-# Encoding: Python kwargs → CallFunctionArgs (09d §2)
-# ---------------------------------------------------------------------------
-
-
-def _base_class_for_fqn(cls: type) -> type:
-    """Return the unparameterized origin of a Pydantic generic class.
-
-    `Box[int]` is a runtime subclass produced by Pydantic v2's
-    `__class_getitem__`; its FQN on the wire is the base `Box`'s, not the
-    parameterization (`13b` §2.1). For non-generic classes this is a
-    no-op — `cls` already names the class we want.
-    """
-    meta = getattr(cls, "__pydantic_generic_metadata__", None)
-    if meta and meta.get("origin"):
-        return meta["origin"]
-    return cls
-
-
-def _derive_baml_fqn(cls: type) -> str:
-    """Reverse 09b §1 routing to produce a BAML FQN for a Python class.
-
-    Informational only — Rust uses it for diagnostics, not correctness
-    (09d §2). Returns the empty string when the class is not routed under
-    `sdk_root` (user-defined models, runtime not initialized, etc.).
-    """
-    sdk_root = _safe_sdk_root()
-    if not sdk_root:
-        return ""
-    module = getattr(cls, "__module__", "") or ""
-    name = getattr(cls, "__name__", "") or ""
-    if not name:
-        return ""
-
-    if module == sdk_root:
-        subpath = name
-    else:
-        prefix = sdk_root + "."
-        if not module.startswith(prefix):
-            return ""
-        subpath = f"{module[len(prefix) :]}.{name}"
-
-    return _subpath_to_baml_fqn(subpath)
-
-
-def _subpath_to_baml_fqn(subpath: str) -> str:
-    """Reverse the §1 routing table.
-
-    Phase 12a collapsed the BEP-030 `root.*` spec convention into the
-    engine's `user.*` package convention; everything downstream (engine
-    `resolved_class_names`, `lookup_function`, outbound `_resolve_type`)
-    now expects `user.*` end-to-end, so emit it directly here. The
-    project-boundary coercion in `bex_project::bex::coerce_arg_to_declared_type`
-    only rewrites the top-level arg's class name; nested classes,
-    enums, and dict/list element types must arrive with the engine FQN
-    already on them or the engine panics on lookup.
-    """
-    if subpath.startswith("vendor."):
-        return subpath[len("vendor.") :]
-    if subpath.startswith("baml."):
-        return subpath
-    return f"user.{subpath}"
-
-
-def _safe_sdk_root() -> str:
-    """Fetch `sdk_root` without raising if the runtime is uninitialized.
-
-    FQN derivation is diagnostic, so it must not promote a missing runtime
-    into a hard failure on the inbound path.
-    """
-    try:
-        from . import (
-            get_runtime,
-        )  # local import: avoids circular binding at module load
-
-        return get_runtime()._sdk_root or ""
-    except Exception:
-        return ""
-
-
-def _set_inbound_value(
-    inbound_value: baml_inbound_pb2.InboundValue,
-    value: Any,
-    *,
-    kwarg_name: str,
-    registered: Optional[List[int]] = None,
-    cloned_handles: Optional[List[int]] = None,
-) -> None:
-    """Populate an `InboundValue` oneof from a Python value per 09d §2.
-
-    `kwarg_name` is threaded through so the `TypeError` raised on
-    unsupported inputs names the offending top-level kwarg, not the
-    nested field we happen to have descended into.
-
-    `registered` and `cloned_handles`, when supplied, collect the two kinds of
-    ownership created during encoding: host-value registry keys for callables,
-    and HANDLE_TABLE keys cloned for wire transfer. If encoding aborts before
-    the bytes reach the engine, callers explicitly release both sets. On
-    success the engine owns them and performs the normal release/drain.
-    """
-    if value is None:
-        return  # oneof unset ≡ null
-
-    if isinstance(value, BamlType):
-        inbound_value.ty_def_value.CopyFrom(value._definition)
-        return
-
-    if isinstance(value, _BamlTypeMetadataRow):
-        cv = inbound_value.class_value
-        for key in ("ty", "alias", "description", "docstring", "other"):
-            _set_inbound_map_entry(
-                cv.fields.add(),
-                key,
-                getattr(value, key),
-                kwarg_name=kwarg_name,
-                registered=registered,
-                cloned_handles=cloned_handles,
-            )
-        return
-
-    # `enum.Enum` must precede the primitive arms. Codegen emits enums as
-    # mixin subclasses of their backing primitive — `SomeEnum(str, enum.Enum)`
-    # (and likewise `int`-backed enums) — so a bare `isinstance(value, str)` /
-    # `isinstance(value, int)` check would otherwise swallow an enum member and
-    # encode it as `string_value` / `int_value`, losing the `T = SomeEnum`
-    # binding the engine recovers from an `EnumVariant`. Same precedence logic
-    # as `bool` before `int`: dispatch on the most specific runtime shape first.
-    if isinstance(value, enum.Enum):
-        ev = inbound_value.enum_value
-        ev.name = get_type_map().py_type_to_baml_type(_base_class_for_fqn(type(value)))
-        if not isinstance(value.value, str):
-            raise TypeError(
-                f"Cannot encode enum member {value!r}: BAML enum wire values must be strings"
-            )
-        ev.value = value.value
-        return
-
-    # bool must precede int — bool is an int subclass in Python.
-    if isinstance(value, bool):
-        inbound_value.bool_value = value
-        return
-    if isinstance(value, int):
-        # Python's `int` is arbitrary-precision, but the wire `int_value`
-        # field is `int64`. Values outside i64 range overflow protobuf
-        # serialization, so route them through `bigint_value` instead.
-        # Hex / base sixteen on the wire; `format(value, "x")` preserves a
-        # leading minus for negatives.
-        if -(1 << 63) <= value < (1 << 63):
-            inbound_value.int_value = value
-        else:
-            inbound_value.bigint_value = format(value, "x")
-        return
-    if isinstance(value, float):
-        inbound_value.float_value = value
-        return
-    if isinstance(value, str):
-        inbound_value.string_value = value
-        return
-    if isinstance(value, (bytes, bytearray)):
-        inbound_value.uint8array_value = bytes(value)
-        return
-    if isinstance(value, (list, tuple)):
-        list_val = inbound_value.list_value
-        # Mark the `list_value` oneof arm present even for an empty list.
-        # Merely reading `inbound_value.list_value` doesn't set the oneof
-        # case; without an `add()` (empty list) the arm stays unset, which
-        # the engine reads as null (see `value is None` above) — so an
-        # empty list would round-trip back as `None`.
-        list_val.SetInParent()
-        for item in value:
-            _set_inbound_value(
-                list_val.values.add(),
-                item,
-                kwarg_name=kwarg_name,
-                registered=registered,
-                cloned_handles=cloned_handles,
-            )
-        return
-    if isinstance(value, dict):
-        map_val = inbound_value.map_value
-        # Same as the empty-list case above: set the oneof arm so an empty
-        # dict encodes as an empty map rather than an unset (null) value.
-        map_val.SetInParent()
-        for k, v in value.items():
-            _set_inbound_map_entry(
-                map_val.entries.add(),
-                k,
-                v,
-                kwarg_name=kwarg_name,
-                registered=registered,
-                cloned_handles=cloned_handles,
-            )
-        return
-
-    # `BamlPyHandle` is its own top-level inbound variant — peer to
-    # `class_value` / `enum_value` / etc. Must precede `pydantic.BaseModel`
-    # so a future `BamlPyHandle` subclass would land here, and must
-    # precede the media-class branch since the media types compose a
-    # `BamlPyHandle` internally and recurse here on `_to_pyhandle()`.
-    if isinstance(value, BamlPyHandle):
-        key, ht = value._clone_key_for_wire()
-        if cloned_handles is not None:
-            try:
-                cloned_handles.append(key)
-            except BaseException:
-                try:
-                    _release_wire_handle(key)
-                except Exception:
-                    pass
-                raise
-        inbound_value.handle.key = key
-        # Wire field stays populated for cross-bridge compat. The proto
-        # field is typed as the enum class, but `BamlHandleType` is an
-        # `int` subclass so the runtime accepts a bare int — cast for
-        # the static checker.
-        inbound_value.handle.handle_type = typing.cast(
-            baml_handle_pb2.BamlHandleType, ht
-        )
-        return
-
-    if isinstance(value, _PortablePromptAst):
-        inbound_value.prompt_ast_value.CopyFrom(value.wire_copy())
-        return
-
-    # `BamlStream` (21b §"Phase 4"): lifted to a bare `handle_value` on
-    # the wire — the engine intercepts the outer Stream class at
-    # `convert_heap_ptr_to_external_with_type` and reconstructs the heap
-    # pointer in `convert_external_to_vm_value`'s `Adt(TaggedHeapHandle)`
-    # arm. So encode as `handle_value(ADT_TAGGED_HEAP_HANDLE)` rather
-    # than the media-style `class_value(name, _data: handle_value)` wrap.
-    # Inbound stays a bare `BamlHandle` (key + type only) since the
-    # engine's `HANDLE_TABLE` row already carries the receiver's `ty`.
-    if isinstance(value, (BamlStream, BamlFunctionSpec, BamlRuntimeValue)):
-        return _set_inbound_value(
-            inbound_value,
-            value._to_pyhandle(),
-            kwarg_name=kwarg_name,
-            registered=registered,
-            cloned_handles=cloned_handles,
-        )
-
-    # Media is data, not an engine capability. Copy its canonical payload
-    # directly onto the wire; the engine reconstructs the stdlib wrapper in
-    # the destination context.
-    if isinstance(value, _MEDIA_PYO3_TYPES):
-        media = inbound_value.media_value
-        media.media = _MEDIA_PROTO_KINDS[type(value)]
-        mime_type = value.mime_type()
-        if mime_type is not None:
-            media.mime_type = mime_type
-        if (url := value.url()) is not None:
-            media.url = url
-        elif (base64 := value.base64()) is not None:
-            media.base64 = base64
-        elif (file := value.file()) is not None:
-            media.file = file
-        else:
-            raise TypeError(f"Cannot encode empty media argument {kwarg_name!r}")
-        return
-
-    # Python callables → register in the host-value table and emit a
-    # `Handle` with `HOST_VALUE_CALLABLE`. The Rust side decodes this into
-    # `BexExternalValue::HostValue` and binds it to an `Object::HostClosure`
-    # so BAML code can invoke it directly. Must precede the pydantic-model
-    # branch because Pydantic models are sometimes callable (classes); we
-    # only register *non-class* callables (functions, lambdas, methods,
-    # callable instances). The check order is: Pydantic class instances
-    # (which `_is_pydantic_model` returns True for) fall through here,
-    # because `isinstance(value, type)` is False; bare classes would not
-    # reach this branch since `_is_pydantic_model_class` only accepts
-    # already-Pydantic-model classes. For non-class callables, register.
-    if (
-        callable(value)
-        and not isinstance(value, type)
-        and not _is_pydantic_model(value)
-    ):
-        key = register_host_callable(value)
-        # Record the key so the encode path can release it if a later
-        # kwarg fails to encode (the call never reaches the engine, so the
-        # engine would never decode — and never release — this key).
-        if registered is not None:
-            registered.append(key)
-        inbound_value.handle.key = key
-        inbound_value.handle.handle_type = typing.cast(
-            baml_handle_pb2.BamlHandleType,
-            baml_handle_pb2.BamlHandleType.HOST_VALUE_CALLABLE,
-        )
-        return
-
-    if _is_pydantic_model(value):
-        private = getattr(value, "__pydantic_private__", None) or {}
-        prompt_data = private.get("_data")
-        if isinstance(prompt_data, _PortablePromptAst):
-            inbound_value.prompt_ast_value.CopyFrom(prompt_data.wire_copy())
-            return
-
-        # Generated field names are Python-safe projections. In particular,
-        # ``ai.Prompt._data`` is exposed as ``field_data`` with wire alias
-        # ``_data``. Detect the portable payload by that alias so a Prompt is
-        # flattened back to its owned AST rather than encoded as a class shell.
-        model_fields = type(value).model_fields
-        field_values = dict(value)
-        for name, candidate in field_values.items():
-            field = model_fields.get(name)
-            wire_name = (
-                field.serialization_alias or field.alias or name if field else name
-            )
-            if wire_name == "_data" and isinstance(candidate, _PortablePromptAst):
-                inbound_value.prompt_ast_value.CopyFrom(candidate.wire_copy())
-                return
-
-        cv = inbound_value.class_value
-        # Bind the class via sparse node-level `value_type`. A parameterized
-        # Pydantic generic (`Box[int]`) carries its exact concrete args. An
-        # unparameterized generic carries only nominal class identity (no
-        # args); the engine can refine that hint from one contextual class but
-        # will not use it to choose between multiple concrete instantiations.
-        instance_type_args = pydantic_instance_type_args(value)
-        inbound_value.value_type.class_ty.name = get_type_map().py_type_to_baml_type(
-            _base_class_for_fqn(type(value))
-        )
-        for arg in instance_type_args:
-            _fill_inner(inbound_value.value_type.class_ty.type_args.add(), arg)
-        # Walk fields by attribute access (Pydantic v2's `__iter__`
-        # yields `(name, value)` without recursive serialization).
-        # `model_dump()` would flatten nested Pydantic instances into
-        # dicts and lose the type info — the Rust-side coercer would
-        # then see them as `Map` instead of `Instance`, so a
-        # `Box<Box<int>>` round-trip collapses into bare dicts at the
-        # second level.
-        for k, v in field_values.items():
-            field = model_fields.get(k)
-            wire_name = (field.serialization_alias or field.alias or k) if field else k
-            _set_inbound_map_entry(
-                cv.fields.add(),
-                wire_name,
-                v,
-                kwarg_name=kwarg_name,
-                registered=registered,
-                cloned_handles=cloned_handles,
-            )
-        # Private attrs aren't iterated by `dict(value)`. Codegen emits
-        # `$rust_type` fields as private attrs (single-underscore names);
-        # walk them explicitly so `BamlPyHandle`-backed shells round-trip.
-        # `__pydantic_private__` is None when the model declares no
-        # private attrs.
-        for k, v in private.items():
-            if isinstance(v, (BamlPyHandle, _PortablePromptAst)):
-                _set_inbound_map_entry(
-                    cv.fields.add(),
-                    k,
-                    v,
-                    kwarg_name=kwarg_name,
-                    registered=registered,
-                    cloned_handles=cloned_handles,
-                )
-        return
-
-    raise TypeError(
-        f"Cannot encode argument {kwarg_name!r} of type "
-        f"{type(value).__name__} into baml_inbound.proto"
-    )
-
-
-def _set_inbound_map_entry(
-    entry,
-    key: Any,
-    value: Any,
-    *,
-    kwarg_name: str,
-    registered: Optional[List[int]] = None,
-    cloned_handles: Optional[List[int]] = None,
-) -> None:
-    """Populate an `InboundMapEntry` from a (key, value) pair. Key-oneof
-    dispatch follows 09d §2 "Map keys"; `bool` precedes `int` (subclass).
-
-    The ownership trackers are threaded to `_set_inbound_value` for
-    encode-error rollback (see that function)."""
-    if isinstance(key, bool):
-        entry.bool_key = key
-    elif isinstance(key, enum.Enum):
-        # Precede `str`/`int`: codegen enums mix in their backing primitive
-        # (`SomeEnum(str, enum.Enum)`), so an enum member must be matched here
-        # before the `str`/`int` arms would swallow it as a plain scalar key.
-        ek = entry.enum_key
-        ek.name = get_type_map().py_type_to_baml_type(_base_class_for_fqn(type(key)))
-        if not isinstance(key.value, str):
-            raise TypeError(
-                f"Cannot encode enum key {key!r}: BAML enum wire values must be strings"
-            )
-        ek.value = key.value
-    elif isinstance(key, str):
-        entry.string_key = key
-    elif isinstance(key, int):
-        entry.int_key = key
-    else:
-        entry.string_key = str(key)  # best-effort fallback
-    _set_inbound_value(
-        entry.value,
-        value,
-        kwarg_name=kwarg_name,
-        registered=registered,
-        cloned_handles=cloned_handles,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +323,15 @@ def _fill_wire_ty(ty: "baml_type_pb2.BamlTy", py_type: Any) -> None:
         if origin in (list, typing.List):
             _fill_inner(ty.list.item, targs[0] if targs else None)
             return
+        if origin in (tuple, typing.Tuple):
+            if not targs or Ellipsis in targs:
+                raise TypeError(
+                    "BAML tuple types need fixed element types, e.g. tuple[int, str]"
+                )
+            ty.tuple.SetInParent()
+            for arg in targs:
+                _fill_inner(ty.tuple.items.add(), arg)
+            return
         if origin in (dict, typing.Dict):
             _fill_inner(ty.map.key, targs[0] if targs else None)
             _fill_inner(ty.map.value, targs[1] if len(targs) > 1 else None)
@@ -764,6 +409,36 @@ def pydantic_instance_type_args(value: Any) -> List[Any]:
     return []
 
 
+def receiver_type_args(value: Any) -> List[Any]:
+    """Concrete class type args of a generic method's receiver, in declaration
+    order: a reference's from the engine, a Pydantic instance's from its generic
+    metadata. Empty when the receiver carries none."""
+    if isinstance(value, BamlOpaque):
+        return list(value._type_args)
+    return pydantic_instance_type_args(value)
+
+
+class _EncodedCall(bytes):
+    """The control part of a call as `CallFunctionArgs` bytes, with the
+    values the bridge encodes against the target's declared types alongside.
+
+    `kwargs` are the arguments by declared parameter name and `cancel` the
+    `_baml.cancel` token, both still Python objects; `BamlRuntime.call_function`
+    takes all three. `_retained` keeps borrowed invocation capabilities alive
+    through native preparation."""
+
+    kwargs: Dict[str, Any]
+    cancel: Any
+    _retained: Any
+
+    def __new__(cls, wire, retained, kwargs, cancel):
+        value = super().__new__(cls, wire)
+        value._retained = retained
+        value.kwargs = kwargs
+        value.cancel = cancel
+        return value
+
+
 def encode_call_args(
     kwargs: Dict[str, Any],
     call_id: int,
@@ -771,57 +446,48 @@ def encode_call_args(
     *,
     function_name: Optional[str] = None,
     function_handle: Optional[int] = None,
-) -> bytes:
-    """Encode function keyword arguments as `CallFunctionArgs` protobuf.
+    _baml: Any = None,
+    _stream_step: bool = False,
+) -> _EncodedCall:
+    """Build the control part of a `CallFunctionArgs` for a call.
 
-    Encoding can create two kinds of owned key: host-callable registry entries
-    and HANDLE_TABLE clones of Python capability handles. A successful encode
-    transfers both to the engine. If a later value fails, the bytes are never
-    sent, so this function explicitly releases every key created so far.
+    The argument values are not encoded here. They ride the returned
+    `_EncodedCall` as Python objects, and the bridge walks them against the
+    types the program declares for the target's parameters; every owner that
+    walk creates is released again if a value does not fit.
     """
     if call_id == 0:
         raise ValueError("call_id must be a nonzero uint64")
-    if function_name is not None and function_handle is not None:
-        raise ValueError("exactly one BAML call target may be set")
-    registered: List[int] = []
-    cloned_handles: List[int] = []
     try:
+        if function_name is not None and function_handle is not None:
+            raise ValueError("exactly one BAML call target may be set")
         args = baml_inbound_pb2.CallFunctionArgs()
         args.call_id = call_id
+        from ._invocation import normalize
+
+        controls, cancel, retained = normalize(_baml, call_id)
+        if _stream_step and controls.trace.WhichOneof("selection") != "reservation":
+            # Keep explicit context/capture patches while leaving pulls in
+            # timing mode. The retained stream function span records errors.
+            if controls.trace.options.mode != baml_inbound_pb2.TRACE_MODE_HIDDEN:
+                controls.trace.options.mode = baml_inbound_pb2.TRACE_MODE_TIMING
+        args.invocation.CopyFrom(controls)
         if function_name is not None:
             args.function_name = function_name
         elif function_handle is not None:
             args.function_handle = function_handle
-        for key, value in kwargs.items():
-            _set_inbound_map_entry(
-                args.kwargs.add(),
-                key,
-                value,
-                kwarg_name=key,
-                registered=registered,
-                cloned_handles=cloned_handles,
-            )
         if type_args:
             for type_var, wire_ty in type_args:
                 entry = args.type_args.add()
                 entry.type_var = type_var
-                if isinstance(wire_ty, BamlType):
-                    entry.type_definition.CopyFrom(wire_ty._definition)
-                else:
-                    entry.type_value.CopyFrom(wire_ty)
-        return args.SerializeToString()
+                # The bridge restates a runtime declaration with a reference
+                # of the call's own; the wrapper keeps its rows.
+                entry.type_value.CopyFrom(
+                    wire_ty._ty if isinstance(wire_ty, BamlType) else wire_ty
+                )
+        return _EncodedCall(args.SerializeToString(), retained, dict(kwargs), cancel)
     except BaseException:
-        # Roll back any host callables registered before the failure.
-        for key in registered:
-            try:
-                release_host_callable(key)
-            except Exception:
-                pass  # best-effort cleanup; never mask the original error
-        for key in cloned_handles:
-            try:
-                _release_wire_handle(key)
-            except Exception:
-                pass  # best-effort cleanup; never mask the original error
+        release_function_call(call_id)
         raise
 
 
@@ -850,16 +516,16 @@ _TY_MEDIA_FQN = {
 }
 
 
-def _ty_to_python_type(ty: "baml_type_pb2.BamlTy", type_map: BamlTypeMap) -> Any:
+def _ty_to_python_type(ty: "baml_type_pb2.BamlTy", type_map: TypeLookup) -> Any:
     """Walk a wire `BamlTy` (`baml_type.proto`) and return the corresponding Python
     type, used for `cls[args]` parameterization on decode.
 
     The runtime inverse of `python_type_to_wire_ty` / `_fill_wire_ty` in the
     same module (the inbound writer) and the mirror of the engine's
     `ty_encode::runtime_ty_to_proto_ty`. A position with no concrete Python
-    binding (a structural union, a type variable, an opaque/runtime-only type)
-    widens to `typing.Any` — an unbound wildcard for parameterization purposes
-    (02a §5).
+    binding (a structural union, a type variable, an opaque/runtime-only type,
+    a name that `type_map` has no Python type for) widens to `typing.Any` — an
+    unbound wildcard for parameterization purposes (02a §5).
     """
     which = ty.WhichOneof("ty")
     # Absent variant or the unknown/top type → wildcard.
@@ -869,14 +535,24 @@ def _ty_to_python_type(ty: "baml_type_pb2.BamlTy", type_map: BamlTypeMap) -> Any
         return _TY_PRIMITIVE_PY.get(ty.primitive.kind, typing.Any)
     if which == "class_ty":
         cls = type_map.get_class(ty.class_ty.name)
+        if cls is None:
+            return typing.Any
         return _parameterize_tys(cls, ty.class_ty.type_args, type_map)
     if which == "enum":
-        return type_map.get_enum(ty.enum.name)
+        enum_cls = type_map.get_enum(ty.enum.name)
+        return typing.Any if enum_cls is None else enum_cls
     if which == "type_alias":
         alias = type_map.get_type_alias(ty.type_alias.name)
+        if alias is None:
+            return typing.Any
         return _parameterize_tys(alias, ty.type_alias.type_args, type_map)
     if which == "list":
         return List[_ty_to_python_type(ty.list.item, type_map)]  # type: ignore[valid-type]
+    if which == "tuple":
+        elements = tuple(_ty_to_python_type(item, type_map) for item in ty.tuple.items)
+        if not elements:
+            return typing.Any
+        return typing.Tuple[elements]  # type: ignore[valid-type]
     if which == "map":
         return Dict[  # type: ignore[valid-type]
             _ty_to_python_type(ty.map.key, type_map),
@@ -905,11 +581,12 @@ def _ty_to_python_type(ty: "baml_type_pb2.BamlTy", type_map: BamlTypeMap) -> Any
         if fqn is None:
             return typing.Any
         try:
-            return type_map.get_class(fqn)
+            media_cls = type_map.get_class(fqn)
         except BamlError:
             return typing.Any
-    # enum_variant / interface / function / future / rust_type / meta_type /
-    # resource / prompt_ast / void / type_var /
+        return typing.Any if media_cls is None else media_cls
+    # enum_variant / interface / function / future / meta_type /
+    # resource / prompt_ast / type_var /
     # associated_type_projection / never — no concrete Python binding in a
     # generic-arg position; treat as an unbound wildcard.
     return typing.Any
@@ -934,7 +611,7 @@ def _decode_ty_literal(literal) -> Any:
     return None
 
 
-def _parameterize_tys(cls, type_args, type_map: BamlTypeMap):
+def _parameterize_tys(cls, type_args, type_map: TypeLookup):
     """Apply a list of wire `BamlTy` generic args to a symbol via `cls[arg_types…]`.
 
     Works for any subscriptable symbol — Pydantic generics, generic type
@@ -963,28 +640,24 @@ def _decode_media(media) -> Any:
     if source is None:
         raise BamlError("BEX emitted a portable media value with no content")
     mime_type = media.mime_type if media.HasField("mime_type") else None
+    if source == "file_content":
+        # Content read from a file keeps the file's name.
+        content = media.file_content
+        return cls.from_file_content(content.name, content.base64, mime_type=mime_type)
     constructor = getattr(cls, f"from_{source}")
     return constructor(getattr(media, source), mime_type=mime_type)
 
 
-def _decode_prompt_ast(prompt_ast, type_map: BamlTypeMap) -> Any:
-    """Reconstruct the generated ``ai.Prompt`` wrapper around owned data."""
+def _decode_prompt_ast(prompt_ast, type_map: TypeLookup) -> Any:
+    """Build the generated ``ai.Prompt``, a field-less model, holding an owned
+    copy of the prompt as its ``_data`` private attribute."""
     cls = type_map.get_class("ai.Prompt")
-    if not _is_pydantic_model_class(cls):
+    portable = _PortablePromptAst(prompt_ast)
+    if cls is None:
+        return BamlClassInstance("ai.Prompt", {"_data": portable})
+    if not issubclass(cls, BaseModel):
         raise BamlError("The generated ai.Prompt host type is not a Pydantic model")
 
-    portable = _PortablePromptAst(prompt_ast)
-    if any(
-        (field.serialization_alias or field.alias or name) == "_data"
-        for name, field in cls.model_fields.items()
-    ):
-        # The generated annotation is the VM-side ``$rust_type`` proxy, while
-        # this host-owned value deliberately carries a portable AST instead.
-        # Construction must therefore bypass Pydantic validation.
-        return cls.model_construct(_data=portable)
-
-    # Compatibility with generated Prompt models that represented ``_data``
-    # as a Pydantic private attribute.
     instance = cls.model_validate({})
     if instance.__pydantic_private__ is None:
         instance.__pydantic_private__ = {}
@@ -992,7 +665,9 @@ def _decode_prompt_ast(prompt_ast, type_map: BamlTypeMap) -> Any:
     return instance
 
 
-def _decode_class(class_value, type_map: BamlTypeMap) -> Any:
+def _decode_class(
+    class_value, type_map: TypeLookup, ownership: Optional[Counter[int]] = None
+) -> Any:
     """Resolve a `BamlValueClass` to a typed Pydantic model instance.
 
     Children are decoded first, so `model_validate` receives an
@@ -1000,25 +675,22 @@ def _decode_class(class_value, type_map: BamlTypeMap) -> Any:
     Generic classes parameterize before validation so static-checker
     annotations (`Box[int]`) line up with the runtime instance —
     `13b` §3.4.
+
+    A class that `type_map` has no Python class for decodes to a
+    `BamlClassInstance`.
     """
     field_dict = {
-        entry.key: decode_value(entry.value, type_map) for entry in class_value.fields
+        entry.key: decode_value(entry.value, type_map, ownership)
+        for entry in class_value.fields
     }
     # Emit always fully qualifies, so the engine FQN already matches
     # what the typemap consumes (`12a-namespace-rules.md §5`).
     cls = type_map.get_class(class_value.name)
-
-    # Media stdlib classes (`baml.media.*`) are PyO3 types wrapping a
-    # `BamlPyHandle`. The engine emits them as
-    # `class_value { name: "baml.media.Pdf", fields: { _data: handle_value }}`;
-    # the inner `_data` decode already constructed a fresh `BamlPdf` via
-    # `_decode_handle` → `cls._from_pyhandle(...)`. Unwrap and return it
-    # directly — `BamlPdf` is not a Pydantic model.
-    if cls in _MEDIA_PYO3_TYPES and "_data" in field_dict:
-        return field_dict["_data"]
+    if cls is None:
+        return BamlClassInstance(class_value.name, field_dict)
 
     parameterized = _parameterize_tys(cls, class_value.type_args, type_map)
-    if not _is_pydantic_model_class(cls):
+    if not issubclass(cls, BaseModel):
         # Not a BaseModel — shouldn't happen for a well-formed SDK; fall
         # back to a plain dict so callers aren't silently lied to.
         return field_dict
@@ -1054,13 +726,15 @@ def _decode_class(class_value, type_map: BamlTypeMap) -> Any:
     return instance
 
 
-def _decode_enum(enum_value, type_map: BamlTypeMap) -> Any:
+def _decode_enum(enum_value, type_map: TypeLookup) -> Any:
     """Resolve a `BamlValueEnum` to a member of the generated enum class."""
     variant = enum_value.value
     fqn = enum_value.name
     try:
         cls = type_map.get_enum(fqn)
     except BamlError:
+        cls = None
+    if cls is None:
         # Runtime-created enums have no generated Python class. The loose host
         # representation is their post-alias variant name (H-5).
         return variant
@@ -1072,7 +746,49 @@ def _decode_enum(enum_value, type_map: BamlTypeMap) -> Any:
         ) from exc
 
 
-def _decode_handle(handle, type_map: BamlTypeMap) -> Any:
+def _opaque_reference(handle, pyhandle: BamlPyHandle, type_map: TypeLookup) -> Any:
+    """The generated wrapper of a runtime value the engine keeps to itself
+    (`reflect.Package`, `sap._ParseCache[int]`, ...), at the class type
+    arguments its `ty` names; `None` for any other runtime value, which keeps
+    the `BamlRuntimeValue` proxy."""
+    cls = _opaque_class(handle, type_map)
+    if cls is None:
+        return None
+    params = getattr(cls, "__parameters__", ())
+    args = handle.ty.class_ty.type_args
+    if len(args) != len(params):
+        raise BamlError(
+            f"a runtime value of the class {handle.ty.class_ty.name} came with "
+            f"{len(args)} type argument(s); the class takes {len(params)}"
+        )
+    # An annotation type references no runtime declaration, so the
+    # arguments hold no engine rows.
+    return cls._from_wire(pyhandle, handle.key, tuple(BamlType(arg) for arg in args))
+
+
+def _opaque_class(handle, type_map: TypeLookup) -> Optional[type]:
+    """The generated class of a runtime value the engine keeps to itself
+    (`reflect.Package`, ...), from the compiled class its `ty` names; `None`
+    for any other runtime value."""
+    ty = getattr(handle, "ty", None)
+    if (
+        ty is None
+        or ty.WhichOneof("ty") != "class_ty"
+        or ty.class_ty.WhichOneof("head") != "name"
+    ):
+        return None
+    try:
+        cls = type_map.get_class(ty.class_ty.name)
+    except BamlError:
+        return None
+    if isinstance(cls, type) and issubclass(cls, BamlOpaque):
+        return cls
+    return None
+
+
+def _decode_handle(
+    handle, type_map: TypeLookup, ownership: Optional[Counter[int]] = None
+) -> Any:
     """Wrap `HANDLE_TABLE[handle.key]` in a `BamlPyHandle` and dispatch
     on the wire `handle.handle_type` field. The `BamlPyHandle` itself
     holds the `handle_type` tag (set at construction from the wire) so
@@ -1088,7 +804,18 @@ def _decode_handle(handle, type_map: BamlTypeMap) -> Any:
     """
     HT = baml_handle_pb2.BamlHandleType
     ht = handle.handle_type
+    if ht in (HT.HOST_VALUE_CALLABLE, HT.HOST_VALUE_OPAQUE):
+        # A host value: the wrapper takes a reference of its own to the key
+        # while the pin still holds the engine's, then the pin is let go.
+        try:
+            return BamlPyHandle(handle.key, int(ht))
+        finally:
+            _release_pin(handle, ownership)
     pyhandle = BamlPyHandle(handle.key, int(ht))
+    # Creating the base wrapper transfers one reference, even if constructing
+    # a typed wrapper or validating its enclosing model subsequently fails.
+    if ownership is not None:
+        ownership[handle.key] -= 1
 
     if ht == HT.ADT_MEDIA_IMAGE:
         return BamlImage._from_pyhandle(pyhandle)
@@ -1103,6 +830,9 @@ def _decode_handle(handle, type_map: BamlTypeMap) -> Any:
     if ht == HT.ADT_FUNCTION_SPEC:
         return BamlFunctionSpec._from_pyhandle(pyhandle)
     if ht == HT.ADT_RUNTIME_VALUE:
+        opaque = _opaque_reference(handle, pyhandle, type_map)
+        if opaque is not None:
+            return opaque
         return BamlRuntimeValue._from_pyhandle(pyhandle)
     if ht == HT.FUNCTION_REF:
         ty = getattr(handle, "ty", None)
@@ -1111,17 +841,40 @@ def _decode_handle(handle, type_map: BamlTypeMap) -> Any:
     if ht == HT.HANDLE_UNSPECIFIED:
         raise BamlError("BEX emitted HANDLE_UNSPECIFIED (Rust-side bug)")
 
-    # Everything else (UNTAGGED_RUST_DATA, UNTAGGED_BEX_HEAP, FUNCTION_REF,
-    # ADT_PROMPT_AST, ADT_TYPE, ADT_MEDIA_GENERIC): bare
+    # Everything else (UNTAGGED_BEX_HEAP, ADT_PROMPT_AST): bare
     # BamlPyHandle. The outer codegen class (if any) wraps it via
     # `_decode_class` → private-attr injection.
     return pyhandle
 
 
-class BamlClosure:
-    """A reusable, engine-owned BAML callable."""
+def _returned_param_aliases(names: List[str]) -> Dict[str, str]:
+    """Mirror codegen's host-name allocation for callable wire parameters."""
+    protected = {"_baml", "_types"}
+    used = {"self", *protected}
+    aliases = {}
+    # Authored legal spellings win over projected or control spellings.
+    for raw in sorted(names, key=lambda name: (
+        not (name not in protected and name.isidentifier() and not keyword.iskeyword(name)),
+        name,
+    )):
+        name = "".join(
+            ch if ch == "_" or ch.isalnum() and (index > 0 or ch.isalpha()) else "_"
+            for index, ch in enumerate(raw)
+        ) or "_"
+        if keyword.iskeyword(name) or raw in protected:
+            name += "_"
+        while name in used:
+            name += "_"
+        used.add(name)
+        if name != raw:
+            aliases[name] = raw
+    return aliases
 
-    __slots__ = ("_handle", "_required_names", "_optional_names")
+
+class BamlClosure:
+    """A reusable BAML callable: `await closure(...)` and the blocking `closure.call_sync(...)`."""
+
+    __slots__ = ("_handle", "_required_names", "_optional_names", "_aliases")
 
     def __init__(self, handle: BamlPyHandle, function_ty: Any):
         mode = baml_type_pb2.BamlTyFunctionParamMode
@@ -1136,8 +889,19 @@ class BamlClosure:
             for index, param in enumerate(function_ty.params)
             if param.mode == mode.BAML_TY_FUNCTION_PARAM_MODE_OPTIONAL
         ]
+        self._aliases = _returned_param_aliases(
+            self._required_names + self._optional_names
+        )
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def _to_pyhandle(self) -> BamlPyHandle:
+        return self._handle
+
+    def _encode_args(
+        self, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Tuple[int, _EncodedCall]:
+        options = kwargs.pop("_baml", None)
+        if "_types" in kwargs:
+            raise TypeError("specialized BAML callable handles do not accept _types")
         if len(args) > len(self._required_names):
             raise TypeError(
                 f"got {len(args)} positional arguments but this BAML closure "
@@ -1146,6 +910,11 @@ class BamlClosure:
         values = dict(zip(self._required_names, args))
         allowed = set(self._required_names) | set(self._optional_names)
         for name, value in kwargs.items():
+            from . import UNSET
+
+            if value is UNSET:
+                continue
+            name = self._aliases.get(name, name)
             if name not in allowed:
                 raise TypeError(f"unexpected keyword argument {name!r}")
             if name in values:
@@ -1156,8 +925,26 @@ class BamlClosure:
             values,
             call_id,
             function_handle=self._handle._key_for_call(),
+            _baml=options,
         )
-        result_bytes = _get_runtime().call_function_sync(args_proto)
+        return call_id, args_proto
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke on the current application loop, with its current context."""
+        from . import _decode_call_result_async
+
+        call_id, args_proto = self._encode_args(args, kwargs)
+        try:
+            result_bytes = await _get_runtime().call_function(args_proto, args_proto.kwargs, args_proto.cancel)
+        except asyncio.CancelledError:
+            cancel_function_call(call_id)
+            raise
+        return _decode_call_result_async(result_bytes)
+
+    def call_sync(self, *args: Any, **kwargs: Any) -> Any:
+        """Blocking twin of `await closure(...)`."""
+        _, args_proto = self._encode_args(args, kwargs)
+        result_bytes = _get_runtime().call_function_sync(args_proto, args_proto.kwargs, args_proto.cancel)
         return decode_call_result(result_bytes)
 
     def __repr__(self) -> str:
@@ -1208,13 +995,107 @@ def _decode_literal(literal) -> Any:
     return None
 
 
-def decode_value(holder, type_map: BamlTypeMap) -> Any:
+def _owned_wire_keys(holder) -> typing.Iterator[int]:
+    """Yield each engine row an outbound value transfers, once per occurrence:
+    its engine handles, the live heads of its types, and the pin of each host
+    value. A host value's own key names the host's registry, not a row."""
+    which = holder.WhichOneof("value")
+    if which == "handle_value":
+        handle = holder.handle_value
+        if handle.handle_type not in (
+            baml_handle_pb2.HOST_VALUE_CALLABLE,
+            baml_handle_pb2.HOST_VALUE_OPAQUE,
+        ):
+            yield handle.key
+        elif handle.pin:
+            yield handle.pin
+    elif which == "list_value":
+        for item in holder.list_value.items:
+            yield from _owned_wire_keys(item)
+    elif which == "tuple_value":
+        for item in holder.tuple_value.items:
+            yield from _owned_wire_keys(item)
+    elif which == "map_value":
+        for entry in holder.map_value.entries:
+            yield from _owned_wire_keys(entry.value)
+    elif which == "class_value":
+        for field in holder.class_value.fields:
+            yield from _owned_wire_keys(field.value)
+    elif which == "union_variant_value":
+        yield from _owned_wire_keys(holder.union_variant_value.value)
+    elif which == "ty_value":
+        yield from _live_keys(holder.ty_value)
+
+
+def _release_pin(handle, ownership: Optional[Counter[int]]) -> None:
+    """Let go of the pin an outbound host value carries, once its key has been
+    read. A handle with no pin (an inbound shape, or an offline encoding)
+    holds nothing."""
+    pin = getattr(handle, "pin", 0)
+    if not pin:
+        return
+    if ownership is not None:
+        ownership[pin] -= 1
+    _release_wire_handle(pin)
+
+
+def _release_owned(ownership: Counter[int]) -> None:
+    """Release every row a decode did not hand to a host wrapper."""
+    for key, count in ownership.items():
+        for _ in range(count):
+            try:
+                _release_wire_handle(key)
+            except RuntimeError:
+                # Cleanup must preserve the original decode failure.
+                pass
+
+
+def _decode_owned(holder, type_map: TypeLookup) -> Any:
+    """Decode an outbound value, owning every row it transfers until a host
+    wrapper takes that reference; a decode that fails partway releases the
+    rest."""
+    ownership = Counter(_owned_wire_keys(holder))
+    try:
+        return decode_value(holder, type_map, ownership)
+    finally:
+        _release_owned(ownership)
+
+
+def _decode_host_call_args(data: bytes) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    """Own every wire reference until a host wrapper takes that reference."""
+    call = baml_outbound_pb2.BamlToHostCall()
+    call.ParseFromString(data)
+    ownership = Counter(key for arg in call.args for key in _owned_wire_keys(arg.value))
+    try:
+        type_map = get_type_map()
+        positional = []
+        optional = {}
+        for arg in call.args:
+            value = decode_value(arg.value, type_map, ownership)
+            if arg.is_optional_arg:
+                optional[arg.arg_name] = value
+            else:
+                positional.append(value)
+        return tuple(positional), optional
+    finally:
+        _release_owned(ownership)
+
+
+def decode_value(
+    holder, type_map: TypeLookup, ownership: Optional[Counter[int]] = None
+) -> Any:
     """Convert a `BamlOutboundValue` message to a typed Python value.
 
-    Every recursive call threads the same `BamlTypeMap` — the only seam
+    Every recursive call threads the same `type_map` — the only seam
     where the dispatcher consults the process-global registry is the
     outer `decode_call_result` callsite, which passes `get_type_map()`.
     Tests build a fresh `BamlTypeMap` and call this directly.
+
+    `type_map` also decides what a class with no Python class is. A
+    `BamlTypeMap` raises for it: the caller of a typed function must not get
+    a stand-in for the model it declares. `BamlTypeMap.where_generated`
+    decodes its instances to `BamlClassInstance`, for a value that has no
+    declared Python type.
     """
     which = holder.WhichOneof("value")
     if which is None or which == "null_value":
@@ -1236,28 +1117,36 @@ def decode_value(holder, type_map: BamlTypeMap) -> Any:
     if which == "literal_value":
         return _decode_literal(holder.literal_value)
     if which == "list_value":
-        return [decode_value(item, type_map) for item in holder.list_value.items]
+        return [
+            decode_value(item, type_map, ownership) for item in holder.list_value.items
+        ]
+    if which == "tuple_value":
+        items = [
+            decode_value(item, type_map, ownership) for item in holder.tuple_value.items
+        ]
+        if holder.tuple_value.HasField("tuple_type"):
+            return BamlTuple(items, holder.tuple_value.tuple_type)
+        return tuple(items)
     if which == "map_value":
         return {
-            entry.key: decode_value(entry.value, type_map)
+            entry.key: decode_value(entry.value, type_map, ownership)
             for entry in holder.map_value.entries
         }
     if which == "class_value":
-        return _decode_class(holder.class_value, type_map)
+        return _decode_class(holder.class_value, type_map, ownership)
     if which == "enum_value":
         return _decode_enum(holder.enum_value, type_map)
     if which == "union_variant_value":
         # Union metadata is discarded — Python is duck-typed. The inner
         # value self-describes (09e §3).
-        return decode_value(holder.union_variant_value.value, type_map)
+        return decode_value(holder.union_variant_value.value, type_map, ownership)
     if which == "handle_value":
-        return _decode_handle(holder.handle_value, type_map)
+        return _decode_handle(holder.handle_value, type_map, ownership)
     if which == "ty_value":
-        definition = baml_type_pb2.BamlTyDef()
-        definition.root.CopyFrom(holder.ty_value)
-        return BamlType(definition)
-    if which == "ty_def_value":
-        return BamlType(holder.ty_def_value)
+        if ownership is not None:
+            for key in _live_keys(holder.ty_value):
+                ownership[key] -= 1
+        return BamlType._adopt(holder.ty_value)
     if which == "media_value":
         return _decode_media(holder.media_value)
     if which == "prompt_ast_value":
@@ -1266,26 +1155,30 @@ def decode_value(holder, type_map: BamlTypeMap) -> Any:
 
 
 def _try_rehydrate_host_value(decoded: Any) -> Optional[BaseException]:
-    """If `decoded` is a `baml.errors.HostCallable` pydantic instance
+    """If `decoded` is a `baml.errors.HostCallable` instance (of the
+    generated class, or a `BamlClassInstance` where there is none)
     whose `_handle` points at a still-live entry in this runtime's
     host-value registry, return the *original* Python exception object.
     Otherwise return `None` (foreign runtime, released key, or
     unexpected shape) so the caller falls back to the metadata-bearing
     `BamlError` wrapper.
     """
-    private = getattr(decoded, "__pydantic_private__", None)
-    handle = private.get("_handle") if isinstance(private, dict) else None
-    if handle is None and _is_pydantic_model_class(type(decoded)):
-        values = vars(decoded)
-        for name, field in type(decoded).model_fields.items():
-            aliases = (
-                field.validation_alias,
-                field.alias,
-                field.serialization_alias,
-            )
-            if "_handle" in aliases:
-                handle = values.get(name)
-                break
+    if isinstance(decoded, BamlClassInstance):
+        handle = decoded.fields.get("_handle")
+    else:
+        private = getattr(decoded, "__pydantic_private__", None)
+        handle = private.get("_handle") if isinstance(private, dict) else None
+        if handle is None and isinstance(decoded, BaseModel):
+            values = vars(decoded)
+            for name, field in type(decoded).model_fields.items():
+                aliases = (
+                    field.validation_alias,
+                    field.alias,
+                    field.serialization_alias,
+                )
+                if "_handle" in aliases:
+                    handle = values.get(name)
+                    break
     if handle is None:
         return None
     from .baml_py import lookup_host_value
@@ -1321,10 +1214,15 @@ def decode_call_result(data: bytes) -> Any:
     """Decode a `BamlOutboundResult` envelope to a Python value, raising
     `BamlError` / `BamlPanic` for the thrown arms (31c / 31f).
 
-    - `ok` → the decoded return value.
+    - `ok` → the decoded return value. A class with no Python class is an
+      error: the return value has a declared type that a typed caller relies
+      on.
     - `error` → `raise BamlError` with `.value` = decoded value,
-      `.baml_trace` = the pre-rendered frame lines.
-    - `panic` → if `is_exit_panic`, flush telemetry and `os._exit(exit_code)`
+      `.baml_trace` = the pre-rendered frame lines. A thrown value has no
+      declared Python type and must reach the caller, so an instance of a
+      class with no Python class is a `BamlClassInstance` here and in a
+      panic: an error of the decode would replace the error that was thrown.
+    - `panic` → if `is_exit_panic`, `os._exit(exit_code)`
       (a clean `baml.sys.exit` — terminate the whole process from any
       thread/task, *not* a catchable `SystemExit`); otherwise
       `raise BamlPanic` likewise.
@@ -1333,10 +1231,11 @@ def decode_call_result(data: bytes) -> Any:
     result.ParseFromString(data)
     which = result.WhichOneof("result")
     type_map = get_type_map()
+    thrown_types = type_map.where_generated()
 
     if which == "error":
         msg = result.error
-        decoded = decode_value(msg.value, type_map)
+        decoded = _decode_owned(msg.value, thrown_types)
         # A value/type mismatch at the call boundary (`baml.errors.TypeMismatch`,
         # synthesized host-side from `EngineError::TypeMismatch`) is a *caller*
         # type error — surface it as Python's native `TypeError` rather than a
@@ -1344,9 +1243,12 @@ def decode_call_result(data: bytes) -> Any:
         # `TypeVar` that can't be inferred and must be specified, conflicting
         # variance occurrences) and ordinary argument-type mismatches.
         if _outbound_class_fqn(msg.value) == "baml.errors.TypeMismatch":
-            message = getattr(decoded, "message", None)
-            if message is None and isinstance(decoded, dict):
-                message = decoded.get("message")
+            if isinstance(decoded, BamlClassInstance):
+                message = decoded.fields.get("message")
+            else:
+                message = getattr(decoded, "message", None)
+                if message is None and isinstance(decoded, dict):
+                    message = decoded.get("message")
             err = TypeError(message if message is not None else str(decoded))
             # Let `attach_baml_traceback` splice the BAML frames onto the
             # native exception (exception instances accept ad-hoc attributes).
@@ -1362,6 +1264,10 @@ def decode_call_result(data: bytes) -> Any:
         if _outbound_class_fqn(msg.value) == "baml.errors.HostCallable":
             rehydrated = _try_rehydrate_host_value(decoded)
             if rehydrated is not None:
+                # `decoded` holds a reference to the key that keeps
+                # `rehydrated` registered; left in this frame, the traceback
+                # raising `rehydrated` would keep both alive for good.
+                del decoded
                 raise attach_baml_traceback(rehydrated)
         raise attach_baml_traceback(
             BamlError(
@@ -1376,7 +1282,6 @@ def decode_call_result(data: bytes) -> Any:
         # Check the discriminator *before* decoding — an exit doesn't need its
         # `baml.panics.Exit` payload decoded to act.
         if msg.is_exit_panic:
-            _flush_for_exit()
             os._exit(msg.exit_code)
         panic_type = (
             BamlCancelledError
@@ -1385,22 +1290,11 @@ def decode_call_result(data: bytes) -> Any:
         )
         raise attach_baml_traceback(
             panic_type(
-                decode_value(msg.value, type_map),
+                _decode_owned(msg.value, thrown_types),
                 baml_trace=list(msg.trace),
                 class_name=_outbound_class_fqn(msg.value),
             )
         )
 
     # `ok` (or an absent oneof — an all-default envelope is a null `ok`).
-    return decode_value(result.ok, type_map)
-
-
-def _flush_for_exit() -> None:
-    """Best-effort flush of buffered telemetry before `os._exit`, which
-    bypasses `atexit` / buffer flushing. Never raises — exit must proceed."""
-    try:
-        from .baml_py import flush_events
-
-        flush_events()
-    except Exception:
-        pass
+    return _decode_owned(result.ok, type_map)

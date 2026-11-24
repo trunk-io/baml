@@ -55,6 +55,9 @@ message BamlOutboundPanic {
 }
 
 message BamlOutboundValue {
+  // Formerly `ty_def_value`: a definition graph beside a type.
+  reserved 22;
+  reserved "ty_def_value";
   // we must include this because we might be a "string"
   // but in a container type like (string | int) and some languages
   // require we decode this.
@@ -80,22 +83,33 @@ message BamlOutboundValue {
     bytes uint8array_value = 19;
     string bigint_value = 20;
     // A reflected BAML type returned as a value (e.g. `reflect.Type.of<T>()`).
-    // Shares the `BamlTy` representation with the inbound side.
+    // Shares the `BamlTy` representation with the inbound side; a runtime
+    // declaration it names is a row the host now holds.
     BamlTy ty_value = 21;
-    // Definition-carrying type handle. Identity is intentionally not encoded.
-    BamlTyDef ty_def_value = 22;
+    // A tuple value, carrying its instantiated tuple type. Positions also
+    // carry their own union envelopes where their slot is a union.
+    BamlValueTuple tuple_value = 23;
   }
 }
 
 // Outbound handle envelope. Mirrors `BamlHandle` (inbound) but carries an
 // extra `ty` describing the underlying tagged type as a full `BamlTy` — the
 // faithful wire form, so an interface keeps its associated-type bindings even
-// though readers only consume the class FQN for typed-wrapper dispatch. Only
-// `ADT_TAGGED_HEAP_HANDLE` populates it; other handle types leave it unset.
+// though readers only consume the class FQN for typed-wrapper dispatch. A
+// reference to an engine value (a callable, a stream, a function spec, a
+// runtime value, a host body's cancel token) populates it; other handle types
+// leave it unset.
+//
+// A host value (`HOST_VALUE_CALLABLE`, `HOST_VALUE_OPAQUE`) goes back to its
+// host by the host's own `key`, and carries a `pin`: a `HOST_VALUE_PIN` row
+// that keeps the engine's references to that key while the host reads the
+// value. The host releases the pin, as it releases any engine row, with the
+// result (or callback arguments) that carried it; it never sends one back.
 message BamlOutboundHandle {
   uint64 key = 1;
   BamlHandleType handle_type = 2;
   BamlTy ty = 3;
+  uint64 pin = 4;
 }
 
 message BamlValueNull {}
@@ -104,6 +118,18 @@ message BamlValueNull {}
 message BamlValueList {
   BamlTy item_type = 1;
   repeated BamlOutboundValue items = 2;
+}
+
+// A tuple value: exactly as many items as the tuple's arity (at least one).
+// Hosts send tuples inbound as a list; the declared type makes it a tuple.
+message BamlValueTuple {
+  repeated BamlOutboundValue items = 1;
+  // The tuple's carried (instantiated) type, always the `tuple` arm of
+  // `BamlTy` with one slot type per item, in order. It is the value's own
+  // identity, not one recovered from its items or the declared type, so a
+  // host can look up its tuple representation (and restate the tuple when
+  // sending it back) without a declared signature.
+  BamlTy tuple_type = 2;
 }
 
 // A helper message to represent map entries (used also in Class).
@@ -156,15 +182,17 @@ message BamlValueUnionVariant {
 // BamlMedia definitions
 // -----------------------------------------------------------------------------
 
-// We need to handle BamlMediaType. Since one variant is "Other(String)",
-// we represent it as a message with an enum tag and an optional string.
+// The kind of a media value. A media value always has one of these kinds;
+// the media type that admits any of them is `BAML_TY_MEDIA_KIND_GENERIC`.
 enum MediaTypeEnum {
   MEDIA_TYPE_UNSPECIFIED = 0;
   IMAGE = 1;
   AUDIO = 2;
   PDF = 3;
   VIDEO = 4;
-  OTHER = 5;
+  // Formerly OTHER: no media value has a generic kind.
+  reserved 5;
+  reserved "OTHER";
 }
 
 message BamlValueMedia {
@@ -173,8 +201,17 @@ message BamlValueMedia {
   oneof value {
     string url = 3;
     string base64 = 4;
-    string file = 5;
+    BamlValueMediaFileContent file_content = 6;
   }
+  // A media value holds content, never a file path: field 5 named one.
+  reserved 5;
+  reserved "file";
+}
+
+// Base64 content that was read from a file, with the base name of that file.
+message BamlValueMediaFileContent {
+  string name = 1;
+  string base64 = 2;
 }
 
 message BamlValuePromptAst {
@@ -219,6 +256,19 @@ message BamlValuePromptAstSimpleMultiple {
 // `BamlOutboundValue` list previously passed to the dispatch FFI.
 message BamlToHostCall {
   repeated BamlToHostArg args = 1;
+}
+
+// V2 host dispatch envelope. The adapter owns the effective-state reference
+// and ordinary references in application_args/cancel until transferred or
+// released. application_args remains an encoded BamlToHostCall.
+message HostInvocation {
+  uint64 host_value_key = 1;
+  uint32 callback_id = 2;
+  bytes application_args = 3;
+  uint64 effective_state = 4;
+  uint64 host_environment = 5;
+  BamlOutboundValue cancel = 6;
+  optional uint64 deadline_ns = 7;
 }
 
 message BamlToHostArg {

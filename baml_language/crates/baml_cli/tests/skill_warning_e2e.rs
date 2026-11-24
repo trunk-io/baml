@@ -8,8 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
-const SKILL_OUTDATED_WARNING: &str =
-    "your baml skill does not match this toolchain; use `baml agent install` to upgrade it";
+const SKILL_OUTDATED_WARNING: &str = "your BAML agent skill does not match this toolchain";
 const SKILL_MISSING_WARNING: &str =
     "no baml skill is installed; set it up with `baml agent install`";
 const SKILL_OUTDATED_ERROR: &str = "the installed BAML agent skill does not match this toolchain";
@@ -23,26 +22,24 @@ fn project_with_skill(content: &str) -> tempfile::TempDir {
     dir
 }
 
-fn command(args: &[&str], cwd: &Path) -> Command {
+fn command(skill_check: &str, args: &[&str], cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_baml-cli"));
     command
+        .args(["--agent-skill-check", skill_check])
         .args(args)
         .current_dir(cwd)
         .env("HOME", cwd.parent().unwrap_or(cwd))
-        .env("BAML_WRAPPER_EXEC", "1")
+        .env("BAML_CLI_ALLOW_DIRECT", "1")
         .env("DO_NOT_TRACK", "1");
     command
 }
 
 fn run_args_from(args: &[&str], cwd: &Path) -> Output {
-    command(args, cwd)
-        .env("BAML_AGENT_SKILL_CHECK", "warn")
-        .output()
-        .unwrap()
+    command("warn", args, cwd).output().unwrap()
 }
 
 fn run_as_detected_agent(args: &[&str], cwd: &Path) -> Output {
-    let mut command = command(args, cwd);
+    let mut command = command("auto", args, cwd);
     for variable in [
         "CLAUDECODE",
         "CODEX_SANDBOX",
@@ -55,11 +52,18 @@ fn run_as_detected_agent(args: &[&str], cwd: &Path) -> Output {
     ] {
         command.env_remove(variable);
     }
-    command
-        .env("AGENT", "1")
-        .env("BAML_AGENT_SKILL_CHECK", "auto")
-        .output()
-        .unwrap()
+    command.env("AGENT", "1").output().unwrap()
+}
+
+fn has_skill_message(stderr: &str) -> bool {
+    [
+        SKILL_OUTDATED_WARNING,
+        SKILL_MISSING_WARNING,
+        SKILL_OUTDATED_ERROR,
+        SKILL_MISSING_ERROR,
+    ]
+    .iter()
+    .any(|message| stderr.contains(message))
 }
 
 fn stderr_of(output: &Output) -> String {
@@ -82,7 +86,7 @@ fn detected_agent_cannot_run_without_skill() {
     let output = run_as_detected_agent(&["init"], project.path());
     let stderr = stderr_of(&output);
 
-    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains(SKILL_MISSING_ERROR), "{stderr}");
     assert!(!project.path().join("baml.toml").exists());
 }
@@ -90,14 +94,14 @@ fn detected_agent_cannot_run_without_skill() {
 #[test]
 fn require_rejects_outdated_skill() {
     let project = project_with_skill("old");
-    let output = command(&["init"], project.path())
-        .env("BAML_AGENT_SKILL_CHECK", "require")
+    let output = command("require", &["init"], project.path())
         .output()
         .unwrap();
     let stderr = stderr_of(&output);
 
-    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains(SKILL_OUTDATED_ERROR), "{stderr}");
+    assert!(stderr.contains("skill version unknown"), "{stderr}");
     assert!(!project.path().join("baml.toml").exists());
 }
 
@@ -126,7 +130,7 @@ fn selected_project_uses_its_skill() {
         &[
             "fmt",
             "--dry-run",
-            "--project",
+            "--project-dir",
             project.path().to_str().unwrap(),
         ],
         cwd.path(),
@@ -148,27 +152,26 @@ fn selected_project_does_not_use_cwd_skill() {
     .unwrap();
 
     let output = run_as_detected_agent(
-        &["check", "--project", project.path().to_str().unwrap()],
+        &["check", "--project-dir", project.path().to_str().unwrap()],
         cwd.path(),
     );
     let stderr = stderr_of(&output);
 
-    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains(SKILL_MISSING_ERROR), "{stderr}");
 }
 
 #[test]
 fn off_bypasses_agent_skill_validation() {
     let project = tempfile::tempdir().unwrap();
-    let output = command(&["init"], project.path())
+    let output = command("off", &["init"], project.path())
         .env("AGENT", "1")
-        .env("BAML_AGENT_SKILL_CHECK", "off")
         .output()
         .unwrap();
     let stderr = stderr_of(&output);
 
     assert!(output.status.success(), "{stderr}");
-    assert!(!stderr.contains("baml skill"), "{stderr}");
+    assert!(!has_skill_message(&stderr), "{stderr}");
     assert!(project.path().join("baml.toml").is_file());
 }
 
@@ -217,7 +220,7 @@ fn matching_project_skill_is_silent() {
     let project = project_with_skill(&common::installed_skill_content());
     let stderr = stderr_of(&run_args_from(&["generate"], project.path()));
 
-    assert!(!stderr.contains("baml skill"), "{stderr}");
+    assert!(!has_skill_message(&stderr), "{stderr}");
 }
 
 #[test]
@@ -232,7 +235,7 @@ fn matching_project_skill_takes_precedence_over_stale_parent() {
     fs::write(project_skill, common::installed_skill_content()).unwrap();
 
     let stderr = stderr_of(&run_args_from(&["generate"], &project));
-    assert!(!stderr.contains("baml skill"), "{stderr}");
+    assert!(!has_skill_message(&stderr), "{stderr}");
 }
 
 #[test]
@@ -249,9 +252,8 @@ fn stale_copy_in_either_agent_directory_prompts_upgrade() {
 #[test]
 fn agent_command_never_nags() {
     let empty = tempfile::tempdir().unwrap();
-    let output = command(&["agent", "install"], empty.path())
+    let output = command("require", &["agent", "install"], empty.path())
         .env("AGENT", "1")
-        .env("BAML_AGENT_SKILL_CHECK", "require")
         .output()
         .unwrap();
     let stderr = stderr_of(&output);

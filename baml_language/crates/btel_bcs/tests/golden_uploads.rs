@@ -4,10 +4,9 @@ use std::{
     time::Duration,
 };
 
-use btel_bcs::{
-    delivery::{BcsDelivery, DeliveryConfig, DeliveryError},
-    proto::CloudUploadEnvelope,
-    wire::{PrepareUploadsRequest, PrepareUploadsResponse, UploadKind},
+use btel_bcs::delivery::{BcsDelivery, DeliveryConfig, DeliveryError};
+use btel_core::upload::{
+    PrepareUploadsRequest, PrepareUploadsResponse, UploadKind, envelope::UploadEnvelope,
 };
 use btel_processor::AggregateDelta;
 use btel_recorder::{RecordingBuilder, RecordingConfig, RecordingId, SealedFile};
@@ -72,10 +71,10 @@ fn sources(pool: &SnapshotPool, count: usize) -> (SealedFile, Vec<Snapshot>) {
         ..AggregateDelta::default()
     });
     for index in 0..count {
-        let snapshot = pool
-            .try_acquire()
-            .unwrap()
-            .finish_value(SnapshotValue::Int(10 + i64::try_from(index).unwrap()));
+        let snapshot = pool.try_acquire().unwrap().finish(
+            SnapshotValue::Int(10 + i64::try_from(index).unwrap()),
+            &mut btel_snapshot::Shaper::default(),
+        );
         builder.span(
             ids[0],
             &mut SpanRecord::FunctionSpanCompletionOk {
@@ -95,7 +94,7 @@ fn sources(pool: &SnapshotPool, count: usize) -> (SealedFile, Vec<Snapshot>) {
 }
 
 fn source_manifest() -> Value {
-    let pool = SnapshotPool::new(5, Limits::default());
+    let pool = SnapshotPool::unbounded(Limits::default());
     let mut recordings = Vec::new();
     let mut blobs = Vec::new();
     for count in [0, 1, 2, 5] {
@@ -109,11 +108,14 @@ fn source_manifest() -> Value {
         if count == 5 {
             for (index, snapshot) in snapshots.iter().enumerate() {
                 let mut blob = Vec::new();
-                snapshot.write_blob(&mut blob).unwrap();
+                snapshot
+                    .root_blob()
+                    .write(&mut btel_snapshot::BlobScratch::default(), &mut blob)
+                    .unwrap();
                 blobs.push(json!({
                     "value": 10 + index,
-                    "snapshot_id": hex::encode(snapshot.id().as_bytes()),
-                    "snapshot_format_version": btel_settings::snapshot::BLOB_VERSION,
+                    "snapshot_id": hex::encode(snapshot.root_id().as_bytes()),
+                    "snapshot_format_version": btel_core::cas::VERSION,
                     "hex": hex::encode(&blob),
                     "length": blob.len(),
                     "sha256": digest(&blob),
@@ -175,7 +177,7 @@ fn fixture_envelopes_embed_exact_sources_and_ordered_membership() {
                     .unwrap()
             };
             let body = checked_body(case, expected);
-            let envelope = CloudUploadEnvelope::decode(body.as_slice()).unwrap();
+            let envelope = UploadEnvelope::decode(body.as_slice()).unwrap();
             assert_eq!(envelope.format_version, 1);
             assert_eq!(envelope.plan_id, response.plan_id);
             assert_eq!(envelope.upload_id, target.upload_id);
@@ -196,8 +198,8 @@ fn fixture_envelopes_embed_exact_sources_and_ordered_membership() {
             } else {
                 assert!(envelope.recording_file.is_none());
             }
-            assert_eq!(envelope.cas_objects.len(), target.candidate_indices.len());
-            for (object, &index) in envelope.cas_objects.iter().zip(&target.candidate_indices) {
+            assert_eq!(envelope.blobs.len(), target.candidate_indices.len());
+            for (object, &index) in envelope.blobs.iter().zip(&target.candidate_indices) {
                 let candidate = &request.candidates[index as usize];
                 assert_eq!(hex::encode(&object.snapshot_id), candidate.snapshot_id);
                 assert_eq!(
@@ -205,6 +207,7 @@ fn fixture_envelopes_embed_exact_sources_and_ordered_membership() {
                     candidate.snapshot_format_version
                 );
                 assert_eq!(hex::encode(&object.blob_sha256), digest(&object.blob));
+                assert_eq!(object.logical_bytes_approx_v1, Some(16));
                 let source = sources["snapshots"]
                     .as_array()
                     .unwrap()
@@ -256,7 +259,6 @@ async fn check_case(case: &str) {
                 max_candidates: 8,
                 max_targets: 8,
                 max_recording_body_bytes: 4096,
-                max_cas_body_bytes: 4096,
                 request_timeout: Duration::from_secs(2),
                 max_attempts: 1,
                 ..DeliveryConfig::new(server.uri().parse().unwrap())
@@ -265,7 +267,7 @@ async fn check_case(case: &str) {
         )
         .unwrap(),
     );
-    let pool = SnapshotPool::new(5, Limits::default());
+    let pool = SnapshotPool::unbounded(Limits::default());
     let (file, snapshots) = sources(&pool, request.candidates.len());
     delivery
         .handle()
@@ -334,7 +336,7 @@ async fn check_case(case: &str) {
             put.headers["content-length"],
             expected["length"].as_u64().unwrap().to_string()
         );
-        let decoded = CloudUploadEnvelope::decode(body.as_slice()).unwrap();
+        let decoded = UploadEnvelope::decode(body.as_slice()).unwrap();
         assert_eq!(decoded.upload_id, expected["upload_id"].as_str().unwrap());
     }
 }
@@ -349,15 +351,15 @@ async fn fixed_upload_contract_on_http_wire() {
 #[test]
 fn golden_bytes_detect_blob_and_membership_corruption() {
     let bytes = bytes_file("mixed/recording.hex");
-    let expected = CloudUploadEnvelope::decode(bytes.as_slice()).unwrap();
+    let expected = UploadEnvelope::decode(bytes.as_slice()).unwrap();
     let mut corrupt = expected.clone();
-    corrupt.cas_objects[0].blob[0] ^= 1;
+    corrupt.blobs[0].blob[0] ^= 1;
     assert_ne!(corrupt.encode_to_vec(), bytes);
     assert_ne!(
-        Sha256::digest(&corrupt.cas_objects[0].blob).as_slice(),
-        corrupt.cas_objects[0].blob_sha256
+        Sha256::digest(&corrupt.blobs[0].blob).as_slice(),
+        corrupt.blobs[0].blob_sha256
     );
     let mut wrong_membership = expected;
-    wrong_membership.cas_objects.clear();
+    wrong_membership.blobs.clear();
     assert_ne!(wrong_membership.encode_to_vec(), bytes);
 }

@@ -19,11 +19,14 @@ workspace = true
 
 [dependencies]
 baml_artifact = { workspace = true }
+baml_base = { workspace = true }
 baml_builtins2 = { workspace = true }
 baml_compiler_diagnostics = { workspace = true }
+baml_env = { workspace = true }
 baml_linker_types = { workspace = true }
 baml_type = { workspace = true }
 bex_heap = { workspace = true }
+bex_sap = { workspace = true }
 bex_str = { workspace = true }
 bex_vm_types = { workspace = true }
 btel_clock = { workspace = true }
@@ -40,14 +43,16 @@ chacha20poly1305 = { workspace = true }
 console = { workspace = true }
 getrandom = { workspace = true }
 indexmap = { workspace = true }
+itoa = { workspace = true }
 log = { workspace = true }
+memchr = { workspace = true }
 num-bigint = { workspace = true }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 rand_xoshiro = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = [ "arbitrary_precision", "preserve_order" ] }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 smallvec = { workspace = true }
@@ -55,10 +60,20 @@ time = { workspace = true }
 tokio = { workspace = true, features = [ "macros" ] }
 tokio-util = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
+zmij = { workspace = true }
 
-# Native-only: tokio runtime so CancelToken.any can `tokio::spawn` its watcher.
+# Native-only: tokio runtime so CancelToken.any can `tokio::spawn` its watcher,
+# and the Google credential classifier `_describe_unreadable_credential_file`
+# describes a setting with (Google auth is native-only, so wasm never needs it).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+google-cloud-auth = { workspace = true }
 tokio = { workspace = true, features = [ "rt", "macros" ] }
+
+# Compiled bodies run on a fiber per VM so they can pause mid-body; see
+# `vm/compiled_rt/fiber.rs` for the targets without one.
+[target.'cfg(not(any(target_arch = "wasm32", all(windows, target_arch = "aarch64"))))'.dependencies]
+corosensei = { workspace = true }
 
 # WASM-only: wasm-bindgen-futures for spawning the watcher.
 # `getrandom/js` is required for the `getrandom::getrandom` calls in
@@ -74,7 +89,7 @@ wasm-bindgen-futures = { workspace = true }
 baml_builtins2_codegen = { workspace = true }
 
 [dev-dependencies]
-baml_db = { workspace = true }
+baml_test_support = { workspace = true }
 indexmap = { workspace = true }
 
 [features]

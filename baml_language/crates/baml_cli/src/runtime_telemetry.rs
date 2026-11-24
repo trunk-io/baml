@@ -11,22 +11,81 @@ pub(crate) fn create_engine(
     argv: Vec<String>,
     project_root: &Path,
     sources: Vec<(String, String)>,
+    build: Option<bex_engine::BuildProvider>,
 ) -> Result<BexEngine, EngineError> {
-    BexEngine::new_with_telemetry_recording(
+    create_engine_with_context(
+        program,
+        argv,
+        project_root,
+        sources,
+        build,
+        Default::default(),
+    )
+}
+
+pub(crate) fn create_engine_with_context(
+    program: bex_vm_types::Program,
+    argv: Vec<String>,
+    project_root: &Path,
+    sources: Vec<(String, String)>,
+    build: Option<bex_engine::BuildProvider>,
+    launch_context: btel_types::context::Context,
+) -> Result<BexEngine, EngineError> {
+    // `--hot` compares each save with this.
+    let hotswap_baseline = baml_env::hotswap_enabled().then(|| {
+        bex_project::hotswap_fingerprint::declaration_fingerprints(
+            sources
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
+        )
+    });
+    // Disabled recording must not validate or discover an unused destination.
+    if btel_settings::mode::from_env()
+        .map_err(|error| EngineError::Other(error.to_string()))?
+        .is_none()
+    {
+        return BexEngine::new_with_config(
+            program,
+            Arc::new(sys_native::SysOps::native()),
+            argv,
+            bex_engine::EngineConfig {
+                launch_context,
+                runtime_compiler: Some(bex_project::runtime_compiler()),
+                hotswap_baseline,
+                ..bex_engine::EngineConfig::default()
+            },
+        );
+    }
+    let boundary = crate::cloud_config::Boundary::read(project_root)
+        .map_err(|error| EngineError::Other(error.to_string()))?;
+    let recording = TelemetryRecording::from_boundary_defaults(
+        boundary.project.as_deref(),
+        boundary.api_url.as_deref(),
+    )
+    .unwrap_or_else(|| {
+        TelemetryRecording::local_files(
+            project_root,
+            btel_settings::publisher::RecordingConfig::default(),
+        )
+    })
+    .with_host("baml")
+    .with_source_upload(boundary.upload_source)
+    .with_sources(sources);
+    let recording = match build {
+        Some(build) => recording.with_build(build),
+        None => recording,
+    };
+    BexEngine::new_with_config(
         program,
         Arc::new(sys_native::SysOps::native()),
         argv,
-        Some(bex_project::runtime_compiler()),
-        btel_settings::clock::DEFAULT_MODE,
-        TelemetryRecording::from_boundary_env()
-            .unwrap_or_else(|| {
-                TelemetryRecording::local_files(
-                    project_root,
-                    btel_settings::publisher::RecordingConfig::default(),
-                )
-            })
-            .with_host("baml")
-            .with_sources(sources),
+        bex_engine::EngineConfig {
+            launch_context,
+            runtime_compiler: Some(bex_project::runtime_compiler()),
+            hotswap_baseline,
+            recording: Some(recording),
+            ..bex_engine::EngineConfig::default()
+        },
     )
 }
 

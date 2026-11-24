@@ -50,6 +50,12 @@ impl<'db> Facts<'db> {
         }
     }
 
+    /// Bound one more rigid parameter: a body's `let type T extends I = …`
+    /// binding, which enters the env where its statement runs.
+    pub(crate) fn add_bounds(&mut self, param: ParamTy, bounds: Vec<Interface>) {
+        self.bounds.insert(param, bounds);
+    }
+
     /// The scope's param env verbatim - the overlap oracle's `bounds` input
     /// shares this shape (`TypeVarBoundsMap`).
     pub fn bounds(&self) -> &rustc_hash::FxHashMap<ParamTy, Vec<Interface>> {
@@ -156,6 +162,11 @@ impl TypeContext for Facts<'_> {
     fn implements_interface(&self, concrete: &Ty, interface: &Interface) -> bool {
         let concrete = crate::impls::interned_ty(concrete);
         let target = InferInterface::from_constraint(interface);
+        if let Some(eligible) =
+            crate::impls::conditional_structural_verdict(self.db, self, &concrete, &target)
+        {
+            return eligible;
+        }
         crate::impls::implements_interface(self.db, &concrete, &target)
     }
 
